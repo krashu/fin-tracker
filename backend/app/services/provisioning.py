@@ -50,8 +50,13 @@ _DEFAULT_INCOME_CATEGORIES: tuple[tuple[str, str], ...] = (
 )
 
 
+_DEFAULT_REFUND_CATEGORIES: tuple[tuple[str, str], ...] = (
+    ("Refund", "#0e9488"),
+)
+
+
 def provision_default_categories(session: Session, user_id: UUID) -> None:
-    """Insert the default spend + income categories for ``user_id``.
+    """Insert the default spend, refund + income categories for ``user_id``.
 
     Does NOT commit — the caller (register) commits the user + categories in one
     transaction. ``is_seeded=True`` so they read as app defaults, not
@@ -60,6 +65,9 @@ def provision_default_categories(session: Session, user_id: UUID) -> None:
     rows = [
         Category(user_id=user_id, name=name, kind="spend", is_seeded=True, color=color)
         for name, color in _DEFAULT_SPEND_CATEGORIES
+    ] + [
+        Category(user_id=user_id, name=name, kind="refund", is_seeded=True, color=color)
+        for name, color in _DEFAULT_REFUND_CATEGORIES
     ] + [
         Category(user_id=user_id, name=name, kind="income", is_seeded=True, color=color)
         for name, color in _DEFAULT_INCOME_CATEGORIES

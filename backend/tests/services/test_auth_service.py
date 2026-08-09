@@ -99,7 +99,7 @@ def test_authenticate_rejects_demo_login_by_default_on_plain_http(
         auth_service.register_user(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD)
         auth_service.register_user(s, email="real@example.com", password=_PW)
 
-    default = Settings(cors_allowed_origins="http://localhost:3000")
+    default = Settings(demo_login_enabled=False, cors_allowed_origins="http://localhost:3000")
     assert default.cookie_secure is False, "this test must exercise the plain-http case"
     monkeypatch.setattr(auth_service, "get_settings", lambda: default)
     with Session(eng) as s:

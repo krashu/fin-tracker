@@ -118,7 +118,7 @@ export type AccountRead = {
 
 /** Spend categories serve spend+refund transactions; income categories serve
  * income. Set at create, immutable thereafter (the backend has no PATCH kind). */
-export type CategoryKind = "spend" | "income";
+export type CategoryKind = "spend" | "income" | "refund";
 
 /** A user-picked `#rrggbb` hex color for a category's dot/bar (the backend
  * validates and lower-cases it). `null` = derive the color from the id — the

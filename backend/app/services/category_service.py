@@ -25,13 +25,16 @@ from app.models import Category, CategoryKindStr, TransactionTypeStr
 def kind_for_type(transaction_type: TransactionTypeStr) -> CategoryKindStr:
     """The category ``kind`` a transaction of this type may carry.
 
-    ``income`` draws income categories; ``spend`` / ``refund`` / ``transfer``
-    draw spend (a refund nets against spend in the same category; a transfer
-    normally carries no category but falls back to spend). Backend mirror of
+    ``income`` draws income categories; ``refund`` draws refund categories;
+    ``spend`` / ``transfer`` draw spend categories. Backend mirror of
     the frontend ``categoryKindForType`` (``frontend/lib/categories.ts``) — the
     single source of truth for which kind each of the four types assigns.
     """
-    return "income" if transaction_type == "income" else "spend"
+    if transaction_type == "income":
+        return "income"
+    if transaction_type == "refund":
+        return "refund"
+    return "spend"
 
 
 def validate_category_ids(

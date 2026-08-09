@@ -3011,36 +3011,29 @@ def test_patch_colliding_amount_with_a_label_change_409s_not_500(
     assert resp.json()["detail"] == "transaction already exists"
 
 
-def test_patch_income_to_refund_with_a_spend_category(
+def test_patch_income_to_refund_with_a_refund_category(
     client: TestClient,
     axis_account: Account,
     session: Session,
 ) -> None:
-    """The correctness case the whole ADR turns on.
-
-    ``_REFUND_RE`` cannot separate a merchant refund from a cashback credit, so an
-    unmatched credit imports as ``income``. Only the user knows which it was, and the
-    type is load-bearing: every F8 aggregate filters
-    ``transaction_type.in_(("spend","refund"))``.
-    """
+    """An unmatched credit imports as income. Changing to refund requires a refund category."""
     txn = _seed_one(session, axis_account=axis_account)
     txn.transaction_type = "income"
     txn.amount_paise = 45000
     txn.category_id = _seed_category(session, axis_account.user_id, "Cashback", "income").id
     txn.fingerprint = _fp_of(txn)
     session.commit()
-    food = _seed_category(session, axis_account.user_id, "Food", "spend")
+    refund_cat = _seed_category(session, axis_account.user_id, "Refund", "refund")
 
     resp = client.patch(
         f"/api/v1/transactions/{txn.id}",
-        json={"transaction_type": "refund", "category_id": food.id},
+        json={"transaction_type": "refund", "category_id": refund_cat.id},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["transaction_type"] == "refund"
-    assert resp.json()["category_id"] == food.id
+    assert resp.json()["category_id"] == refund_cat.id
 
     session.refresh(txn)
-    # The type is NOT in the ADR-0006 payload, so identity is untouched (rule 2).
     assert txn.fingerprint == _fp_of(txn)
 
 
@@ -3108,7 +3101,7 @@ def test_patch_same_kind_type_change_keeps_the_category(
     axis_account: Account,
     session: Session,
 ) -> None:
-    """spend ↔ refund share the spend kind, so the category is still valid."""
+    """Changing fields within the same type keeps the category."""
     txn = _seed_one(session, axis_account=axis_account)
     food = _seed_category(session, axis_account.user_id, "Food", "spend")
     txn.category_id = food.id
@@ -3116,7 +3109,7 @@ def test_patch_same_kind_type_change_keeps_the_category(
 
     resp = client.patch(
         f"/api/v1/transactions/{txn.id}",
-        json={"transaction_type": "refund", "amount_paise": 12345},
+        json={"amount_paise": -9999},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["category_id"] == food.id

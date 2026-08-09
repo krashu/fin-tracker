@@ -16,13 +16,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import timedelta
-from decimal import Decimal
-
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from app.services.provisioning import provision_default_categories
 
 from app.core import clock, rate_limit
 from app.core.config import get_settings
@@ -108,13 +108,8 @@ def seeded_user(session: Session) -> User:
 
 @pytest.fixture
 def seeded_categories(session: Session, seeded_user: User) -> list[Category]:
-    """Mirror the 0003 migration seed since ``create_all`` skips data migrations.
-
-    The migration parity test in :mod:`tests.test_migration_parity` covers
-    the *actual* seed; this fixture just gives API tests a populated
-    ``categories`` table to query against without depending on Alembic.
-    """
-    names = (
+    """The set of categories seeded by migration 0003_seed_default_categories."""
+    spend_names = (
         "Food",
         "Groceries",
         "Transport",
@@ -127,11 +122,11 @@ def seeded_categories(session: Session, seeded_user: User) -> list[Category]:
         "Subscriptions",
         "EMI",
         "Investment",
-        "Income",
-        "Transfer",
         "Other",
+        "Transfer",
     )
-    cats = [Category(user_id=seeded_user.id, name=n, is_seeded=True) for n in names]
+    cats = [Category(user_id=seeded_user.id, name=n, kind="spend", is_seeded=True) for n in spend_names]
+    cats.append(Category(user_id=seeded_user.id, name="Income", kind="income", is_seeded=True))
     session.add_all(cats)
     session.commit()
     for c in cats:

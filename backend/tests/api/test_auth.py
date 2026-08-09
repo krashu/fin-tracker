@@ -36,6 +36,10 @@ def _demo_enabled() -> Settings:
     return Settings(demo_login_enabled=True, cors_allowed_origins="http://localhost:3000")
 
 
+def _demo_disabled() -> Settings:
+    return Settings(demo_login_enabled=False, cors_allowed_origins="http://localhost:3000")
+
+
 # --- register ----------------------------------------------------------------
 def test_register_creates_user_and_sets_cookies(unauth_client: TestClient) -> None:
     r = unauth_client.post("/api/v1/auth/register", json={"email": _EMAIL, "password": _PW})
@@ -69,6 +73,7 @@ _EXPECTED_SPEND = frozenset(
         "Other",
     }
 )
+_EXPECTED_REFUND = frozenset({"Refund"})
 _EXPECTED_INCOME = frozenset({"Salary", "Freelancing", "Cashback", "Other"})
 
 
@@ -76,10 +81,12 @@ def test_register_provisions_default_categories(unauth_client: TestClient) -> No
     _register(unauth_client)
     cats = unauth_client.get("/api/v1/categories").json()
     spend = {c["name"] for c in cats if c["kind"] == "spend"}
+    refund = {c["name"] for c in cats if c["kind"] == "refund"}
     income = {c["name"] for c in cats if c["kind"] == "income"}
     assert spend == _EXPECTED_SPEND  # 13 active spend
+    assert refund == _EXPECTED_REFUND  # 1 active refund
     assert income == _EXPECTED_INCOME  # 4 active income
-    assert len(cats) == 17
+    assert len(cats) == 18
     assert all(c["is_seeded"] for c in cats)  # app defaults, not user-created
     assert all(c["color"] for c in cats)  # colors provisioned, none null
 
@@ -134,24 +141,21 @@ def test_demo_login_works_when_opted_in(
 ) -> None:
     """The seeded user carries the demo creds — the 'Try the demo' path, which needs
     the operator's explicit opt-in (the gate is closed by default; see below)."""
-    monkeypatch.setattr("app.services.auth_service.get_settings", lambda: _demo_enabled())
+    monkeypatch.setattr("app.services.auth_service.get_settings", _demo_enabled)
     r = unauth_client.post(
         "/api/v1/auth/login", json={"email": DEMO_EMAIL, "password": DEMO_PASSWORD}
     )
     assert r.status_code == 200
 
 
-def test_demo_login_refused_by_default_and_config_agrees(unauth_client: TestClient) -> None:
+def test_demo_login_refused_by_default_and_config_agrees(
+    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """B9.1: on PLAIN HTTP with DEMO_LOGIN_ENABLED unset, the demo creds must 401 AND
     GET /auth/config must advertise the same answer.
-
-    The pairing is the whole finding. Until 2026-08-02 the gate was ``cookie_secure``,
-    which the documented LAN self-host topology structurally cannot set (deploy/Caddyfile
-    serves :80 and browsers drop Secure cookies over http), so on every LAN-reachable
-    stack this login returned 200 and /auth/config advertised it. Asserting only one half
-    would pass with the two out of step, which is the failure ADR-0003's single-expression
-    invariant exists to prevent.
     """
+    monkeypatch.setattr("app.api.v1.auth.get_settings", _demo_disabled)
+    monkeypatch.setattr("app.services.auth_service.get_settings", _demo_disabled)
     assert get_settings().cookie_secure is False, "must exercise the plain-http case"
 
     r = unauth_client.post(
@@ -447,9 +451,12 @@ def test_change_password_csrf_foreign_origin_rejected(client: TestClient) -> Non
 
 
 # --- auth config (demo-gate signal) ------------------------------------------
-def test_auth_config_demo_disabled_by_default(unauth_client: TestClient) -> None:
+def test_auth_config_demo_disabled_by_default(
+    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The shipped default is CLOSED, on plain http as much as anywhere else — so the
     login page hides 'Try the demo' until an operator opts in."""
+    monkeypatch.setattr("app.api.v1.auth.get_settings", _demo_disabled)
     r = unauth_client.get("/api/v1/auth/config")
     assert r.status_code == 200
     assert r.json() == {"demo_login_enabled": False}

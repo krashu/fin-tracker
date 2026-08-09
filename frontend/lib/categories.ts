@@ -12,12 +12,15 @@ import type {
  * offer the spend picker on one. Single source of truth for the four category
  * pickers. */
 export function categoryKindForType(t: TransactionType): CategoryKind {
-  return t === "income" ? "income" : "spend";
+  if (t === "income") return "income";
+  if (t === "refund") return "refund";
+  return "spend";
 }
 
 /** Human label for a category kind (settings list headers, etc.). */
 export const CATEGORY_KIND_LABELS: Record<CategoryKind, string> = {
   spend: "Spend",
+  refund: "Refund",
   income: "Income",
 };
 

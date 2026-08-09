@@ -460,10 +460,17 @@ def commit_import_batch(
             Category.archived_at.is_(None),
         )
     )
+    refund_default_id = session.scalar(
+        select(Category.id).where(
+            Category.user_id == user_id,
+            Category.kind == "refund",
+            Category.archived_at.is_(None),
+        )
+    )
 
     # Active (non-archived) category ids among the rows' current categories. A
     # spend/refund row whose category was archived mid-review is then treated
-    # like an untagged one below (default to "Other") — so it never commits to a
+    # like an untagged one below — so it never commits to a
     # dead bucket, and pass 3 never resurrects a merchant_tag_map row pointing at
     # the archived category. Scoped to the user, so only *this user's archived*
     # categories are re-bucketed; foreign/absent refs are unreachable in v1
@@ -488,25 +495,31 @@ def commit_import_batch(
 
     returned_ids = {r.id for r in rows}
     invalid_ids: set[int] = requested_ids - returned_ids
-    # Rows we defaulted to "Other" — excluded from pass-3 learning below, since a
+    # Rows we defaulted to "Other" or "Refund" — excluded from pass-3 learning below, since a
     # fallback isn't a merchant→category decision worth teaching F3.
     defaulted_ids: set[int] = set()
     for r in rows:
         if r.confirmed_at is not None:
             invalid_ids.add(r.id)
             continue
-        # spend/refund with no category — or one whose category was archived
-        # mid-review — default to the spend "Other" category rather than being
-        # rejected. income/transfer stay as-is: income may commit uncategorized,
-        # and auto_link (pass 2) can flip an income CC-payment to a transfer,
-        # which MUST stay category-null — so we never stamp Other on it.
-        if r.transaction_type in ("spend", "refund") and (
+        # spend row with no category defaults to spend "Other" category.
+        # refund row with no category defaults to "Refund" category.
+        if r.transaction_type == "spend" and (
             r.category_id is None or r.category_id not in active_category_ids
         ):
             if spend_other_id is None:
                 invalid_ids.add(r.id)  # no Other to fall back to — keep the guard
             else:
                 r.category_id = spend_other_id
+                defaulted_ids.add(r.id)
+        elif r.transaction_type == "refund" and (
+            r.category_id is None or r.category_id not in active_category_ids
+        ):
+            target_id = refund_default_id or spend_other_id
+            if target_id is None:
+                invalid_ids.add(r.id)
+            else:
+                r.category_id = target_id
                 defaulted_ids.add(r.id)
 
     if invalid_ids:

@@ -8,49 +8,26 @@ export type TagPickerProps = {
   /** Resolved category name, or null when the row has no category yet. */
   categoryName: string | null;
   /**
-   * True when this untagged row is staged and will commit under the seeded
-   * "Other" category (spend/refund). Swaps the urgent "Pick category" prompt for
-   * a muted "Other · default" so the user sees what it will commit as.
+   * True when this untagged row is staged and will commit under a default category
+   * (e.g. spend -> Other, refund -> Refund).
    */
   defaultsToOther?: boolean;
+  defaultCategoryName?: string;
   priorMatches: number;
-  /**
-   * True when the winning rule for this (merchant, category) is user-authored
-   * (pinned). A pinned rule prefills even at hit_count=1, so its "authored"
-   * state must outrank the low-prior-matches confidence tint — otherwise a
-   * category the user explicitly pinned reads as "only 1 prior / re-check me".
-   */
   pinned?: boolean;
 } & React.ComponentProps<"button">;
 
-/**
- * Category trigger for an import-review row. Presentational only — it renders a
- * single <button> and forwards props, so the parent wraps it in
- * `<DropdownMenuTrigger asChild>` and owns the category list + PATCH mutation.
- *
- * Visual keys on whether a category is set, then on the F3 confidence signal
- * (prior_matches against the row's existing tag). Confidence drives the tint
- * only — never staging, which the parent decides from the category.
- *
- * - no category, will default to Other: muted "Other · default" pill
- * - no category otherwise: dashed "Pick category" (+ "· no history" when priorMatches===0)
- * - pinned (category set): primary dot + name + "· pinned" — outranks confidence
- * - confident: primary dot + name + "· N prior"
- * - uncertain: warn-tinted + question icon + "· only N prior"
- * - none but tagged: muted dot + name + "· no history" (just-tagged / no history)
- */
 export function TagPicker({
   confidence,
   categoryName,
   defaultsToOther = false,
+  defaultCategoryName = "Other",
   priorMatches,
   pinned = false,
   className,
   ...props
 }: TagPickerProps) {
   if (categoryName == null) {
-    // Staged-but-untagged: it will commit as "Other". Muted, non-urgent pill —
-    // the row's already going in, the user just hasn't picked a real category.
     if (defaultsToOther) {
       return (
         <button
@@ -65,7 +42,7 @@ export function TagPicker({
             aria-hidden
             className="size-1.5 rounded-full bg-muted-foreground/40"
           />
-          <span>Other</span>
+          <span>{defaultCategoryName}</span>
           <span className="text-[11px] font-normal text-muted-foreground/70">
             · default
           </span>

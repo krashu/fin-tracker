@@ -35,10 +35,11 @@ import type {
  * dialog, but they are browsable here — otherwise a mis-detected F4a link or a
  * stray manual transfer would be unreachable from the UI, with no way to
  * inspect or delete it. */
-export type TypeFilter = "spending" | "income" | "transfers";
+export type TypeFilter = "spending" | "refunds" | "income" | "transfers";
 
 const TYPE_FILTER_LABEL: Record<TypeFilter, string> = {
   spending: "Spending",
+  refunds: "Refunds",
   income: "Income",
   transfers: "Transfers",
 };
@@ -47,9 +48,10 @@ const TYPE_FILTER_LABEL: Record<TypeFilter, string> = {
  * the param, since omitting it widens the list endpoint to *every* type at once
  * (transfers mixed into the spending list), which no view wants. */
 export function typeFilterToParam(t: TypeFilter): TransactionType[] {
+  if (t === "refunds") return ["refund"];
   if (t === "income") return ["income"];
   if (t === "transfers") return ["transfer"];
-  return ["spend", "refund"];
+  return ["spend"];
 }
 
 export type FilterRowProps = {
@@ -105,7 +107,12 @@ export function FilterRow({
   // income). Transfers keep the spend picker deliberately: a transfer may carry
   // a spend category (ADR-0007 rule 7), so hiding it would strand those rows.
   const category = categories.find((c) => c.id === categoryId);
-  const categoryKind = typeFilter === "income" ? "income" : "spend";
+  const categoryKind =
+    typeFilter === "income"
+      ? "income"
+      : typeFilter === "refunds"
+      ? "refund"
+      : "spend";
   const visibleCategories = categories.filter((c) => c.kind === categoryKind);
   const label = labels.find((l) => l.id === labelId);
 
@@ -119,7 +126,7 @@ export function FilterRow({
           </Pill>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="max-h-72 w-48">
-          {(["spending", "income", "transfers"] as const).map((t) => (
+          {(["spending", "refunds", "income", "transfers"] as const).map((t) => (
             <DropdownMenuItem key={t} onSelect={() => onTypeFilterChange(t)}>
               {t === "spending" ? (
                 <span className="text-muted-foreground">

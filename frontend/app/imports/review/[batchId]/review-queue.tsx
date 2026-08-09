@@ -60,6 +60,7 @@ import {
   type CategoryRead,
   type LabelRead,
   type TransactionCandidate,
+  type TransactionUpdate,
 } from "@/lib/api/client";
 import { categoryKindForType } from "@/lib/categories";
 import { formatINR, formatDateWithYear } from "@/lib/format";
@@ -242,6 +243,10 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
     (c) => categoryKindForType(c.transaction_type) === "spend",
   )
     ? "spend"
+    : stagedCandidates.some(
+        (c) => categoryKindForType(c.transaction_type) === "refund",
+      )
+    ? "refund"
     : "income";
   const bulkTargets = stagedCandidates
     .filter((c) => categoryKindForType(c.transaction_type) === bulkKind)
@@ -276,8 +281,18 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   const forceUnstage = (ids: Iterable<number>) => setStagedFor(ids, false);
 
   const patchMutation = useMutation({
-    mutationFn: (vars: { id: number; categoryId: number | null }) =>
-      patchTransaction(vars.id, { category_id: vars.categoryId }),
+    mutationFn: (vars: { id: number; categoryId: number | null }) => {
+      const cat = vars.categoryId != null ? categoriesById.get(vars.categoryId) : null;
+      const body: TransactionUpdate = { category_id: vars.categoryId };
+      if (cat?.kind === "refund") {
+        body.transaction_type = "refund";
+      } else if (cat?.kind === "income") {
+        body.transaction_type = "income";
+      } else if (cat?.kind === "spend") {
+        body.transaction_type = "spend";
+      }
+      return patchTransaction(vars.id, body);
+    },
     onMutate: (vars) => setPendingRowIds((prev) => new Set(prev).add(vars.id)),
     // Picking a category is a fresh staging decision: reset the row to the pure
     // category-based default by clearing any prior `toggled` flip, THEN refetch so
@@ -325,9 +340,14 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
       for (let i = 0; i < vars.ids.length; i += BULK_CHUNK) {
         const chunk = vars.ids.slice(i, i + BULK_CHUNK);
         const results = await Promise.allSettled(
-          chunk.map((id) =>
-            patchTransaction(id, { category_id: vars.categoryId }),
-          ),
+          chunk.map((id) => {
+            const cat = categoriesById.get(vars.categoryId);
+            const body: TransactionUpdate = { category_id: vars.categoryId };
+            if (cat?.kind === "refund") body.transaction_type = "refund";
+            else if (cat?.kind === "income") body.transaction_type = "income";
+            else if (cat?.kind === "spend") body.transaction_type = "spend";
+            return patchTransaction(id, body);
+          }),
         );
         results.forEach((r, j) => {
           if (r.status === "fulfilled") updated.push(chunk[j]);
@@ -1003,13 +1023,13 @@ function ReviewRow({
   // range-select silently degrades to a plain toggle with no type error.
   const shiftRef = useRef(false);
 
-  // Picker options are kind-filtered to the row's transaction type — income rows
-  // draw income categories, spend/refund draw spend (transfer falls back to
-  // spend, but commits category-null regardless). Mirrors the other four
-  // pickers; without it the merged list shows both scopes' "Other". Name lookup
-  // still uses the parent's full-list map (categoriesById).
-  const visibleCategories = categories.filter(
-    (cat) => cat.kind === categoryKindForType(c.transaction_type),
+  // Credit rows (positive amount) offer both income and refund categories so
+  // merchant credits / refunds can be categorized under Refund or Income.
+  // Debit rows offer spend categories.
+  const visibleCategories = categories.filter((cat) =>
+    isCredit
+      ? cat.kind === "income" || cat.kind === "refund"
+      : cat.kind === "spend",
   );
 
   return (
@@ -1084,6 +1104,7 @@ function ReviewRow({
             confidence={c.confidence}
             categoryName={categoryName}
             defaultsToOther={defaultsToOther}
+            defaultCategoryName={c.transaction_type === "refund" ? "Refund" : "Other"}
             priorMatches={c.prior_matches}
             pinned={c.pinned}
             disabled={pending}
