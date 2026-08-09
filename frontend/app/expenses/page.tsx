@@ -20,7 +20,6 @@ import { Button } from "@/components/ui/button";
 import { PageHeader } from "@/components/shell/page-header";
 import { IconUpload } from "@/components/icons";
 import { ExpensesBoard } from "./expenses-board";
-import { SummaryStrip } from "@/components/dashboard/summary-strip";
 import { AddControls } from "./add-transaction";
 import { ReviewPendingButton } from "./review-pending-button";
 
@@ -45,10 +44,11 @@ export default function ExpensesPage() {
           </>
         }
       />
-      <SummaryStrip />
       {/* ExpensesBoard reads useSearchParams (?account/?category deep-links from
           the ⌘K palette); a Suspense boundary is required so the route still
-          prerenders (Next bails the subtree to client-render inside it). */}
+          prerenders (Next bails the subtree to client-render inside it).
+          SummaryStrip is rendered inside ExpensesBoard so it can follow the
+          board's year/month/allDates filter state. */}
       <Suspense>
         <ExpensesBoard />
       </Suspense>

@@ -28,6 +28,15 @@ export function monthRange(anchor: Date): { date_from: string; date_to: string }
   return { date_from: toLocalYMD(first), date_to: toLocalYMD(last) };
 }
 
+/** `{date_from, date_to}` spanning a full calendar year (Jan 1 → Dec 31) as
+ * local YYYY-MM-DD. Mirrors `monthRange` for year-level filtering on the
+ * /expenses board. */
+export function yearRange(year: number): { date_from: string; date_to: string } {
+  const first = new Date(year, 0, 1);
+  const last = new Date(year, 11, 31);
+  return { date_from: toLocalYMD(first), date_to: toLocalYMD(last) };
+}
+
 /** `{start, end}` for [Monday `weeksBack` weeks ago .. today] — Monday-aligned so
  * the leftmost weekly bucket isn't a clipped partial week. With weeksBack=13 the
  * backend returns 14 ISO-week buckets (13 full + the current partial week).

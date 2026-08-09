@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Pill } from "@/components/ui/pill";
 import { IconChevronDown, IconChevronRight, IconX } from "@/components/icons";
-import { formatMonthYear } from "@/lib/format";
+import { formatMonth } from "@/lib/format";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import type {
@@ -60,6 +60,8 @@ export type FilterRowProps = {
   accountId?: number;
   categoryId?: number;
   labelId?: number;
+  year: number;
+  availableYears: number[];
   monthAnchor: Date;
   allDates: boolean;
   atCurrentMonth: boolean;
@@ -69,6 +71,7 @@ export type FilterRowProps = {
   onAccountChange: (id: number | undefined) => void;
   onCategoryChange: (id: number | undefined) => void;
   onLabelChange: (id: number | undefined) => void;
+  onYearChange: (year: number) => void;
   onStepMonth: (delta: number) => void;
   onToggleAllDates: () => void;
 };
@@ -81,6 +84,8 @@ export function FilterRow({
   accountId,
   categoryId,
   labelId,
+  year,
+  availableYears,
   monthAnchor,
   allDates,
   atCurrentMonth,
@@ -90,6 +95,7 @@ export function FilterRow({
   onAccountChange,
   onCategoryChange,
   onLabelChange,
+  onYearChange,
   onStepMonth,
   onToggleAllDates,
 }: FilterRowProps) {
@@ -192,6 +198,27 @@ export function FilterRow({
         </DropdownMenu>
       ) : null}
 
+      {/* Year selector — dropdown pill listing available transaction years. */}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Pill active={year !== new Date().getFullYear()}>
+            {year}
+            <IconChevronDown className="size-3 opacity-70" />
+          </Pill>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="max-h-72 w-32">
+          {availableYears.map((y) => (
+            <DropdownMenuItem key={y} onSelect={() => onYearChange(y)}>
+              {y === new Date().getFullYear() ? (
+                <span className="text-muted-foreground">{y}</span>
+              ) : (
+                String(y)
+              )}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+
       {/* Month navigator — pill-height (h-7) so the row keeps its height and the
           table's sticky `stickyTop` offset stays valid. Dimmed but clickable
           while All-dates is active. */}
@@ -210,7 +237,7 @@ export function FilterRow({
           <IconChevronRight className="size-3.5 rotate-180" />
         </button>
         <span className="min-w-[100px] text-center text-[12px] font-medium tabular-nums text-foreground">
-          {formatMonthYear(monthAnchor)}
+          {formatMonth(monthAnchor)}
         </span>
         <button
           type="button"
@@ -224,7 +251,7 @@ export function FilterRow({
       </div>
 
       <Pill active={allDates} onClick={onToggleAllDates}>
-        All dates
+        All months
       </Pill>
 
       {/* Appears only when a filter is off its default — resets everything in one

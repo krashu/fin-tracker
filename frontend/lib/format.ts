@@ -175,6 +175,14 @@ export function formatMonthYear(d: Date): string {
   return monthYearFmt.format(d);
 }
 
+const monthOnlyFmt = new Intl.DateTimeFormat("en-IN", { month: "long" });
+
+/** "June" — month name only, used by the filter row when the year is shown
+ * separately in the year dropdown. */
+export function formatMonth(d: Date): string {
+  return monthOnlyFmt.format(d);
+}
+
 const pctFmt = new Intl.NumberFormat("en-IN", {
   style: "percent",
   minimumFractionDigits: 1,

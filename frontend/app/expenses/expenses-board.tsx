@@ -22,6 +22,7 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   listAccounts,
+  listAvailableYears,
   listCategories,
   listLabels,
   listTransactions,
@@ -33,12 +34,13 @@ import {
 } from "@/lib/api/client";
 import { accountLabel } from "@/lib/accounts";
 import { formatINR, formatDate } from "@/lib/format";
-import { thisMonthAnchor, monthKey, monthRange } from "@/lib/dates";
+import { thisMonthAnchor, monthKey, monthRange, yearRange } from "@/lib/dates";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
 import { LabelChip } from "@/components/labels/label-chip";
 import { Sensitive } from "@/components/balance-visibility";
 import { StateRow, Td, Th } from "@/components/ui/table";
+import { SummaryStrip } from "@/components/dashboard/summary-strip";
 import { TransactionDialog } from "./transaction-dialog";
 import { FilterRow, typeFilterToParam, type TypeFilter } from "./filter-row";
 import { SelectionBar } from "./selection-bar";
@@ -72,6 +74,7 @@ export function ExpensesBoard() {
     urlCategoryId,
   );
   const [labelId, setLabelId] = useState<number | undefined>(undefined);
+  const [year, setYear] = useState(() => new Date().getFullYear());
   const [monthAnchor, setMonthAnchor] = useState(thisMonthAnchor);
   const [allDates, setAllDates] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -92,21 +95,29 @@ export function ExpensesBoard() {
     setSelectedIds(new Set());
   }, [urlCategoryId]);
 
+  // Fetch available years for the year dropdown.
+  const availableYearsQuery = useQuery({
+    queryKey: ["dashboards", "available-years"],
+    queryFn: listAvailableYears,
+  });
+  const availableYears = availableYearsQuery.data?.years ?? [new Date().getFullYear()];
+
   // Cap forward stepping at the current month — no future spend to browse.
   const atCurrentMonth = monthKey(monthAnchor) === monthKey(thisMonthAnchor());
   // Stable string for the query key (never a raw Date — TanStack identity-hashes
   // objects) and the human-readable "scope" of what's loaded.
-  const monthScope = allDates ? "all" : monthKey(monthAnchor);
+  const monthScope = allDates ? `year-${year}` : monthKey(monthAnchor);
 
   // "Active" = any filter off its default view (Spending · all accounts · all
-  // categories · current month). Drives the Clear pill's visibility. A non-
-  // current month or All-dates both count as a moved date filter.
+  // categories · current month · current year). Drives the Clear pill's visibility.
+  const currentYear = new Date().getFullYear();
   const hasActiveFilters =
     typeFilter !== "spending" ||
     accountId != null ||
     categoryId != null ||
     labelId != null ||
     allDates ||
+    year !== currentYear ||
     !atCurrentMonth;
 
   // Any filter change drops the selection (a selected row may not survive the
@@ -122,6 +133,7 @@ export function ExpensesBoard() {
     setAccountId(undefined);
     setCategoryId(undefined);
     setLabelId(undefined);
+    setYear(currentYear);
     setMonthAnchor(thisMonthAnchor());
     setAllDates(false);
     resetView();
@@ -147,7 +159,7 @@ export function ExpensesBoard() {
         account_id: accountId,
         category_id: categoryId,
         label_id: labelId,
-        ...(allDates ? {} : monthRange(monthAnchor)),
+        ...(allDates ? yearRange(year) : monthRange(monthAnchor)),
       }),
     getNextPageParam: (lastPage, pages) =>
       lastPage.length === PAGE_SIZE ? pages.length * PAGE_SIZE : undefined,
@@ -211,6 +223,8 @@ export function ExpensesBoard() {
 
   return (
     <>
+      <SummaryStrip year={year} monthAnchor={monthAnchor} allDates={allDates} />
+
       <FilterRow
         accounts={accountsQuery.data ?? []}
         categories={categoriesQuery.data ?? []}
@@ -219,6 +233,8 @@ export function ExpensesBoard() {
         accountId={accountId}
         categoryId={categoryId}
         labelId={labelId}
+        year={year}
+        availableYears={availableYears}
         monthAnchor={monthAnchor}
         allDates={allDates}
         atCurrentMonth={atCurrentMonth}
@@ -249,11 +265,31 @@ export function ExpensesBoard() {
           setLabelId(id);
           resetView();
         }}
+        onYearChange={(y) => {
+          setYear(y);
+          // Keep the monthAnchor's month index but move it to the new year.
+          // If the current month is in the future for the selected year,
+          // clamp to December.
+          const curMonth = monthAnchor.getMonth();
+          const now = new Date();
+          const maxMonth = y === now.getFullYear() ? now.getMonth() : 11;
+          const newMonth = Math.min(curMonth, maxMonth);
+          setMonthAnchor(new Date(y, newMonth, 1));
+          setAllDates(false);
+          resetView();
+        }}
         onStepMonth={(delta) => {
           // Stepping picks a concrete month → leave All-dates mode.
-          setMonthAnchor(
-            (a) => new Date(a.getFullYear(), a.getMonth() + delta, 1),
-          );
+          // When crossing year boundaries, auto-update the year.
+          setMonthAnchor((a) => {
+            const newMonth = a.getMonth() + delta;
+            const newDate = new Date(a.getFullYear(), newMonth, 1);
+            // Auto-update year when stepping across year boundaries.
+            if (newDate.getFullYear() !== year) {
+              setYear(newDate.getFullYear());
+            }
+            return newDate;
+          });
           setAllDates(false);
           resetView();
         }}
