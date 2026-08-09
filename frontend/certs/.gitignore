@@ -1,0 +1,10 @@
+# Local-only CA certs for the corporate-proxy hook (see README.md). Two consumers:
+# the frontend Dockerfile `base` stage installs any *.crt dropped here into the image
+# trust store so `next build` can fetch fonts through a TLS-inspection proxy, and the
+# Makefile's `ca-bundle` target merges them with certifi's roots so the backend's F7
+# price feeds (AMFI / Yahoo) verify too.
+# NEVER commit a real corporate CA — only this dir's docs stay tracked, and the
+# source-packaging script (scripts/package_source.py) strips certs from the zip too.
+*
+!.gitignore
+!README.md

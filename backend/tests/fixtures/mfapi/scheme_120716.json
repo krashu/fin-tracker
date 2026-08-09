@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "fund_house": "Example AMC",
+    "scheme_type": "Open Ended Schemes(Equity Scheme - Index Funds)",
+    "scheme_category": "Index Funds/ETFs",
+    "scheme_code": 120716,
+    "scheme_name": "Nifty 50 Index Fund - Direct Plan - Growth"
+  },
+  "data": [
+    {"date": "19-06-2026", "nav": "245.6789"},
+    {"date": "18-06-2026", "nav": "244.1200"},
+    {"date": "17-06-2026", "nav": "243.8800"},
+    {"date": "16-06-2026", "nav": "242.5000"},
+    {"date": "15-06-2026", "nav": "241.9000"},
+    {"date": "12-06-2026", "nav": "240.7500"},
+    {"date": "11-06-2026", "nav": "239.6000"},
+    {"date": "10-06-2026", "nav": "240.1000"},
+    {"date": "09-06-2026", "nav": "238.4500"},
+    {"date": "08-06-2026", "nav": "237.9000"}
+  ],
+  "status": "SUCCESS"
+}

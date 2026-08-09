@@ -1,0 +1,49 @@
+# Dev hot-reload overlay — auto-merged by a bare `docker compose up` (i.e. `make dev`).
+# Layers bind-mounts + reload commands on top of docker-compose.yml. NOT used by
+# `make up` / `make up-proxy`, which pass explicit -f lists (disabling auto-merge).
+services:
+  backend:
+    # Source is bind-mounted for reload; a NAMED volume over /app/.venv keeps the
+    # image-built venv (Docker seeds a fresh named volume from the image), so the
+    # host ./backend/.venv never shadows it and dev needs no manual `uv sync`.
+    volumes:
+      - ./backend:/app
+      - backend-venv:/app/.venv
+    # Runs the venv interpreter directly (the runtime image no longer ships uv — see
+    # backend/Dockerfile). The backend-venv named volume seeds /app/.venv from the image,
+    # so .venv/bin/python is present; watchfiles (uvicorn[standard]) powers --reload.
+    command: .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # Dev convenience: a fresh dev DB self-seeds the demo dataset on boot. The base
+    # docker-compose.yml (self-host `up`/`up-proxy`, real data) pins this false, so
+    # only the dev overlay opts back in.
+    #
+    # DEMO_LOGIN_ENABLED likewise: the demo credentials are published in this repo, so the
+    # login is refused by default (ADR-0003 §Demo account gate) and only `make dev` opts
+    # back in. Deliberately NOT set in docker-compose.yml — `up` / `up-proxy` hold real
+    # data and are LAN-reachable, and a base `environment:` entry would outrank .env and
+    # stop a self-hoster enabling it deliberately.
+    environment:
+      SEED_DEMO_ON_STARTUP: "true"
+      DEMO_LOGIN_ENABLED: "true"
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    # Distinct tag so this dev image never reuses the base `:run` (pruned) image —
+    # compose won't rebuild on a changed target alone.
+    image: fin-tracker-frontend:dev
+    # Bind source for HMR; the anonymous /app/node_modules is seeded from the `dev`
+    # stage's populated modules, so `pnpm dev` starts without a manual install.
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: pnpm dev
+    # Dev reads NEXT_PUBLIC_API_BASE_URL at runtime; the default-port case already
+    # falls back to http://localhost:8000/api/v1 in lib/api/client.ts. Uncomment and
+    # set only if you remap the API to a non-default host/port:
+    # environment:
+    #   NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+
+volumes:
+  backend-venv:

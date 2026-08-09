@@ -1,0 +1,14 @@
+Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Net Asset Value;Date
+
+Open Ended Schemes(Debt Scheme - Banking and PSU Fund)
+
+Aditya Birla Sun Life Mutual Fund
+
+119551;INF209KA12Z1;INF209KA13Z9;Aditya Birla Sun Life Banking & PSU Debt Fund - DIRECT - IDCW;105.9219;20-Jun-2026
+119552;INF209K01YM2;-;Aditya Birla Sun Life Banking & PSU Debt Fund - DIRECT - Growth;117.0754;20-Jun-2026
+
+Open Ended Schemes(Other Scheme - Index Funds)
+
+HDFC Mutual Fund
+
+120503;INF179KC1979;-;HDFC Index Fund-NIFTY 50 Plan-Direct Plan-Growth Option;245.6789;20-Jun-2026

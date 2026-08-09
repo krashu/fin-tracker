@@ -1,0 +1,67 @@
+# OS / IDE
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+
+# Env (catch every .env variant; keep the template tracked)
+.env*
+!.env.example
+
+# Local data
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# PDF safety — never accidentally commit a real bank statement.
+# Fixture PDFs (which the pre-commit fixture-redaction guard enforces are
+# redacted) are explicitly allowed.
+*.pdf
+!backend/tests/fixtures/**/*.pdf
+
+# Real (unredacted) statement PDFs for local-only parser tests.
+# Tests in backend/tests/parsers/ skip when these files are absent, so CI
+# stays green; locally they enable real-data smoke tests.
+backend/tests/fixtures/_local/
+
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ty_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+coverage/
+*.log
+
+# Claude
+.claude/settings.local.json
+.claude/.session/
+
+# Agent working notes (arc plans etc.) — not tracked artifacts
+.scratch/
+
+# Playwright CLI (agent UI-verification artifacts: snapshots, console logs, screenshots)
+.playwright-cli/

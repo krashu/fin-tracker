@@ -1,0 +1,24 @@
+# Keep the build context lean AND keep secrets / PII / host artifacts out of the image.
+# The venv is rebuilt inside the image; the host one (Defender-quarantined on this box)
+# must never shadow it. data/*.db and .env carry real financial data + secrets.
+
+.venv/
+data/
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.ty_cache/
+.coverage
+htmlcov/
+
+# Real, un-redacted statement fixtures (gitignored; never ship them).
+tests/fixtures/_local/
+
+# Editor / tooling noise.
+.claude/
+*.egg-info/

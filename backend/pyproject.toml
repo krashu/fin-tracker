@@ -1,0 +1,126 @@
+[project]
+name = "fin-tracker-backend"
+version = "0.0.0"
+description = "Personal finance tracker — FastAPI backend"
+requires-python = ">=3.13,<3.14"
+# Version policy (PRD §Maintenance posture): bounded ranges — floor = current
+# (no regress), ceiling = next breaking boundary (minor for 0.x, major for >=1.x).
+# uv.lock pins exact + is committed; ranges only cap `uv lock --upgrade`.
+dependencies = [
+    # Web framework
+    "fastapi>=0.136.3,<0.139",
+    "uvicorn[standard]>=0.47.0,<0.48",
+    "pydantic-settings>=2.14.1,<3",
+    "python-multipart>=0.0.20,<0.1",  # required by FastAPI Form/File/UploadFile (PRD §F1 statement upload)
+    # DB
+    "sqlalchemy>=2.0.49,<3",
+    "alembic>=1.18.4,<2",
+    # PDF parsing (v0.1 — Axis CC)
+    "pdfplumber>=0.11.9,<0.12",
+    "pikepdf>=10.6.0,<11",
+    # Observability
+    "structlog>=25.5.0,<26",
+    # XIRR (v0.4 / PRD §F7/§F8) — Rust extension; used by portfolio_service.
+    "pyxirr>=0.10.8,<0.11",
+    # HTTP (v0.6.5 / PRD §F7 — NAV snapshot: AMFI NAVAll + Yahoo quotes). Landed here ahead
+    # of its v0.5 FX use; ships py.typed so no type-checker override needed.
+    "httpx>=0.28.1,<0.29",
+    # Auth (multi-user, PRD §Users&access v2) — argon2id password hashing +
+    # JWT access tokens. Both ship py.typed; bounded per §Maintenance posture.
+    "argon2-cffi>=25.1.0,<26",
+    "pyjwt>=2.13.0,<3",
+]
+# Added at later milestones (do not install yet):
+#   v0.7 — google-api-python-client, google-auth-oauthlib, cryptography
+#                                    (Drive sync + Fernet token store)
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.13,<0.16",
+    # Type checker (see docs/adr/0005-type-checker-ty.md). Pre-1.0: behaviour can shift
+    # between 0.0.x releases, so the ceiling is the next minor per §Maintenance posture
+    # and uv.lock pins exact — upgrades are deliberate (`uv lock --upgrade`).
+    # Floor is 0.0.63 (not the newer 0.0.64) because the 3-day `exclude-newer` cooldown
+    # below filters anything younger; both were verified clean on app/.
+    "ty>=0.0.63,<0.1",
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.3.0,<2",
+    "pytest-cov>=7.1.0,<8",
+    "pre-commit>=4.6.0,<5",
+]
+
+[tool.uv]
+# Personal project — use public PyPI directly, ignore any global UV_INDEX override
+# (e.g. corporate artifactory) that may be set in the shell.
+index-url = "https://pypi.org/simple"
+# Trust the OS/native certificate store (corporate TLS proxy CA). Replaces the
+# deprecated `native-tls = true`; same effect — load platform certs over the
+# bundled Mozilla roots.
+system-certs = true
+# Dependency cooldown: never resolve to a release younger than 3 days (rolling
+# window). Applies only at resolution time (`uv lock` / `--upgrade`), not at
+# `uv sync --frozen`/`--locked` install — guards against freshly-published
+# yanked/regressed/malicious releases. Duration syntax needs uv >=0.9.17.
+exclude-newer = "3 days"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# ANN carries the annotation-completeness half of what `mypy --strict` used to enforce
+# (disallow_untyped_defs / disallow_incomplete_defs): ty has no equivalent knob, since it
+# type-checks unannotated code rather than skipping it. See ADR 0005.
+select = ["E", "F", "I", "B", "UP", "SIM", "ANN"]
+# ANN401 bans explicit `Any` in annotations — stricter than the old gate, which allowed it
+# (`disallow_any_explicit` was never enabled). The handful of `Any`s in app/ are deliberate.
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests/ was never type-gated (the gate has always been `app` only); keeping it out of ANN
+# holds this migration scope-neutral. Annotating the suite is a clean standalone follow-up.
+"tests/**" = ["ANN"]
+
+[tool.ty.environment]
+python-version = "3.13"
+
+# No pyxirr override needed. mypy required `ignore_missing_imports` for it (a Rust extension
+# with no stubs); ty resolves it cleanly. If that ever regresses, the lever is
+# `[tool.ty.analysis] allowed-unresolved-imports`.
+#
+# No strictness block either: ty's defaults are stricter than mypy's here (it checks
+# unannotated bodies and infers list/dict literals precisely, neither of which is
+# configurable), and `terminal.error-on-warning` defaults true so warnings fail the gate.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov --cov-report=term-missing"
+markers = [
+    "real_pdf: requires _local/*.pdf fixtures and AXIS_TEST_PWD env var; skipped when absent",
+]
+
+[tool.coverage.run]
+# CLAUDE.md §Working agreements pins 75% on parsers/ + services/ + any
+# other module with real behaviour. ``source = ["app"]`` measures the
+# whole package; ``omit`` strips low-signal declarative wiring (route
+# handlers, SQLAlchemy model definitions, Pydantic schemas, app config,
+# main.py composition). What's left: parsers, services, middleware.py,
+# and core/log_config.py — exactly the modules whose behaviour we gate.
+source = ["app"]
+omit = [
+    "app/__init__.py",
+    "app/api/*",
+    "app/core/__init__.py",
+    "app/core/config.py",
+    "app/core/db.py",
+    "app/main.py",
+    "app/models/*",
+    "app/schemas/*",
+]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 75

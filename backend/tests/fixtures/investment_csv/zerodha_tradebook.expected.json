@@ -1,0 +1,47 @@
+[
+  {
+    "line_no": 2,
+    "symbol": "INFY",
+    "isin": "INE009A01021",
+    "name": "INFY",
+    "asset_class": "indian_equity",
+    "exchange": "NSE",
+    "currency": "INR",
+    "date": "2024-03-15",
+    "txn_type": "buy",
+    "units": "10.00000000",
+    "price": "1450.50000000",
+    "amount_native_paise": 1450500,
+    "fees_native_paise": 0
+  },
+  {
+    "line_no": 3,
+    "symbol": "INFY",
+    "isin": "INE009A01021",
+    "name": "INFY",
+    "asset_class": "indian_equity",
+    "exchange": "NSE",
+    "currency": "INR",
+    "date": "2024-06-20",
+    "txn_type": "sell",
+    "units": "4.00000000",
+    "price": "1600.00000000",
+    "amount_native_paise": 640000,
+    "fees_native_paise": 0
+  },
+  {
+    "line_no": 4,
+    "symbol": "TCS",
+    "isin": "INE467B01029",
+    "name": "TCS",
+    "asset_class": "indian_equity",
+    "exchange": "NSE",
+    "currency": "INR",
+    "date": "2024-04-10",
+    "txn_type": "buy",
+    "units": "5.00000000",
+    "price": "3800.25000000",
+    "amount_native_paise": 1900125,
+    "fees_native_paise": 0
+  }
+]

@@ -1,0 +1,62 @@
+[
+  {
+    "date": "2026-04-19",
+    "amount_paise": -306000,
+    "merchant_raw": "SENTINEL BOOKS ONLINE",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-04-23",
+    "amount_paise": -50300,
+    "merchant_raw": "SENTINEL FOOD DELIVERY BLR",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-04-23",
+    "amount_paise": -19800,
+    "merchant_raw": "SENTINEL FASHION PVT L,BLR",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-04-23",
+    "amount_paise": -143800,
+    "merchant_raw": "SENTINEL FASHION PVT L,BLR",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-04-24",
+    "amount_paise": -79200,
+    "merchant_raw": "SENTINEL RETAIL,BLR",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-05-02",
+    "amount_paise": 379884,
+    "merchant_raw": "BBPS PAYMENT RECEIVED - SENTINELREF",
+    "txn_type": "payment"
+  },
+  {
+    "date": "2026-05-04",
+    "amount_paise": 1500,
+    "merchant_raw": "ADDITIONAL CASHBACK FOR SENTINEL TXNS",
+    "txn_type": "other"
+  },
+  {
+    "date": "2026-05-07",
+    "amount_paise": -12200,
+    "merchant_raw": "SENTINEL RETAIL LIMITED,NAVI MUMBAI",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-05-07",
+    "amount_paise": 300,
+    "merchant_raw": "SENTINEL RETAIL LIMITED,NAVI MUMBAI",
+    "txn_type": "other"
+  },
+  {
+    "date": "2026-05-11",
+    "amount_paise": 17500,
+    "merchant_raw": "CASHBACK CREDIT APR26-SENTINEL:148~POS:16~REF_PV",
+    "txn_type": "other"
+  }
+]

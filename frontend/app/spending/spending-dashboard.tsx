@@ -1,0 +1,173 @@
+"use client";
+
+/**
+ * /spending dashboard island (PRD §F8 views 2 + 3, spending-only). Composes the
+ * monthly spend-by-category breakdown and the spend-over-time bar. This shell owns
+ * two pieces of shared state: the F3a tag cross-filter (PRD §F3a labels), threaded
+ * into the spend charts as `labelId` so a picked tag scopes them all at once, and
+ * the month anchor for the three MONTHLY cards (spend-by-category, spend-by-tag,
+ * top-merchants) so their three steppers move as one. The trend cards keep their own
+ * period state — a grain toggle is a different control from a month, and no finding
+ * asks for them to follow along. Views 1 & 4 (live portfolio tiles, net worth over
+ * time) land with F7 — this surface is the spending slice of F8.
+ *
+ * Card dispositions under the tag filter:
+ *  - SpendByCategory / TopMerchants / SpendByPeriodBar / CategoryTrendBar → scoped.
+ *  - CashflowBar → whole-account (income can't carry tags, so a tag filter would
+ *    zero income and make "am I solvent" meaningless); it shows a caption instead.
+ *  - TaggingHealthCard → auto-tag *health* metric, not a spend view → unscoped.
+ *  - SpendByTag (spend-by-tag breakdown + coverage, arc Phase B) → the tag
+ *    breakdown itself → unscoped (filtering it to one tag would collapse it to a
+ *    single bar). Hidden until the user has ≥ 1 tag, like the filter chip, so a
+ *    tag-less catalog leaves the page exactly as it was.
+ */
+import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import { CashflowBar } from "@/components/dashboard/cashflow-bar";
+import { CategoryTrendBar } from "@/components/dashboard/category-trend-bar";
+import { SpendByCategory } from "@/components/dashboard/spend-by-category";
+import { SpendByPeriodBar } from "@/components/dashboard/spend-by-period-bar";
+import { SpendByTag } from "@/components/dashboard/spend-by-tag";
+import { SpendByTagHeatmap } from "@/components/dashboard/spend-by-tag-heatmap";
+import { TaggingHealthCard } from "@/components/dashboard/tagging-health-card";
+import { TopMerchants } from "@/components/dashboard/top-merchants";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Pill } from "@/components/ui/pill";
+import { IconChevronDown } from "@/components/icons";
+import { listAvailableYears, listLabels } from "@/lib/api/client";
+import { labelDisplay } from "@/lib/labels";
+
+const MONTH_OPTIONS = [
+  { value: undefined, label: "All months" },
+  { value: "01", label: "January" },
+  { value: "02", label: "February" },
+  { value: "03", label: "March" },
+  { value: "04", label: "April" },
+  { value: "05", label: "May" },
+  { value: "06", label: "June" },
+  { value: "07", label: "July" },
+  { value: "08", label: "August" },
+  { value: "09", label: "September" },
+  { value: "10", label: "October" },
+  { value: "11", label: "November" },
+  { value: "12", label: "December" },
+] as const;
+
+export function SpendingDashboard() {
+  const [selectedYear, setSelectedYear] = useState<number>(() => new Date().getFullYear());
+  const [selectedMonth, setSelectedMonth] = useState<string | undefined>(undefined);
+  const [labelId, setLabelId] = useState<number | undefined>(undefined);
+
+  const yearsQuery = useQuery({
+    queryKey: ["dashboards", "available-years"],
+    queryFn: listAvailableYears,
+  });
+  const availableYears = yearsQuery.data?.years ?? [new Date().getFullYear()];
+
+  const labelsQuery = useQuery({ queryKey: ["labels"], queryFn: listLabels });
+  const labels = labelsQuery.data ?? [];
+
+  // Orphan-filter guard: if the selected tag is deleted, clear it.
+  useEffect(() => {
+    const data = labelsQuery.data;
+    if (labelId != null && data && !data.some((l) => l.id === labelId)) {
+      setLabelId(undefined);
+    }
+  }, [labelId, labelsQuery.data]);
+
+  const selectedTag = labels.find((l) => l.id === labelId);
+  const monthParam = selectedMonth ? `${selectedYear}-${selectedMonth}` : undefined;
+
+  return (
+    <div className="flex flex-col gap-5">
+      {/* Top Filter Controls: Year selector + Month selector + Tag selector */}
+      <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex items-center gap-2">
+          <span className="text-[12.5px] text-muted-foreground">Year</span>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Pill active={true}>
+                {selectedYear}
+                <IconChevronDown className="size-3 opacity-70" />
+              </Pill>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="max-h-72 w-32">
+              {availableYears.map((yr) => (
+                <DropdownMenuItem key={yr} onSelect={() => setSelectedYear(yr)}>
+                  {yr}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-[12.5px] text-muted-foreground">Month</span>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Pill active={selectedMonth != null}>
+                {selectedMonth
+                  ? MONTH_OPTIONS.find((m) => m.value === selectedMonth)?.label
+                  : "All months"}
+                <IconChevronDown className="size-3 opacity-70" />
+              </Pill>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="max-h-72 w-40">
+              {MONTH_OPTIONS.map((m) => (
+                <DropdownMenuItem
+                  key={m.value ?? "all"}
+                  onSelect={() => setSelectedMonth(m.value)}
+                >
+                  <span className={m.value == null ? "text-muted-foreground" : ""}>
+                    {m.label}
+                  </span>
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        {labels.length > 0 ? (
+          <div className="flex items-center gap-2">
+            <span className="text-[12.5px] text-muted-foreground">
+              Filter by tag
+            </span>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Pill active={labelId != null}>
+                  {selectedTag ? labelDisplay(selectedTag.name) : "All tags"}
+                  <IconChevronDown className="size-3 opacity-70" />
+                </Pill>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="max-h-72 w-48">
+                <DropdownMenuItem onSelect={() => setLabelId(undefined)}>
+                  <span className="text-muted-foreground">All tags</span>
+                </DropdownMenuItem>
+                {labels.map((l) => (
+                  <DropdownMenuItem key={l.id} onSelect={() => setLabelId(l.id)}>
+                    {labelDisplay(l.name)}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        ) : null}
+      </div>
+
+      <SpendByCategory labelId={labelId} year={selectedYear} month={monthParam} />
+      {labels.length > 0 ? <SpendByTag year={selectedYear} month={monthParam} /> : null}
+      <TopMerchants labelId={labelId} year={selectedYear} month={monthParam} />
+      <CashflowBar tagActive={labelId != null} year={selectedYear} />
+      <SpendByPeriodBar labelId={labelId} year={selectedYear} />
+      <CategoryTrendBar labelId={labelId} year={selectedYear} />
+      {labels.length > 0 ? <SpendByTagHeatmap year={selectedYear} /> : null}
+      <TaggingHealthCard />
+    </div>
+  );
+}

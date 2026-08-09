@@ -1,0 +1,72 @@
+# fin-tracker — local self-host stack (the PRD §Users&access "self-host" path).
+#
+# This base file is the PROXY-LESS, direct two-port deployment: the browser loads
+# the frontend on :3000 and calls the API directly on :8000. Migrations self-apply
+# on backend boot (app.core.migrations, apply_migrations_on_startup=True), so a
+# fresh ./data volume comes up seeded with the single user row and nothing else.
+#
+# Usage:
+#   make up          -> this file only (self-host)
+#   make dev         -> this file + docker-compose.override.yml (hot-reload)
+#   make up-proxy    -> this file + docker-compose.proxy.yml    (single origin)
+#
+# Requires Docker Compose >= 2.24 (env_file long-form + depends_on.condition; the
+# proxy overlay additionally uses the `!reset` tag).
+services:
+  backend:
+    build: ./backend
+    image: fin-tracker-backend:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Host-visible SQLite so the DB survives `down` and is easy to back up.
+      # ./data is gitignored (root .gitignore `data/`).
+      #
+      # The backend runs non-root (uid 10001, see backend/Dockerfile). On Docker Desktop
+      # (Windows/macOS) bind mounts ignore container uid — nothing to do. On a NATIVE LINUX
+      # host, make ./data writable by that uid ONCE before `make up`, else the SQLite open
+      # + boot migrations fail:
+      #     mkdir -p data && sudo chown -R 10001:10001 data
+      # (-R so an existing root-owned fin-tracker.db from the pre-non-root image is fixed too.)
+      - ./data:/data
+    environment:
+      # From .env if set (e.g. to point at Postgres); otherwise the mounted /data
+      # volume. Four slashes = absolute path /data/fin-tracker.db.
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/fin-tracker.db}
+      # Self-host stacks hold REAL data — a fresh ./data volume must come up with the
+      # single user row and nothing else. The dev overlay (docker-compose.override.yml)
+      # flips this back on for `make dev`.
+      SEED_DEMO_ON_STARTUP: "false"
+    # Optional so `up` works before a .env exists; carries JWT_SECRET etc. as real
+    # env vars (which outrank the in-container /.env path the app would otherwise
+    # look for). Copy .env.example -> .env and set JWT_SECRET for the self-host stacks.
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      # FastAPI serves /openapi.json with no auth; slim image has no curl, use python.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      # Default `run` stage (lean standalone). NEXT_PUBLIC_* is baked at build time,
+      # so the API URL is a build arg, not a runtime env var.
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+    # Distinct tag so the dev/proxy overlays (which rebuild with different targets /
+    # build args) never silently reuse this image.
+    image: fin-tracker-frontend:run
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy

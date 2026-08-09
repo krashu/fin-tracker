@@ -1,0 +1,61 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # --unsafe: syntax-only check. Docker Compose files use custom tags
+        # (`!reset` in docker-compose.proxy.yml) that the strict loader can't
+        # construct; `docker compose config` is their authoritative validator.
+        args: [--unsafe]
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff (backend)
+        entry: bash -c 'cd backend && uv run ruff check --fix'
+        language: system
+        types: [python]
+        files: ^backend/
+        pass_filenames: false
+
+      - id: ruff-format
+        name: ruff-format (backend)
+        entry: bash -c 'cd backend && uv run ruff format'
+        language: system
+        types: [python]
+        files: ^backend/
+        pass_filenames: false
+
+      - id: ty
+        name: ty (backend)
+        entry: bash -c 'cd backend && uv run python -m ty check app'
+        language: system
+        types: [python]
+        files: ^backend/app/
+        pass_filenames: false
+
+      - id: eslint
+        name: eslint (frontend)
+        entry: bash -c 'cd frontend && pnpm lint'
+        language: system
+        files: ^frontend/.*\.(ts|tsx|js|jsx)$
+        pass_filenames: false
+
+      - id: typecheck
+        name: tsc --noEmit (frontend)
+        entry: bash -c 'cd frontend && pnpm typecheck'
+        language: system
+        files: ^frontend/.*\.(ts|tsx)$
+        pass_filenames: false
+
+      - id: fixture-redaction
+        name: fixture redaction guard
+        entry: bash -c 'cd backend && uv run pytest tests/test_fixture_redaction.py -q --no-cov'
+        language: system
+        pass_filenames: false
+        files: ^backend/tests/fixtures/

@@ -1,0 +1,15 @@
+# Single-origin reverse proxy for the opt-in proxy stack (docker-compose.proxy.yml).
+# Frontend + API served from one origin so the browser makes same-origin relative
+# calls (/api/v1/...) — no CORS, and reachable from other LAN devices.
+#
+# Use `handle` (NOT `handle_path`): the backend mounts its router under /api/v1, so
+# the full path must be preserved. `handle_path /api/*` would strip /api and turn
+# /api/v1/auth/login into /v1/... -> 404.
+:80 {
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+	handle {
+		reverse_proxy frontend:3000
+	}
+}

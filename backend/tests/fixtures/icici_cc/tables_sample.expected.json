@@ -1,0 +1,56 @@
+[
+  {
+    "date": "2026-04-05",
+    "amount_paise": -200000,
+    "merchant_raw": "SENTINEL PETROL CHN",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-04-10",
+    "amount_paise": -123450,
+    "merchant_raw": "SENTINEL GROCERY MUM",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-04-12",
+    "amount_paise": 500000,
+    "merchant_raw": "PAYMENT RECEIVED AUTOPAY",
+    "txn_type": "payment"
+  },
+  {
+    "date": "2026-04-15",
+    "amount_paise": 25000,
+    "merchant_raw": "REVERSAL SENTINEL ECOM",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-04-18",
+    "amount_paise": -7500,
+    "merchant_raw": "INTEREST CHARGES",
+    "txn_type": "other"
+  },
+  {
+    "date": "2026-04-19",
+    "amount_paise": 175000,
+    "merchant_raw": "CHARGEBACK SENTINEL ECOM",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-04-20",
+    "amount_paise": -4500,
+    "merchant_raw": "SERVICE TAX",
+    "txn_type": "other"
+  },
+  {
+    "date": "2026-04-21",
+    "amount_paise": 15000,
+    "merchant_raw": "CASHBACK SENTINEL",
+    "txn_type": "other"
+  },
+  {
+    "date": "2026-04-22",
+    "amount_paise": -89900,
+    "merchant_raw": "SENTINEL DINING BLR",
+    "txn_type": "purchase"
+  }
+]

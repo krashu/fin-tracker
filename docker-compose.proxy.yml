@@ -1,0 +1,51 @@
+# Opt-in single-origin overlay (applied ON TOP of docker-compose.yml):
+#   make up-proxy   ==  docker compose -f docker-compose.yml -f docker-compose.proxy.yml up --build
+#
+# Adds a Caddy reverse proxy so the frontend + API share ONE origin. The frontend is
+# rebuilt with a RELATIVE API base URL (/api/v1) — same-origin, so no CORS on the
+# happy path and it works from other LAN devices. Only the proxy port is published.
+#
+# Requires Docker Compose >= 2.24 for the `!reset` tag.
+services:
+  proxy:
+    image: caddy:2
+    ports:
+      - "${PROXY_PORT:-8080}:80"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Relative -> resolved against the page (proxy) origin. Forces a rebuild that
+        # is a DISTINCT image from the direct-mode :run build.
+        NEXT_PUBLIC_API_BASE_URL: /api/v1
+    image: fin-tracker-frontend:proxy
+    # Only the proxy is exposed to the host now.
+    ports: !reset []
+
+  backend:
+    environment:
+      # DATABASE_URL is inherited from docker-compose.yml (which honors .env if set).
+      # MANDATORY under the proxy: the browser Origin is now the proxy's, and the
+      # OriginCSRF check (app/middleware.py) 403s any mutating request whose Origin
+      # isn't listed. Both loopback spellings by default; APPEND your LAN origin
+      # (e.g. http://192.168.1.42:8080) here to allow login from another device.
+      CORS_ALLOWED_ORIGINS: http://localhost:${PROXY_PORT:-8080},http://127.0.0.1:${PROXY_PORT:-8080}
+      # Recommended under the proxy: the backend only ever sees Caddy's IP, so key the auth rate
+      # limiter on X-Forwarded-For instead (otherwise the whole LAN shares one bucket). Safe here —
+      # the backend port isn't published (ports: !reset [] below), so XFF can't be spoofed directly.
+      # Uncomment to enable:
+      #   RATE_LIMIT_TRUST_PROXY: "true"
+      # NOT recommended under the proxy, and off by default: this is the LAN-reachable stack, and
+      # the demo credentials are published in this repo. Caddy serves plain http, so COOKIE_SECURE
+      # can't be the gate here — that is exactly why the gate is this explicit flag (ADR-0003
+      # §Demo account gate). Uncomment only if every device that can reach this port is trusted:
+      #   DEMO_LOGIN_ENABLED: "true"
+    ports: !reset []

@@ -1,0 +1,26 @@
+[
+  {
+    "scheme_code": "119551",
+    "isin_growth": "INF209KA12Z1",
+    "isin_reinvest": "INF209KA13Z9",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund - DIRECT - IDCW",
+    "nav": "105.9219",
+    "nav_date": "2026-06-20"
+  },
+  {
+    "scheme_code": "119552",
+    "isin_growth": "INF209K01YM2",
+    "isin_reinvest": null,
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund - DIRECT - Growth",
+    "nav": "117.0754",
+    "nav_date": "2026-06-20"
+  },
+  {
+    "scheme_code": "120503",
+    "isin_growth": "INF179KC1979",
+    "isin_reinvest": null,
+    "scheme_name": "HDFC Index Fund-NIFTY 50 Plan-Direct Plan-Growth Option",
+    "nav": "245.6789",
+    "nav_date": "2026-06-20"
+  }
+]

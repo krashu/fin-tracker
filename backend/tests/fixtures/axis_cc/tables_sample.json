@@ -1,0 +1,18 @@
+[
+  [
+    ["Date", "Description", "Amount (₹)"],
+    ["15/03/2026", "SENTINEL CAFE BLR", "450.00"],
+    ["10/03/2026", "SENTINEL ELECTRONICS DEL", "₹1,23,456.78"],
+    ["12/03/2026", "FINANCE CHARGE", "250.00"],
+    ["20/03/2026", "PAYMENT RECEIVED THANK YOU", "10000.00 CR"]
+  ],
+  [
+    ["25/03/2026", "REFUND SENTINEL MERCHANT", "₹999.50 CR"],
+    ["26/03/2026", "CHARGEBACK SENTINEL MERCHANT", "₹2,500.00 CR"],
+    ["05/03/2026", "SENTINEL TRANSPORT NCR", "85.00"],
+    ["27/03/2026", "REVERSAL SENTINEL MERCHANT", "₹1,200.00 CR"],
+    ["28/03/2026", "CASHBACK SENTINEL", "50.00 CR"],
+    ["", "Total Outstanding", "1,15,191.28"],
+    ["Available Credit Limit", "", "84,808.72"]
+  ]
+]

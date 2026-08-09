@@ -1,0 +1,56 @@
+[
+  {
+    "date": "2026-03-05",
+    "amount_paise": -8500,
+    "merchant_raw": "SENTINEL TRANSPORT NCR",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-03-10",
+    "amount_paise": -12345678,
+    "merchant_raw": "SENTINEL ELECTRONICS DEL",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-03-12",
+    "amount_paise": -25000,
+    "merchant_raw": "FINANCE CHARGE",
+    "txn_type": "other"
+  },
+  {
+    "date": "2026-03-15",
+    "amount_paise": -45000,
+    "merchant_raw": "SENTINEL CAFE BLR",
+    "txn_type": "purchase"
+  },
+  {
+    "date": "2026-03-20",
+    "amount_paise": 1000000,
+    "merchant_raw": "PAYMENT RECEIVED THANK YOU",
+    "txn_type": "payment"
+  },
+  {
+    "date": "2026-03-25",
+    "amount_paise": 99950,
+    "merchant_raw": "REFUND SENTINEL MERCHANT",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-03-26",
+    "amount_paise": 250000,
+    "merchant_raw": "CHARGEBACK SENTINEL MERCHANT",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-03-27",
+    "amount_paise": 120000,
+    "merchant_raw": "REVERSAL SENTINEL MERCHANT",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-03-28",
+    "amount_paise": 5000,
+    "merchant_raw": "CASHBACK SENTINEL",
+    "txn_type": "other"
+  }
+]

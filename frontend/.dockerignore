@@ -1,0 +1,14 @@
+# Keep the build context lean; node_modules + .next are rebuilt inside the image,
+# and a host node_modules (pnpm symlink farm) must never leak into the build.
+
+node_modules/
+.next/
+out/
+
+.env
+.env.*
+!.env.example
+
+.claude/
+npm-debug.log*
+.DS_Store

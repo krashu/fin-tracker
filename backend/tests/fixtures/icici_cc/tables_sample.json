@@ -1,0 +1,17 @@
+[
+  [
+    ["Trans Date", "Posting Date", "Description", "Amount (₹)"],
+    ["10/04/2026", "11/04/2026", "SENTINEL GROCERY MUM", "1,234.50"],
+    ["12/04/2026", "13/04/2026", "PAYMENT RECEIVED AUTOPAY", "5000.00 CR"],
+    ["15/04/2026", "16/04/2026", "REVERSAL SENTINEL ECOM", "₹250.00 CR"],
+    ["18/04/2026", "19/04/2026", "INTEREST CHARGES", "75.00"],
+    ["05/04/2026", "06/04/2026", "SENTINEL PETROL CHN", "₹2,000.00"],
+    ["19/04/2026", "20/04/2026", "CHARGEBACK SENTINEL ECOM", "₹1,750.00 CR"],
+    ["20/04/2026", "21/04/2026", "SERVICE TAX", "45.00"]
+  ],
+  [
+    ["22/04/2026", "23/04/2026", "SENTINEL DINING BLR", "899.00"],
+    ["21/04/2026", "22/04/2026", "CASHBACK SENTINEL", "150.00 CR"],
+    ["", "", "Total Amount Due", "1,15,191.28"]
+  ]
+]

@@ -1,0 +1,125 @@
+"""Alembic migration environment.
+
+Driven by :func:`app.core.config.get_settings` so dev / test / prod all
+share one source of truth for the database URL (the same object backing
+:data:`app.core.db.engine`). The ``[alembic] sqlalchemy.url`` knob in
+``alembic.ini`` is deliberately blank — this module overrides it.
+
+In-process callers (e.g. ``tests/test_migration_parity.py``) pass an
+existing connection via ``cfg.attributes["connection"]``; CLI callers
+go through ``engine_from_config``.
+
+For SQLite, ``render_as_batch=True`` is set so ALTER TABLE migrations work
+via copy-and-move. Those batch rebuilds DROP and recreate the target table;
+when the target is referenced by another table (``categories`` ←
+``transactions`` / ``merchant_tag_map``; ``transactions`` ← its own
+``transfer_pair_id``), SQLite's implicit row-delete during ``DROP TABLE``
+trips the child FK the moment the DB holds real data. So CLI migrations run
+with ``PRAGMA foreign_keys=OFF`` — batch preserves row ids, so references stay
+valid across the rebuild — and the running app re-enables FK at connect time
+via ``app/core/db.py``. Empty in-memory test DBs never hit the violation,
+which is why this only bites a populated dev / prod database.
+"""
+
+from __future__ import annotations
+
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config, event, pool
+from sqlalchemy.engine import Engine
+
+from alembic import context
+from app.core.config import get_settings
+from app.models import Base  # noqa: F401 — populates Base.metadata via re-exports
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+_DB_URL = get_settings().database_url
+config.set_main_option("sqlalchemy.url", _DB_URL)
+
+
+def _is_sqlite() -> bool:
+    return _DB_URL.startswith("sqlite")
+
+
+def _disable_sqlite_fk_for_migration(engine: Engine) -> None:
+    """Turn FK enforcement OFF for the CLI migration run (see module docstring).
+
+    Set at DBAPI ``connect`` time — before Alembic opens its transaction —
+    because ``PRAGMA foreign_keys`` is a no-op inside an open transaction on
+    SQLite. The app's own connections (``app/core/db.py``) keep FK ON; this OFF
+    applies only to the migration engine built here, so batch table-rebuilds
+    can drop a referenced table on a populated DB without tripping its child FK.
+    """
+
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_conn, _record) -> None:  # noqa: ANN001 — alembic event sig
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=OFF")
+        cur.close()
+
+
+def run_migrations_offline() -> None:
+    """SQL-script emit mode: render migrations as text, no DB connection."""
+    context.configure(
+        url=_DB_URL,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        render_as_batch=_is_sqlite(),
+        compare_type=True,
+        compare_server_default=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Live-DB mode.
+
+    Honours ``config.attributes["connection"]`` if a caller (e.g. the
+    parity test) has set it; otherwise builds an engine from the .ini
+    section that ``set_main_option`` populated above.
+    """
+    existing = config.attributes.get("connection")
+    if existing is not None:
+        context.configure(
+            connection=existing,
+            target_metadata=target_metadata,
+            render_as_batch=_is_sqlite(),
+            compare_type=True,
+            compare_server_default=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    if _is_sqlite():
+        _disable_sqlite_fk_for_migration(connectable)
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            render_as_batch=_is_sqlite(),
+            compare_type=True,
+            compare_server_default=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
