@@ -44,6 +44,23 @@ export function IconChevronDown(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+export function IconChevronLeft(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      aria-hidden="true"
+      {...props}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="m10 4-4 4 4 4" />
+    </svg>
+  );
+}
+
 export function IconChevronRight(props: SVGProps<SVGSVGElement>) {
   return (
     <svg

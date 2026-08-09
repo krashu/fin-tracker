@@ -590,6 +590,9 @@ class AccountBalanceRow(BaseModel):
     currency: CurrencyStr
     balance_paise: int
     spend_ytd_paise: int | None
+    gross_spend_ytd_paise: int | None = None
+    refund_ytd_paise: int | None = None
+    cashback_ytd_paise: int | None = None
     archived: bool
 
 

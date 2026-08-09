@@ -29,7 +29,7 @@
  * existing transaction/account mutations (which invalidate those prefixes)
  * refresh the bands without a reload (PRD §F9).
  */
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 
@@ -43,13 +43,15 @@ import {
   type OverviewResponse,
   type TransactionRead,
 } from "@/lib/api/client";
-import { formatDate, formatINR } from "@/lib/format";
+import { formatDate, formatINR, formatMonthYear } from "@/lib/format";
+import { monthKey, thisMonthAnchor } from "@/lib/dates";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
 import { Sensitive } from "@/components/balance-visibility";
 import { MONO } from "@/components/ui/table";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SummaryStrip } from "@/components/dashboard/summary-strip";
+import { IconChevronLeft, IconChevronRight } from "@/components/icons";
 
 // Hand-mirror of the backend's NET_WORTH_EXCLUDED_TYPES
 // (app/schemas/dashboards.py), which is the source of truth. tsc cannot catch
@@ -73,12 +75,19 @@ const ACCOUNT_GROUPS: { type: AccountBalanceRow["type"]; label: string }[] = [
 ];
 
 export function Overview() {
-  // Current calendar month (YYYY-MM), local — drives the month-scoped figures.
   const now = new Date();
-  const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const [selectedYear, setSelectedYear] = useState<number>(now.getFullYear());
+  const [autoDetectDone, setAutoDetectDone] = useState(false);
+
+  // If selectedYear is current calendar year, pass current YYYY-MM; else pass YYYY-12
+  const currentYear = now.getFullYear();
+  const month =
+    selectedYear === currentYear
+      ? `${selectedYear}-${String(now.getMonth() + 1).padStart(2, "0")}`
+      : `${selectedYear}-12`;
 
   const overviewQuery = useQuery({
-    queryKey: ["dashboards", "overview", { month }],
+    queryKey: ["dashboards", "overview", { month, selectedYear }],
     queryFn: () => getOverview({ month }),
   });
   // Recent activity — own cache entry, still `["transactions"]`-prefixed so txn
@@ -100,6 +109,29 @@ export function Overview() {
     queryKey: ["categories"],
     queryFn: listCategories,
   });
+
+  // Auto-detect year if current year yields 0 credit card spend and recent txns exist
+  useEffect(() => {
+    if (autoDetectDone || !overviewQuery.isSuccess || !recentQuery.isSuccess) return;
+    const data = overviewQuery.data;
+    const recent = recentQuery.data;
+    if (!data) return;
+
+    const hasCardActivity = (data.accounts ?? []).some(
+      (a) => a.type === "credit_card" && (a.spend_ytd_paise ?? 0) !== 0,
+    );
+
+    if (!hasCardActivity && recent && recent.length > 0) {
+      const latestTxn = recent[0];
+      if (latestTxn?.date) {
+        const parts = latestTxn.date.split("-").map(Number);
+        if (parts.length >= 1 && parts[0]) {
+          setSelectedYear(parts[0]);
+        }
+      }
+    }
+    setAutoDetectDone(true);
+  }, [autoDetectDone, overviewQuery.isSuccess, overviewQuery.data, recentQuery.isSuccess, recentQuery.data]);
 
   const data = overviewQuery.data;
   const accountsById = new Map<number, string>(
@@ -134,8 +166,6 @@ export function Overview() {
 
   return (
     <div className="flex flex-col gap-5">
-      {/* The page's single h1 — the net-worth figure is the visual headline, so
-          the heading is visually hidden but present for the document outline. */}
       <h1 className="sr-only">Overview</h1>
       <NetWorthHero data={data} />
       <SummaryStrip />
@@ -143,6 +173,8 @@ export function Overview() {
         <AccountsCard
           accounts={data?.accounts ?? []}
           ready={data !== undefined}
+          year={selectedYear}
+          onYearChange={(y) => setSelectedYear(y)}
         />
         <PortfolioCard
           valuePaise={data?.portfolio_value_paise ?? 0}
@@ -176,14 +208,6 @@ function NetWorthHero({ data }: { data: OverviewResponse | undefined }) {
   const accounts = data?.accounts ?? [];
   const netWorth = data?.net_worth_paise ?? 0;
   const investments = data?.portfolio_value_paise ?? 0;
-  // Both `assets` and `owed` skip every excluded type, mirroring the server's
-  // net_worth_paise so that assets + investments − owed reconciles exactly with
-  // it and the client can't drift. Filtering on credit_card alone was the drift:
-  // an investment account created before its balance was pinned to 0 has no
-  // correction path, so its stored balance would land in `assets` while the
-  // headline (correctly) leaves it out. assets = Σ max(0, balance) of
-  // contributing accounts; owed = Σ max(0, −balance) of the same (normally 0 —
-  // only a genuine bank overdraft surfaces an "Owed" line).
   const contributing = accounts.filter(
     (a) => !NET_WORTH_EXCLUDED_TYPES.has(a.type),
   );
@@ -228,9 +252,6 @@ function NetWorthHero({ data }: { data: OverviewResponse | undefined }) {
           ) : null}
         </p>
       ) : null}
-      {/* net_worth_paise is short by any priced-but-unconvertible USD holding, so
-          say so rather than render an understated headline silently. Read off the
-          same response as the figure it qualifies. */}
       {data && data.fx_unavailable_count > 0 ? (
         <p className="mt-1.5 text-[11.5px] text-muted-foreground">
           ⚠ Excludes {data.fx_unavailable_count} USD holding
@@ -257,14 +278,39 @@ function GroupLabel({ children }: { children: ReactNode }) {
 function AccountsCard({
   accounts,
   ready,
+  year,
+  onYearChange,
 }: {
   accounts: AccountBalanceRow[];
   ready: boolean;
+  year: number;
+  onYearChange: (y: number) => void;
 }) {
   return (
     <section className="rounded-lg border border-border bg-card">
-      <div className="flex h-10 items-center px-4">
+      <div className="flex h-10 items-center justify-between px-4">
         <Eyebrow as="h2">Accounts</Eyebrow>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => onYearChange(year - 1)}
+            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            title="Previous year"
+          >
+            <IconChevronLeft className="h-3.5 w-3.5" />
+          </button>
+          <span className="px-1 text-[12px] font-medium tabular-nums text-foreground">
+            {year}
+          </span>
+          <button
+            type="button"
+            onClick={() => onYearChange(year + 1)}
+            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            title="Next year"
+          >
+            <IconChevronRight className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
       {!ready ? (
         <p className="px-4 pb-4 text-[13px] text-muted-foreground">Loading…</p>
@@ -281,22 +327,11 @@ function AccountsCard({
               <div key={g.type}>
                 <div className="flex items-baseline gap-2 px-4 pb-1 pt-2.5">
                   <GroupLabel>{g.label}</GroupLabel>
-                  {/* Credit cards show year-to-date spend, not a balance owed
-                      (they're spend channels — bill payments aren't recorded).
-                      The caption makes the number's meaning explicit, and names
-                      the exclusion for the same reason the investment one does:
-                      credit_card is in the server's NET_WORTH_EXCLUDED_TYPES,
-                      so this group contributes nothing to the headline above. */}
                   {g.type === "credit_card" ? (
                     <span className="text-[10px] text-muted-foreground/70">
-                      spent this year · not in net worth
+                      spent in {year} · not in net worth
                     </span>
                   ) : null}
-                  {/* Same idea, other excluded type: an investment account is a
-                      placeholder, so its balance is out of the headline above.
-                      New ones are always ₹0, but a row created before that rule
-                      keeps its balance and has no correction path — without this
-                      caption it reads as money the hero forgot. */}
                   {g.type === "investment" ? (
                     <span className="text-[10px] text-muted-foreground/70">
                       not in net worth
@@ -326,30 +361,58 @@ function AccountRow({ account }: { account: AccountBalanceRow }) {
     ? Math.max(0, -(account.spend_ytd_paise ?? 0))
     : Math.abs(account.balance_paise);
   const neg = !isCard && account.balance_paise < 0;
+
+  const grossSpendPaise = isCard ? Math.abs(account.gross_spend_ytd_paise ?? 0) : 0;
+  const refundPaise = isCard ? (account.refund_ytd_paise ?? 0) : 0;
+  const cashbackPaise = isCard ? (account.cashback_ytd_paise ?? 0) : 0;
+  const hasBreakdown =
+    isCard &&
+    (refundPaise > 0 ||
+      cashbackPaise > 0 ||
+      (grossSpendPaise > 0 && grossSpendPaise !== displayPaise));
+
   return (
-    <div className="flex items-center justify-between gap-3 px-4 py-1.5">
-      <span className="min-w-0 truncate text-[12.5px] text-foreground/90">
-        {account.name}
-        {/* The leading {" "} is load-bearing, not formatting: accessible-name
-            computation concatenates adjacent inline children without inserting
-            a separator, so without it the row announces "Axis CC Aarchived".
-            Same fix, same shape as review-queue.tsx:868-871. */}
-        {account.archived ? (
-          <span className="ml-1.5 text-[10.5px] text-muted-foreground/70">
-            {" "}
-            archived
-          </span>
-        ) : null}
-      </span>
-      <span
-        className={cn("text-[12.5px]", neg ? "text-neg" : "text-foreground")}
-        style={MONO}
-      >
-        <Sensitive>
-          {neg ? "−" : ""}
-          {formatINR(displayPaise)}
-        </Sensitive>
-      </span>
+    <div className="flex flex-col border-b border-border/30 last:border-0 px-4 py-2">
+      <div className="flex items-center justify-between gap-3">
+        <span className="min-w-0 truncate text-[12.5px] font-medium text-foreground/90">
+          {account.name}
+          {account.archived ? (
+            <span className="ml-1.5 text-[10.5px] font-normal text-muted-foreground/70">
+              {" "}
+              archived
+            </span>
+          ) : null}
+        </span>
+        <span
+          className={cn("text-[12.5px]", neg ? "text-neg" : "text-foreground")}
+          style={MONO}
+        >
+          <Sensitive>
+            {neg ? "−" : ""}
+            {formatINR(displayPaise)}
+          </Sensitive>
+        </span>
+      </div>
+
+      {hasBreakdown ? (
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground/80">
+          {grossSpendPaise > 0 ? (
+            <span>
+              Spend: <Sensitive>{formatINR(grossSpendPaise)}</Sensitive>
+            </span>
+          ) : null}
+          {refundPaise > 0 ? (
+            <span className="text-pos">
+              Refund: <Sensitive>+{formatINR(refundPaise)}</Sensitive>
+            </span>
+          ) : null}
+          {cashbackPaise > 0 ? (
+            <span className="text-pos">
+              Cashback: <Sensitive>+{formatINR(cashbackPaise)}</Sensitive>
+            </span>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

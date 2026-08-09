@@ -983,19 +983,35 @@ def overview(
     # credit-card accounts get a value; every other type maps to None below.
     ytd_first = date(window.year, 1, 1)
     ytd_stmt = (
-        select(Transaction.account_id, func.sum(Transaction.amount_paise))
+        select(
+            Transaction.account_id,
+            func.sum(case((Transaction.transaction_type == "spend", Transaction.amount_paise), else_=0)).label("gross_spend"),
+            func.sum(case((Transaction.transaction_type == "refund", Transaction.amount_paise), else_=0)).label("refund"),
+            func.sum(case((Transaction.transaction_type == "income", Transaction.amount_paise), else_=0)).label("cashback"),
+        )
         .where(
             Transaction.user_id == user_id,
-            Transaction.transaction_type.in_(("spend", "refund")),
+            Transaction.transaction_type.in_(("spend", "refund", "income")),
             Transaction.date >= ytd_first,
             Transaction.date <= last,
         )
         .group_by(Transaction.account_id)
     )
     ytd_stmt = confirmed_only(ytd_stmt)
-    ytd_spend: dict[int, int] = {
-        acct_id: int(total or 0) for acct_id, total in session.execute(ytd_stmt).all()
-    }
+    ytd_spend: dict[int, int] = {}
+    ytd_gross_spend: dict[int, int] = {}
+    ytd_refund: dict[int, int] = {}
+    ytd_cashback: dict[int, int] = {}
+    for row in session.execute(ytd_stmt).all():
+        m = row._mapping
+        acct_id = m["account_id"]
+        gs = int(m["gross_spend"] or 0)
+        rf = int(m["refund"] or 0)
+        cb = int(m["cashback"] or 0)
+        ytd_spend[acct_id] = gs + rf
+        ytd_gross_spend[acct_id] = gs
+        ytd_refund[acct_id] = rf
+        ytd_cashback[acct_id] = cb
 
     accounts = [
         AccountBalanceRow(
@@ -1005,6 +1021,9 @@ def overview(
             currency=a.currency,
             balance_paise=a.opening_balance_paise + summed.get(a.id, 0),
             spend_ytd_paise=(ytd_spend.get(a.id, 0) if a.type == "credit_card" else None),
+            gross_spend_ytd_paise=(ytd_gross_spend.get(a.id, 0) if a.type == "credit_card" else None),
+            refund_ytd_paise=(ytd_refund.get(a.id, 0) if a.type == "credit_card" else None),
+            cashback_ytd_paise=(ytd_cashback.get(a.id, 0) if a.type == "credit_card" else None),
             archived=a.archived_at is not None,
         )
         for a in session.scalars(

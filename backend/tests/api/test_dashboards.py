@@ -2093,6 +2093,9 @@ def test_overview_account_balance_net_worth_and_period(
             "currency": "INR",
             "balance_paise": -15000,  # opening 0 + (-15000), all-time
             "spend_ytd_paise": -15000,  # signed net spend, Jan 1 → end of May
+            "gross_spend_ytd_paise": -15000,
+            "refund_ytd_paise": 0,
+            "cashback_ytd_paise": 0,
             "archived": False,
         }
     ]
@@ -2197,6 +2200,9 @@ def test_overview_archived_account_with_balance_included(
             "currency": "INR",
             "balance_paise": 30000,
             "spend_ytd_paise": None,  # non-CC rows carry no YTD-spend figure
+            "gross_spend_ytd_paise": None,
+            "refund_ytd_paise": None,
+            "cashback_ytd_paise": None,
             "archived": True,
         }
     ]

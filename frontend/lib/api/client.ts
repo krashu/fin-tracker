@@ -1217,6 +1217,9 @@ export type AccountBalanceRow = {
   currency: AccountRead["currency"];
   balance_paise: number;
   spend_ytd_paise: number | null;
+  gross_spend_ytd_paise?: number | null;
+  refund_ytd_paise?: number | null;
+  cashback_ytd_paise?: number | null;
   archived: boolean;
 };
 
