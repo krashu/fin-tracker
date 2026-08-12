@@ -10,12 +10,19 @@ mis-picked column is a wrong number on a money path for every issuer at once.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 import pytest
 
 from app.parsers import RawTransaction
-from app.parsers.base import _interpret_row
+from app.parsers.base import (
+    ParserError,
+    _extract_text,
+    _find_labelled_amount,
+    _find_period,
+    _interpret_row,
+)
 from app.parsers.icici_cc import IciciCC, _classify
 
 
@@ -107,3 +114,74 @@ def test_amount_after_date_is_still_found_without_a_serial_column() -> None:
     assert txn is not None
     assert txn.amount_paise == -123450
     assert txn.merchant_raw == "SENTINEL GROCERY MUM"
+
+
+# --- balance-reconciliation plan Phase 2: _extract_text / _find_labelled_amount / _find_period ---
+
+
+def test_extract_text_raises_on_corrupt_bytes() -> None:
+    with pytest.raises(ParserError, match="failed to extract text"):
+        _extract_text(b"this is definitely not a pdf")
+
+
+def test_extract_text_returns_a_list_of_lines_for_a_textless_pdf() -> None:
+    """Mirrors _extract_tables's own contract: a well-formed PDF with nothing
+    on the page returns an empty list, never raises and never None."""
+    import io
+
+    import pikepdf
+
+    pdf = pikepdf.new()
+    pdf.add_blank_page(page_size=(612, 792))
+    buf = io.BytesIO()
+    pdf.save(buf)
+
+    assert _extract_text(buf.getvalue()) == []
+
+
+def test_find_labelled_amount_finds_the_trailing_value() -> None:
+    lines = ["Statement Period: 01/03/2026 to 31/03/2026", "Previous Balance          5,699.00"]
+    pattern = re.compile(r"Previous\s+Balance", re.IGNORECASE)
+
+    assert _find_labelled_amount(lines, pattern) == (569900, False)
+
+
+def test_find_labelled_amount_handles_a_credit_marker_split_by_whitespace() -> None:
+    """ "1,234.56 CR" tokenises as two words — the two-word attempt must run
+    before the one-word attempt, or the marker gets silently dropped."""
+    lines = ["Total Amount Due          1,234.56 CR"]
+    pattern = re.compile(r"Total\s+Amount\s+Due", re.IGNORECASE)
+
+    assert _find_labelled_amount(lines, pattern) == (123456, True)
+
+
+def test_find_labelled_amount_skips_an_unparseable_match_for_a_later_line() -> None:
+    lines = ["Previous Balance carried forward", "Previous Balance          100.00"]
+    pattern = re.compile(r"Previous\s+Balance", re.IGNORECASE)
+
+    assert _find_labelled_amount(lines, pattern) == (10000, False)
+
+
+def test_find_labelled_amount_returns_none_when_the_pattern_is_absent() -> None:
+    lines = ["Total Amount Due          1,234.56"]
+    pattern = re.compile(r"Statement\s+Period", re.IGNORECASE)
+
+    assert _find_labelled_amount(lines, pattern) is None
+
+
+def test_find_period_extracts_the_first_two_dates_on_the_matched_line() -> None:
+    lines = ["Statement Period: 01/03/2026 to 31/03/2026"]
+    pattern = re.compile(r"Statement\s+Period", re.IGNORECASE)
+
+    result = _find_period(lines, pattern, ("%d/%m/%Y",))
+
+    assert result == (date(2026, 3, 1), date(2026, 3, 31))
+
+
+def test_find_period_returns_none_when_the_matched_line_has_only_one_date() -> None:
+    lines = ["Payment Due Date 25/03/2026"]
+    pattern = re.compile(r"Payment\s+Due\s+Date", re.IGNORECASE)
+
+    result = _find_period(lines, pattern, ("%d/%m/%Y",))
+
+    assert result is None

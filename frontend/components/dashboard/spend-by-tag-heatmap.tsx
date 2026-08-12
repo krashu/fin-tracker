@@ -46,9 +46,9 @@ import { useQuery } from "@tanstack/react-query";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { listSpendByTagByPeriod } from "@/lib/api/client";
-import { trailingMonths } from "@/lib/dates";
 import { formatINR } from "@/lib/format";
 import { MONTH_ABBR } from "@/lib/charts";
+import { periodRange } from "@/lib/period";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
@@ -115,8 +115,7 @@ export function SpendByTagHeatmap({ year }: { year: number }) {
   const { hidden } = useBalanceHidden();
   const [active, setActive] = useState<ActiveCell | null>(null);
 
-  const start = `${year}-01-01`;
-  const end = `${year}-12-31`;
+  const { start, end } = periodRange({ year });
   const query = useQuery({
     queryKey: [
       "dashboards",

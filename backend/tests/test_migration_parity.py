@@ -53,10 +53,27 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.schema import CreateIndex
 
 from alembic import command
+from app.core import clock
 from app.core.config import get_settings
 from app.core.db import make_engine
-from app.models import Base, Benchmark, Category, Instrument, Transaction, User
-from app.services.provisioning import _DEFAULT_INCOME_CATEGORIES, _DEFAULT_SPEND_CATEGORIES
+from app.models import (
+    Base,
+    Benchmark,
+    Category,
+    Instrument,
+    MerchantAlias,
+    MerchantTagMap,
+    Transaction,
+    User,
+)
+from app.services.demo_seed import seed_demo_data
+from app.services.provisioning import (
+    _DEFAULT_INCOME_CATEGORIES,
+    _DEFAULT_SPEND_CATEGORIES,
+    _MERCHANT_DICTIONARY,
+    provision_default_categories,
+)
+from app.services.tag_service import pin_tag
 
 BACKEND_ROOT = Path(__file__).parent.parent
 
@@ -1408,5 +1425,386 @@ def test_0028_backfills_origin_fingerprint_for_import_rows_only() -> None:
             )
         assert stamped["amazon"] == "fp-amazon"
         assert stamped["chai"] is None
+    finally:
+        eng.dispose()
+
+
+def _seed_refund_row(conn: object, *, uid_hex: str, acct_id: int) -> int:
+    """A ``transaction_type='refund'`` row at 0028 — the pre-0029 shape this
+    migration's data step retypes. Positive amount, per the F2/§F4a sign rule
+    ``RawTransaction.__post_init__`` already enforced on ``refund`` rows, so
+    0029's upgrade never has to re-sign anything, only retype."""
+    conn.execute(  # ty: ignore[unresolved-attribute]
+        text(
+            "INSERT INTO transactions "
+            "(user_id, account_id, date, amount_paise, transaction_type, "
+            " merchant_normalized, fingerprint, source) "
+            "VALUES (:u, :a, '2025-06-01', 5000, 'refund', 'swiggy', 'fp-refund-1', 'import')"
+        ).bindparams(u=uid_hex, a=acct_id)
+    )
+    return conn.execute(  # ty: ignore[unresolved-attribute]
+        text("SELECT id FROM transactions WHERE fingerprint = 'fp-refund-1'")
+    ).scalar()
+
+
+def test_0029_recomputes_refund_rows_to_positive_spend() -> None:
+    """The only test that proves 0029's data step actually ran (ADR-0009).
+
+    Seed a ``transaction_type='refund'`` row at 0028, upgrade to head, and assert
+    it now stores ``spend`` with the SAME positive ``amount_paise`` — a pure
+    retype, no re-signing (the migration docstring's claim). Also asserts the
+    narrowed CHECK actually rejects ``refund`` post-upgrade, so a future
+    contributor can't silently widen the vocabulary back without this failing.
+    """
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    try:
+        uid_hex = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "0028_add_origin_fingerprint")
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)").bindparams(u=uid_hex))
+            conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type) "
+                    "VALUES (:u, 'Axis CC', 'credit_card')"
+                ).bindparams(u=uid_hex)
+            )
+            acct_id = conn.execute(text("SELECT id FROM accounts")).scalar()
+            txn_id = _seed_refund_row(conn, uid_hex=uid_hex, acct_id=acct_id)
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+
+        with eng.connect() as conn:
+            stored_type, stored_amount = conn.execute(
+                text(
+                    "SELECT transaction_type, amount_paise FROM transactions WHERE id = :t"
+                ).bindparams(t=txn_id)
+            ).one()
+        assert stored_type == "spend"
+        assert stored_amount == 5000  # unchanged — a pure retype, not a re-sign.
+
+        # The narrowed CHECK is live: a raw 'refund' insert now fails outright.
+        with pytest.raises(IntegrityError), eng.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO transactions "
+                    "(user_id, account_id, date, amount_paise, transaction_type, "
+                    " merchant_normalized, fingerprint, source) "
+                    "VALUES (:u, :a, '2025-06-02', 1000, 'refund', 'x', 'fp-refund-2', 'import')"
+                ).bindparams(u=uid_hex, a=acct_id)
+            )
+    finally:
+        eng.dispose()
+
+
+def test_0029_partial_index_predicate_survives_up_and_down() -> None:
+    """``ix_transactions_user_confirmed_date`` keeps ``confirmed_at IS NOT NULL``
+    through 0029's rebuild in BOTH directions.
+
+    ``test_migration_matches_models`` does not compare partial-index WHERE
+    clauses (see ``Transaction.__table_args__``), so this asserts it directly —
+    mirroring ``test_partial_index_where_clause_preserved`` /
+    ``test_0025_batch_rebuild_preserves_the_partial_index_predicate``, but
+    checking the downgrade side too, since 0029's downgrade rebuilds the same
+    table and could lose the predicate the same way the upgrade could.
+    """
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    try:
+
+        def _predicate_sql() -> str | None:
+            with eng.connect() as conn:
+                return conn.execute(
+                    text(
+                        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                        "AND name = 'ix_transactions_user_confirmed_date'"
+                    )
+                ).scalar()
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        sql = _predicate_sql()
+        assert sql is not None
+        assert "confirmed_at IS NOT NULL" in sql
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), "0028_add_origin_fingerprint")
+        sql = _predicate_sql()
+        assert sql is not None, "downgrade dropped the partial index entirely"
+        assert "confirmed_at IS NOT NULL" in sql, (
+            f"downgrade rebuild lost the partial-index predicate: {sql}"
+        )
+    finally:
+        eng.dispose()
+
+
+def test_0029_downgrade_restores_refund_type_and_is_reversible() -> None:
+    """``alembic downgrade 0028`` from head re-widens the CHECK and retypes every
+    positive ``spend`` back to ``refund``; re-upgrading collapses it to ``spend``
+    again. House precedent: each migration ships a downgrade test;
+    ``test_migration_matches_models`` runs upgrade-only.
+
+    Also the executable form of the module docstring's reconstructive-not-exact
+    caveat: a positive spend that was NEVER a refund is indistinguishable from
+    one that was, so the downgrade retypes it too. Out of scope to assert here
+    (no such row is reachable pre-0029, since ``spend > 0`` 422ed before this
+    migration) — the up→down→up round trip is what this test actually proves.
+    """
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    try:
+        uid_hex = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "0028_add_origin_fingerprint")
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)").bindparams(u=uid_hex))
+            conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type) "
+                    "VALUES (:u, 'Axis CC', 'credit_card')"
+                ).bindparams(u=uid_hex)
+            )
+            acct_id = conn.execute(text("SELECT id FROM accounts")).scalar()
+            txn_id = _seed_refund_row(conn, uid_hex=uid_hex, acct_id=acct_id)
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        with eng.connect() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT transaction_type FROM transactions WHERE id = :t").bindparams(
+                        t=txn_id
+                    )
+                ).scalar()
+                == "spend"
+            )
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), "0028_add_origin_fingerprint")
+        with eng.connect() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT transaction_type FROM transactions WHERE id = :t").bindparams(
+                        t=txn_id
+                    )
+                ).scalar()
+                == "refund"
+            )
+
+        # Re-upgrade — up → down → up is clean.
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        with eng.connect() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT transaction_type FROM transactions WHERE id = :t").bindparams(
+                        t=txn_id
+                    )
+                ).scalar()
+                == "spend"
+            )
+    finally:
+        eng.dispose()
+
+
+def test_merchant_dictionary_matches_migration_seed() -> None:
+    """Sibling to ``test_provisioning_matches_migration_seed``: the migration-seeded v1 user's
+    ``is_seeded`` aliases + ``hit_count=0`` map rows must equal what ``_MERCHANT_DICTIONARY``
+    implies, keeping migration 0032's frozen literal and ``provisioning.py``'s tuple mutually
+    guarding (Phase A5 trap 6) instead of registrants silently diverging from the demo user.
+    """
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+
+        session_factory = sessionmaker(bind=eng)
+        with session_factory() as s:
+            v1 = get_settings().v1_user_id
+            cats = {
+                c.name: c.id
+                for c in s.scalars(
+                    select(Category).where(Category.user_id == v1, Category.archived_at.is_(None))
+                )
+            }
+            aliases = {
+                (a.pattern, a.canonical)
+                for a in s.scalars(
+                    select(MerchantAlias).where(
+                        MerchantAlias.user_id == v1, MerchantAlias.is_seeded.is_(True)
+                    )
+                )
+            }
+            zero_hit_rows = {
+                (m.merchant_normalized, m.category_id)
+                for m in s.scalars(
+                    select(MerchantTagMap).where(
+                        MerchantTagMap.user_id == v1, MerchantTagMap.hit_count == 0
+                    )
+                )
+            }
+        expected_aliases = {(p, c) for p, c, _ in _MERCHANT_DICTIONARY}
+        expected_map = {(c, cats[name]) for _, c, name in _MERCHANT_DICTIONARY}
+        assert aliases == expected_aliases
+        assert zero_hit_rows == expected_map
+    finally:
+        eng.dispose()
+
+
+def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
+    """The realistic Phase A5 trap-1 scenario: an existing deployment already ran
+    ``app.services.demo_seed.seed_demo_data`` (12 of this dictionary's canonicals collide with
+    what it teaches, at real hit_counts, via the ordinary ``record_tag`` path) BEFORE ever
+    seeing migration 0032. The backfill must not raise, must not disturb those 12 rows, and
+    must seed a second, unrelated pre-existing user identically — "idempotent" (safe against
+    pre-existing colliding data) + "user-scoped" in one test.
+    """
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
+
+        v1 = get_settings().v1_user_id
+        other_user_id = uuid.uuid4()
+        session_factory = sessionmaker(bind=eng)
+        with session_factory() as s:
+            seed_demo_data(s, user_id=v1)
+            # A second, pre-existing user who registered before Phase A5 shipped: has
+            # categories (the old provision_default_categories), no merchant dictionary yet.
+            s.add(User(id=other_user_id))
+            s.flush()
+            provision_default_categories(s, other_user_id)
+            s.commit()
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")  # must not raise
+
+        collisions = {
+            "swiggy",
+            "zomato",
+            "uber",
+            "netflix",
+            "spotify",
+            "apollo pharmacy",
+            "makemytrip",
+            "big basket",
+            "croma",
+            "myntra",
+            "bookmyshow",
+            "airtel",
+        }
+        distinct_canonicals = {c for _, c, _ in _MERCHANT_DICTIONARY}
+        with session_factory() as s:
+            v1_maps = {
+                m.merchant_normalized: m.hit_count
+                for m in s.scalars(select(MerchantTagMap).where(MerchantTagMap.user_id == v1))
+            }
+            assert all(v1_maps[c] >= 1 for c in collisions)  # demo's learned rows untouched
+            zero_hit = {k for k, v in v1_maps.items() if v == 0}
+            assert zero_hit == distinct_canonicals - collisions
+
+            other_maps = {
+                m.merchant_normalized
+                for m in s.scalars(
+                    select(MerchantTagMap).where(MerchantTagMap.user_id == other_user_id)
+                )
+            }
+            assert other_maps == distinct_canonicals
+            other_aliases = {
+                a.pattern
+                for a in s.scalars(
+                    select(MerchantAlias).where(MerchantAlias.user_id == other_user_id)
+                )
+            }
+            assert other_aliases == {p for p, _, _ in _MERCHANT_DICTIONARY}
+    finally:
+        eng.dispose()
+
+
+def test_0032_downgrade_preserves_pinned_seed_row() -> None:
+    """``downgrade()`` must not delete a seed row the user has PINNED.
+
+    ``hit_count == 0`` is not an exclusive seed marker on its own: ``pin_tag``
+    deliberately does not bump ``hit_count`` on an existing row (a pin is an
+    assertion, not an observed decision), so pinning a seeded merchant leaves the
+    row at ``hit_count = 0, pinned = True`` — user-authored data that the
+    unqualified ``DELETE FROM merchant_tag_map WHERE hit_count = 0`` silently
+    discarded. Sibling to
+    ``test_default_categories_downgrade_removes_seeded_only``.
+    """
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+
+        v1 = get_settings().v1_user_id
+        session_factory = sessionmaker(bind=eng)
+        with session_factory() as s:
+            pinned = s.scalar(
+                select(MerchantTagMap).where(
+                    MerchantTagMap.user_id == v1,
+                    MerchantTagMap.merchant_normalized == "netflix",
+                )
+            )
+            assert pinned is not None and pinned.hit_count == 0
+            pin_tag(
+                s,
+                user_id=v1,
+                merchant_normalized="netflix",
+                category_id=pinned.category_id,
+            )
+            s.commit()
+            # The pin landed on the existing seed row without bumping hit_count —
+            # the precondition this test exists for.
+            s.refresh(pinned)
+            assert (pinned.hit_count, pinned.pinned) == (0, True)
+            survivor = (pinned.merchant_normalized, pinned.category_id)
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
+
+        with session_factory() as s:
+            rows = {
+                (m.merchant_normalized, m.category_id)
+                for m in s.scalars(select(MerchantTagMap).where(MerchantTagMap.user_id == v1))
+            }
+            assert survivor in rows
+            # Every other untouched seed row still goes.
+            assert rows == {survivor}
+    finally:
+        eng.dispose()
+
+
+def test_seed_bound_to_archived_category_not_created_via_migration() -> None:
+    """Phase A5 trap 3 at the migration level: ``uq_categories_active_user_name`` is a
+    *partial* index, so an archived category can share a name with an active one. An archived
+    category must not receive a seed row, without disturbing any other category."""
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
+
+        v1 = get_settings().v1_user_id
+        session_factory = sessionmaker(bind=eng)
+        with session_factory() as s:
+            utilities = s.scalars(
+                select(Category).where(
+                    Category.user_id == v1,
+                    Category.kind == "spend",
+                    Category.name == "Utilities",
+                )
+            ).one()
+            utilities.archived_at = clock.naive_utcnow()
+            s.commit()
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+
+        utilities_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name == "Utilities"}
+        other_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name != "Utilities"}
+        with session_factory() as s:
+            v1_maps = {
+                m.merchant_normalized
+                for m in s.scalars(select(MerchantTagMap).where(MerchantTagMap.user_id == v1))
+            }
+            assert not (v1_maps & utilities_canonicals)
+            assert v1_maps == other_canonicals
     finally:
         eng.dispose()

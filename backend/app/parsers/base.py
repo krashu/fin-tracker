@@ -3,6 +3,10 @@
 Public surface re-exported by ``app.parsers``:
 
 * :class:`RawTransaction` — one parsed row (frozen, with sign invariant).
+* :class:`StatementSummary` — statement-level metadata (opening/closing balance,
+  period); every field independently optional.
+* :class:`ParsedStatement` — everything one statement file yields: ``rows`` plus
+  a ``summary``.
 * :data:`TxnType` / :data:`AccountType` — narrow Literal aliases.
 * :class:`StatementParser` — Protocol every per-issuer parser satisfies.
 * :class:`ParserError` / :class:`InvalidPasswordError` — exception hierarchy.
@@ -54,18 +58,43 @@ class RawTransaction:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class StatementSummary:
+    """Statement-level metadata: opening/closing balance and billing period.
+
+    Every field is independently optional — a layout that prints no summary
+    block (or one a parser can't read) yields an all-``None`` instance, never
+    ``None`` itself. That removes a ``None``-of-``None`` double check at every
+    read site.
+    """
+
+    opening_balance_paise: int | None = None
+    closing_balance_paise: int | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedStatement:
+    """Everything one statement file yields: rows plus statement-level metadata."""
+
+    rows: list[RawTransaction]
+    summary: StatementSummary
+
+
 class StatementParser(Protocol):
     """Contract every per-issuer parser implements.
 
     Concrete parsers are classes with a :meth:`parse` classmethod that
-    returns rows ordered by ``(date, page_index, row_index)``. Dispatch
-    keys off the account's ``(issuer, type)`` DB columns via the
-    ``PARSERS`` table in :mod:`app.services.import_service` — parsers
-    don't carry their own issuer/type metadata.
+    returns a :class:`ParsedStatement` whose rows are ordered by
+    ``(date, page_index, row_index)``. Dispatch keys off the account's
+    ``(issuer, type)`` DB columns via the ``PARSERS`` table in
+    :mod:`app.services.import_service` — parsers don't carry their own
+    issuer/type metadata.
     """
 
     @classmethod
-    def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]: ...
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement: ...
 
 
 class ParserError(Exception):
@@ -122,6 +151,80 @@ def _extract_tables(decrypted_bytes: bytes) -> list[list[list[str]]]:
         return pages
     except Exception as e:
         raise ParserError(f"failed to extract tables: {e}") from e
+
+
+def _extract_text(decrypted_bytes: bytes) -> list[str]:
+    """Extract page text from a decrypted PDF, split into lines and concatenated
+    across pages in page order.
+
+    ``page.extract_text()`` is a practical superset of table text, so a summary
+    block (opening/closing balance, statement period) prints here whether or not
+    it also landed in a detected table — this is what :func:`_find_labelled_amount`
+    and :func:`_find_period` scan.
+
+    Raises:
+        ParserError: pdfplumber could not open the PDF or text extraction failed.
+    """
+    try:
+        lines: list[str] = []
+        with pdfplumber.open(BytesIO(decrypted_bytes)) as pdf:
+            for page in pdf.pages:
+                lines.extend((page.extract_text() or "").splitlines())
+        return lines
+    except Exception as e:
+        raise ParserError(f"failed to extract text: {e}") from e
+
+
+def _find_labelled_amount(
+    lines: Sequence[str], pattern: re.Pattern[str]
+) -> tuple[int, bool] | None:
+    """First line matching ``pattern``, then :func:`_try_parse_amount` on its
+    trailing amount token. Returns ``(paise, is_credit)`` — sign application
+    stays the caller's job, exactly as it already is for row amounts.
+
+    The trailing token is tried two words wide before one (``"1,234.56 CR"``
+    is a label-then-amount line with the credit marker split off by
+    whitespace; trying the single last word first would grab bare ``"CR"``
+    and fail to parse it, silently losing the marker). Lines whose matched
+    label has no parseable trailing amount are skipped, not fatal — a later
+    line matching the same pattern gets a turn.
+
+    Returns ``None`` if no matching line yields a parseable amount.
+    """
+    for line in lines:
+        if not pattern.search(line):
+            continue
+        tokens = line.split()
+        for width in (2, 1):
+            if len(tokens) < width:
+                continue
+            parsed = _try_parse_amount(" ".join(tokens[-width:]))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _find_period(
+    lines: Sequence[str], pattern: re.Pattern[str], date_formats: Sequence[str]
+) -> tuple[date, date] | None:
+    """First line matching ``pattern``; the first two of its whitespace-separated
+    tokens that parse as dates (via ``date_formats``) become
+    ``(period_start, period_end)``. Punctuation immediately touching a date
+    token (``:``, ``,``) is stripped before parsing.
+
+    Returns ``None`` if no matching line yields two parseable dates.
+    """
+    for line in lines:
+        if not pattern.search(line):
+            continue
+        found: list[date] = []
+        for token in line.split():
+            parsed = _try_parse_date(token.strip(":,"), date_formats)
+            if parsed is not None:
+                found.append(parsed)
+        if len(found) >= 2:
+            return found[0], found[1]
+    return None
 
 
 # ---------------------------------------------------------------------------

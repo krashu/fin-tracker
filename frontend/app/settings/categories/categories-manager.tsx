@@ -43,7 +43,7 @@ import {
 import { invalidateRules } from "@/lib/queries/invalidate";
 import { cn } from "@/lib/utils";
 
-const KINDS: readonly CategoryKind[] = ["spend", "refund", "income"];
+const KINDS: readonly CategoryKind[] = ["spend", "income"];
 
 /** The one open dialog (or none). `edit`/`archive` always carry their row. */
 type CategoryDialog =

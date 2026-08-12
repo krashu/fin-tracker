@@ -6,6 +6,14 @@ parser ``RawTransaction.txn_type`` (CC-specific) maps into the PRD-level
 ``transaction_type`` enum here when the future ``import_service``
 composes a row.
 
+**A refund is not a transaction type.** It is a ``spend`` row carrying a
+*positive* ``amount_paise`` — derived at read time, never stored
+(``docs/adr/0009-refund-as-signed-spend.md``). So ``spend`` is the only type
+that accepts either sign, and every F8 aggregate discriminates on the sign
+rather than on the type. Identity is unaffected: the ADR-0006 fingerprint
+never hashed ``transaction_type``, so collapsing the enum moves no hash,
+no ``origin_fingerprint`` and no ``occurrence``.
+
 ``fingerprint`` is the dedup key from PRD §F4, as amended by
 ``docs/adr/0006-f4-dedup-key.md``:
 ``sha256("\\x1f".join(date_iso, amount_paise, normalized_merchant, account_id))``.
@@ -74,7 +82,7 @@ from app.models.base import Base, TimestampMixin
 if TYPE_CHECKING:
     from app.models.label import Label
 
-TransactionTypeStr = Literal["spend", "income", "transfer", "refund"]
+TransactionTypeStr = Literal["spend", "income", "transfer"]
 TransactionSourceStr = Literal["import", "manual"]
 
 

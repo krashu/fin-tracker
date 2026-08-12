@@ -107,7 +107,7 @@ exact version from `package.json`'s `packageManager` field, so everyone runs the
 
 ```bash
 corepack enable
-corepack prepare pnpm@11.14.0 --activate   # matches packageManager in frontend/package.json
+corepack prepare pnpm@11.21.0 --activate   # matches packageManager in frontend/package.json
 cd frontend
 pnpm install
 pnpm dev                                    # http://localhost:3000

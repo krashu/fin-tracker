@@ -17,8 +17,9 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { listPeriodTotals, listSpendByPeriod } from "@/lib/api/client";
-import { toLocalYMD, monthRange, trailingWeeksWindow } from "@/lib/dates";
+import { monthRange, trailingWeeksWindow } from "@/lib/dates";
 import { formatINR, formatMonthYear } from "@/lib/format";
+import { periodRange } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
 
@@ -38,12 +39,15 @@ export function SummaryStrip({
   const { hidden } = useBalanceHidden();
 
   // ── Yearly totals ─────────────────────────────────────────────────────
-  const yearStart = `${year}-01-01`;
-  const yearEnd = `${year}-12-31`;
+  const { start: yearStart, end: yearEnd } = periodRange({ year });
 
   const yearTotalsQ = useQuery({
     queryKey: ["dashboards", "period-totals", { start: yearStart, end: yearEnd }],
     queryFn: () => listPeriodTotals({ start: yearStart, end: yearEnd }),
+    // Mirrors monthTotalsQ's `enabled: !allDates` below — only one of the two
+    // totals is ever rendered (see `totalsQ` further down), so the other was
+    // fetching for nothing.
+    enabled: allDates,
   });
 
   const yearSpend = -(yearTotalsQ.data?.expense_paise ?? 0);

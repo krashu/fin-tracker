@@ -16,12 +16,17 @@ from uuid import UUID
 
 import pytest
 import structlog
-from sqlalchemy import event
+from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Account, Transaction, User
-from app.services.reconciliation_service import auto_link_cc_bill
+from app.models import Account, ImportBatch, Transaction, User
+from app.services.reconciliation_service import (
+    auto_link_cc_bill,
+    reconcile_batch,
+    rows_removed_since_import,
+)
+from app.services.transaction_queries import confirmed_only
 
 # ---------------------------------------------------------------------------
 # Local fixtures — mirror tests/services/test_tag_service.py (services tests
@@ -219,14 +224,27 @@ def test_links_single_matching_bank_row(
 
 @pytest.mark.parametrize(
     "candidate_state",
-    ["no_candidate", "outside_date_window", "already_paired", "refund_type"],
+    ["no_candidate", "outside_date_window", "already_paired", "positive_refund_wrong_sign"],
 )
 def test_no_op_on_no_or_bad_candidate(
     candidate_state: str,
     session: Session,
     user: User,
 ) -> None:
-    """No link when the bank-side candidate is missing or filtered out."""
+    """No link when the bank-side candidate is missing or filtered out.
+
+    ``positive_refund_wrong_sign`` is the T2 mis-pair guard (ADR-0009): since a
+    refund is a ``spend`` row with a positive amount, the type filter alone no
+    longer excludes one, so ``auto_link_cc_bill`` needs an explicit
+    ``amount_paise < 0`` predicate on the bank side. That guard is normally
+    *derivable* rather than stated — ``txn`` (CC-side) is an ``income`` row, and
+    ``sign_error`` pins ``income > 0``, which alone would make the bank target
+    negative and a positive refund unreachable. But ``POST /backup/import``
+    persists type + amount verbatim without ``sign_error`` (a hand-edited zip
+    is its declared threat model), so a NEGATIVE ``income`` row is reachable —
+    flipping the target positive and making a same-magnitude positive refund a
+    live mis-pair candidate without the guard.
+    """
     bank, cc = _make_bank_and_cc(session, user.id)
 
     if candidate_state == "no_candidate":
@@ -245,19 +263,25 @@ def test_no_op_on_no_or_bad_candidate(
         bank_row = _make_bank_transfer_row(session, user.id, bank, transfer_pair_id=partner.id)
         partner.transfer_pair_id = bank_row.id
         session.commit()
-    elif candidate_state == "refund_type":
-        # Bank-side refund of equal magnitude should NOT pair.
+    elif candidate_state == "positive_refund_wrong_sign":
+        # Bank-side refund (a `spend` row, positive) of the magnitude that
+        # WOULD match a NEGATIVE `income` row on the CC side — see the
+        # docstring above. Constructed below via a negative-amount CC row.
         _make_bank_transfer_row(
             session,
             user.id,
             bank,
-            transaction_type="refund",
-            amount_paise=_CC_AMOUNT,  # refunds are positive; magnitude matches
+            transaction_type="spend",
+            amount_paise=_CC_AMOUNT,
         )
     else:
         raise AssertionError(f"unknown candidate_state: {candidate_state}")
 
-    cc_row = _make_cc_payment_row(session, user.id, cc)
+    # `positive_refund_wrong_sign` needs the CC row itself negative — the state
+    # `sign_error` blocks at the API but `backup_csv` does not enforce on
+    # restore. Every other branch keeps the ordinary positive-income CC row.
+    cc_amount = -_CC_AMOUNT if candidate_state == "positive_refund_wrong_sign" else _CC_AMOUNT
+    cc_row = _make_cc_payment_row(session, user.id, cc, amount_paise=cc_amount)
     auto_link_cc_bill(session, user_id=user.id, txn=cc_row)
     session.expire_all()
 
@@ -379,3 +403,314 @@ def test_a_constraint_failure_on_the_pair_write_is_not_swallowed(
             auto_link_cc_bill(session, user_id=user.id, txn=cc_row)
     finally:
         event.remove(session, "before_flush", _fail_the_pair_write)
+
+
+# ---------------------------------------------------------------------------
+# Balance reconciliation (PRD §F1/§F4a) — reconcile_batch, the window
+# fallback, the anti-drift pin against /overview, and rows_removed_since_import.
+#
+# reconcile_batch's happy-path arithmetic and the (corrected) short-statement
+# sign case are covered end-to-end through import_statement in
+# tests/services/test_import_service.py, matching the plan's own file split.
+# These tests exercise reconcile_batch directly for behaviour that needs
+# hand-built ImportBatch / Transaction state import_statement can't drive:
+# the window fallback and the anti-drift pin.
+# ---------------------------------------------------------------------------
+
+
+def _make_cc_account(session: Session, user_id: UUID, *, opening_balance_paise: int = 0) -> Account:
+    account = Account(
+        user_id=user_id,
+        name="Axis CC",
+        type="credit_card",
+        issuer="axis",
+        last4="1234",
+        opening_balance_paise=opening_balance_paise,
+    )
+    session.add(account)
+    session.commit()
+    return account
+
+
+def _make_batch(
+    session: Session,
+    user_id: UUID,
+    account_id: int | None,
+    *,
+    opening_balance_paise: int | None,
+    closing_balance_paise: int | None,
+    period_start: date | None,
+    period_end: date | None,
+    imported_count: int = 0,
+    source_file_hash: str = "hash",
+) -> ImportBatch:
+    batch = ImportBatch(
+        user_id=user_id,
+        account_id=account_id,
+        source_file_hash=source_file_hash,
+        parser_name="AxisCC",
+        status="completed",
+        imported_count=imported_count,
+        statement_opening_balance_paise=opening_balance_paise,
+        statement_closing_balance_paise=closing_balance_paise,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    session.add(batch)
+    session.commit()
+    return batch
+
+
+def _make_row(
+    session: Session,
+    user_id: UUID,
+    account: Account,
+    *,
+    amount_paise: int,
+    txn_date: date,
+    fingerprint: str,
+    confirmed: bool,
+    import_batch_id: int | None = None,
+) -> Transaction:
+    row = Transaction(
+        user_id=user_id,
+        account_id=account.id,
+        date=txn_date,
+        amount_paise=amount_paise,
+        transaction_type="spend" if amount_paise < 0 else "income",
+        merchant_raw="SENTINEL MERCHANT",
+        merchant_normalized="sentinel merchant",
+        fingerprint=fingerprint,
+        source="import",
+        confirmed_at=datetime.now(UTC) if confirmed else None,
+        import_batch_id=import_batch_id,
+    )
+    session.add(row)
+    session.commit()
+    return row
+
+
+def test_window_fallback_uses_min_max_row_date_when_period_absent(
+    session: Session,
+    user: User,
+) -> None:
+    """Balances present, period absent (Phase 3 test 5): reconcile_batch falls
+    back to min/max row date over the batch's own rows, STAMPS that fallback
+    onto batch.period_start/period_end (so a later read sees a window either
+    way), and the check still runs to a real delta."""
+    account = _make_cc_account(session, user.id)
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=-1000,
+        closing_balance_paise=-2500,
+        period_start=None,
+        period_end=None,
+    )
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-1500,
+        txn_date=date(2026, 3, 5),
+        fingerprint="fp-1",
+        confirmed=False,
+        import_batch_id=batch.id,
+    )
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=0,  # ignored for the delta; still counts toward the date range
+        txn_date=date(2026, 3, 20),
+        fingerprint="fp-2",
+        confirmed=False,
+        import_batch_id=batch.id,
+    )
+
+    delta = reconcile_batch(session, user_id=user.id, batch=batch)
+    session.commit()
+
+    assert delta == 0  # actual -1500 == expected (-2500) - (-1000) == -1500
+    assert batch.period_start == date(2026, 3, 5)
+    assert batch.period_end == date(2026, 3, 20)
+
+
+def test_window_fallback_returns_none_when_batch_has_no_rows(
+    session: Session,
+    user: User,
+) -> None:
+    """Both balances present, no period, and no rows on the batch to fall
+    back to — min/max is (None, None), so the check has no usable window."""
+    account = _make_cc_account(session, user.id)
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=-1000,
+        closing_balance_paise=-2500,
+        period_start=None,
+        period_end=None,
+    )
+
+    assert reconcile_batch(session, user_id=user.id, batch=batch) is None
+    assert batch.period_start is None
+    assert batch.period_end is None
+
+
+def test_returns_none_for_an_account_less_batch(
+    session: Session,
+    user: User,
+) -> None:
+    """Investment / backup-restore batches have no account, hence no window
+    to check — reconcile_batch must no-op rather than raise. Not reachable
+    through import_statement (spend-only, always account-scoped) today, but
+    will be once Phase 4's GET /imports/{id}/reconciliation calls this for
+    every batch shape."""
+    batch = _make_batch(
+        session,
+        user.id,
+        None,
+        opening_balance_paise=-1000,
+        closing_balance_paise=-2500,
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+
+    assert reconcile_batch(session, user_id=user.id, batch=batch) is None
+
+
+def test_anti_drift_window_check_agrees_with_overview_balance(
+    session: Session,
+    user: User,
+) -> None:
+    """Phase 3 test 7 — the anti-drift pin. For an account whose ENTIRE
+    history is one statement, and whose opening_balance_paise equals that
+    statement's own opening balance, reconcile_batch's window check and the
+    /overview absolute balance (api/v1/dashboards.py:
+    ``a.opening_balance_paise + Σ(confirmed rows, all time)``, reused here
+    via the same confirmed_only predicate the route imports — not
+    reimplemented) must agree. If either definition moves, this goes red.
+    """
+    account = _make_cc_account(session, user.id, opening_balance_paise=-1000)
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=-1000,
+        closing_balance_paise=-2500,
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+    # Confirmed — this account's entire history, board-visible like /overview reads.
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-1500,
+        txn_date=date(2026, 3, 5),
+        fingerprint="fp-1",
+        confirmed=True,
+        import_batch_id=batch.id,
+    )
+
+    delta = reconcile_batch(session, user_id=user.id, batch=batch)
+    session.commit()
+    assert delta == 0
+
+    overview_sum_stmt = confirmed_only(
+        select(func.sum(Transaction.amount_paise)).where(
+            Transaction.user_id == user.id, Transaction.account_id == account.id
+        )
+    )
+    overview_balance_paise = account.opening_balance_paise + (
+        session.scalar(overview_sum_stmt) or 0
+    )
+    assert overview_balance_paise == batch.statement_closing_balance_paise
+
+
+def test_rows_removed_since_import_counts_hard_deletes(
+    session: Session,
+    user: User,
+) -> None:
+    """The discard-noise qualifier (approved fix, option c): imported_count is
+    frozen at first import; a live count below it means rows were hard-deleted
+    since (e.g. an investment-transfer row discarded at review). No amount
+    trace survives the delete, so this is a count, not a paise correction."""
+    account = _make_cc_account(session, user.id)
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=None,
+        closing_balance_paise=None,
+        period_start=None,
+        period_end=None,
+        imported_count=3,
+    )
+    # Only 2 of the original 3 rows still exist for this batch.
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-100,
+        txn_date=date(2026, 3, 5),
+        fingerprint="fp-1",
+        confirmed=True,
+        import_batch_id=batch.id,
+    )
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-200,
+        txn_date=date(2026, 3, 6),
+        fingerprint="fp-2",
+        confirmed=True,
+        import_batch_id=batch.id,
+    )
+
+    assert rows_removed_since_import(session, batch=batch) == 1
+
+
+def test_rows_removed_since_import_floors_at_zero_on_reupload_growth(
+    session: Session,
+    user: User,
+) -> None:
+    """A re-upload can re-stage rows onto the SAME batch_id, pushing the live
+    count above imported_count — that's rows coming back, not more being
+    removed, so this floors at zero rather than going negative."""
+    account = _make_cc_account(session, user.id)
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=None,
+        closing_balance_paise=None,
+        period_start=None,
+        period_end=None,
+        imported_count=1,
+    )
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-100,
+        txn_date=date(2026, 3, 5),
+        fingerprint="fp-1",
+        confirmed=True,
+        import_batch_id=batch.id,
+    )
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-200,
+        txn_date=date(2026, 3, 6),
+        fingerprint="fp-2",
+        confirmed=False,
+        import_batch_id=batch.id,
+    )
+
+    assert rows_removed_since_import(session, batch=batch) == 0

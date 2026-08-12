@@ -5,15 +5,18 @@ single winning category per merchant; this learns a *set* of user labels and the
 import review queue prefills every one that clears :data:`LABEL_PREFILL_MIN`.
 
 :func:`prefetch_label_map` is called once per import to build
-``{merchant_normalized: [label_id, ...]}``, and those labels are written onto the
-pending rows (mirroring the ``auto_category_id`` prefill). :func:`record_label` learns
+``{canonical: [label_id, ...]}`` (keyed on the alias resolver's canonical, per
+PRD §F3a / ADR-0011 merchant-alias layer, Phase A2 — never the raw merchant
+string), and those labels are written onto the pending rows (mirroring the
+``auto_category_id`` prefill). :func:`record_label` learns
 each merchant→label decision. (No caller list: it drifts by construction — the routes
 now go through :func:`learn_merchant_memory` rather than calling in directly. ``grep``
 is authoritative.)
 
 The eligibility gate is reused wholesale from :mod:`app.services.tag_service`
-(:func:`should_learn_tag` — spend/refund + non-empty merchant): label learning
-is deliberately spend/refund-only, matching category learning. Labels are
+(:func:`should_learn_tag` — a ``spend`` type + non-empty merchant): label
+learning is deliberately spend-only, matching category learning. Refunds are
+included — they are spend rows carrying a positive amount (ADR-0009). Labels are
 editable on *all* transaction types in the API, so a ``#salary`` on an income row
 or ``#rent`` on a transfer **persists and filters but is never learned or
 prefilled** — income/transfer are hand-classified and must not feed the
@@ -25,18 +28,15 @@ from __future__ import annotations
 from collections.abc import Iterable
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.core.db_errors import is_unique_violation, savepoint_insert
 from app.core.log_config import get_logger
 from app.models import Label, MerchantLabelMap
-from app.services.tag_service import (
-    merchant_map_winner_order,
-    record_tag,
-    should_learn_tag,
-)
+from app.services.merchant_alias import AliasResolver
+from app.services.tag_service import record_tag, should_learn_tag
 
 logger = get_logger(__name__)
 
@@ -53,43 +53,76 @@ logger = get_logger(__name__)
 LABEL_PREFILL_MIN: int = 3
 
 
-def prefetch_label_map(session: Session, *, user_id: UUID) -> dict[str, list[int]]:
-    """Return ``{merchant_normalized: [label_id, ...]}`` of prefill-worthy labels.
+def prefetch_label_map(
+    session: Session, *, user_id: UUID, resolver: AliasResolver
+) -> dict[str, list[int]]:
+    """Return ``{canonical: [label_id, ...]}`` of prefill-worthy labels.
 
-    One SELECT joining ``merchant_label_map`` → ``labels`` filtered to the given
-    user and ``hit_count >= LABEL_PREFILL_MIN``. The JOIN is defence-in-depth: a
-    label hard-delete cascades its map rows (composite FK, ON DELETE CASCADE), so
-    an orphan should never exist, but the JOIN keeps the promise if a future path
-    ever leaves one. Labels are ordered by hit_count so a merchant's strongest
-    tags lead its list (cosmetic — the review queue applies the whole set).
+    Unlike :func:`app.services.tag_service.prefetch_tag_map`'s single winner,
+    labels are a *set*: a label prefills once its hit_count, SUMMED ACROSS
+    EVERY raw ``merchant_normalized`` an alias folds onto this canonical,
+    clears :data:`LABEL_PREFILL_MIN`, or it is pinned on ANY of those raw
+    rows. The filter moved out of SQL and applies AFTER summing — three
+    ``swiggy*x`` rows at 1 each must reach the bar as canonical ``swiggy`` at
+    3, which is exactly the feature the alias layer exists to deliver.
+
+    That means the SELECT is genuinely wider than the pre-alias version, which
+    filtered ``hit_count >= LABEL_PREFILL_MIN OR pinned`` in SQL and returned only
+    prefill-worthy rows: a below-bar row cannot be excluded before summing,
+    because it may be what carries its canonical over. The cost is the user's
+    whole label map per import, reduced in Python. Narrowing it again means
+    pushing the fold into SQL (a join against ``merchant_alias``), not restoring
+    the old predicate.
+
+    The JOIN is defence-in-depth: a label hard-delete cascades its map rows
+    (composite FK, ON DELETE CASCADE), so an orphan should never exist, but
+    the JOIN keeps the promise if a future path ever leaves one.
+
+    List order is cosmetic only (the review queue applies the whole set
+    regardless of order): pinned labels first, then by summed hit_count
+    descending, with ``label_id`` ascending as a final deterministic
+    tiebreak.
+
+    ``resolver`` is a REQUIRED keyword argument for the same reason as
+    :func:`app.services.tag_service.prefetch_tag_map` — no default, so a
+    forgetful call site cannot silently disable aliasing.
+
+    With ``EMPTY_RESOLVER``, ``canonical(m) == m`` and the map's
+    ``UniqueConstraint(user_id, merchant_normalized, label_id)`` guarantees at
+    most one row per ``(user, merchant, label)`` — so every group has exactly
+    one member and this reduces to the original per-row filter,
+    byte-identical to pre-alias behaviour.
     """
     stmt = (
-        select(MerchantLabelMap.merchant_normalized, MerchantLabelMap.label_id)
+        select(
+            MerchantLabelMap.merchant_normalized,
+            MerchantLabelMap.label_id,
+            MerchantLabelMap.hit_count,
+            MerchantLabelMap.pinned,
+        )
         .join(
             Label,
             (Label.id == MerchantLabelMap.label_id) & (Label.user_id == MerchantLabelMap.user_id),
         )
-        .where(
-            MerchantLabelMap.user_id == user_id,
-            # A pinned label prefills even below the learned bar (F3a authoring) —
-            # this WHERE widening is the *only* behavioural change on this path;
-            # unlike prefetch_tag_map, the ORDER BY here is cosmetic (see below).
-            or_(
-                MerchantLabelMap.hit_count >= LABEL_PREFILL_MIN,
-                MerchantLabelMap.pinned,
-            ),
-        )
-        # Shared winner ordering (merchant_map_winner_order) for lockstep symmetry
-        # with prefetch_tag_map — though here it is cosmetic: prefetch_label_map
-        # returns the whole label *set* per merchant, so intra-merchant order
-        # doesn't change which labels prefill (the review queue applies them all).
-        .order_by(*merchant_map_winner_order(MerchantLabelMap))
+        .where(MerchantLabelMap.user_id == user_id)
     )
+    sums: dict[str, dict[int, tuple[int, bool]]] = {}
+    for merchant_normalized, label_id, hit_count, pinned in session.execute(stmt):
+        canonical = resolver.canonical(merchant_normalized)
+        by_label = sums.setdefault(canonical, {})
+        prev_count, prev_pinned = by_label.get(label_id, (0, False))
+        by_label[label_id] = (prev_count + hit_count, prev_pinned or pinned)
+
     out: dict[str, list[int]] = {}
-    # TODO(v2 postgres): SQLite has no window functions in older builds; v1 does
-    # the group-by-merchant reduction in Python — trivially cheap for one user.
-    for merchant_normalized, label_id in session.execute(stmt):
-        out.setdefault(merchant_normalized, []).append(label_id)
+    for canonical, by_label in sums.items():
+        ids = [
+            label_id
+            for label_id, (count, pinned) in by_label.items()
+            if count >= LABEL_PREFILL_MIN or pinned
+        ]
+        if ids:
+            ids.sort(key=lambda lid: (not by_label[lid][1], -by_label[lid][0], lid))
+            out[canonical] = ids
     return out
 
 
@@ -187,7 +220,7 @@ def learn_merchant_memory(
     label_ids: Iterable[int] = (),
 ) -> None:
     """Teach merchant→category (F3) and merchant→label (F3a) from one confirmed
-    spend/refund decision, behind the single :func:`should_learn_tag` gate.
+    spend-type decision, behind the single :func:`should_learn_tag` gate.
 
     De-dups the gate + loop that ``create_transaction``, ``update_transaction``,
     and the demo seeder each hand-rolled (a divergence that already let one write

@@ -18,6 +18,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Pill } from "@/components/ui/pill";
+import { PeriodPicker } from "@/components/dashboard/period-picker";
 import { IconChevronDown, IconChevronRight, IconX } from "@/components/icons";
 import { formatMonth } from "@/lib/format";
 import { labelDisplay } from "@/lib/labels";
@@ -26,15 +27,15 @@ import type {
   AccountRead,
   CategoryRead,
   LabelRead,
-  TransactionType,
+  ListTransactionsParams,
 } from "@/lib/api/client";
 
 /** The board's transaction-type view. "spending" is its default identity
- * (spend + refund — refunds net against spend per §F4a); "income" and
- * "transfers" are the opt-in views. Transfers are *entered* through their own
- * dialog, but they are browsable here — otherwise a mis-detected F4a link or a
- * stray manual transfer would be unreachable from the UI, with no way to
- * inspect or delete it. */
+ * (every `spend` row, either sign — refunds net against spend per §F4a);
+ * "refunds", "income" and "transfers" are the opt-in views. Transfers are
+ * *entered* through their own dialog, but they are browsable here — otherwise
+ * a mis-detected F4a link or a stray manual transfer would be unreachable
+ * from the UI, with no way to inspect or delete it. */
 export type TypeFilter = "spending" | "refunds" | "income" | "transfers";
 
 const TYPE_FILTER_LABEL: Record<TypeFilter, string> = {
@@ -44,14 +45,19 @@ const TYPE_FILTER_LABEL: Record<TypeFilter, string> = {
   transfers: "Transfers",
 };
 
-/** The `transaction_type` set each view requests. Always concrete — never omits
- * the param, since omitting it widens the list endpoint to *every* type at once
- * (transfers mixed into the spending list), which no view wants. */
-export function typeFilterToParam(t: TypeFilter): TransactionType[] {
-  if (t === "refunds") return ["refund"];
-  if (t === "income") return ["income"];
-  if (t === "transfers") return ["transfer"];
-  return ["spend"];
+/** The list-endpoint params each view requests. `transaction_type` is always
+ * concrete — never omitted, since omitting it widens the list endpoint to
+ * *every* type at once (transfers mixed into the spending list), which no view
+ * wants. "refunds" is no longer its own `transaction_type` (ADR-0009 collapsed
+ * it into a positively-signed `spend`), so it composes the orthogonal
+ * `amount_sign` filter instead — `spend` rows, positive amount only. */
+export function typeFilterToParam(
+  t: TypeFilter,
+): Pick<ListTransactionsParams, "transaction_type" | "amount_sign"> {
+  if (t === "refunds") return { transaction_type: ["spend"], amount_sign: "positive" };
+  if (t === "income") return { transaction_type: ["income"] };
+  if (t === "transfers") return { transaction_type: ["transfer"] };
+  return { transaction_type: ["spend"] };
 }
 
 export type FilterRowProps = {
@@ -107,12 +113,7 @@ export function FilterRow({
   // income). Transfers keep the spend picker deliberately: a transfer may carry
   // a spend category (ADR-0007 rule 7), so hiding it would strand those rows.
   const category = categories.find((c) => c.id === categoryId);
-  const categoryKind =
-    typeFilter === "income"
-      ? "income"
-      : typeFilter === "refunds"
-      ? "refund"
-      : "spend";
+  const categoryKind = typeFilter === "income" ? "income" : "spend";
   const visibleCategories = categories.filter((c) => c.kind === categoryKind);
   const label = labels.find((l) => l.id === labelId);
 
@@ -205,26 +206,14 @@ export function FilterRow({
         </DropdownMenu>
       ) : null}
 
-      {/* Year selector — dropdown pill listing available transaction years. */}
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Pill active={year !== new Date().getFullYear()}>
-            {year}
-            <IconChevronDown className="size-3 opacity-70" />
-          </Pill>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="max-h-72 w-32">
-          {availableYears.map((y) => (
-            <DropdownMenuItem key={y} onSelect={() => onYearChange(y)}>
-              {y === new Date().getFullYear() ? (
-                <span className="text-muted-foreground">{y}</span>
-              ) : (
-                String(y)
-              )}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      {/* Year selector. Year-only — the month navigator below is its own,
+          separate control (a stepper, not this dropdown). */}
+      <PeriodPicker
+        period={{ year }}
+        availableYears={availableYears}
+        onChange={(p) => onYearChange(p.year)}
+        allowMonth={false}
+      />
 
       {/* Month navigator — pill-height (h-7) so the row keeps its height and the
           table's sticky `stickyTop` offset stays valid. Dimmed but clickable

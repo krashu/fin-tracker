@@ -16,13 +16,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import timedelta
+from decimal import Decimal
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
-
-from app.services.provisioning import provision_default_categories
 
 from app.core import clock, rate_limit
 from app.core.config import get_settings
@@ -108,7 +108,7 @@ def seeded_user(session: Session) -> User:
 
 @pytest.fixture
 def seeded_categories(session: Session, seeded_user: User) -> list[Category]:
-    """The set of categories seeded by migration 0003_seed_default_categories."""
+    """The set of categories seeded by migration 0003."""
     spend_names = (
         "Food",
         "Groceries",
@@ -125,7 +125,9 @@ def seeded_categories(session: Session, seeded_user: User) -> list[Category]:
         "Other",
         "Transfer",
     )
-    cats = [Category(user_id=seeded_user.id, name=n, kind="spend", is_seeded=True) for n in spend_names]
+    cats = [
+        Category(user_id=seeded_user.id, name=n, kind="spend", is_seeded=True) for n in spend_names
+    ]
     cats.append(Category(user_id=seeded_user.id, name="Income", kind="income", is_seeded=True))
     session.add_all(cats)
     session.commit()

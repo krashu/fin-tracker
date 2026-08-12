@@ -24,7 +24,7 @@ has no ``kind`` field). Kind-matching between a transaction's
 ``category_id`` and its ``transaction_type`` IS enforced at the API for
 every category-assignment path — POST/PATCH ``/transactions`` and
 ``POST /rules/categories`` all pass a ``kind`` to
-:func:`app.services.category_service.validate_category_ids` (spend/refund/
+:func:`app.services.category_service.validate_category_ids` (spend/
 transfer → ``spend``, income → ``income``, via ``kind_for_type``). The
 durable ``merchant_tag_map`` rule made UI-only enforcement insufficient (a
 pinned income category would re-pollute every future spend import), so the

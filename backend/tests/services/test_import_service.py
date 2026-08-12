@@ -9,7 +9,7 @@ on missing account or unknown parser, and zero-paise row skipping.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 import structlog
@@ -17,8 +17,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models import Account, Category, MerchantTagMap, Transaction, User
-from app.parsers import RawTransaction
+from app.models import Account, Category, MerchantAlias, MerchantTagMap, Transaction, User
+from app.parsers import ParsedStatement, RawTransaction, StatementSummary
 from app.services import import_service
 from app.services.fingerprint import transaction_fingerprint
 from app.services.import_service import (
@@ -49,20 +49,31 @@ def seeded(session: Session) -> tuple[User, Account]:
 
 
 @pytest.mark.parametrize(
-    ("txn_type", "amount_paise", "expected"),
+    ("txn_type", "amount_paise", "merchant_raw", "expected"),
     [
-        ("purchase", -8500, "spend"),
-        ("payment", 100000, "income"),
-        ("refund", 5000, "refund"),
-        ("other", -25000, "spend"),  # finance charge, fee — debit
-        ("other", 5000, "income"),  # cashback, adjustment — credit
+        ("purchase", -8500, "X", "spend"),
+        ("payment", 100000, "X", "income"),
+        # A parser-flagged refund is spend-typed too (ADR-0009) — its positive
+        # sign, not the type, is what makes it a refund.
+        ("refund", 5000, "X", "spend"),
+        ("other", -25000, "X", "spend"),  # finance charge, fee — debit
+        # An unmatched credit-card credit — vocabulary the parser's _REFUND_RE
+        # missed — defaults to spend, not income (PRD §F5: its positive sign
+        # makes it a refund; the user corrects the rare genuine-cashback case;
+        # a wrong income default would inflate spend by the credit's full
+        # magnitude, per §F4a note 3).
+        ("other", 5000, "X", "spend"),
+        # ...unless the description names it cashback itself — then the keyword
+        # is trusted over the generic spend fallback (is_cashback_credit).
+        ("other", 5000, "ADDITIONAL CASHBACK FOR SWIGGY TRANSACTIONS", "income"),
+        ("other", 5000, "cashback credit", "income"),  # case-insensitive
     ],
 )
-def test_map_type(txn_type: str, amount_paise: int, expected: str) -> None:
+def test_map_type(txn_type: str, amount_paise: int, merchant_raw: str, expected: str) -> None:
     row = RawTransaction(
         date=date(2026, 3, 5),
         amount_paise=amount_paise,
-        merchant_raw="X",
+        merchant_raw=merchant_raw,
         txn_type=txn_type,  # type: ignore[arg-type]
     )
     assert _map_type(row) == expected
@@ -115,8 +126,8 @@ def _stub_parser_with(rows: list[RawTransaction]) -> type:
 
     class StubParser:
         @classmethod
-        def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]:
-            return rows
+        def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+            return ParsedStatement(rows=rows, summary=StatementSummary())
 
     return StubParser
 
@@ -483,6 +494,126 @@ def test_import_auto_tags_from_existing_map(
     assert txn.auto_category_id == food.id
 
 
+def test_import_prefills_via_alias(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point of Phase A2: a raw descriptor that never literally
+    matches any merchant_tag_map row still prefills, because it tokenizes
+    through an alias to a canonical the map WAS taught under."""
+    user, account = seeded
+    food = Category(user_id=user.id, name="Food")
+    session.add(food)
+    session.commit()
+    session.add(MerchantAlias(user_id=user.id, pattern="swiggy", canonical="food delivery"))
+    session.add(
+        MerchantTagMap(
+            user_id=user.id,
+            merchant_normalized="food delivery",
+            category_id=food.id,
+            hit_count=4,
+        )
+    )
+    session.commit()
+
+    monkeypatch.setitem(
+        import_service.PARSERS,
+        ("axis", "credit_card"),
+        _stub_parser_with(
+            [
+                RawTransaction(
+                    date=date(2026, 3, 5),
+                    amount_paise=-8500,
+                    merchant_raw="swiggy*blr*99999",
+                    txn_type="purchase",
+                ),
+            ]
+        ),
+    )
+
+    import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    txn = session.scalar(select(Transaction))
+    assert txn is not None
+    assert txn.category_id == food.id
+    assert txn.auto_category_id == food.id
+    # merchant_normalized still stores normalize_merchant's output (lowercase +
+    # whitespace collapse only -- normalize_merchant does not strip "*"), never
+    # the canonical: it is a read-time key only, never persisted on the row.
+    assert txn.merchant_normalized == "swiggy*blr*99999"
+
+
+def test_fingerprint_is_byte_identical_with_full_alias_table_loaded(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Required test 5 (ADR-0006 guard) -- a REAL comparison: every stored
+    fingerprint must equal transaction_fingerprint() computed directly from
+    normalize_merchant(row.merchant_raw), independent of the resolver, even
+    with a full alias table loaded."""
+    user, account = seeded
+    session.add_all(
+        [
+            MerchantAlias(user_id=user.id, pattern="swiggy", canonical="food"),
+            MerchantAlias(user_id=user.id, pattern="ola", canonical="transport"),
+            MerchantAlias(user_id=user.id, pattern="big basket", canonical="groceries"),
+        ]
+    )
+    session.commit()
+
+    rows = [
+        RawTransaction(
+            date=date(2026, 3, 5),
+            amount_paise=-8500,
+            merchant_raw="Swiggy*BLR*11111",
+            txn_type="purchase",
+        ),
+        RawTransaction(
+            date=date(2026, 3, 6),
+            amount_paise=-1200,
+            merchant_raw="UPI/OLA/2222@ybl",
+            txn_type="purchase",
+        ),
+        RawTransaction(
+            date=date(2026, 3, 7),
+            amount_paise=-3400,
+            merchant_raw="Big Basket Online",
+            txn_type="purchase",
+        ),
+    ]
+    expected_fps = {
+        r.merchant_raw: transaction_fingerprint(
+            txn_date=r.date,
+            amount_paise=r.amount_paise,
+            normalized_merchant=normalize_merchant(r.merchant_raw),
+            account_id=account.id,
+        )
+        for r in rows
+    }
+    monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with(rows))
+
+    import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    stored = {t.merchant_raw: t.fingerprint for t in session.scalars(select(Transaction)).all()}
+    assert stored == expected_fps
+
+
 def test_import_skips_auto_tag_for_income_and_transfer(
     session: Session,
     seeded: tuple[User, Account],
@@ -585,7 +716,8 @@ def test_import_auto_tags_refund_row(
 
     txn = session.scalar(select(Transaction))
     assert txn is not None
-    assert txn.transaction_type == "refund"
+    assert txn.transaction_type == "spend"
+    assert txn.amount_paise == 5000  # the positive sign IS the refund (ADR-0009)
     assert txn.category_id == food.id
 
 
@@ -1142,3 +1274,259 @@ def test_reupload_after_an_edit_into_a_deleted_rows_fingerprint_does_not_collide
     assert again.imported == 1
     persisted = session.scalars(select(Transaction).where(Transaction.fingerprint == uber_fp)).all()
     assert sorted(t.occurrence for t in persisted) == [0, 1]
+
+
+# ---------- Balance reconciliation (PRD §F1/§F4a, migration 0030) ----------
+
+
+def _stub_parser_with_summary(rows: list[RawTransaction], summary: StatementSummary) -> type:
+    """Like :func:`_stub_parser_with`, but with a controlled ``StatementSummary``
+    instead of the all-None default — these tests need real opening/closing
+    balances and a period to reconcile against."""
+
+    class StubParser:
+        @classmethod
+        def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+            return ParsedStatement(rows=rows, summary=summary)
+
+    return StubParser
+
+
+def test_reconciliation_metadata_stamped_and_clean_import_reconciles(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3 test 1: a clean import — the newly-staged rows sum exactly to
+    closing − opening — stamps all four metadata columns and reconciles to
+    delta 0, using this batch's still-pending rows (decision 1: checked at
+    upload, before the user has confirmed anything)."""
+    user, account = seeded
+    rows = [
+        RawTransaction(
+            date=date(2026, 3, 5), amount_paise=-8500, merchant_raw="A", txn_type="purchase"
+        ),
+        RawTransaction(
+            date=date(2026, 3, 10), amount_paise=-1500, merchant_raw="B", txn_type="purchase"
+        ),
+    ]
+    summary = StatementSummary(
+        opening_balance_paise=-2000,
+        closing_balance_paise=-12000,  # -2000 + (-8500 - 1500) == -12000
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+    monkeypatch.setitem(
+        import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with_summary(rows, summary)
+    )
+
+    result = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    batch = session.get(import_service.ImportBatch, result.batch_id)
+    assert batch is not None
+    assert batch.statement_opening_balance_paise == -2000
+    assert batch.statement_closing_balance_paise == -12000
+    assert batch.period_start == date(2026, 3, 1)
+    assert batch.period_end == date(2026, 3, 31)
+    assert batch.reconciliation_delta_paise == 0
+    assert result.reconciliation_delta_paise == 0
+
+
+def test_reconciliation_counts_board_rows_plus_this_batchs_pending_rows(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3 test 2: a pre-existing CONFIRMED board row inside the window
+    counts alongside this batch's newly-staged (still-pending) row — the
+    delta only reconciles because both contribute to ``actual``."""
+    user, account = seeded
+    session.add(
+        Transaction(
+            user_id=user.id,
+            account_id=account.id,
+            date=date(2026, 3, 3),
+            amount_paise=-1000,
+            transaction_type="spend",
+            merchant_raw="PRIOR",
+            merchant_normalized="prior",
+            fingerprint="fp-prior",
+            source="manual",
+            confirmed_at=datetime.now(UTC),
+        )
+    )
+    session.commit()
+
+    rows = [
+        RawTransaction(
+            date=date(2026, 3, 5), amount_paise=-9000, merchant_raw="NEW", txn_type="purchase"
+        ),
+    ]
+    summary = StatementSummary(
+        opening_balance_paise=-2000,
+        closing_balance_paise=-12000,  # -2000 + (-1000 - 9000) == -12000
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+    monkeypatch.setitem(
+        import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with_summary(rows, summary)
+    )
+
+    result = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    assert result.reconciliation_delta_paise == 0
+
+
+def test_short_statement_produces_a_positive_delta_not_a_negative_one(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3 test 3, corrected sign. plans/balance-reconciliation.md
+    originally stated this fixture's delta as -12345678; corrected
+    2026-08-12 to +12345678, per the plan's OWN formula (actual − expected,
+    stated twice in the brief): deleting a row of amount A from ``actual``
+    while ``expected`` stays fixed always yields ``delta = -A``. Here
+    A = -12345678 (a debit — the removed SENTINEL ELECTRONICS DEL row), so
+    the delta must be positive.
+
+    Numbers mirror the plan's own Axis fixture: opening -569900,
+    closing -11519128 (expected -10949228); the one staged row is the
+    full-statement row sum (-10949228) with that -12345678 row removed.
+    """
+    user, account = seeded
+    rows = [
+        RawTransaction(
+            date=date(2026, 3, 15),
+            amount_paise=1396450,  # -10949228 - (-12345678)
+            merchant_raw="SENTINEL CREDIT",
+            txn_type="other",
+        ),
+    ]
+    summary = StatementSummary(
+        opening_balance_paise=-569900,
+        closing_balance_paise=-11519128,
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+    monkeypatch.setitem(
+        import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with_summary(rows, summary)
+    )
+
+    result = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    assert result.imported == 1
+    assert result.reconciliation_delta_paise == 12345678
+
+
+def test_no_summary_block_leaves_metadata_and_delta_null(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3 test 4: a layout with no summary block at all (the Flipkart
+    co-branded Axis layout's real closing text) legitimately reconciles to
+    "not checked" — never a ParserError. ``_stub_parser_with``'s default
+    ``StatementSummary()`` already models this."""
+    user, account = seeded
+    rows = [
+        RawTransaction(
+            date=date(2026, 3, 5), amount_paise=-500, merchant_raw="X", txn_type="purchase"
+        ),
+    ]
+    monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with(rows))
+
+    result = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    batch = session.get(import_service.ImportBatch, result.batch_id)
+    assert batch is not None
+    assert batch.statement_opening_balance_paise is None
+    assert batch.statement_closing_balance_paise is None
+    assert batch.period_start is None
+    assert batch.period_end is None
+    assert batch.reconciliation_delta_paise is None
+    assert result.reconciliation_delta_paise is None
+
+
+def test_reupload_restamps_metadata_and_recomputes_the_delta(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3 test 6: metadata stamping runs on EVERY import, not just the
+    first — unlike imported_count/skipped_count/status, which record the
+    first import's outcome. A re-upload of a batch stamped before this
+    feature shipped (all-None metadata) repairs it: same file in, fresh
+    metadata + a real delta out."""
+    user, account = seeded
+    row = RawTransaction(
+        date=date(2026, 3, 5), amount_paise=-1000, merchant_raw="X", txn_type="purchase"
+    )
+    monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with([row]))
+    first = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+    assert first.reconciliation_delta_paise is None
+
+    # Re-upload: same file_bytes (same source_file_hash → reuses the batch),
+    # but the parser now reads a real summary for the SAME row.
+    summary = StatementSummary(
+        opening_balance_paise=-500,
+        closing_balance_paise=-1500,  # -500 + -1000 == -1500
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+    monkeypatch.setitem(
+        import_service.PARSERS,
+        ("axis", "credit_card"),
+        _stub_parser_with_summary([row], summary),
+    )
+    second = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    assert second.batch_id == first.batch_id
+    assert second.already_imported is True
+    batch = session.get(import_service.ImportBatch, second.batch_id)
+    assert batch is not None
+    assert batch.statement_opening_balance_paise == -500
+    assert batch.statement_closing_balance_paise == -1500
+    assert second.reconciliation_delta_paise == 0

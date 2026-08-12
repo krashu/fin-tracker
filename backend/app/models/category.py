@@ -27,7 +27,7 @@ from sqlalchemy.sql import expression
 
 from app.models.base import Base, TimestampMixin
 
-CategoryKindStr = Literal["spend", "income", "refund"]
+CategoryKindStr = Literal["spend", "income"]
 
 
 class Category(Base, TimestampMixin):

@@ -6,9 +6,10 @@ Covers:
 * ``GET /imports/{batch_id}/candidates`` — pending filter, ``prior_matches``
   COALESCE, confidence threshold boundaries, cross-user 404.
 * ``POST /imports/{batch_id}/commit`` — happy path, atomic 422 (missing /
-  cross-batch / already-confirmed), untagged spend/refund → "Other" default
-  (with 422 fallback when no "Other" exists), income/transfer null-category
-  branch, same-merchant-twice ``hit_count`` accounting.
+  cross-batch / already-confirmed), untagged spend-kind (spend + refund) →
+  "Other" default (with 422 fallback when it doesn't exist),
+  income/transfer null-category branch, same-merchant-twice ``hit_count``
+  accounting.
 * ``DELETE /imports/{batch_id}`` — partial cancel keeps batch, full cancel
   deletes batch (re-upload re-runs parser), idempotency, cross-user 404.
 
@@ -18,7 +19,7 @@ Uses the ``_StubAxisParser`` pattern from ``test_imports.py`` — no real PDF.
 from __future__ import annotations
 
 import uuid
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import ClassVar
 
 import pytest
@@ -31,11 +32,12 @@ from app.models import (
     Account,
     Category,
     ImportBatch,
+    MerchantAlias,
     MerchantTagMap,
     Transaction,
     User,
 )
-from app.parsers import RawTransaction
+from app.parsers import ParsedStatement, RawTransaction, StatementSummary
 from app.services import import_service
 
 # -----------------------------------------------------------------------------
@@ -71,16 +73,21 @@ _REVIEW_ROWS: list[RawTransaction] = [
 
 class _StubAxisParser:
     rows: ClassVar[list[RawTransaction]] = []
+    # Defaults to an all-None summary (no balance block) — the reconciliation
+    # tests below override this per-case; every other test in this module is
+    # unaffected since reset happens in the stub_parser fixture.
+    summary: ClassVar[StatementSummary] = StatementSummary()
 
     @classmethod
-    def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]:
-        return list(cls.rows)
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+        return ParsedStatement(rows=list(cls.rows), summary=cls.summary)
 
 
 @pytest.fixture
 def stub_parser(monkeypatch: pytest.MonkeyPatch) -> type[_StubAxisParser]:
     monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _StubAxisParser)
     _StubAxisParser.rows = list(_REVIEW_ROWS)
+    _StubAxisParser.summary = StatementSummary()
     return _StubAxisParser
 
 
@@ -134,7 +141,8 @@ def test_candidates_returns_only_pending_rows_of_this_batch(
         "2026-03-06",
         "2026-03-05",
     ]
-    # Wire shape — same as TransactionRead + prior_matches + confidence + pinned.
+    # Wire shape — same as TransactionRead + prior_matches + confidence + pinned
+    # + cc_payment_candidate.
     assert set(candidates[0].keys()) == {
         "id",
         "account_id",
@@ -148,6 +156,7 @@ def test_candidates_returns_only_pending_rows_of_this_batch(
         "prior_matches",
         "confidence",
         "pinned",
+        "cc_payment_candidate",
     }
 
 
@@ -314,6 +323,244 @@ def test_candidates_null_category_collapses_to_prior_matches_zero(
     assert income_row["confidence"] == "none"
 
 
+def test_candidates_cc_payment_candidate_flag(
+    client: TestClient,
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+) -> None:
+    """``cc_payment_candidate`` is the type+merchant gate ``is_cc_payment`` uses
+    (``auto_link_cc_bill``'s gate 3), surfaced so the review queue can offer the
+    "Card bill payment" action (PRD §F4a-1). True only for an income row whose
+    merchant matches — a cashback-named income credit, an ordinary spend, and
+    an income row with an unrelated merchant must all read False.
+    """
+    _StubAxisParser.rows = [
+        # income (payment) + merchant match -> True.
+        RawTransaction(
+            date=date(2026, 3, 10),
+            amount_paise=500000,
+            merchant_raw="PAYMENT RECEIVED",
+            txn_type="payment",
+        ),
+        # income (cashback) but not a card-bill merchant -> False.
+        RawTransaction(
+            date=date(2026, 3, 9),
+            amount_paise=17500,
+            merchant_raw="CASHBACK FOR SWIGGY TRANSACTIONS",
+            txn_type="other",
+        ),
+        # ordinary spend, merchant text is irrelevant -> False (type gate).
+        RawTransaction(
+            date=date(2026, 3, 8),
+            amount_paise=-15000,
+            merchant_raw="SWIGGY BLR",
+            txn_type="purchase",
+        ),
+        # income (payment) but an unrelated merchant -> False (merchant gate).
+        # Only "payment" reaches bare `income` here — _map_type folds every
+        # other positive, non-cashback credit to `spend` (a refund).
+        RawTransaction(
+            date=date(2026, 3, 7),
+            amount_paise=250000,
+            merchant_raw="SALARY CREDITED VIA NEFT",
+            txn_type="payment",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+
+    candidates = {
+        c["merchant_raw"]: c for c in client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    }
+    assert candidates["PAYMENT RECEIVED"]["transaction_type"] == "income"
+    assert candidates["PAYMENT RECEIVED"]["cc_payment_candidate"] is True
+    assert candidates["CASHBACK FOR SWIGGY TRANSACTIONS"]["transaction_type"] == "income"
+    assert candidates["CASHBACK FOR SWIGGY TRANSACTIONS"]["cc_payment_candidate"] is False
+    assert candidates["SWIGGY BLR"]["transaction_type"] == "spend"
+    assert candidates["SWIGGY BLR"]["cc_payment_candidate"] is False
+    assert candidates["SALARY CREDITED VIA NEFT"]["transaction_type"] == "income"
+    assert candidates["SALARY CREDITED VIA NEFT"]["cc_payment_candidate"] is False
+
+
+# -----------------------------------------------------------------------------
+# GET /candidates — merchant-alias layer (ADR-0011, Phase A3).
+# -----------------------------------------------------------------------------
+
+
+def test_candidates_confidence_follows_alias_across_different_raw_descriptor(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session: Session,
+) -> None:
+    """The core scenario Phase A3 exists for: a category confirmed under one raw
+    descriptor makes a *different* raw descriptor's candidate — aliased to the
+    same canonical — read non-zero prior_matches. Under the old exact-string
+    LEFT JOIN this candidate would have read prior_matches=0/"none", because
+    "swiggy hyd 67890" never had its own merchant_tag_map row.
+    """
+    food = next(c for c in seeded_categories if c.name == "Food")
+    session.add(MerchantAlias(user_id=axis_account.user_id, pattern="swiggy", canonical="swiggy"))
+    session.add(
+        MerchantTagMap(
+            user_id=axis_account.user_id,
+            merchant_normalized="swiggy blr 12345",
+            category_id=food.id,
+            hit_count=1,
+        )
+    )
+    session.commit()
+
+    _StubAxisParser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 5),
+            amount_paise=-15000,
+            merchant_raw="SWIGGY HYD 67890",
+            txn_type="purchase",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+
+    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert len(candidates) == 1
+    row = candidates[0]
+    # Import-time auto-tag (Phase A2) already resolves the alias.
+    assert row["category_id"] == food.id
+    assert row["prior_matches"] == 1
+    assert row["confidence"] == "uncertain"
+
+
+def test_candidates_confidence_seeded_when_present_at_hit_count_zero(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session: Session,
+) -> None:
+    """A (canonical, category) pair present at hit_count == 0 — what Phase A5's
+    seed dictionary will insert — reads "seeded", distinct from an absent
+    pair's "none" even though both carry prior_matches == 0."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    session.add(
+        MerchantTagMap(
+            user_id=axis_account.user_id,
+            merchant_normalized="swiggy blr",
+            category_id=food.id,
+            hit_count=0,
+        )
+    )
+    session.commit()
+
+    _StubAxisParser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 5),
+            amount_paise=-15000,
+            merchant_raw="SWIGGY BLR",
+            txn_type="purchase",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+
+    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert len(candidates) == 1
+    row = candidates[0]
+    assert row["category_id"] == food.id
+    assert row["prior_matches"] == 0
+    assert row["confidence"] == "seeded"
+
+
+def test_candidates_pinned_survives_seeded_hit_count_zero(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session: Session,
+) -> None:
+    """A PINNED seed row must surface ``pinned: true`` alongside
+    ``confidence: "seeded"``.
+
+    ``pin_tag`` never bumps ``hit_count`` on an existing row, so pinning a seed
+    row is the one way to reach ``hit_count == 0, pinned=True``. Hard-coding
+    ``pinned=False`` in ``_candidate_strength``'s zero-hit branch made the user's
+    own authored rule render as an unconfirmed dictionary suggestion — TagPicker
+    checks ``pinned`` before ``confidence``, so carrying the real flag is the
+    whole fix.
+    """
+    food = next(c for c in seeded_categories if c.name == "Food")
+    session.add(
+        MerchantTagMap(
+            user_id=axis_account.user_id,
+            merchant_normalized="swiggy blr",
+            category_id=food.id,
+            hit_count=0,
+            pinned=True,
+        )
+    )
+    session.commit()
+
+    _StubAxisParser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 5),
+            amount_paise=-15000,
+            merchant_raw="SWIGGY BLR",
+            txn_type="purchase",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+
+    row = client.get(f"/api/v1/imports/{batch_id}/candidates").json()[0]
+    assert row["category_id"] == food.id
+    assert row["prior_matches"] == 0
+    assert row["confidence"] == "seeded"
+    assert row["pinned"] is True
+
+
+def test_candidates_confidence_drops_to_none_once_category_archived(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session: Session,
+) -> None:
+    """Named, not discovered: the old LEFT JOIN never touched ``Category``, so
+    archiving a category left an existing candidate's prior_matches untouched.
+    ``prefetch_tag_strength`` (via ``_aggregate_tag_rows``) inherits the
+    archived-category filter, so the same candidate now reads "none" — more
+    consistent with the real prefill, and a deliberate behaviour change."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    session.add(
+        MerchantTagMap(
+            user_id=axis_account.user_id,
+            merchant_normalized="swiggy blr",
+            category_id=food.id,
+            hit_count=5,
+        )
+    )
+    session.commit()
+
+    _StubAxisParser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 5),
+            amount_paise=-15000,
+            merchant_raw="SWIGGY BLR",
+            txn_type="purchase",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+
+    before = client.get(f"/api/v1/imports/{batch_id}/candidates").json()[0]
+    assert before["prior_matches"] == 5
+    assert before["confidence"] == "confident"
+
+    food.archived_at = datetime.now(UTC)
+    session.add(food)
+    session.commit()
+
+    after = client.get(f"/api/v1/imports/{batch_id}/candidates").json()[0]
+    assert after["prior_matches"] == 0
+    assert after["confidence"] == "none"
+
+
 # -----------------------------------------------------------------------------
 # POST /commit.
 # -----------------------------------------------------------------------------
@@ -406,8 +653,10 @@ def test_commit_defaults_untagged_spend_to_other(
     stub_parser: type[_StubAxisParser],
     session_factory: sessionmaker[Session],
 ) -> None:
-    """Untagged spend/refund rows commit under the spend "Other" category (PRD §F5
-    fallback), not rejected; income stays null. The Other default is NOT learned."""
+    """Untagged spend rows commit under the spend "Other" category (PRD §F5
+    fallback), not rejected; income stays null. The Other default is NOT learned.
+    Refunds share this one spend-kind fallback — see
+    ``test_commit_defaults_untagged_refund_to_other`` below."""
     batch_id = _import_and_get_batch_id(client, axis_account.id)
     other = next(c for c in seeded_categories if c.name == "Other")
 
@@ -429,6 +678,105 @@ def test_commit_defaults_untagged_spend_to_other(
         income = s.get(Transaction, income_id)
         assert income is not None and income.category_id is None
         # "Other" defaults are a fallback, not a merchant decision — no learning.
+        assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
+
+
+def test_commit_defaults_untagged_refund_to_other(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """An untagged refund row commits under the spend "Other" category — the
+    same spend-kind fallback an untagged spend row gets, since a refund nets
+    against spend in the same category (PRD §F5). Not rejected (cf.
+    test_commit_refund_with_null_category_rejected, which seeds no category so
+    the row IS rejected). The default is NOT learned, mirroring the spend case."""
+    _StubAxisParser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 10),
+            amount_paise=50000,
+            merchant_raw="SWIGGY BLR REFUND",
+            txn_type="refund",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+    other = next(c for c in seeded_categories if c.name == "Other")
+
+    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert len(candidates) == 1
+    assert candidates[0]["transaction_type"] == "spend"  # a refund IS spend (ADR-0009)
+    assert candidates[0]["amount_paise"] == 50000  # positive — the refund
+    assert candidates[0]["category_id"] is None
+
+    commit = client.post(
+        f"/api/v1/imports/{batch_id}/commit",
+        json={"transaction_ids": [candidates[0]["id"]]},
+    )
+    assert commit.status_code == 204, commit.text
+
+    with session_factory() as s:
+        row = s.get(Transaction, candidates[0]["id"])
+        assert row is not None
+        assert row.category_id == other.id
+        # A fallback default isn't a merchant→category decision worth teaching F3.
+        assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
+
+
+def test_commit_defaults_untagged_cashback_income_to_cashback_category(
+    client: TestClient,
+    session: Session,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """An unmatched credit named cashback in its own description types as
+    ``income`` (``is_cashback_credit`` — not the generic ``refund`` fallback,
+    see ``test_commit_defaults_untagged_refund_to_refund_category`` for that
+    case), and an untagged one commits under the seeded income "Cashback"
+    category, not left null. The Cashback default is NOT learned, mirroring
+    the Other/Refund fallbacks.
+
+    ``seeded_categories`` mirrors migrations 0003+0029's demo-user seed, which
+    predates the income category set (Salary/Freelancing/Cashback/Other) that
+    ``provisioning.py`` gives a *newly registered* user — so "Cashback" is
+    seeded here directly rather than widening that shared fixture.
+    """
+    cashback_cat = Category(
+        user_id=axis_account.user_id, name="Cashback", kind="income", is_seeded=False
+    )
+    session.add(cashback_cat)
+    session.commit()
+    session.refresh(cashback_cat)
+
+    _StubAxisParser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 10),
+            amount_paise=17500,
+            merchant_raw="ADDITIONAL CASHBACK FOR SWIGGY TRANSACTIONS",
+            txn_type="other",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+
+    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert len(candidates) == 1
+    assert candidates[0]["transaction_type"] == "income"
+    assert candidates[0]["category_id"] is None
+
+    commit = client.post(
+        f"/api/v1/imports/{batch_id}/commit",
+        json={"transaction_ids": [candidates[0]["id"]]},
+    )
+    assert commit.status_code == 204, commit.text
+
+    with session_factory() as s:
+        row = s.get(Transaction, candidates[0]["id"])
+        assert row is not None
+        assert row.category_id == cashback_cat.id
+        # A fallback default isn't a merchant→category decision worth teaching F3.
         assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
 
 
@@ -528,6 +876,43 @@ def test_patch_pending_row_does_not_learn(
         row = s.get(Transaction, swiggy_id)
         # Category set on the row, but no rule learned yet — it's still pending.
         assert row is not None and row.category_id == food.id and row.confirmed_at is None
+        assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
+
+
+def test_patch_pending_row_type_flip_does_not_learn(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """The review queue's merged Spend/Income category picker (review-queue.tsx)
+    PATCHes `transaction_type` directly on a still-pending row: picking a spend
+    category retypes an `income` credit to `spend` (its positive amount is what
+    makes it a refund, ADR-0009). Same no-learning contract as a category-only
+    PATCH (mirrors test_patch_pending_row_does_not_learn), and the same
+    ADR-0007 rule-5 kind-flip requirement as a confirmed row: the new kind's
+    category must be sent in the same request."""
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+    payment_id = next(
+        c["id"]
+        for c in client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+        if c["transaction_type"] == "income"
+    )
+    food = next(c for c in seeded_categories if c.name == "Food")
+
+    resp = client.patch(
+        f"/api/v1/transactions/{payment_id}",
+        json={"transaction_type": "spend", "category_id": food.id},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transaction_type"] == "spend"
+    assert resp.json()["category_id"] == food.id
+
+    with session_factory() as s:
+        row = s.get(Transaction, payment_id)
+        assert row is not None and row.confirmed_at is None
+        # Retyped, but still pending — no rule learned yet.
         assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
 
 
@@ -822,6 +1207,7 @@ def test_reupload_after_partial_cancel_resurfaces_cancelled_rows(
         "pending_count": n_purchases,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
 
     with session_factory() as s:
@@ -1019,8 +1405,10 @@ def test_commit_refund_with_null_category_rejected(
     stub_parser: type[_StubAxisParser],
 ) -> None:
     """Untagged refund falls back to 422 when there's no "Other" category to
-    default to (this test seeds no categories). Also guards that the null-category
-    rule covers ``refund``, not just ``spend``."""
+    default to (this test seeds no categories). A refund is a `spend` row
+    (positive amount, ADR-0009), so the null-category rule reaches it through
+    the SAME `spend` branch as any other untagged spend — there is no separate
+    refund case left to guard."""
     _StubAxisParser.rows = [
         RawTransaction(
             date=date(2026, 3, 10),
@@ -1033,7 +1421,7 @@ def test_commit_refund_with_null_category_rejected(
 
     candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
     assert len(candidates) == 1
-    assert candidates[0]["transaction_type"] == "refund"
+    assert candidates[0]["transaction_type"] == "spend"
     assert candidates[0]["category_id"] is None
 
     commit = client.post(
@@ -1099,6 +1487,7 @@ def test_pending_lists_open_batch_with_count_and_label(
         "account_name": "Axis CC",
         "account_last4": "1234",
         "pending_count": len(_REVIEW_ROWS),
+        "reconciliation_delta_paise": None,
     }
 
 
@@ -1942,3 +2331,224 @@ def test_reupload_after_editing_a_committed_row_restages_only_the_cancelled_rows
         rows = list(s.scalars(select(Transaction)))
         assert len(rows) == len(_REVIEW_ROWS)  # no duplicate of the edited row
         assert [r.amount_paise for r in rows if r.confirmed_at is not None] == [512345]
+
+
+# -----------------------------------------------------------------------------
+# Balance reconciliation (PRD §F1/§F4a) — ImportSummary/PendingImportBatch's
+# reconciliation_delta_paise field, and GET /imports/{batch_id}/reconciliation.
+# -----------------------------------------------------------------------------
+# _REVIEW_ROWS sums to 453500 paise (-15000 -22000 -9500 +500000), spanning
+# 2026-03-05..2026-03-08 — used below as the "clean" statement window.
+_REVIEW_ROWS_SUM = sum(r.amount_paise for r in _REVIEW_ROWS)
+
+
+def test_import_response_surfaces_reconciliation_delta(
+    client: TestClient,
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+) -> None:
+    """POST /imports proxies the batch's just-computed delta (Phase 3) verbatim."""
+    _StubAxisParser.summary = StatementSummary(
+        opening_balance_paise=0,
+        closing_balance_paise=_REVIEW_ROWS_SUM + 12345,  # mismatch by 12345
+        period_start=date(2026, 3, 5),
+        period_end=date(2026, 3, 8),
+    )
+    resp = client.post(
+        "/api/v1/imports",
+        data={"account_id": str(axis_account.id)},
+        files={"file": ("statement.pdf", b"file-recon-A", "application/pdf")},
+    )
+    assert resp.status_code == 200, resp.text
+    # actual (453500) - expected (453500 + 12345) = -12345
+    assert resp.json()["reconciliation_delta_paise"] == -12345
+
+
+def test_pending_surfaces_persisted_reconciliation_delta(
+    client: TestClient,
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+) -> None:
+    """GET /imports/pending selects reconciliation_delta_paise off ImportBatch
+    (the outer query, not the pending-count subquery's GROUP BY)."""
+    _StubAxisParser.summary = StatementSummary(
+        opening_balance_paise=0,
+        closing_balance_paise=_REVIEW_ROWS_SUM,  # reconciles clean
+        period_start=date(2026, 3, 5),
+        period_end=date(2026, 3, 8),
+    )
+    _import_and_get_batch_id(client, axis_account.id, content=b"file-recon-B")
+
+    rows = client.get("/api/v1/imports/pending").json()
+    assert len(rows) == 1
+    assert rows[0]["reconciliation_delta_paise"] == 0
+
+
+def test_reconciliation_route_matched(
+    client: TestClient,
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+) -> None:
+    _StubAxisParser.summary = StatementSummary(
+        opening_balance_paise=0,
+        closing_balance_paise=_REVIEW_ROWS_SUM,
+        period_start=date(2026, 3, 5),
+        period_end=date(2026, 3, 8),
+    )
+    batch_id = _import_and_get_batch_id(client, axis_account.id, content=b"file-recon-C")
+
+    resp = client.get(f"/api/v1/imports/{batch_id}/reconciliation")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "batch_id": batch_id,
+        "opening_balance_paise": 0,
+        "closing_balance_paise": _REVIEW_ROWS_SUM,
+        "period_start": "2026-03-05",
+        "period_end": "2026-03-08",
+        "expected_paise": _REVIEW_ROWS_SUM,
+        "actual_paise": _REVIEW_ROWS_SUM,
+        "delta_paise": 0,
+        "status": "matched",
+        "rows_removed_since_import": 0,
+    }
+
+
+def test_reconciliation_route_mismatched_reports_the_breakdown(
+    client: TestClient,
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """actual/expected/delta stay algebraically consistent (actual = expected + delta),
+    and the fresh delta is persisted onto the ImportBatch row."""
+    expected = _REVIEW_ROWS_SUM + 12345
+    _StubAxisParser.summary = StatementSummary(
+        opening_balance_paise=0,
+        closing_balance_paise=expected,
+        period_start=date(2026, 3, 5),
+        period_end=date(2026, 3, 8),
+    )
+    batch_id = _import_and_get_batch_id(client, axis_account.id, content=b"file-recon-D")
+
+    resp = client.get(f"/api/v1/imports/{batch_id}/reconciliation")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["expected_paise"] == expected
+    assert body["actual_paise"] == _REVIEW_ROWS_SUM
+    assert body["delta_paise"] == _REVIEW_ROWS_SUM - expected
+    assert body["status"] == "mismatched"
+    # Nothing discarded here — this mismatch is a genuine statement/record gap,
+    # not the discard-noise false-positive class.
+    assert body["rows_removed_since_import"] == 0
+
+    with session_factory() as s:
+        batch = s.get(ImportBatch, batch_id)
+        assert batch is not None
+        assert batch.reconciliation_delta_paise == _REVIEW_ROWS_SUM - expected
+
+
+def test_reconciliation_route_unavailable_without_a_summary_block(
+    client: TestClient,
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+) -> None:
+    """No printed balance block (e.g. the Axis Flipkart layout) → "unavailable",
+    never a 4xx — absent metadata is not a parse failure."""
+    batch_id = _import_and_get_batch_id(client, axis_account.id)  # default: StatementSummary()
+
+    resp = client.get(f"/api/v1/imports/{batch_id}/reconciliation")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "batch_id": batch_id,
+        "opening_balance_paise": None,
+        "closing_balance_paise": None,
+        "period_start": None,
+        "period_end": None,
+        "expected_paise": None,
+        "actual_paise": None,
+        "delta_paise": None,
+        "status": "unavailable",
+        "rows_removed_since_import": 0,
+    }
+
+
+def test_reconciliation_route_recomputes_after_a_row_is_discarded(
+    client: TestClient,
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+) -> None:
+    """The route recomputes on every call — it doesn't just echo the stored
+    column — so a discard between two GETs is picked up without a re-import."""
+    _StubAxisParser.summary = StatementSummary(
+        opening_balance_paise=0,
+        closing_balance_paise=_REVIEW_ROWS_SUM,
+        period_start=date(2026, 3, 5),
+        period_end=date(2026, 3, 8),
+    )
+    batch_id = _import_and_get_batch_id(client, axis_account.id, content=b"file-recon-E")
+
+    first = client.get(f"/api/v1/imports/{batch_id}/reconciliation")
+    assert first.json()["status"] == "matched"
+    assert first.json()["rows_removed_since_import"] == 0
+
+    # Discard the pending -9500 UBER row (the review-queue "not mine" action).
+    uber_id = next(
+        c["id"]
+        for c in client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+        if c["merchant_raw"] == "UBER MUM"
+    )
+    assert client.delete(f"/api/v1/transactions/{uber_id}").status_code == 204
+
+    second = client.get(f"/api/v1/imports/{batch_id}/reconciliation")
+    assert second.status_code == 200, second.text
+    body = second.json()
+    # actual dropped by -9500 (the deleted row's own amount) while expected held.
+    assert body["actual_paise"] == _REVIEW_ROWS_SUM - (-9500)
+    assert body["delta_paise"] == 9500
+    assert body["status"] == "mismatched"
+    # The discard-noise qualifier explains exactly this mismatch: one of the
+    # batch's 4 originally-staged rows (imported_count) no longer exists.
+    assert body["rows_removed_since_import"] == 1
+
+
+def test_reconciliation_route_unknown_batch_returns_404(
+    client: TestClient,
+    seeded_user: User,
+) -> None:
+    resp = client.get("/api/v1/imports/99999/reconciliation")
+    assert resp.status_code == 404
+
+
+def test_reconciliation_route_cross_user_returns_404(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    other_user = User(id=uuid.UUID("00000000-0000-0000-0000-000000000096"))
+    session.add(other_user)
+    session.commit()
+    other_account = Account(
+        user_id=other_user.id,
+        name="Other CC",
+        type="credit_card",
+        issuer="axis",
+        last4="4444",
+    )
+    session.add(other_account)
+    session.commit()
+    session.refresh(other_account)
+
+    batch = ImportBatch(
+        user_id=other_user.id,
+        account_id=other_account.id,
+        source_file_hash="other-recon-hash",
+        parser_name="AxisCC",
+        status="completed",
+    )
+    session.add(batch)
+    session.commit()
+    session.refresh(batch)
+
+    # v1 single-user client always acts as seeded_user; this batch is not theirs.
+    resp = client.get(f"/api/v1/imports/{batch.id}/reconciliation")
+    assert resp.status_code == 404

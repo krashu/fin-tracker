@@ -22,11 +22,8 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { IconChevronRight } from "@/components/icons";
 import { listTopMerchants } from "@/lib/api/client";
 import { formatINR, formatMonthYear } from "@/lib/format";
-import { thisMonthAnchor, monthKey } from "@/lib/dates";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
 

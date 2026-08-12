@@ -12,6 +12,12 @@ Findings are marked **[verified]** (read the code / a primary source myself),
 **[cited]** (traced to a vendor doc or primary source by a research pass), or
 **[inferred]** (reasoning beyond what any source states).
 
+> **A second pass ran 2026-08-10 — see [§13](#13-addendum-2026-08-10--transaction-taxonomy--auto-categorisation).**
+> It corrects the status of §1/§2 (shipped), adds findings the first pass never covered
+> (transaction-type taxonomy, split transactions, merchant canonicalisation), and records
+> where its recommendations **collide with §7's Killed list**. Read §13.1 before trusting
+> the build order in §2.
+
 ---
 
 ## 1. Defects found in our own code
@@ -150,6 +156,14 @@ Splitting `pdf_bytes → list[str]` from `list[str] → list[RawTransaction]`:
 Sequence this **before** writing more parsers, since it changes what a fixture is.
 
 Licence: PP is EPL-1.0 — read for design, don't copy files.
+
+**Update (2026-08-12):** the *return* half of this landed early, via
+[ADR-0010](../adr/0010-parsed-statement-return.md) (`parse()` → `ParsedStatement`, needed by
+§13.8's balance reconciliation for statement-level metadata). `interpret_summary(lines) ->
+StatementSummary` already has the line-based text-input shape this section wants for row
+parsing too. Only the **input** seam remains: splitting `pdf_bytes → list[str]` from
+`list[str] → list[RawTransaction]` for `interpret_tables`/`_interpret_row`, which still work
+on cells, not lines.
 
 ### 3.4 Restore-then-verify round-trip test
 
@@ -555,3 +569,360 @@ rocks in it. The nearest Indian OSS analogue, Paisa, has been dormant ~8 months;
 top user complaint was manual import plus (the maintainer's own words) "very crude tf-idf
 based categorization," with users asking for merchant-history-based auto-categorisation —
 which we already ship.
+
+---
+
+# 13. Addendum 2026-08-10 — transaction taxonomy & auto-categorisation
+
+**Date:** 2026-08-10 · **Method:** targeted schema-level pass on five apps (Firefly III,
+Actual Budget, YNAB, Lunch Money, GnuCash), reading vendor docs and — for Firefly —
+seeder source and issue threads via the GitHub API · **Status:** findings only, nothing
+accepted into [PRD.md](../../PRD.md); §13.7 records where these **collide with §7**.
+
+Narrower than the 2026-07-30 sweep by design. It started from one question — *should
+`refund` be a transaction type?* — and the answer forced the rest.
+
+## 13.1 Status corrections to the first pass
+
+**Read this before working from §2's build order.**
+
+| First-pass item | Actual status (2026-08-10) |
+|---|---|
+| §1.1 same-day duplicate data loss | **Shipped** — `occurrence` column + `\x1f` separator, migration 0025, [ADR-0006](../adr/0006-f4-dedup-key.md) |
+| §1.2 fingerprint separator | **Shipped** — same migration. The `fingerprint_version` discriminator was **not** adopted |
+| §1.3 IDCW-reinvest | **Shipped** — linked `dividend`+`buy` pair, `switch_pair_id`→`pair_id`, migration 0026 |
+| §2 build order rows 1–2 | Complete. Rows 3–8 unstarted |
+| Link to `defect-handoff.md` (§1) | **Dangling** — the file is not in the repo. The content it pointed at is now in ADR-0006 |
+
+## 13.2 `refund` is not a transaction type anywhere in the field
+
+**[verified]** Firefly III seeds `Refund` as a **LinkType** — a typed, bidirectional
+relationship between two transaction journals (`is (partially) refunded by` /
+`(partially) refunds`) — in `database/seeders/LinkTypeSeeder.php`, alongside `Related`,
+`Paid` and `Reimbursement`. Its `TransactionType` set is Withdrawal / Deposit / Transfer
+plus the Opening-balance and Reconciliation specials. There is no refund type.
+
+**[verified]** Firefly III issue **#769, "Suggestion: transaction type 'refund'"**, asked
+for exactly the model we currently ship. The maintainer rejected it, cited GnuCash's
+"negative expense" as the correct treatment, and named the failure mode:
+
+> "When you buy something large and return it, you'll see a huge expense and a huge income,
+> skewing all charts."
+
+**[cited]** Actual Budget: a return is a positive transaction in the **same category as the
+purchase**, and its docs are explicit that *"even though the money from this return will be
+flowing in to your budget, it isn't income."* **[cited]** Lunch Money has no transaction-type
+field at all — `is_income` lives on the *category* (our `category.kind`) and direction comes
+from the sign. **[cited]** YNAB categorises a refund as an inflow to the original spend
+category rather than Ready-to-Assign; note the support article body was only partially
+retrievable, so this one rests on the search abstract plus community sources.
+
+**Zero of five have a refund transaction type. Zero of five have a Refund category.**
+
+This is what [PRD.md §F4a](../../PRD.md#L307) already asserts (*refund carries the opposite
+sign, same category, so signed sums net naturally*) — we encoded it as a convention policed
+by two hand-written validators (`sign_error`, `kind_for_type`) instead of as structure.
+
+**Recommendation:** collapse `transactions.transaction_type` to `spend | income | transfer`;
+a refund becomes `transaction_type == "spend" AND amount_paise > 0`, derived and
+display-level only.
+
+Two facts that de-risk it, both **[verified]**:
+
+- **ADR-0006's fingerprint never hashed the type** — it is
+  `date ⋅ amount_paise ⋅ merchant_normalized ⋅ account_id`. The frozen dedup key is
+  untouched, and no recompute migration is implied.
+- Nine `.in_(("spend", "refund"))` filter sites in [`dashboards.py`](../../backend/app/api/v1/dashboards.py)
+  get *simpler*, not harder. The `gross_spend` / `refund` YTD case-expressions switch from
+  type to sign; every wire field keeps its name and meaning.
+
+**Accepted cost:** `sign_error`'s `spend < 0` guard dies, so a fat-fingered positive spend
+renders as a refund instead of 422-ing. All five apps accept the equivalent trade; Lunch
+Money documents the mirror case (a negative amount in an income category deducts from income
+totals). Parser provenance ("the statement line said REFUND") is also lost, though nothing in
+`app/` reads it today except the netting itself.
+
+**This also kills the seeded spend-kind "Refund" category** added in an uncommitted pass —
+it duplicates the type on the category axis and defeats the §F4a netting it was meant to
+serve (a Groceries refund parked in "Refund" leaves Groceries inflated). [PRD.md §F5](../../PRD.md#L365)
+already states the governing rule three lines above where that change edited: *"Income" and
+"Transfer" are **not** category names — those moved to the `kind` and `transaction_type`
+dimensions.* Refund was the third instance of the same mistake.
+
+**Deferred, not rejected:** Firefly's actual answer — *linking* a refund to the spend it
+reverses. `transactions.transfer_pair_id` exists, but [ADR-0002](../adr/0002-transfer-pair-id-semantics.md)
+pins its semantics to transfers, so reusing it is a re-litigation rather than a freebie. See
+§13.3's note on when a generic links table starts paying.
+
+## 13.3 Split transactions — the one universal feature we lack
+
+**[verified]** [`transaction.py:152`](../../backend/app/models/transaction.py#L152) carries a
+single `category_id`. The only "split" in the PRD is the F7 stock-split corporate action,
+unrelated. **[cited]** All four peers ship transaction splitting; Firefly models it as a
+transaction *group* containing N journals, Actual as a **parent transaction with child rows
+whose amounts must sum to the parent's**.
+
+Indian relevance is high: one Amazon/Flipkart line spans electronics + household, one
+BigBasket line is groceries + personal care, one Swiggy Instamart order is groceries +
+eating out, one UPI covers a shared dinner.
+
+**[inferred]** The current workaround is not merely inconvenient, it is unsafe: the only way
+to split today is to delete the imported row and hand-enter N manual rows, which discards
+`origin_fingerprint` and therefore [ADR-0007](../adr/0007-transaction-field-editability.md)
+rule 9's protection — **re-importing that statement re-stages the original line**. Splitting
+is the only dedup-safe way to do something users will do regardless.
+
+**Take Actual's shape, not Firefly's.** Firefly moves identity into a group wrapper, which
+collides head-on with ADR-0006. Actual's parent/child maps onto our schema without touching
+the frozen key:
+
+- parent keeps `fingerprint` / `origin_fingerprint` / `occurrence` / `amount_paise` — ADR-0006
+  and ADR-0007 rule 9 both intact
+- children carry `parent_transaction_id` (nullable, composite same-user FK following ADR-0002's
+  precedent) plus their own `category_id`
+- aggregates count children and skip split parents; `Σ children = parent` is the invariant
+- the board renders the parent with an expander
+
+The work is the parent-exclusion predicate applied consistently across every aggregate in
+`dashboards.py` — miss one and it double-counts. It composes cleanly with §13.2 (a partial
+refund of a split order is just a positive-amount child).
+
+**When a generic links table starts paying:** we now have two special-purpose pair columns
+(`transactions.transfer_pair_id`, `investment_transactions.pair_id`), which is technically
+[AGENTS.md](../../AGENTS.md) §Simplicity's second-concrete-use threshold for Firefly's
+`transaction_links` + `LinkType` pattern. Still defer — both existing columns are 1:1 and
+DB-enforced via composite same-user FKs and CHECK constraints, which a generic link table
+trades away. **Trigger to revisit: wanting to link a refund to the specific spend it
+reverses.** That is the third use.
+
+## 13.4 Per-category exclude-from-totals
+
+**[cited]** Lunch Money categories carry three booleans: `is_income` (we have it, as `kind`),
+plus **`exclude_from_totals`** and **`exclude_from_budget`**, both inheritable from a category
+group. Their transfer categories set both.
+
+**[verified]** We have no equivalent. The only exclusion in the codebase is
+`NET_WORTH_EXCLUDED_TYPES` ([`dashboards.py`](../../backend/app/api/v1/dashboards.py#L1038)),
+which is *account*-typed and does not help here.
+
+**[verified]** This is a live double-count, not a hypothetical: **"Investment" is a seeded
+spend category** ([`provisioning.py`](../../backend/app/services/provisioning.py)). An SIP
+debit is counted as consumption across every spend aggregate *and* recorded again as a
+holding under F7. The taxonomy has no way to say "this left the account but I still own it."
+Same shape for EMI principal (balance-sheet movement) and for anything a household member
+reimburses.
+
+Cost: one boolean on `categories`, one migration, one predicate in the spend aggregates, one
+checkbox in `/settings/categories`. Strictly additive; does not collide with §13.2 or §13.3.
+
+### 13.4.1 Decision 2026-08-12 — NOT BUILT; workaround adopted instead
+
+**The flag is not being built.** The chosen v1 answer is a workflow one: **don't commit
+investment-transfer rows at all.** At import review, a SIP debit (or anything else that is a
+transfer to an asset rather than consumption) is discarded rather than staged, so it never
+enters `transactions` and cannot reach a spend aggregate.
+
+That is a legitimate trade for a personal tool, and it costs nothing to adopt. It is recorded
+here with its price so the price isn't rediscovered as a bug.
+
+**[verified]** Discard is a hard `DELETE /transactions/{id}` (the review queue's `onDiscard`
+→ `deleteTransaction`), and account balance is
+`opening_balance_paise + Σ(amount_paise)` over confirmed rows
+([`dashboards.py`](../../backend/app/api/v1/dashboards.py#L961)). So a dropped ₹25,000 SIP
+debit leaves the bank balance **₹25,000 too high**, permanently:
+
+| | bank balance | holding | net worth | spend total |
+|---|---|---|---|---|
+| Reality | −25k | +25k | correct | — |
+| Commit as spend, no flag | −25k ✓ | +25k ✓ | ✓ | **+25k inflated** |
+| Commit + exclude flag | −25k ✓ | +25k ✓ | ✓ | ✓ |
+| **Don't commit (chosen)** | **0 ✗** | +25k ✓ | **+25k inflated** | ✓ |
+
+**The double-count is relocated, not removed** — it moves from the spend view to net worth,
+where it compounds monthly and is silent. Two further consequences:
+
+1. **[verified] Discarded rows re-stage on re-import.** Dedup judges "missing" on
+   `COALESCE(origin_fingerprint, fingerprint)` against rows that exist; a deleted row is not
+   there, so re-uploading the statement re-stages it. That is ADR-0006's documented
+   re-surface contract working as intended, but it means the discard is a per-import chore,
+   not a one-time decision.
+2. **It leaves §13.8 with a chronic false warning.** The balance-reconciliation brief (written
+   2026-08-12, `plans/balance-reconciliation.md`, untracked) already locks **window-delta-only**
+   comparison — `(closing − opening)` off the statement vs Σ over that statement's own date
+   window — and **warn, never block**. Window-delta removes the dependence on *prior history*;
+   it does **not** help here, because a discarded row sits *inside* the compared window. A
+   statement running ₹1,00,000 → ₹50,000 that contains a ₹25,000 discarded SIP compares
+   −₹25,000 against −₹50,000 and warns by exactly the discarded amount, **every month**.
+   Warn-never-block means this degrades to noise rather than a broken import — but a check
+   that cries wolf monthly is a check that gets ignored, which is the failure mode §13.8
+   exists to prevent. **Resolved 2026-08-12** by the second option: the comparison stays
+   window-delta-only (teaching it about intentionally-omitted rows was rejected — a hard
+   delete leaves no amount to correct with), and the review screen says so in the UI copy
+   instead, via a live count of rows discarded since import
+   (`reconciliation_service.rows_removed_since_import`) shown alongside the mismatch.
+
+**[inferred]** The transfer route the peers use is closed to us: a contribution to a broker is
+a transfer between your own accounts in Firefly / Actual / YNAB, but [PRD.md §F6](../../PRD.md)
+refuses transactions *and* transfers on `investment`-type accounts by design.
+
+**Revisit the flag if** the accounts panel or net-worth figure starts being trusted for
+anything, or when §13.8 is picked up — whichever comes first. The design above is unchanged
+and still one boolean.
+
+## 13.5 Merchant canonicalisation — and the miss-rate measurement §7 asked for
+
+**Status (2026-08-12): shipped.** See [ADR-0011](../adr/0011-merchant-alias-layer.md) and
+[PRD.md §F3](../../PRD.md#L216) for the shipped design; execution brief at
+`plans/merchant-alias.md` (untracked, local-only).
+
+§7 killed statistical/ML categorisation with an explicit precondition: ***"Measure our
+exact-match miss rate first; if small, it's a §2 over-build."*** This pass answers that, and
+the answer relocates the problem.
+
+**[verified]** [`merchant.py:40-42`](../../backend/app/services/merchant.py#L40-L42) is
+lowercase + whitespace-collapse and nothing else. Therefore:
+
+```
+swiggy*blr*12345     → learns "Food"
+swiggy*blr*67890     → different key. Learns nothing, suggests nothing.
+upi/swiggy/9876@ybl  → different key again.
+```
+
+**F3's miss rate on any merchant whose descriptor embeds an order id, RRN, auth code or VPA
+is 100% by construction** — which on Indian CC and UPI statements is most of them. The
+≥80% pre-tag success metric is being measured against a matcher that structurally cannot
+fire on high-cardinality merchants. [PRD.md §F3](../../PRD.md#L208) names this exact case
+(`swiggy*blr*12345 → swiggy`) as "Future" and correctly notes that changing
+`normalize_merchant` demands ADR-0006's three-store recompute — so it has stayed parked.
+
+**The fix is not an ML classifier and not a richer rules engine. It is a third string layer.**
+**[cited]** Actual Budget stores `imported_payee` (*"always the original text when the
+transaction was imported"*) separately from `payee` (a canonical payee object); rules rewrite
+the second and never the first. Firefly reaches the same place structurally — its expense /
+revenue *accounts* are the canonical merchant, with the raw description alongside.
+
+```
+merchant_raw → normalize_merchant() → merchant_normalized   [FROZEN — feeds the fingerprint]
+                                            ↓
+                                   resolve_alias() → merchant_canonical   [F3 / F3a key]
+```
+
+A user-scoped alias table maps a match pattern → canonical name; F3 and F3a re-key on the
+canonical while the fingerprint keeps using `merchant_normalized`. **This delivers what
+[ADR-0008](../adr/0008-f3-upi-merchant-normalisation-deferral.md) deferred without touching
+`normalize_merchant`** — no recompute migration, ADR-0006 stays frozen, and the CHANGE HAZARD
+block's three-store collapse never arises.
+
+**[inferred]** It can ship with *zero* migration first: leave the map keyed on
+`merchant_normalized` and resolve aliases at read time in
+[`prefetch_tag_map`](../../backend/app/services/tag_service.py#L86), summing `hit_count`
+across aliases in the existing Python reducer. Consolidate rows later using the merge rules
+`merchant.py`'s hazard block already specifies (sum `hit_count`, max `last_used_at`, OR
+`pinned`).
+
+**[cited]** Worth stealing alongside it: when a user renames a payee, Actual offers to *apply
+the rename to future transactions* and auto-creates a rule in a `pre` stage that runs before
+categorisation. We already have the authoring surface (`/settings/rules`) and the `pinned`
+concept to hang it on.
+
+**Open tension:** matching `upi/swiggy/9876@ybl` needs a *contains* match, and PRD §F3 puts
+regex rules out of scope v1. A substring alias is lighter than a regex engine but adjacent
+enough that it needs a PRD amendment, not a silent divergence (§13.10).
+
+## 13.6 Cold-start seed dictionary
+
+**[inferred]**, from a **[cited]** structural fact the first pass already established (§9:
+no aggregator rail covers India). Lunch Money, Monarch and Copilot get first-import
+categorisation free from Plaid's merchant taxonomy; Actual and Firefly get bank-supplied
+categories. India has no equivalent, so F3 starts at literally 0% on a user's first
+statement and climbs only as they hand-tag.
+
+Ship ~100 seeded merchant→category rows (Swiggy/Zomato→Food, Blinkit/Zepto/BigBasket→
+Groceries, Uber/Ola/Rapido→Transport, Netflix/Spotify/Hotstar→Subscriptions,
+IRCTC/MakeMyTrip→Travel, PharmEasy/Apollo→Health) as **unpinned, lowest-priority** rows, so
+any learned or pinned user rule outranks them.
+
+It is data, not a model, so it does not reopen §7's ML kill. Paired with §13.5's substring
+matching it is the difference between a first import arriving fully untagged and mostly
+tagged — the moment a user decides the tool is worth the effort.
+
+## 13.7 Collides with §7 Killed — recorded, not re-litigated
+
+Three things this pass surfaced **are** the rules-engine expansion §7 killed. They are
+logged here so the collision is visible, and are **not** recommended:
+
+| Surfaced | §7's standing refusal |
+|---|---|
+| Conditions beyond merchant (account, amount range, day-of-month) | *"Rules-engine expansion (ordered rules, boolean logic, regex, amount conditions)"* — Firefly's written refusal about complexity, Actual's 67- and 96-comment templating threads |
+| Explicit rule priority / specificity ranking | Same entry — and §7 notes Actual's specificity scoring *"would be **inert** against exact-merchant-only rules"* |
+| Retroactive "apply rule to existing transactions" **[cited]** — Firefly ships it; Actual's rule editor lists matching transactions behind an "Apply actions" button | Adjacent to the same entry. Genuinely useful, and cheap given `/settings/rules` exists — but it is rule-engine surface, and §7 says no |
+
+**The only new evidence this pass produced bears on §13.5, not on rule structure.** The
+100%-miss-rate finding says the *merchant key* is wrong, which is a normalisation problem;
+it does not argue for boolean conditions or an ordering model. §7's `is`=10 / `contains`=0
+observation actually reinforces that reading. §7 stands.
+
+## 13.8 Statement closing-balance reconciliation — promote it
+
+**Status (2026-08-12): promoted; shipped.** Brief at `plans/balance-reconciliation.md`
+(untracked, local-only); see [ADR-0010](../adr/0010-parsed-statement-return.md) for the parser
+protocol change it needed, and PRD §F4a case 5 for the shipped design. §13.4.1's open item
+below is resolved: the discard-noise qualifier is surfaced on the review screen alongside a
+mismatch, not just computed at the service layer.
+
+Already parked in [PRD.md §Roadmap](../../PRD.md#L1039) "Considered, unscheduled", and
+**[cited]** Firefly, Actual and YNAB all ship it. One argument the first pass did not make:
+those three make the user *type* the closing balance because they are register-first. **We
+already parse the statement** — the closing balance sits in the PDF beside the transactions
+we extract. So it costs us a parser field plus a comparison against the running balance the
+net-worth view already computes, where it costs them a reconciliation UI.
+
+It catches precisely the failure mode our architecture is most exposed to: a missed page, a
+duplicated import, an F4 false-positive dedup that silently dropped a row. Cheapest
+high-confidence integrity check available, and cheaper here than in any peer.
+
+## 13.9 Proposed sequence
+
+Revised 2026-08-12 after §13.4.1 removed the exclude-flag step.
+
+1. **§13.2 refund-as-signed-spend** — no migration risk to the dedup key; simplifies nine
+   aggregate sites; unblocks the rest by settling what a spend row *is*
+2. **§13.5 merchant alias layer** ✅ **shipped 2026-08-12** — shippable with zero migration;
+   largest expected move in the pre-tag metric
+3. **§13.6 seed dictionary** ✅ **shipped 2026-08-12** — pure data on top of 2
+4. **§13.8 balance reconciliation** ✅ **shipped 2026-08-12** — scoped to window-deltas per this
+   note's own resolution; the don't-commit workaround's guaranteed mismatch is accepted as a
+   known, warned false-positive class (PRD §F4a case 5) rather than solved outright
+5. **§13.3 splits** — last, because it changes what a "row" means to every aggregate; take it
+   only once the type predicate is stable
+
+~~§13.4 exclude-from-totals~~ — dropped, see §13.4.1.
+
+## 13.10 PRD amendments needed
+
+Extends §8.3. None of these are made yet — the PRD still wins until edited.
+
+- **§F2 / §F4a / §F5 / §F8 / §Data model** — the sign rule, refund treatment, category
+  defaults and aggregate descriptions all assume a `refund` type (§13.2).
+- **§F3** — a substring/contains alias is a scope change against *"Out of scope v1: fuzzy
+  match, **regex** rules"* (§13.5).
+- **§F5** — a per-category exclude flag changes what a category *is* (§13.4).
+- **§Roadmap "Considered, unscheduled"** — add splits (§13.3); promote balance
+  reconciliation (§13.8).
+- An ADR is warranted for §13.2 (amends ADR-0007 rule 4) and for §13.5 (supersedes ADR-0008's
+  deferral by routing around it rather than reversing it).
+
+## 13.11 Method notes for this pass
+
+- **Five apps, not seventeen.** This was a depth pass on one question, not a survey; the
+  §10 corpus is unchanged and still the broader reference.
+- **Primary sources where it mattered.** Firefly's link types and the #769 rejection were
+  read from the repo and the issue API, not from a summary. Actual's, Lunch Money's and
+  YNAB's behaviour is vendor documentation — `docs.firefly-iii.org` returned 403 to direct
+  fetches, so Firefly's *docs* (as opposed to its source) come via a mirror and search
+  abstracts.
+- **The YNAB citation is the weakest** — the support article body was not fully retrievable.
+  It agrees with the other four, so nothing rests on it alone.
+- **Licence position unchanged** from §10: Actual is MIT (borrowable with attribution);
+  Firefly is AGPL-3.0 — the seeder and issue thread were read to understand a mechanism, and
+  no code is copied.

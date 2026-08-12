@@ -49,6 +49,7 @@ import {
   type AccountRead,
   type CategoryRead,
   type TransactionRead,
+  type TransactionType,
   type TransactionUpdate,
 } from "@/lib/api/client";
 import { accountLabel } from "@/lib/accounts";
@@ -57,10 +58,13 @@ import { paiseToRupees, rupeesToPaise } from "@/lib/format";
 import { sameLabelSet } from "@/lib/labels";
 import { invalidateRules } from "@/lib/queries/invalidate";
 import {
-  EDITABLE_TRANSACTION_TYPES,
+  ENTRY_DIRECTIONS,
+  ENTRY_DIRECTION_LABELS,
   TRANSACTION_TYPE_LABELS,
+  directionForTransaction,
+  directionToType,
   signedPaise,
-  type EditableTransactionType,
+  type EntryDirection,
 } from "@/lib/transaction-types";
 
 const UNCATEGORIZED = "Uncategorized";
@@ -80,9 +84,16 @@ export function TransactionDialog({
 }) {
   const queryClient = useQueryClient();
 
-  // A transfer leg keeps its type in state so the picker can render "Transfer",
-  // but that type is never selectable and the field is disabled while paired.
-  const [type, setType] = useState(txn.transaction_type);
+  // A transfer leg keeps "transfer" in state so the picker can render
+  // "Transfer", but that value is never selectable and the field is disabled
+  // while paired. Any other row seeds an EntryDirection (ADR-0009: a refund is
+  // not its own stored type, so the picker's three-way Spend/Refund/Income
+  // choice has to be recovered from {type, sign} via `directionForTransaction`).
+  const [entry, setEntry] = useState<EntryDirection | "transfer">(() =>
+    txn.transaction_type === "transfer"
+      ? "transfer"
+      : directionForTransaction(txn),
+  );
   const [date, setDate] = useState(txn.date);
   const [amount, setAmount] = useState(paiseToRupees(Math.abs(txn.amount_paise)));
   const [merchant, setMerchant] = useState(txn.merchant_raw ?? "");
@@ -126,7 +137,8 @@ export function TransactionDialog({
   const isPaired = txn.transfer_pair_id != null && !unlink.isSuccess;
 
   const magnitude = rupeesToPaise(amount);
-  const mergedType = type;
+  const mergedType: TransactionType =
+    entry === "transfer" ? "transfer" : directionToType(entry);
   const categoryKind = categoryKindForType(mergedType);
   // Lookup stays over the full list; only the picker options are kind-filtered.
   const selectedCategory = categories.find((c) => c.id === categoryId) ?? null;
@@ -139,13 +151,17 @@ export function TransactionDialog({
   const accountText =
     selectedAccount != null ? accountLabel(selectedAccount) : accountLabelText;
 
-  // Switching type swaps the category scope; drop a now-mismatched selection so an
-  // income category can't ride along on a spend row. The backend 422s on a kind
-  // flip that keeps an incompatible category (ADR-0007 rule 5) — clearing here is
-  // what turns that into one round-trip instead of an error.
-  function handleTypeChange(next: EditableTransactionType) {
-    setType(next);
-    if (selectedCategory && selectedCategory.kind !== categoryKindForType(next)) {
+  // Switching direction swaps the category scope; drop a now-mismatched
+  // selection so an income category can't ride along on a spend row. The
+  // backend 422s on a kind flip that keeps an incompatible category (ADR-0007
+  // rule 5) — clearing here is what turns that into one round-trip instead of
+  // an error. Spend → refund is a no-op here — both share the spend scope.
+  function handleDirectionChange(next: EntryDirection) {
+    setEntry(next);
+    if (
+      selectedCategory &&
+      selectedCategory.kind !== categoryKindForType(directionToType(next))
+    ) {
       setCategoryId(null);
     }
   }
@@ -157,11 +173,11 @@ export function TransactionDialog({
   // leaves a paired row's amount untouched (the input is disabled, so the magnitude
   // still equals the stored one) while keeping an UNPAIRED transfer — a legal
   // survivor of a delete or an unlink — fully editable. `transfer` is never
-  // reachable as a NEW type; it isn't in EDITABLE_TRANSACTION_TYPES.
+  // reachable as a NEW selection; it isn't in `ENTRY_DIRECTIONS`.
   const nextAmount =
-    mergedType === "transfer"
+    entry === "transfer"
       ? (txn.amount_paise < 0 ? -magnitude : magnitude)
-      : signedPaise(mergedType, magnitude);
+      : signedPaise(entry, magnitude);
 
   const changed = {
     date: date !== txn.date,
@@ -238,12 +254,16 @@ export function TransactionDialog({
           <div className="grid grid-cols-2 gap-3">
             <Field label="Type">
               <PickerButton
-                label={TRANSACTION_TYPE_LABELS[mergedType]}
+                label={
+                  entry === "transfer"
+                    ? TRANSACTION_TYPE_LABELS.transfer
+                    : ENTRY_DIRECTION_LABELS[entry]
+                }
                 disabled={isPaired}
               >
-                {EDITABLE_TRANSACTION_TYPES.map((t) => (
-                  <DropdownMenuItem key={t} onSelect={() => handleTypeChange(t)}>
-                    {TRANSACTION_TYPE_LABELS[t]}
+                {ENTRY_DIRECTIONS.map((d) => (
+                  <DropdownMenuItem key={d} onSelect={() => handleDirectionChange(d)}>
+                    {ENTRY_DIRECTION_LABELS[d]}
                   </DropdownMenuItem>
                 ))}
               </PickerButton>

@@ -20,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.models import Category, User
-from app.parsers import RawTransaction
+from app.parsers import ParsedStatement, RawTransaction, StatementSummary
 from app.services import import_service
 
 
@@ -28,8 +28,8 @@ class _StubAxisParser:
     rows: ClassVar[list[RawTransaction]] = []
 
     @classmethod
-    def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]:
-        return list(cls.rows)
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+        return ParsedStatement(rows=list(cls.rows), summary=StatementSummary())
 
 
 _SLICE_ROWS: list[RawTransaction] = [

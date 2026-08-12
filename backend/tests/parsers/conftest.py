@@ -41,6 +41,11 @@ def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_lines(path: Path) -> list[str]:
+    """Read a summary-block text fixture as the line list ``_extract_text`` yields."""
+    return path.read_text(encoding="utf-8").splitlines()
+
+
 @pytest.fixture
 def axis_tables() -> list[list[list[str]]]:
     return _load_json(FIXTURES_ROOT / "axis_cc" / "tables_sample.json")
@@ -69,3 +74,23 @@ def icici_tables() -> list[list[list[str]]]:
 @pytest.fixture
 def icici_tables_expected() -> list[dict[str, Any]]:
     return _load_json(FIXTURES_ROOT / "icici_cc" / "tables_sample.expected.json")
+
+
+@pytest.fixture
+def axis_summary_lines() -> list[str]:
+    return _load_lines(FIXTURES_ROOT / "axis_cc" / "summary_sample.txt")
+
+
+@pytest.fixture
+def axis_summary_expected() -> dict[str, Any]:
+    return _load_json(FIXTURES_ROOT / "axis_cc" / "summary_sample.expected.json")
+
+
+@pytest.fixture
+def icici_summary_lines() -> list[str]:
+    return _load_lines(FIXTURES_ROOT / "icici_cc" / "summary_sample.txt")
+
+
+@pytest.fixture
+def icici_summary_expected() -> dict[str, Any]:
+    return _load_json(FIXTURES_ROOT / "icici_cc" / "summary_sample.expected.json")

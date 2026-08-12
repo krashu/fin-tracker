@@ -33,9 +33,10 @@
   navigating away (there is no other batch-list endpoint).
 
 * ``GET /imports/{batch_id}/candidates`` — pending rows of this batch with
-  ``prior_matches`` (LEFT-joined ``merchant_tag_map.hit_count``) +
-  ``confidence`` (computed read-time from thresholds). The frontend's review
-  queue surface. Why not ``GET /transactions?import_batch_id=X&status=pending``:
+  ``prior_matches`` + ``confidence`` attached, resolved through the user's
+  alias table (ADR-0011 merchant-alias layer, Phase A3) rather than a raw
+  ``merchant_tag_map`` join — see :func:`list_candidates`. The frontend's
+  review queue surface. Why not ``GET /transactions?import_batch_id=X&status=pending``:
   candidates carry ``prior_matches`` / ``confidence`` which ``TransactionRead``
   deliberately omits per its docstring.
 
@@ -53,11 +54,16 @@
   **re-surface as pending** on that same batch. See
   :func:`cancel_import_batch`'s docstring for the authoritative statement of
   both paths.
+
+* ``GET /imports/{batch_id}/reconciliation`` — recompute + persist this
+  batch's statement-balance reconciliation (PRD §F1/§F4a) and return the
+  full breakdown. Declared **after** ``/pending`` so that literal path is
+  never captured as a ``batch_id``. See :func:`get_batch_reconciliation`.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, cast, get_args
+from typing import Annotated, Literal, cast, get_args
 from uuid import UUID
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
@@ -70,13 +76,13 @@ from app.models import (
     Account,
     Category,
     ImportBatch,
-    MerchantTagMap,
     Transaction,
     TransactionLabel,
 )
 from app.models.instrument import AssetClassStr
 from app.parsers.base import InvalidPasswordError, ParserError
 from app.schemas import (
+    BatchReconciliation,
     ImportCommit,
     ImportSummary,
     InvestmentCsvImportSummary,
@@ -85,15 +91,24 @@ from app.schemas import (
     TransactionRead,
 )
 from app.schemas.transactions import ConfidenceStr
+from app.services.category_service import default_category_id
 from app.services.import_service import (
     AccountNotFoundError,
     NonInrAccountError,
     ParserNotRegisteredError,
     import_statement,
+    is_cashback_credit,
 )
 from app.services.investment_import_service import import_investment_csv
+from app.services.merchant_alias import load_alias_resolver
 from app.services.merchant_labels import LABEL_PREFILL_MIN, learn_merchant_memory
-from app.services.reconciliation_service import auto_link_cc_bill
+from app.services.reconciliation_service import (
+    auto_link_cc_bill,
+    is_cc_payment,
+    reconcile_batch,
+    rows_removed_since_import,
+)
+from app.services.tag_service import prefetch_tag_strength
 
 # Confidence thresholds (PRD §F3-derived). Locked at the backend so frontend
 # tooltip copy doesn't have to know them — the response carries the label.
@@ -241,6 +256,41 @@ def _confidence(prior_matches: int) -> ConfidenceStr:
     return "none"
 
 
+def _candidate_strength(
+    strength: dict[tuple[str, int], tuple[int, bool]],
+    *,
+    canonical: str,
+    category_id: int | None,
+) -> tuple[int, ConfidenceStr, bool]:
+    """(prior_matches, confidence, pinned) for one candidate row.
+
+    ``category_id=None`` (income/transfer, or a spend row with no category yet)
+    can never be a key in ``strength`` — every stored merchant_tag_map row has a
+    real category — so it degrades to "none" the same way the old LEFT JOIN's
+    ``NULL = NULL`` did. A ``(canonical, category_id)`` pair ABSENT from
+    ``strength`` is "no rule at all" -> ``"none"``; one PRESENT at
+    ``hit_count == 0`` is a seeded, never-confirmed row (ADR-0011 decision 4)
+    -> ``"seeded"``. Collapsing that distinction with a
+    ``.get(key, (0, False))`` default is exactly what
+    :func:`app.services.tag_service.prefetch_tag_strength`'s docstring forbids.
+
+    The zero-hit branch carries ``pinned`` THROUGH rather than hard-coding
+    ``False``: pinning a seeded row is the one way a row reaches
+    ``hit_count == 0, pinned=True``, because
+    :func:`app.services.tag_service.pin_tag` deliberately never bumps
+    ``hit_count`` on an existing row. ``TagPicker`` checks ``pinned`` ahead of
+    ``confidence``, so that pin renders as user-authored instead of an
+    unconfirmed dictionary suggestion.
+    """
+    entry = strength.get((canonical, category_id)) if category_id is not None else None
+    if entry is None:
+        return 0, "none", False
+    hit_count, pinned = entry
+    if hit_count == 0:
+        return 0, "seeded", pinned
+    return hit_count, _confidence(hit_count), pinned
+
+
 @router.get("/pending", response_model=list[PendingImportBatch])
 def list_pending_imports(
     session: SessionDep,
@@ -250,10 +300,12 @@ def list_pending_imports(
 
     Two-step to stay Postgres-portable: a subquery aggregates the count
     grouped by ``import_batch_id`` alone, then the outer select joins
-    ``ImportBatch`` (ordering) + LEFT-joins ``Account`` (label; account_id is
-    nullable for investment batches). Projecting the ungrouped ImportBatch /
-    Account columns only in the outer query avoids a bare-non-aggregated-column
-    ``GROUP BY`` (legal on SQLite, rejected by Postgres).
+    ``ImportBatch`` (ordering + ``reconciliation_delta_paise``) + LEFT-joins
+    ``Account`` (label; account_id is nullable for investment batches).
+    Projecting the ungrouped ImportBatch / Account columns only in the outer
+    query avoids a bare-non-aggregated-column ``GROUP BY`` (legal on SQLite,
+    rejected by Postgres) — ``reconciliation_delta_paise`` is one such column,
+    selected here rather than added to the subquery's ``GROUP BY``.
 
     Route ordering: this literal path is declared before ``/{batch_id}/...``
     so ``pending`` is never captured as a ``batch_id`` path param.
@@ -278,6 +330,7 @@ def list_pending_imports(
             Account.name,
             Account.last4,
             pending.c.pending_count,
+            ImportBatch.reconciliation_delta_paise,
         )
         .join(ImportBatch, ImportBatch.id == pending.c.batch_id)
         # Account.user_id belongs in the ON clause, NOT the WHERE: account_id is
@@ -299,8 +352,11 @@ def list_pending_imports(
             account_name=account_name,
             account_last4=account_last4,
             pending_count=int(pending_count),
+            reconciliation_delta_paise=reconciliation_delta_paise,
         )
-        for batch_id, account_name, account_last4, pending_count in session.execute(stmt).all()
+        for batch_id, account_name, account_last4, pending_count, reconciliation_delta_paise in (
+            session.execute(stmt).all()
+        )
     ]
 
 
@@ -312,34 +368,31 @@ def list_candidates(
 ) -> list[TransactionCandidate]:
     """Pending rows of this batch with prior_matches + confidence attached.
 
-    LEFT JOIN on ``(user_id, merchant_normalized, category_id)`` returns
-    ``prior_matches = COALESCE(mtm.hit_count, 0)``. For rows where
-    ``category_id IS NULL`` (income/transfer; or new-merchant spend),
-    ``NULL = NULL`` semantics collapse to "no match" → 0 → ``"none"``.
-    Without the ``COALESCE`` Pydantic's ``Field(ge=0)`` would reject null.
+    Resolved through the user's alias table (ADR-0011 merchant-alias layer,
+    Phase A3) rather than a raw ``merchant_tag_map`` join: one resolver load +
+    one :func:`app.services.tag_service.prefetch_tag_strength` call (both
+    user-scoped, same cost shape as the import-time prefetch), then each row
+    looks up ``(resolver.canonical(merchant_normalized), category_id)`` in the
+    strength map via :func:`_candidate_strength`. This is deliberately the
+    same resolution path :func:`app.services.import_service.import_statement`
+    uses to prefill — a candidate that resolves via an alias to a merchant the
+    user *has* confirmed (under a different raw descriptor) now shows that
+    history, which the old exact-string LEFT JOIN could never see.
+
+    Note the archived-category filter now reaches this endpoint too:
+    ``prefetch_tag_strength`` (via ``_aggregate_tag_rows``) excludes rows whose
+    category is archived, so a candidate pointing at a since-archived category
+    reads ``"none"`` here — the old LEFT JOIN touched no ``Category`` row and
+    kept the raw ``hit_count`` regardless. That is a deliberate side effect
+    (more consistent with the real prefill), not a regression.
     """
     _get_batch_or_404(session, batch_id=batch_id, user_id=user_id)
 
     stmt = (
-        select(
-            Transaction,
-            func.coalesce(MerchantTagMap.hit_count, 0).label("prior_matches"),
-            # A user-authored (pinned) winner prefills at hit_count=1; surface the
-            # flag so the picker can render "authored" instead of a low-confidence
-            # tint. No joined row → NULL → coalesced to False.
-            func.coalesce(MerchantTagMap.pinned, False).label("pinned"),
-        )
+        select(Transaction)
         # selectinload the labels so TransactionCandidate.labels serializes in one
         # batched query, not N per-row lazy loads.
         .options(selectinload(Transaction.labels))
-        .outerjoin(
-            MerchantTagMap,
-            and_(
-                MerchantTagMap.user_id == Transaction.user_id,
-                MerchantTagMap.merchant_normalized == Transaction.merchant_normalized,
-                MerchantTagMap.category_id == Transaction.category_id,
-            ),
-        )
         .where(
             Transaction.user_id == user_id,
             Transaction.import_batch_id == batch_id,
@@ -348,15 +401,26 @@ def list_candidates(
         .order_by(Transaction.date.desc(), Transaction.id.desc())
     )
 
-    return [
-        TransactionCandidate(
-            **TransactionRead.model_validate(txn).model_dump(),
-            prior_matches=int(prior_matches),
-            confidence=_confidence(int(prior_matches)),
-            pinned=bool(pinned),
+    resolver = load_alias_resolver(session, user_id=user_id)
+    strength = prefetch_tag_strength(session, user_id=user_id, resolver=resolver)
+
+    candidates = []
+    for txn in session.scalars(stmt):
+        canonical = resolver.canonical(txn.merchant_normalized)
+        prior_matches, confidence, pinned = _candidate_strength(
+            strength, canonical=canonical, category_id=txn.category_id
         )
-        for txn, prior_matches, pinned in session.execute(stmt).all()
-    ]
+        candidates.append(
+            TransactionCandidate(
+                **TransactionRead.model_validate(txn).model_dump(),
+                prior_matches=prior_matches,
+                confidence=confidence,
+                pinned=pinned,
+                cc_payment_candidate=txn.transaction_type == "income"
+                and is_cc_payment(txn.merchant_normalized),
+            )
+        )
+    return candidates
 
 
 @router.post("/{batch_id}/commit", status_code=status.HTTP_204_NO_CONTENT)
@@ -375,17 +439,30 @@ def commit_import_batch(
       → silently bucketed into ``invalid_ids`` (never leak whether the id
       exists for a different user).
     * Already confirmed → ``invalid_ids``.
-    * ``spend`` / ``refund`` with ``category_id IS NULL`` **or a category that was
-      archived mid-review** → **defaulted** to the user's spend ``"Other"``
-      category (PRD §F5 fallback), not rejected. This keeps a row off a dead
-      bucket AND stops pass 3 resurrecting a ``merchant_tag_map`` row for the
-      archived category. Only if ``"Other"`` itself is archived/absent do these
-      rows fall back to ``invalid_ids``. ``income`` / ``transfer`` keep committing
-      with their current category — income may be uncategorized, and pass-2
-      auto-link can flip an income CC-payment to a ``transfer``, which must stay
-      category-null, so we never stamp Other on it. Defaulted ids are tracked so
-      pass 3 skips *category* learning them (a fallback isn't a merchant→category
-      decision worth teaching F3); their labels are still learned.
+    * A **spend-kind** row (``spend`` / ``refund``) with ``category_id IS NULL``
+      **or a category that was archived mid-review** → **defaulted**, not
+      rejected: the row lands on the user's spend ``"Other"`` category (PRD §F5
+      fallback). One spend fallback serves both, since a refund nets against
+      spend in the same category. This keeps a row off a dead bucket AND stops
+      pass 3 resurrecting a ``merchant_tag_map`` row for the archived category.
+      Only if ``"Other"`` is itself archived/absent does the row fall back to
+      ``invalid_ids``. ``income`` / ``transfer``
+      keep committing with their current category — income may be uncategorized,
+      and pass-2 auto-link can flip an income CC-payment to a ``transfer``, which
+      must stay category-null, so we never stamp a default on it. Defaulted ids
+      are tracked so pass 3 skips *category* learning them (a fallback isn't a
+      merchant→category decision worth teaching F3); their labels are still
+      learned.
+    * ``income`` with ``category_id IS NULL`` **and** ``merchant_raw`` naming it
+      cashback (``is_cashback_credit``, the same keyword ``import_service._map_type``
+      already used to type the row ``income`` rather than ``spend``) → also
+      **defaulted**, to the seeded income ``"Cashback"`` category, and tracked
+      in ``defaulted_ids`` for the same reason: a keyword guess isn't a
+      merchant→category decision worth teaching F3 either. Unlike the spend
+      fallback this one is NOT guarded by ``invalid_ids`` if the category is
+      missing — income tolerates staying uncategorized, so a renamed/archived
+      "Cashback" category just means the row commits uncategorized, same as any
+      other income row without this keyword.
 
     On any invalid id → 422 with nested
     ``detail={"message": ..., "invalid_ids": [int, ...]}`` and **no writes**
@@ -449,27 +526,21 @@ def commit_import_batch(
             )
         )
     )
-    # The user's active spend "Other" category — the fallback for a staged
-    # spend/refund row committed without a tag (PRD §F5). Looked up once; None
-    # only if the user archived it (then those rows fall back to the 422 guard).
-    spend_other_id = session.scalar(
-        select(Category.id).where(
-            Category.user_id == user_id,
-            Category.name == "Other",
-            Category.kind == "spend",
-            Category.archived_at.is_(None),
-        )
-    )
-    refund_default_id = session.scalar(
-        select(Category.id).where(
-            Category.user_id == user_id,
-            Category.kind == "refund",
-            Category.archived_at.is_(None),
-        )
+    # The user's active spend "Other" category — the fallback for a staged spend
+    # row committed without a tag (PRD §F5), refunds included: a refund is a
+    # spend row with a positive amount, so it lands in the same bucket. Looked up
+    # once; None only if the user archived or renamed it away (then those rows
+    # fall back to the 422 guard).
+    spend_other_id = default_category_id(session, user_id=user_id, name="Other")
+    # Same idea for a cashback-named income row (see the docstring above) —
+    # income kind, and None here is NOT guarded: it just means those rows
+    # commit uncategorized, same as any other income row.
+    cashback_default_id = default_category_id(
+        session, user_id=user_id, name="Cashback", kind="income"
     )
 
     # Active (non-archived) category ids among the rows' current categories. A
-    # spend/refund row whose category was archived mid-review is then treated
+    # spend row whose category was archived mid-review is then treated
     # like an untagged one below — so it never commits to a
     # dead bucket, and pass 3 never resurrects a merchant_tag_map row pointing at
     # the archived category. Scoped to the user, so only *this user's archived*
@@ -495,32 +566,34 @@ def commit_import_batch(
 
     returned_ids = {r.id for r in rows}
     invalid_ids: set[int] = requested_ids - returned_ids
-    # Rows we defaulted to "Other" or "Refund" — excluded from pass-3 learning below, since a
+    # Rows we defaulted to "Other" — excluded from pass-3 learning below, since a
     # fallback isn't a merchant→category decision worth teaching F3.
     defaulted_ids: set[int] = set()
     for r in rows:
         if r.confirmed_at is not None:
             invalid_ids.add(r.id)
             continue
-        # spend row with no category defaults to spend "Other" category.
-        # refund row with no category defaults to "Refund" category.
-        if r.transaction_type == "spend" and (
+        # A spend-kind row with no category — or one whose category was archived
+        # mid-review — defaults to "Other" rather than being rejected. income/
+        # transfer stay as-is: income may commit uncategorized, and auto_link
+        # (pass 2) can flip an income CC-payment to a transfer, which MUST stay
+        # category-null — so we never stamp a default on it.
+        if r.transaction_type in ("spend", "refund") and (
             r.category_id is None or r.category_id not in active_category_ids
         ):
             if spend_other_id is None:
-                invalid_ids.add(r.id)  # no Other to fall back to — keep the guard
+                invalid_ids.add(r.id)  # no fallback category to land on — keep the guard
             else:
                 r.category_id = spend_other_id
                 defaulted_ids.add(r.id)
-        elif r.transaction_type == "refund" and (
-            r.category_id is None or r.category_id not in active_category_ids
+        elif (
+            r.transaction_type == "income"
+            and r.category_id is None
+            and cashback_default_id is not None
+            and is_cashback_credit(r.merchant_raw or "")
         ):
-            target_id = refund_default_id or spend_other_id
-            if target_id is None:
-                invalid_ids.add(r.id)
-            else:
-                r.category_id = target_id
-                defaulted_ids.add(r.id)
+            r.category_id = cashback_default_id
+            defaulted_ids.add(r.id)
 
     if invalid_ids:
         raise HTTPException(
@@ -639,3 +712,75 @@ def cancel_import_batch(
         session.delete(batch)
 
     session.commit()
+
+
+@router.get("/{batch_id}/reconciliation", response_model=BatchReconciliation)
+def get_batch_reconciliation(
+    batch_id: int,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> BatchReconciliation:
+    """Recompute + persist this batch's statement-balance reconciliation.
+
+    Recomputes via :func:`reconcile_batch` on every call rather than only
+    reading the stored column — a commit or a discard of a pending row since
+    the last check can flip a stale mismatch to matched (or vice versa).
+    Persists the fresh delta and commits before returning, so
+    ``GET /imports/pending`` picks up the same figure without a second
+    reconciliation pass.
+
+    ``expected_paise`` / ``actual_paise`` are derived algebraically from the
+    delta (``expected = closing − opening``, ``actual = expected + delta``)
+    rather than a second query — they cannot drift from the persisted delta
+    by construction. ``None`` when the delta itself is ``None`` (no usable
+    statement metadata, or an account-less batch), in which case ``status``
+    is ``"unavailable"``.
+
+    ``rows_removed_since_import`` (:func:`rows_removed_since_import`) is
+    computed regardless of ``status`` — it's a live COUNT independent of
+    whether the balance check itself could run — so a mismatch caused by a
+    routine discard (an investment-transfer SIP debit, most commonly) reads
+    as an explained qualifier rather than a bare, unexplained delta.
+
+    Route ordering: declared **after** ``/pending`` — that literal path must
+    never be captured as a ``batch_id`` path param.
+    """
+    batch = _get_batch_or_404(session, batch_id=batch_id, user_id=user_id)
+
+    delta = reconcile_batch(session, user_id=user_id, batch=batch)
+    batch.reconciliation_delta_paise = delta
+    # Independent of the balance check above — a live COUNT, computed and
+    # returned regardless of `status`, so it pairs with a mismatch to explain
+    # a discard-noise false positive rather than leaving it unexplained.
+    removed = rows_removed_since_import(session, batch=batch)
+
+    opening = batch.statement_opening_balance_paise
+    closing = batch.statement_closing_balance_paise
+    expected_paise: int | None = None
+    actual_paise: int | None = None
+    if delta is not None and opening is not None and closing is not None:
+        expected_paise = closing - opening
+        actual_paise = expected_paise + delta
+
+    recon_status: Literal["unavailable", "matched", "mismatched"]
+    if delta is None:
+        recon_status = "unavailable"
+    elif delta == 0:
+        recon_status = "matched"
+    else:
+        recon_status = "mismatched"
+
+    session.commit()
+
+    return BatchReconciliation(
+        batch_id=batch.id,
+        opening_balance_paise=opening,
+        closing_balance_paise=closing,
+        period_start=batch.period_start,
+        period_end=batch.period_end,
+        expected_paise=expected_paise,
+        actual_paise=actual_paise,
+        delta_paise=delta,
+        status=recon_status,
+        rows_removed_since_import=removed,
+    )

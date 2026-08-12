@@ -6,23 +6,26 @@
  *
  * Reads three endpoints and joins client-side: TransactionRead is flat (FK ids
  * only), so account name+last4 and the category label come from accountsById /
- * categoriesById lookups. The Type filter scopes the list to Spending
- * (spend+refund, the default), Income, or Transfers — one concrete type set per
- * view, never omitted (server-side filter keeps pagination honest).
+ * categoriesById lookups. The Type filter scopes the list to Spending (every
+ * `spend` row, either sign — the default), Refunds, Income, or Transfers — one
+ * concrete `{transaction_type, amount_sign?}` param set per view, never
+ * omitted (server-side filter keeps pagination honest); see
+ * `typeFilterToParam`.
  *
  * Amount sign keys off the *stored* sign (PRD §F4a source of truth): the
- * backend stores spend negative, refund positive, so a positive amount renders
- * as a green credit and a negative as a spend magnitude. Render does not key
- * off transaction_type — sign is the contract.
+ * backend stores spend negative, refund positive (a refund IS a `spend` row —
+ * ADR-0009), so a positive amount renders as a green credit and a negative as
+ * a spend magnitude. Render does not key off transaction_type — sign is the
+ * contract.
  */
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 
 import { Checkbox } from "@/components/ui/checkbox";
+import { useAvailableYears } from "@/components/dashboard/use-available-years";
 import {
   listAccounts,
-  listAvailableYears,
   listCategories,
   listLabels,
   listTransactions,
@@ -74,10 +77,14 @@ export function ExpensesBoard() {
     urlCategoryId,
   );
   const [labelId, setLabelId] = useState<number | undefined>(undefined);
-  const [year, setYear] = useState(() => new Date().getFullYear());
   const [monthAnchor, setMonthAnchor] = useState(thisMonthAnchor);
   const [allDates, setAllDates] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  // Derived, not its own state: onYearChange keeps monthAnchor's year in sync
+  // (below), so a separate `year` state was purely redundant — and updating it
+  // from inside onStepMonth's setMonthAnchor updater was an impure nested
+  // setState (React requires updaters to be pure).
+  const year = monthAnchor.getFullYear();
 
   // Next.js doesn't remount /expenses on a query-string-only change, so a one-
   // time seed isn't enough — a palette pick made while already on /expenses
@@ -96,11 +103,7 @@ export function ExpensesBoard() {
   }, [urlCategoryId]);
 
   // Fetch available years for the year dropdown.
-  const availableYearsQuery = useQuery({
-    queryKey: ["dashboards", "available-years"],
-    queryFn: listAvailableYears,
-  });
-  const availableYears = availableYearsQuery.data?.years ?? [new Date().getFullYear()];
+  const { years: availableYears } = useAvailableYears();
 
   // Cap forward stepping at the current month — no future spend to browse.
   const atCurrentMonth = monthKey(monthAnchor) === monthKey(thisMonthAnchor());
@@ -133,7 +136,6 @@ export function ExpensesBoard() {
     setAccountId(undefined);
     setCategoryId(undefined);
     setLabelId(undefined);
-    setYear(currentYear);
     setMonthAnchor(thisMonthAnchor());
     setAllDates(false);
     resetView();
@@ -153,7 +155,7 @@ export function ExpensesBoard() {
     initialPageParam: 0,
     queryFn: ({ pageParam }) =>
       listTransactions({
-        transaction_type: typeFilterToParam(typeFilter),
+        ...typeFilterToParam(typeFilter),
         limit: PAGE_SIZE,
         offset: pageParam,
         account_id: accountId,
@@ -266,8 +268,8 @@ export function ExpensesBoard() {
           resetView();
         }}
         onYearChange={(y) => {
-          setYear(y);
-          // Keep the monthAnchor's month index but move it to the new year.
+          // Keep the monthAnchor's month index but move it to the new year —
+          // `year` (derived above) follows automatically on the next render.
           // If the current month is in the future for the selected year,
           // clamp to December.
           const curMonth = monthAnchor.getMonth();
@@ -279,17 +281,11 @@ export function ExpensesBoard() {
           resetView();
         }}
         onStepMonth={(delta) => {
-          // Stepping picks a concrete month → leave All-dates mode.
-          // When crossing year boundaries, auto-update the year.
-          setMonthAnchor((a) => {
-            const newMonth = a.getMonth() + delta;
-            const newDate = new Date(a.getFullYear(), newMonth, 1);
-            // Auto-update year when stepping across year boundaries.
-            if (newDate.getFullYear() !== year) {
-              setYear(newDate.getFullYear());
-            }
-            return newDate;
-          });
+          // Stepping picks a concrete month → leave All-dates mode. A pure
+          // updater — crossing a year boundary just changes what `monthAnchor`
+          // holds, and the derived `year` above reflects that on the next
+          // render with no separate setState needed.
+          setMonthAnchor((a) => new Date(a.getFullYear(), a.getMonth() + delta, 1));
           setAllDates(false);
           resetView();
         }}

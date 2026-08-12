@@ -1,9 +1,14 @@
 """Unit tests for :mod:`app.services.tag_service`.
 
-Covers the two public callables:
+Covers:
 
-* :func:`prefetch_tag_map` — single SELECT, returns the winning category
-  per merchant (highest hit_count → most-recent last_used → highest id).
+* :func:`prefetch_tag_map` — aggregates merchant_tag_map rows onto their
+  canonical (Phase A2), returns the winning category per canonical (pinned →
+  highest hit_count → most-recent last_used → highest id).
+* :func:`prefetch_tag_strength` — every (canonical, category) pair's summed
+  strength, not just the winner.
+* :func:`_aggregate_tag_rows` / :func:`merchant_agg_winner_key` — the
+  aggregation + ranking `prefetch_tag_map` is built from.
 * :func:`record_tag` — INSERT or hit_count+1 upsert with race recovery.
 """
 
@@ -19,9 +24,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Category, MerchantTagMap, User
 from app.services import tag_service
+from app.services.merchant_alias import EMPTY_RESOLVER, AliasResolver
 from app.services.tag_service import (
     pin_tag,
     prefetch_tag_map,
+    prefetch_tag_strength,
     record_tag,
     set_tag_pinned,
     should_learn_tag,
@@ -39,7 +46,7 @@ def _make_category(session: Session, user_id: uuid.UUID, name: str) -> Category:
 
 
 def test_prefetch_returns_empty_dict_for_empty_map(session: Session, user: User) -> None:
-    assert prefetch_tag_map(session, user_id=user.id) == {}
+    assert prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {}
 
 
 def test_prefetch_picks_highest_hit_count_per_merchant(session: Session, user: User) -> None:
@@ -63,7 +70,7 @@ def test_prefetch_picks_highest_hit_count_per_merchant(session: Session, user: U
     )
     session.flush()
 
-    result = prefetch_tag_map(session, user_id=user.id)
+    result = prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
     assert result == {"swiggy": food.id}
 
 
@@ -100,7 +107,7 @@ def test_prefetch_tiebreaks_by_last_used_then_id_desc(session: Session, user: Us
     ).all()
     winner_category_id = rows[0].category_id
 
-    result = prefetch_tag_map(session, user_id=user.id)
+    result = prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
     assert result["zomato"] == winner_category_id
 
 
@@ -129,7 +136,7 @@ def test_prefetch_user_scoped(session: Session, user: User) -> None:
     )
     session.flush()
 
-    result = prefetch_tag_map(session, user_id=user.id)
+    result = prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
     assert result == {"amazon": food.id}
 
 
@@ -151,7 +158,7 @@ def test_prefetch_skips_archived_category(session: Session, user: User) -> None:
     )
     session.flush()
 
-    result = prefetch_tag_map(session, user_id=user.id)
+    result = prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
     assert result == {}
 
 
@@ -187,7 +194,7 @@ def test_prefetch_ignores_a_map_row_pointing_at_another_users_category(
     )
     session.flush()
 
-    assert prefetch_tag_map(session, user_id=user.id) == {}
+    assert prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {}
 
 
 # ---------- record_tag ----------------------------------------------------
@@ -475,8 +482,7 @@ def test_record_tag_repeated_bumps_accumulate(session: Session, user: User) -> N
 @pytest.mark.parametrize(
     ("transaction_type", "merchant", "expected"),
     [
-        ("spend", "swiggy", True),
-        ("refund", "swiggy", True),
+        ("spend", "swiggy", True),  # refunds are spend rows (positive amount) — same type
         ("income", "swiggy", False),
         ("transfer", "swiggy", False),
         ("spend", "", False),
@@ -589,7 +595,9 @@ def test_prefetch_all_unpinned_unchanged(session: Session, user: User) -> None:
         ]
     )
     session.flush()
-    assert prefetch_tag_map(session, user_id=user.id) == {"swiggy": subs.id}
+    assert prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {
+        "swiggy": subs.id
+    }
 
 
 def test_prefetch_pinned_beats_higher_hit_count(session: Session, user: User) -> None:
@@ -612,7 +620,9 @@ def test_prefetch_pinned_beats_higher_hit_count(session: Session, user: User) ->
         ]
     )
     session.flush()
-    assert prefetch_tag_map(session, user_id=user.id) == {"swiggy": food.id}
+    assert prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {
+        "swiggy": food.id
+    }
 
 
 def test_pin_tag_inserts_new_pinned_row(session: Session, user: User) -> None:
@@ -749,17 +759,170 @@ def test_set_tag_pinned_toggle_preserves_hit_count(session: Session, user: User)
 
     set_tag_pinned(session, user_id=user.id, map_id=food_row.id, pinned=True)
     session.flush()
-    assert prefetch_tag_map(session, user_id=user.id) == {"swiggy": food.id}
+    result = prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
+    assert result == {"swiggy": food.id}
     assert food_row.hit_count == 2  # untouched
 
     set_tag_pinned(session, user_id=user.id, map_id=food_row.id, pinned=False)
     session.flush()
-    assert prefetch_tag_map(session, user_id=user.id) == {"swiggy": subs.id}  # reverted
+    result = prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
+    assert result == {"swiggy": subs.id}  # reverted
     assert food_row.hit_count == 2  # still untouched
 
 
 def test_set_tag_pinned_missing_returns_none(session: Session, user: User) -> None:
     assert set_tag_pinned(session, user_id=user.id, map_id=999999, pinned=True) is None
+
+
+# ---------- Phase A2: aggregation, ranking agreement, isolation -----------
+
+
+def test_merchant_agg_winner_key_agrees_with_sql_ordering(session: Session, user: User) -> None:
+    """Ranking agreement (required test 2): the Python winner pick over an
+    aggregated group must agree with the SQL ORDER BY over raw rows, on a
+    fixture exercising pinned, a hit_count tie, and a last_used tie."""
+    food = _make_category(session, user.id, "Food")
+    gift = _make_category(session, user.id, "Gift")
+    subs = _make_category(session, user.id, "Subscriptions")
+    ts = datetime(2026, 5, 1, 12, 0, 0)
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=user.id,
+                merchant_normalized="swiggy",
+                category_id=food.id,
+                hit_count=4,
+                last_used=ts,
+                pinned=True,
+            ),
+            MerchantTagMap(
+                user_id=user.id,
+                merchant_normalized="swiggy",
+                category_id=gift.id,
+                hit_count=4,
+                last_used=ts,
+            ),
+            MerchantTagMap(
+                user_id=user.id,
+                merchant_normalized="swiggy",
+                category_id=subs.id,
+                hit_count=1,
+                last_used=ts,
+            ),
+        ]
+    )
+    session.flush()
+
+    sql_winner = session.execute(
+        select(MerchantTagMap.category_id)
+        .join(Category, Category.id == MerchantTagMap.category_id)
+        .where(MerchantTagMap.user_id == user.id, Category.user_id == user.id)
+        .order_by(*tag_service.merchant_map_winner_order(MerchantTagMap))
+        .limit(1)
+    ).scalar_one()
+
+    groups = tag_service._aggregate_tag_rows(session, user_id=user.id, resolver=EMPTY_RESOLVER)
+    py_winner = max(
+        groups["swiggy"].items(), key=lambda kv: tag_service.merchant_agg_winner_key(kv[1])
+    )[0]
+    assert py_winner == sql_winner
+
+
+def test_aggregate_tag_rows_sums_across_aliased_merchants(session: Session, user: User) -> None:
+    """Aggregation (required test 3): three distinct raw descriptors under one
+    alias sum to a canonical hit_count of 3."""
+    food = _make_category(session, user.id, "Food")
+    resolver = AliasResolver(((("swiggy",), "food"),))
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=user.id, merchant_normalized="swiggy blr 111", category_id=food.id
+            ),
+            MerchantTagMap(
+                user_id=user.id, merchant_normalized="swiggy blr 222", category_id=food.id
+            ),
+            MerchantTagMap(
+                user_id=user.id, merchant_normalized="upi swiggy 333", category_id=food.id
+            ),
+        ]
+    )
+    session.flush()
+
+    assert prefetch_tag_map(session, user_id=user.id, resolver=resolver) == {"food": food.id}
+    strength = prefetch_tag_strength(session, user_id=user.id, resolver=resolver)
+    assert strength[("food", food.id)] == (3, False)
+
+
+def test_archived_filter_bites_per_raw_row_under_aliasing(session: Session, user: User) -> None:
+    """Required test 4, under aliasing specifically: one raw merchant aliased
+    to a canonical points at an archived category; a second raw merchant
+    under the SAME canonical points at a live one. Only the live row's
+    hit_count survives the sum — the archived one is dropped entirely, not
+    merged in."""
+    live = _make_category(session, user.id, "Food")
+    archived = _make_category(session, user.id, "OldFood")
+    archived.archived_at = datetime(2026, 1, 1)
+    resolver = AliasResolver(((("swiggy",), "food"),))
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=user.id,
+                merchant_normalized="swiggy old",
+                category_id=archived.id,
+                hit_count=9,
+            ),
+            MerchantTagMap(
+                user_id=user.id, merchant_normalized="swiggy new", category_id=live.id, hit_count=1
+            ),
+        ]
+    )
+    session.flush()
+
+    assert prefetch_tag_map(session, user_id=user.id, resolver=resolver) == {"food": live.id}
+    strength = prefetch_tag_strength(session, user_id=user.id, resolver=resolver)
+    assert strength[("food", live.id)] == (1, False)
+    assert ("food", archived.id) not in strength
+
+
+def test_prefetch_tag_map_user_b_alias_does_not_leak_into_user_a(
+    session: Session, user: User
+) -> None:
+    """Tenant isolation (required test 6): user B's alias folding multiple raw
+    merchants together must never influence user A's prefill, even when A has
+    no alias of their own for the same raw string."""
+    other = User(id=uuid.uuid4())
+    session.add(other)
+    session.flush()
+    a_food = _make_category(session, user.id, "Food")
+    b_food = _make_category(session, other.id, "Food")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=user.id, merchant_normalized="swiggy", category_id=a_food.id, hit_count=1
+            ),
+            MerchantTagMap(
+                user_id=other.id,
+                merchant_normalized="swiggy blr 1",
+                category_id=b_food.id,
+                hit_count=1,
+            ),
+            MerchantTagMap(
+                user_id=other.id,
+                merchant_normalized="swiggy blr 2",
+                category_id=b_food.id,
+                hit_count=1,
+            ),
+        ]
+    )
+    session.flush()
+    b_resolver = AliasResolver(((("swiggy",), "food"),))
+
+    # User A has no alias — resolver is EMPTY_RESOLVER regardless of what B's
+    # alias table looks like; A's own raw key is untouched.
+    result_a = prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
+    assert result_a == {"swiggy": a_food.id}
+    strength_b = prefetch_tag_strength(session, user_id=other.id, resolver=b_resolver)
+    assert strength_b[("food", b_food.id)] == (2, False)
 
 
 def test_set_tag_pinned_cross_user_returns_none(session: Session, user: User) -> None:

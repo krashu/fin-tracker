@@ -4,6 +4,8 @@ Public surface for importers downstream (import_service, API routes):
 
 * :class:`StatementParser` — the contract every parser satisfies.
 * :class:`RawTransaction` — a single parsed row.
+* :class:`StatementSummary` — statement-level metadata (opening/closing balance, period).
+* :class:`ParsedStatement` — everything one statement file yields: rows plus a summary.
 * :data:`TxnType` / :data:`AccountType` — Literal aliases.
 * :class:`ParserError`, :class:`InvalidPasswordError` — exception hierarchy.
 * :class:`AxisCC`, :class:`IciciCC` — concrete spend-statement parsers.
@@ -20,9 +22,11 @@ from app.parsers.axis_cc import AxisCC
 from app.parsers.base import (
     AccountType,
     InvalidPasswordError,
+    ParsedStatement,
     ParserError,
     RawTransaction,
     StatementParser,
+    StatementSummary,
     TxnType,
 )
 from app.parsers.frankfurter import FrankfurterParseError, FxRateRow, parse_frankfurter_rates
@@ -43,9 +47,11 @@ __all__ = [
     "MfApiNavRow",
     "MfApiParseError",
     "ParsedInvestmentRow",
+    "ParsedStatement",
     "ParserError",
     "RawTransaction",
     "StatementParser",
+    "StatementSummary",
     "TxnType",
     "parse_frankfurter_rates",
     "parse_investment_csv",

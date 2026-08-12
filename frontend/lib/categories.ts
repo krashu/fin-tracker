@@ -5,22 +5,20 @@ import type {
 } from "@/lib/api/client";
 
 /** Which category scope a transaction type draws from: income transactions use
- * income categories; spend + refund both use spend categories (a refund nets
- * against spend in the same category). Transfers take the "spend" fallback and
- * that path IS reached through the UI — a transfer may carry a spend category
- * (ADR-0007 rule 7), and both the row dialog and the board's Transfers view
- * offer the spend picker on one. Single source of truth for the four category
- * pickers. */
+ * income categories; spend uses spend categories, of either sign — a refund is
+ * a positive-amount spend (ADR-0009), so it nets against spend in the same
+ * category rather than drawing from a scope of its own. Transfers take the
+ * "spend" fallback and that path IS reached through the UI — a transfer may
+ * carry a spend category (ADR-0007 rule 7), and both the row dialog and the
+ * board's Transfers view offer the spend picker on one. Single source of
+ * truth for the four category pickers. */
 export function categoryKindForType(t: TransactionType): CategoryKind {
-  if (t === "income") return "income";
-  if (t === "refund") return "refund";
-  return "spend";
+  return t === "income" ? "income" : "spend";
 }
 
 /** Human label for a category kind (settings list headers, etc.). */
 export const CATEGORY_KIND_LABELS: Record<CategoryKind, string> = {
   spend: "Spend",
-  refund: "Refund",
   income: "Income",
 };
 

@@ -5,35 +5,35 @@ Personal finance tracker for Indian banks + global investments — import statem
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![Node](https://img.shields.io/badge/node-24-brightgreen)
-![Status](https://img.shields.io/badge/status-v0.1%20WIP-orange)
 
-> 🚧 **v0.1 — scaffold + bootstrap complete.** Axis CC parser is the next milestone. See [Roadmap](#roadmap).
+> Self-hosted and privacy-first — your statements and portfolio data never leave your machine.
 
 ## Why this exists
 
-Existing trackers (Mint, Lunchmoney, YNAB, Kuvera) each fall short on at least one axis: poor support for Indian bank statement formats, no investment-side depth, or SaaS hosting your full financial data. This is a self-hosted alternative that imports CC + bank PDFs from HDFC / ICICI / Axis, tracks investments via a canonical transaction-CSV import (any broker / AMC export), handles US stocks held via INDmoney in USD with FX-adjusted rollups, and computes XIRR / allocation properly. Built primarily as a personal tool — also a portfolio project.
+Existing trackers (Mint, Lunchmoney, YNAB, Kuvera) each fall short on at least one axis: poor support for Indian bank statement formats, no investment-side depth, or SaaS hosting your full financial data. This is a self-hosted alternative that imports CC + bank PDFs from ICICI / Axis, tracks investments via a canonical transaction-CSV import (any broker / AMC export), handles US stocks held via INDmoney in USD with FX-adjusted rollups, and computes XIRR / allocation properly. Built primarily as a personal tool — also a portfolio project.
 
 ## Screenshots
 
-> _Screenshots arrive at v0.6 when dashboards land. Tracking via [Roadmap](#roadmap)._
+> _Coming soon._
 
 ## Features
 
-- 📥 Import credit-card & bank statements (CSV + password-protected PDF) — HDFC / ICICI / Axis  *(v1)*
-- 🤖 Auto-tag transactions by learning your past merchant→category mappings  *(v1)*
-- ✍️ Manual transactions (cash, transfers, imports the parser missed)  *(v1)*
-- 📊 Investments via canonical transaction-CSV import — MFs & equities from any broker/AMC export  *(v1)*
-- 🌍 US stocks/ETFs via INDmoney transaction export, with per-transaction FX stamping  *(v1)*
-- 💱 INR home currency with USD investment rollup  *(v1)*
-- 📈 Live portfolio tiles + monthly spend dashboards  *(v1)*
-- 🏆 Portfolio vs benchmark — "am I beating the market?" against an index fund, in XIRR alpha  *(v1)*
-- 🧾 Capital-gains statement (FIFO STCG/LTCG split, debt-slab flag, ₹1.25L exemption) + dividend-income summary — to reconcile against your AMC report & AIS at filing  *(v1)*
-- 🗂️ One-click CSV export to Google Drive  *(v1)*
-- 🔄 Recurring-txn detection, OCR for scanned bills, budgets, multi-user, capital-loss set-off + carry-forward, tax-loss harvesting  *(v2)*
+- 📥 Import credit-card & bank statements (CSV + password-protected PDF) — ICICI / Axis
+- 🤖 Auto-tag transactions by learning your past merchant→category mappings
+- ✍️ Manual transactions (cash, transfers, imports the parser missed)
+- 📊 Investments via canonical transaction-CSV import — MFs & equities from any broker/AMC export
+- 🌍 US stocks/ETFs via INDmoney transaction export, with per-transaction FX stamping
+- 💱 INR home currency with USD investment rollup
+- 📈 Live portfolio tiles + monthly spend dashboards
+- 🏆 Portfolio vs benchmark — "am I beating the market?" against an index fund, in XIRR alpha
+- 🧾 Capital-gains statement (FIFO STCG/LTCG split, debt-slab flag, ₹1.25L exemption) + dividend-income summary — to reconcile against your AMC report & AIS at filing
+- 🗂️ One-click CSV export to Google Drive
+
+**Coming soon:** recurring-transaction detection, OCR for scanned bills, budgets, multi-user households, capital-loss set-off + carry-forward, tax-loss harvesting.
 
 Full scope in [PRD.md](PRD.md).
 
-## Architecture (target — v1.0)
+## Architecture
 
 ```
                            ┌──────────────────────────────────────┐
@@ -50,17 +50,17 @@ Full scope in [PRD.md](PRD.md).
                      └──────────────────────────────────────────┘
 ```
 
-Server-rendered? No — Next.js is the React frontend, FastAPI is the JSON API. The four consumed Pydantic schemas are hand-mirrored as TypeScript types in `frontend/lib/api/client.ts`. Live tiles use TanStack Query polling (v1) → SSE push (v2).
+Server-rendered? No — Next.js is the React frontend, FastAPI is the JSON API. The four consumed Pydantic schemas are hand-mirrored as TypeScript types in `frontend/lib/api/client.ts`. Live tiles use TanStack Query polling today; a push-based SSE channel is planned.
 
 ## Tech stack
 
 | Layer        | Choice                                                      |
 | ------------ | ----------------------------------------------------------- |
 | Backend      | Python 3.13 + FastAPI + SQLAlchemy 2 + Alembic              |
-| DB           | SQLite (v1) → Postgres (v1.5+)                              |
+| DB           | SQLite, with Postgres support planned                       |
 | PDF parsing  | pdfplumber + pikepdf (per-issuer strategy pattern)          |
-| XIRR         | `pyxirr` *(v0.4)*                                           |
-| Frontend     | Next.js 16 LTS + React 19 + TypeScript 5 + Tailwind CSS 4   |
+| XIRR         | `pyxirr`                                                     |
+| Frontend     | Next.js 16 LTS + React 19 + TypeScript 7 + Tailwind CSS 4   |
 | UI kit       | shadcn/ui (Radix primitives) + Recharts via shadcn `Chart`  |
 | Data layer   | TanStack Query v5                                           |
 | Tooling      | uv (Python) / pnpm (Node) / pre-commit / ruff / ty / eslint |
@@ -85,11 +85,11 @@ Confirm it works: `docker --version`.
 ### 2. Get the code
 
 ```bash
-git clone https://github.com/your-username/fin-tracker.git
+git clone <repository-url>
 cd fin-tracker
 ```
 
-No git? On the [project's GitHub page](https://github.com/your-username/fin-tracker) use **Code → Download ZIP**, unzip it, and open a terminal in that
+No git? On the project's page use **Code → Download ZIP**, unzip it, and open a terminal in that
 folder.
 
 ### 3. Start it
@@ -176,7 +176,7 @@ make dev   # docker compose up: backend + frontend with hot-reload
 # Backend (one terminal)
 cd backend
 uv sync
-uv run alembic upgrade head   # one-time (and after new migrations): seeds the v1 user row
+uv run alembic upgrade head   # one-time (and after new migrations): seeds the app's user row
 uv run main.py                # start the API — host/port/reload read from .env (see Configuration)
 ```
 
@@ -187,7 +187,7 @@ row in `users`, and the migrations seed that row. Equivalent: `make migrate`.
 ```bash
 # Frontend (second terminal)
 # First time only: install pnpm globally (no admin required on Windows)
-npm install -g pnpm@11.14.0
+npm install -g pnpm@11.21.0
 # Windows: ensure %APPDATA%\npm is on PATH (PowerShell, no admin):
 #   setx PATH "%PATH%;%APPDATA%\npm"
 # Reopen the shell after.
@@ -205,12 +205,12 @@ Runtime config lives in a gitignored `.env` at the repo root (copy from [.env.ex
 
 | Var            | Default                             | Purpose                                                          |
 | -------------- | ----------------------------------- | ---------------------------------------------------------------- |
-| `API_HOST`     | `127.0.0.1`                         | Backend bind address. Set `0.0.0.0` to expose on the LAN *(v1.5)*. |
+| `API_HOST`     | `127.0.0.1`                         | Backend bind address. Set `0.0.0.0` to expose on the LAN.        |
 | `API_PORT`     | `8000`                              | Backend API port — the frontend calls the API here.              |
 | `API_RELOAD`   | `false`                             | Uvicorn auto-reload. Set `true` for local hot-reload.            |
-| `LOG_FORMAT`   | `console`                           | Set `json` for structured logs *(v2 hosting)*.                   |
+| `LOG_FORMAT`   | `console`                           | Set `json` for structured logs in production.                   |
 | `LOG_LEVEL`    | `info`                              | Level for app + bridged uvicorn logs. Not SQLAlchemy: it pins its own logger to WARNING at import. |
-| `DATABASE_URL` | `sqlite:///./data/fin-tracker.db`   | SQLAlchemy URL — Postgres in v1.5+.                              |
+| `DATABASE_URL` | `sqlite:///./data/fin-tracker.db`   | SQLAlchemy URL — Postgres support planned.                       |
 | `V1_USER_ID`   | seeded UUID                         | Must match the Alembic-seeded `users` row.                       |
 
 ### VS Code / IDE setup
@@ -240,18 +240,17 @@ cd backend && uv run pre-commit install
 
 ## Roadmap
 
-- **v0.1** — One issuer, end-to-end (Axis CC PDF → parse → dedupe → tag → review screen). *Current.*
-- **v0.2** — Add HDFC + ICICI parsers.
-- **v0.3** — Manual transactions + category management UI.
-- **v0.4** — Investment side: manual + transaction-CSV import + XIRR.
-- **v0.5** — Multi-currency + INDmoney import.
-- **v0.6** — Dashboards (4 of 5 v1 views).
-- **v0.6.5** — Portfolio vs benchmark (scalar XIRR alpha + Indian NAV/price snapshot: AMFI NAVAll for MFs + a public equity quote source).
-- **v0.7** — CSV export + Google Drive sync.
-- **v0.8** — Tax statements & reporting: capital-gains statement (FIFO STCG/LTCG split, debt-slab flag, ₹1.25L exemption) + dividend-income summary.
-- **v1.0** — README screenshots, tests passing, CI green, tag and ship.
-- **v1.5** — Basic auth, cloud-deployable.
-- **v2** — OCR, recurring-txn detection, budgets, multi-user, capital-loss set-off + carry-forward, tax-loss harvesting, SSE push channel.
+- One issuer, end-to-end: Axis CC PDF → parse → dedupe → tag → review screen.
+- Add ICICI parser.
+- Manual transactions + category management UI.
+- Investment side: manual + transaction-CSV import + XIRR.
+- Multi-currency + INDmoney import.
+- Dashboards: live tiles, monthly-by-category, weekly/monthly bar, net-worth headline.
+- Portfolio vs benchmark: scalar XIRR alpha against an Indian index-fund NAV/price snapshot.
+- CSV export + Google Drive sync.
+- Tax statements & reporting: capital-gains statement (FIFO STCG/LTCG split, debt-slab flag, ₹1.25L exemption) + dividend-income summary.
+- Basic auth, cloud-deployable.
+- OCR for scanned bills, recurring-transaction detection, budgets, multi-user households, capital-loss set-off + carry-forward, tax-loss harvesting, push-based live updates.
 
 Full sequencing detail in [PRD.md § Build sequencing](PRD.md#build-sequencing--what-to-build-first).
 

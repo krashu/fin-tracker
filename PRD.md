@@ -77,7 +77,11 @@ creeps and the project drifts. Targets for v1:
   is the core daily-driver loop and the strongest signal that imports are usable.
 - **Tagging precision**: after 3 months of usage, ≥80% of imported transactions
   arrive pre-tagged correctly (no edit needed). Signal that exact-match auto-tag
-  (F3) is doing its job; below this, fuzzy/rules need to come forward.
+  (F3) is doing its job; below this, fuzzy/rules need to come forward. Carried by
+  `coverage_rate` on `GET /dashboards/tagging-stats` (added alongside the merchant alias layer,
+  [ADR-0011](docs/adr/0011-merchant-alias-layer.md)) — the fraction of imported rows that arrive
+  pre-tagged, as distinct from `acceptance_rate` on the same endpoint, which answers a different
+  question: of what we suggested, how much did the user keep?
 - **XIRR accuracy**: portfolio-level XIRR within 0.1% of Kuvera / Groww's number
   for the same set of transactions. Signal that `pyxirr` + my data model are
   computing the right thing.
@@ -162,6 +166,11 @@ Three families of import, each with its own parser registered in a
   one. Bank-statement parsers are unbuilt for every issuer; see §Verification step 6 for
   how F4a is exercised without one.
 - Output: spending `transactions` rows in INR.
+- Parser contract ([ADR-0010](docs/adr/0010-parsed-statement-return.md)): `StatementParser`
+  yields the parsed rows **plus** statement-level metadata — opening/closing balance and
+  billing period — read off the same file. The metadata is optional per layout: a statement
+  whose printed layout carries no balance block yields it all-`None`, which is a legitimate
+  result, never a parse failure. See §F4a case 5 for what it's used for.
 
 **2. Investment transactions (canonical CSV)**
 - Format: a transaction-level CSV exported from a broker / AMC — seeded against the
@@ -199,9 +208,12 @@ self-host on a public IP), where an unbounded upload is a trivial memory / disk 
 
 ### F2. Manual transaction entry
 
-- Fields: `date`, `account`, `amount` (signed: negative = spend, positive = income/credit),
-  `merchant` (free text), `category`, `notes`, `transaction_type`
-  (spend / income / transfer / refund).
+- Fields: `date`, `account`, `amount` (signed), `merchant` (free text), `category`, `notes`,
+  `transaction_type` (spend / income / transfer).
+- Sign rule ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)): `spend` accepts either sign
+  — negative is an outflow, **positive is a refund** — `income` requires a positive amount,
+  `transfer` accepts either sign, and zero is rejected for all three. A refund is not its own
+  type; it is a `spend` row.
 - Transfers between user's own accounts use `transaction_type = transfer` and are
   excluded from spend reports.
 
@@ -216,6 +228,19 @@ self-host on a public IP), where an unbounded upload is a trivial memory / disk 
   memory maps, so changing it requires the recompute migration in
   [ADR-0006](docs/adr/0006-f4-dedup-key.md) §Recompute procedure. See the CHANGE HAZARD
   block in `services/merchant.py`.
+  **Shipped, without touching this function** ([ADR-0011](docs/adr/0011-merchant-alias-layer.md)):
+  a `merchant_alias` table resolves a canonical merchant *downstream* of normalisation, and the
+  two memory maps re-key on it at read time, leaving the fingerprint on `merchant_normalized`.
+  Matching is **token-boundary contains** — both strings are split on runs of non-alphanumerics,
+  and an alias fires when its token sequence is a contiguous subsequence of the merchant's tokens
+  (so `upi/swiggy/9876@ybl` resolves to `swiggy`, but `ola` does not false-merge into
+  `chocolate hut`). Conflicts resolve by longest-pattern-wins, a total order derived from the
+  data — not a user-editable priority field. Authored on `/settings/rules`; every new user is
+  seeded at registration with ~96 Indian-merchant dictionary entries (`is_seeded=True`,
+  `hit_count=0`), fixing the cold start this measurement below describes. That route is what makes
+  the miss rate worth quoting in the first place: normalisation is lowercase + whitespace-collapse
+  only, so before aliasing, auto-tagging **could not fire at all** on a merchant whose descriptor
+  carries an order id, RRN or VPA — most Indian CC and UPI rows.
 - On import: for each new row, look up `normalized_merchant`; if found, prefill category
   with highest-hit-count entry.
 - "User decision" fires `merchant_tag_map` upsert (insert or `hit_count++`) at these sites.
@@ -242,8 +267,11 @@ self-host on a public IP), where an unbounded upload is a trivial memory / disk 
   sets the flag, and pin/un-pin toggle *only* the flag (never `hit_count` /
   `last_used`), so un-pinning reverts to the untouched learned ranking. Still
   merchant-**exact** — not the regex rules below.
-- Out of scope v1: fuzzy match, **regex** rules, ML classifier (merchant-exact
-  manual pinning above *is* in scope). Schema leaves room.
+- Out of scope v1: fuzzy/edit-distance match, **regex** rules, wildcards, ML classifier, and any
+  condition on amount, account or date (research §7's killed rules-engine expansion; re-checked
+  against the alias layer at research §13.7 without collision). **Token-boundary contains
+  matching, scoped to the merchant string alone, is in scope** — the alias layer above and the
+  merchant-exact manual pinning above both are (research §13.10).
 
 ### F3a. Transaction labels (user tags)
 
@@ -274,8 +302,9 @@ avoid colliding with the F3 `merchant_tag_map` / `tag_service` "tag" namespace.
 - **Phase 2 (shipped)**: F3 auto-tagging also learns merchant→label (a
   `merchant_label_map` sibling to `merchant_tag_map`) and pre-fills labels whose
   `hit_count` clears the confidence bar in the review queue — so "auto-tagging"
-  now covers categories *and* labels. Exact-match only, spend/refund-gated, no
-  decay (mirrors merchant→category learning).
+  now covers categories *and* labels. Exact-match only, spend-gated (a refund
+  included — [ADR-0009](docs/adr/0009-refund-as-signed-spend.md)), no decay
+  (mirrors merchant→category learning).
 
 ### F4. Duplicate detection
 
@@ -337,20 +366,28 @@ would produce wrong totals.
   user can rename or archive via Settings → Instruments.
 
 **3. Refunds.**
+- A refund is not its own `transaction_type` — it is a `spend` row carrying a
+  *positive* `amount_paise`, derived at read time rather than stored
+  ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)). **The sign is load-bearing,
+  not the type.** Every F8 aggregate discriminates `spend` rows by sign — negative
+  into gross spend, positive into refunds — and there is no separate `refund` value
+  left to route incorrectly.
 - Refunds preserve the original merchant and category. A Swiggy refund auto-tags to
   Food. This is correct for personal-finance accounting: category totals are
-  *signed sums*, so the refund naturally reduces the month's Food spend.
-- Imports may emit refunds with `transaction_type = refund` (when the parser can
-  tell — e.g. negative amounts on a CC statement). **The type is load-bearing, not
-  informational.** Every F8 aggregate filters `transaction_type IN ('spend','refund')`
-  and routes `income` to a separate bucket, so a refund left typed `income` never
-  enters the expense sum and displayed spend is inflated by the refund's full
-  magnitude — sign alone does not save it.
-- The parser cannot close this gap: a merchant refund and a cashback credit are
-  indistinguishable on a CC statement, and cashback is legitimately *income* (§F5).
-  So the classification is a best effort and **the user corrects it** — every
-  user-visible column, `transaction_type` included, is editable on
-  `PATCH /transactions` ([ADR-0007](docs/adr/0007-transaction-field-editability.md)).
+  *signed sums*, so the refund naturally reduces the month's Food spend — and
+  because a refund is a `spend` row by construction, it cannot drift into income's
+  bucket the way a mistyped row once could.
+- A CC statement credit is still ambiguous on arrival: a merchant refund and a
+  cashback credit are indistinguishable from the statement text alone, and cashback
+  is legitimately *income* (§F5). The parser's classification is therefore a best
+  effort (positive amount → tentatively `spend`, i.e. a refund, unless the merchant
+  text names cashback, in which case `income`), and **the user corrects it** by
+  picking a category — a spend category keeps it a refund netting against that
+  category, an income category retypes it to `income`. This is now a *category-kind*
+  choice, not a type choice: every user-visible column, `transaction_type` included,
+  is editable on `PATCH /transactions`
+  ([ADR-0007](docs/adr/0007-transaction-field-editability.md)), but the review queue's
+  merged spend/income category picker is what most users act through.
 
 **4. Statement re-import after the issuer corrects a row.**
 - Fingerprint includes amount, so a corrected amount produces a *new* fingerprint
@@ -362,12 +399,43 @@ would produce wrong totals.
 - v1.5 idea (not committed): a "Reconcile" tool that flags suspected supersedes
   side-by-side for user confirmation.
 
+**5. Statement closing balance vs our record.**
+- Detection: a **window-delta** comparison, not the running-balance-vs-history check the
+  §Roadmap entry this supersedes once proposed. `expected = closing_balance − opening_balance`,
+  both read straight off the statement; `actual = Σ(amount_paise)` over the account's confirmed
+  transactions **plus this batch's still-pending rows**, restricted to the statement's own
+  `[period_start, period_end]` window. `delta = actual − expected` (signed, exact integer paise —
+  no tolerance). Window-scoping removes the dependence on the account's whole prior history, so a
+  first-ever import reconciles without it.
+- Credit-card sign convention (stated, not derived): **negative = owed.** A printed "Total Amount
+  Due" of ₹X stores as **−X paise** — a card's `opening_balance_paise`/`closing_balance_paise`
+  use the same convention as the account's own balance. A `CR` (overpaid) closing balance stores
+  positive.
+- Action on mismatch: **warn, never block** — the delta persists on the `ImportBatch` row and
+  surfaces as a review-screen banner plus a pending-batches feed badge; the commit still succeeds
+  regardless. No acknowledge flag, no blocked commit.
+- A statement whose layout prints no balance block (the Axis Flipkart co-branded layout) imports
+  with the check simply not run — `NULL` delta, never a parse error (ADR-0010).
+- **Known false-positive classes, accepted, not corrected:** (a) a manually-entered (F2) row for
+  a transaction the statement also lists produces a mismatch — the statement lists everything the
+  issuer recorded, and F4's per-account dedup can't catch a manual row with different merchant
+  text; (b) a row **discarded** at review (most commonly an investment-transfer debit that
+  belongs to F7, not this board) permanently removes its amount from `actual` with no trace — a
+  hard delete, not a soft one, so the delta cannot self-correct. Both are informative, not noise;
+  warn-never-block makes them cheap. Case (b) is qualified, not silently unexplained: the review
+  screen also reports *how many* of the batch's originally-staged rows were later discarded (a
+  live count against the batch's frozen `imported_count`,
+  `reconciliation_service.rows_removed_since_import`), so a routine monthly SIP discard reads as
+  "N rows removed since import," not an unexplained mismatch.
+
 ### F5. Categories
 
 - Categories are **typed** by a first-class `kind` column (`spend` | `income`), set at
   create and immutable thereafter (there is no PATCH for `kind`). Spend categories serve
-  `spend` + `refund` transactions; income categories serve `income`. Each row also
-  carries a user-pickable `color` (`#rrggbb`, nullable → derived from the id).
+  `spend` transactions of either sign — a refund included
+  ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)); income categories serve
+  `income`. Each row also carries a user-pickable `color` (`#rrggbb`, nullable →
+  derived from the id).
 - Registration provisions 17 defaults (`services/provisioning.py` is the live path):
   - **spend (13)**: Food, Groceries, Transport, Rent, Utilities, Shopping,
     Entertainment, Health, Travel, Subscriptions, EMI, Investment, Other.
@@ -753,7 +821,7 @@ migration; `holdings_service._consume_fifo` currently discards the consumed lots
 | FX rates    | **`frankfurter.app`** or **`exchangerate.host`** (free, no key) | Daily INR↔USD rates. Cached in `fx_rates` table; fallback to last-known if API down. |
 | Drive sync  | **google-api-python-client** + **google-auth-oauthlib**| Official Google libs. `drive.file` scope = least privilege.|
 | Token store | **cryptography (Fernet)** over a local file            | Encrypts the OAuth refresh token at rest.                 |
-| Frontend    | **Next.js 16.2.10 LTS (App Router) + React 19 + TypeScript 6.x + Tailwind CSS 4.x** | Portfolio-grade, learning-aligned, real-time-friendly. See "Frontend stack rationale" below. |
+| Frontend    | **Next.js 16.3.0 LTS (App Router) + React 19 + TypeScript 7.x + Tailwind CSS 4.x** | Portfolio-grade, learning-aligned, real-time-friendly. See "Frontend stack rationale" below. |
 | UI kit      | **shadcn/ui** + its `Chart` component (Recharts engine) | Copy-paste components live in your repo — zero runtime dep, no upstream version churn. Production-strength via Radix UI primitives. |
 | Data layer  | **TanStack Query v5** (server state) + minimal Zustand only if needed | Polling, cache invalidation, optimistic updates — drives the live-update behaviour in F9. |
 | Real-time   | v1: TanStack Query polling. v2: FastAPI **SSE** endpoint + `EventSource` on the client | SSE chosen over WebSocket because portfolio updates are server→client only. |
@@ -770,7 +838,7 @@ production frontend work, and (c) **React as an explicit learning goal**. The
 React ecosystem's maintenance cost is real but acceptable when each upgrade
 doubles as deliberate practice.
 
-- **Next.js 16.2.10** is the current LTS (Next.js 15 EOLs 2026-10-21). Powers
+- **Next.js 16.3.0** is the current LTS (Next.js 15 EOLs 2026-10-21). Powers
   vercel.com, notion.so, hulu.com, anthropic.com, OpenAI's chat surface. Turbopack
   is the default bundler in 16 and is stable; React Compiler ships stable too
   (auto-memoisation — fewer manual `useMemo` / `useCallback`).
@@ -778,7 +846,7 @@ doubles as deliberate practice.
   matters; design rule for this app: dashboards and forms are **Client Components**
   (`"use client"`) since they need interactivity / TanStack Query; pages that are
   pure layout stay Server Components.
-- **TypeScript 6.x** — industry default. The Pydantic schemas consumed by the frontend
+- **TypeScript 7.x** — industry default. The Pydantic schemas consumed by the frontend
   are hand-mirrored as TS types in `lib/api/client.ts` (see the API-client row above for
   the count and the decision). **Drift is only half-caught by tsc, and this is the
   canonical statement of the asymmetry**: tsc *does* flag a TS field the backend dropped
@@ -1033,14 +1101,38 @@ next milestone never ships):**
   overlay (needs dense per-holding historical NAV; v1 ships the scalar alpha only);
   additional currencies (GBP / EUR); **SSE push channel** for live portfolio updates
   (replacing v1's polling — see F9).
-- **Considered, unscheduled** — three moderate adds whose backing data mostly already ships,
-  parked here so the decisions aren't lost: **balance reconciliation** (a user-entered
-  statement closing balance vs the query-time running balance the net-worth view already
-  computes — catches a missed or duplicated import); **target-allocation drift** (the
-  allocation donut already computes actuals; net-new is storing a user target + the drift
-  delta + the rupee move to rebalance); **spend-spike anomaly** in the review queue (the
-  untagged-import queue already ships — this flags a merchant whose amount jumps vs its
-  trailing 3-month average). None block v1.
+- **Considered, unscheduled** — moderate adds whose backing data mostly already ships, parked
+  here so the decisions aren't lost. None block v1. Most came out of the two competitive
+  passes written up in
+  [docs/research/competitive-findings.md](docs/research/competitive-findings.md) (2026-07-30
+  and the 2026-08-10 addendum) — read its **§7 Killed** table before proposing anything
+  adjacent, since several nearby ideas were rejected there with cited evidence and should not
+  be re-litigated without new evidence.
+  - **Split transactions** — one statement line across N categories (a Flipkart order that is
+    part electronics, part household; a Swiggy Instamart order that is part groceries, part
+    eating out). All four surveyed peers ship it; we carry a single `category_id`. Take
+    Actual Budget's parent/child shape — children sum to the parent, parent keeps the
+    identity columns — rather than Firefly III's transaction-group model, which moves
+    identity off the row and collides with [ADR-0006](docs/adr/0006-f4-dedup-key.md). It is
+    also the only dedup-safe way to split: today's delete-and-re-enter workaround discards
+    `origin_fingerprint`, so re-importing that statement re-stages the original line
+    ([ADR-0007](docs/adr/0007-transaction-field-editability.md) rule 9). The work is a
+    parent-exclusion predicate applied consistently across every §F8 aggregate — miss one and
+    it double-counts (research §13.3).
+  - **Per-category exclude-from-totals** — **not being built** (decided 2026-08-12). Lunch
+    Money's category flag would stop a SIP debit counting as consumption across every spend
+    aggregate while it also counts as a holding under §F7 (`NET_WORTH_EXCLUDED_TYPES` is
+    account-typed and does not reach it). The chosen answer instead is a workflow one:
+    **investment-transfer rows are discarded at import review rather than committed**, so they
+    never reach an aggregate. That relocates the error rather than removing it — a discarded
+    debit never reduces the account balance, so **net worth is overstated by the cumulative
+    discarded amount and compounds monthly** — and discarded rows re-stage on re-import
+    (ADR-0006's re-surface contract). Revisit the flag if the accounts panel or net-worth
+    figure starts being relied on. Full trade-off table: research §13.4.1.
+  - **Target-allocation drift** — the allocation donut already computes actuals; net-new is
+    storing a user target + the drift delta + the rupee move to rebalance.
+  - **Spend-spike anomaly** in the review queue — the untagged-import queue already ships;
+    this flags a merchant whose amount jumps vs its trailing 3-month average.
 
 ## Verification
 
@@ -1050,8 +1142,18 @@ End-to-end test once built:
    confirm transactions appear in the review screen with parsed dates, amounts,
    merchants. Upload the same file again → confirm "Imported 0, skipped N" dedupe summary.
    - **Credit-side classification**: a `CHARGEBACK` credit row must store
-     `transaction_type = refund` (so it nets against spend per F4a-3), not `income`. Both
-     parsers' refund vocabularies must agree on it — they diverged once.
+     `transaction_type = spend` with a **positive** `amount_paise` — a refund is a signed
+     spend, not its own type ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)) — so it
+     nets against spend per F4a-3, not `income`. Both parsers' refund vocabularies must agree
+     on it — they diverged once. Netting assertion: importing that row alongside its original
+     negative spend in the same category must bring the category's signed total to **exactly
+     zero**, not merely "close" or "smaller."
+   - **Card-bill payment is reachable in review**: a statement containing a `PAYMENT RECEIVED`
+     row surfaces it with `cc_payment_candidate = true`; choosing *Card bill payment* stages it
+     with `category_id` still NULL, and committing it alongside an imported bank debit of equal
+     magnitude within ±2 days flips both rows to `transfer` with a shared `transfer_pair_id`
+     (F4a-1). With no matching debit it commits as uncategorized `income` and **never** appears
+     in an income category total.
    - **Column detection on a serial-numbered table**: a statement whose rows carry a leading
      serial-number column (`1`, `2`, …) parses with the real amount, not `₹1` — the amount
      column is detected *after* the date column, never from index 0, since a bare digit string
@@ -1089,6 +1191,14 @@ End-to-end test once built:
      `rows_in == rows_imported + rows_skipped + rows_rejected` on every path — including a
      re-upload, where the investment importer's hash short-circuit reports every row skipped
      rather than reporting nothing at all.
+   - **Closing-balance reconciliation** (F4a case 5, [ADR-0010](docs/adr/0010-parsed-statement-return.md)):
+     import a CC statement whose printed closing balance agrees with its rows → the batch
+     reconciles (delta `0`) and no banner shows. Delete one row's page from the same statement
+     and re-import into a fresh account → the review screen warns with the exact missing
+     amount, **the commit still succeeds**, and the delta persists on the batch after commit. A
+     statement with no summary block (the Axis Flipkart layout) imports with the check simply
+     not run — never a parse error. A credit-card "Total Amount Due" of ₹X stores as **−X
+     paise**: owed is negative, matching `opening_balance_paise` for a card.
 2. **Auto-tag**: Tag 5 transactions with categories → upload next month's statement →
    confirm same merchants are pre-categorised.
    - **Prefill never crosses users** ([ADR-0003](docs/adr/0003-multi-user-auth.md)):
@@ -1235,6 +1345,23 @@ End-to-end test once built:
     because Caddy serves `:80` and the gate rode `cookie_secure` until 2026-08-02. (Note
     the login page caches this response with `staleTime: Infinity`, so an already-open tab
     keeps its button until reload.)
+15. **Merchant alias layer + seed dictionary** ([ADR-0011](docs/adr/0011-merchant-alias-layer.md)):
+    register a fresh user → their `merchant_alias` / `merchant_tag_map` rows carry the seeded
+    dictionary (`is_seeded=True`, `hit_count=0`) → import a statement containing a seeded merchant
+    under a raw descriptor never seen before → the row prefills its category with no prior
+    hand-tag. A second, differently-referenced descriptor for that same real merchant (e.g. a
+    different order-id suffix) also prefills without a second hand-tag, via the same alias.
+    `coverage_rate` rises against the Phase A0 baseline, and every `transactions.fingerprint` is
+    byte-identical to the value produced with the alias table empty (the
+    [ADR-0006](docs/adr/0006-f4-dedup-key.md) guard).
+    - **Authoring leg**: the seed dictionary is a starting point, not the whole story, so the
+      user must be able to correct it. Author a *narrowing* alias for a brand the dictionary
+      already seeds — `uber eats -> uber eats` against the seeded `uber -> uber` — and confirm
+      `POST /rules/aliases` accepts it (a seeded canonical is also a seeded pattern, and an
+      over-broad conflict check made this exact submission 422 once), then that the sub-brand
+      resolves to its own canonical while the parent brand does not move. The two brands must
+      then learn independently: confirming a category on one must not change the other's
+      suggestion.
 
 ## Open assumptions to confirm later
 

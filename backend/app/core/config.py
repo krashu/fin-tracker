@@ -16,6 +16,7 @@ from uuid import UUID
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 # parents[3]: config.py → core/ → app/ → backend/ → repo root.
 # Brittle to layout changes; revisit if app/ ever moves.
@@ -24,6 +25,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # by design: the compose stack injects settings as real env vars, which take
 # precedence over the env_file anyway.
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# Anchor for a relative sqlite DATABASE_URL (see _anchor_relative_sqlite_path
+# below) — the backend/ dir, where data/ actually lives on disk today.
+# Independent of migrations.py's own _BACKEND_ROOT (same value, computed from
+# that module's file location) rather than imported from it, so config.py —
+# imported at module-load time by app/core/db.py — doesn't pull in alembic.
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 # Fixed API mount prefix. Single source of truth: main.py mounts the v1 router
 # here and app/api/v1/auth.py derives its refresh-cookie path from it. Lives in
@@ -69,11 +77,14 @@ class Settings(BaseSettings):
         validation_alias="SEED_DEMO_ON_STARTUP",
         description=(
             "Seed the demo dataset (sample accounts / spending / investments) in the app "
-            "lifespan when the DB is empty. True (default) suits local-first dev: a fresh "
-            "`make backend` comes up with a populated app and no separate seed step. Set "
-            "false for the self-host stacks (real data) so a fresh ./data volume stays "
-            "empty; forced false in the test suite. Only ever fires on an empty DB — never "
-            "re-seeds or touches a DB that already has accounts/transactions."
+            "lifespan on every boot. True (default) suits local-first dev: a fresh "
+            "`make backend` comes up with a populated app and no separate seed step, and "
+            "every subsequent restart re-syncs the spend/income window to end at today "
+            "instead of going stale. Set false for the self-host stacks (real data) so a "
+            "fresh ./data volume stays empty and this never touches it; forced false in "
+            "the test suite. Accounts/instruments are find-or-create; the demo accounts' "
+            "transactions are wiped and regenerated on every call — see "
+            "app.services.demo_seed."
         ),
     )
     v1_user_id: UUID = Field(
@@ -340,6 +351,40 @@ class Settings(BaseSettings):
                 "CORS_ALLOWED_ORIGINS cannot be '*' — credentialed CORS forbids a "
                 "wildcard; list explicit origins."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _anchor_relative_sqlite_path(self) -> Settings:
+        """Rewrite a relative sqlite ``database_url`` to an absolute one, anchored
+        at ``backend/`` rather than the process's current working directory.
+
+        The default — ``sqlite:///./data/fin-tracker.db`` — is only correct when
+        the process happens to be launched with ``backend/`` as CWD (the
+        documented ``cd backend && uv run main.py``). Launched any other way —
+        an absolute path to ``main.py``, an IDE run config, a cron job — SQLite
+        silently opens (or creates) a *different*, empty DB file under whatever
+        directory the process actually started in, instead of erroring. Rewriting
+        here, once, fixes every consumer of this field in one place —
+        app/core/db.py's module-level engine, app/core/migrations.py's
+        startup-upgrade path, and alembic/env.py's CLI path all just read
+        ``settings.database_url``.
+
+        No-op for ``:memory:``, an already-absolute path (including the Docker
+        image's ``sqlite:////data/fin-tracker.db``), or a non-sqlite URL (v2
+        Postgres) — ``make_url`` parses the sqlite URL variants (relative /
+        absolute / query params) robustly rather than string-splitting.
+        """
+        url = make_url(self.database_url)
+        if not url.drivername.startswith("sqlite"):
+            return self
+        if not url.database or url.database == ":memory:":
+            return self
+        relative_path = Path(url.database)
+        if relative_path.is_absolute():
+            return self
+        absolute_path = (_BACKEND_ROOT / relative_path).resolve()
+        new_url = url.set(database=str(absolute_path))
+        self.database_url = new_url.render_as_string(hide_password=False)
         return self
 
 

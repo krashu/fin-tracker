@@ -1,38 +1,58 @@
 """Demo dataset — single source of truth for the demo/sample data.
 
-Pure data, no I/O. Two consumers share it so the demo set never drifts:
-
-* :mod:`app.services.demo_seed` — writes it straight to the ORM in the app
-  lifespan (a fresh DB self-seeds on boot; PRD §Users & access v2 demo account).
-* :mod:`scripts.seed_dev_data` — drives the running HTTP API to (re)seed a
-  server that's already up (or to add new months without a DB reset).
+Pure data, no I/O. The sole consumer is :mod:`app.services.demo_seed`, which
+writes it straight to the ORM in the app lifespan, on EVERY boot (PRD §Users &
+access v2 demo account) — not just an empty DB. A restart is what keeps the
+"Try the demo" account looking current. (A second, HTTP-driving consumer —
+``scripts/seed_dev_data.py`` — existed before boot-time seeding refreshed
+itself on every restart; it was deleted once that made it redundant.)
 
 Rupee magnitudes here are whole ₹; each writer converts to paise (×100).
 Investment ``amount``/``fee`` are already native paise; ``units``/``price`` are
 exact-decimal strings.
 
-Fingerprint stability (PRD §F4 = date + amount + normalized_merchant +
-account_id): the 2026-04 / -05 / -06 spend + salary rows are PRESERVED VERBATIM
-from the original 3-month seed, so an already-seeded DB 409-skips (HTTP writer)
-them on re-run instead of duplicating. Adding new months is fine; never mutate an
-existing tuple's date / merchant / amount.
-
 ``labels`` (F3a user tags) are populated on a representative subset of spends so
 the tag feature — chips, autocomplete, and the board tag filter — is visibly
-demonstrated without every row looking annotated. Empty tuple = no labels. (The
-free-text ``note`` was dropped when labels landed; ``InvestmentTransaction`` keeps
-its ``note``.)
+demonstrated without every row looking annotated. Empty tuple = no labels.
+
+## Rolling window, not fixed dates
+
+The spend/income dataset used to be a flat list of absolute ISO dates, which
+goes stale the moment "today" walks past the last seeded month. It is now a
+12-slot cyclic monthly TEMPLATE (day-of-month + merchant/category/rupees/labels)
+materialized by :func:`build_demo_dataset` relative to an ``anchor`` date —
+normally ``clock.today()``, supplied by the caller so this module stays pure
+and testable. Slot 0 is the anchor's own (current, partial) month; slot 11 is
+the oldest of the 12-month narrative cycle. A window wider than 12 months (the
+default is :data:`DEMO_WINDOW_MONTHS`) just repeats the earliest slots — fine
+for a synthetic demo, nobody is comparing year-over-year.
+
+The merchant vocabulary is deliberately UNCHANGED from the old fixed dataset —
+only which relative month/day each row lands on moved. ``tests/test_migration_parity.py``
+hardcodes the 12 merchants this dataset teaches (F3 auto-tag learning) as
+colliding with the ADR-0011 seed dictionary; renaming or dropping one of those
+12 breaks that test. Add new merchants freely; don't rename the existing ones.
+
+The current (slot 0) month is truncated to ``day <= anchor.day`` so a demo
+session never shows a future-dated transaction.
 """
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+import calendar
+from datetime import date as date_t
+from typing import Any, Literal, NamedTuple
+
+# Trailing window the boot-time seeder keeps in place, in months (inclusive of
+# the current partial month). Picked as a bit more than a year so the rolling
+# window always has full-year context, not just a bare 12.
+DEMO_WINDOW_MONTHS = 14
 
 
 class SpendRow(NamedTuple):
-    """A card spend / refund row. ``rupees`` is a positive magnitude; the writer
-    signs it (spend negative, refund positive). ``labels`` are F3a user tags
-    (get-or-created on seed)."""
+    """A concrete, dated card spend / refund row. ``rupees`` is a positive
+    magnitude; the writer signs it (spend negative, refund positive). ``labels``
+    are F3a user tags (get-or-created on seed)."""
 
     date: str
     merchant: str
@@ -42,138 +62,240 @@ class SpendRow(NamedTuple):
 
 
 class IncomeRow(NamedTuple):
-    """A bank income row. ``rupees`` is positive (credited to the bank)."""
+    """A concrete, dated income row. ``rupees`` is positive. ``account`` picks
+    which demo account it posts to — almost everything is bank-credited salary,
+    but card cashback is credited to the CARD statement, not the linked bank
+    account (real Axis Flipkart behaviour)."""
 
     date: str
     source: str
     category: str
     rupees: int
     labels: tuple[str, ...] = ()
+    account: Literal["bank", "card"] = "bank"
 
 
-# Card spends across twelve months & categories, stored negative (spend) on the
-# credit card. Spans 2025-08 → 2026-07 so the trailing-12 cashflow / category
-# charts and the spend-over-time bar each see a full window. Merchants recur
-# (Big Basket, Swiggy, Uber, Netflix, …) so the top-merchants aggregate ranks
-# meaningfully; 2025-10 is a deliberate Diwali DEFICIT month (Travel + Shopping
-# spike pushes spend above the 50k salary) so the cashflow net line dips below 0.
-CARD_SPENDS: list[SpendRow] = [
-    # 2025-08
-    SpendRow("2025-08-05", "Big Basket", "Groceries", 2800),
-    SpendRow("2025-08-10", "Swiggy", "Food", 650, ("online",)),
-    SpendRow("2025-08-14", "Uber", "Transport", 380),
-    SpendRow("2025-08-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2025-08-24", "Amazon", "Shopping", 1500, ("online",)),
-    # 2025-09
-    SpendRow("2025-09-06", "Big Basket", "Groceries", 3100),
-    SpendRow("2025-09-11", "Zomato", "Food", 720, ("online",)),
-    SpendRow("2025-09-15", "Metro", "Transport", 250),
-    SpendRow("2025-09-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2025-09-21", "Spotify", "Subscriptions", 149),
-    SpendRow("2025-09-26", "Apollo Pharmacy", "Health", 540),
-    # 2025-10 — Diwali deficit month (spend > 50k salary → net < 0)
-    SpendRow("2025-10-04", "Big Basket", "Groceries", 3600),
-    SpendRow("2025-10-09", "Swiggy", "Food", 980, ("online",)),
-    SpendRow("2025-10-12", "MakeMyTrip", "Travel", 32000, ("travel", "goa")),
-    SpendRow("2025-10-18", "Croma", "Shopping", 18500, ("festive",)),
-    SpendRow("2025-10-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2025-10-22", "Myntra", "Shopping", 6200, ("festive",)),
-    SpendRow("2025-10-25", "Uber", "Transport", 720, ("travel",)),
-    # 2025-11
-    SpendRow("2025-11-05", "Big Basket", "Groceries", 2900),
-    SpendRow("2025-11-09", "Blue Tokai", "Food", 480, ("restaurant",)),
-    SpendRow("2025-11-14", "Swiggy", "Food", 610, ("online",)),
-    SpendRow("2025-11-16", "Metro", "Transport", 300),
-    SpendRow("2025-11-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2025-11-23", "BookMyShow", "Entertainment", 900, ("weekend",)),
-    # 2025-12
-    SpendRow("2025-12-06", "Big Basket", "Groceries", 3400),
-    SpendRow("2025-12-11", "Zomato", "Food", 850, ("online",)),
-    SpendRow("2025-12-15", "Uber", "Transport", 560),
-    SpendRow("2025-12-19", "Amazon", "Shopping", 3200, ("online", "gifts")),
-    SpendRow("2025-12-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2025-12-27", "Airtel", "Utilities", 1200),
-    # 2026-01
-    SpendRow("2026-01-05", "Big Basket", "Groceries", 3000),
-    SpendRow("2026-01-10", "Swiggy", "Food", 700, ("online",)),
-    SpendRow("2026-01-14", "Metro", "Transport", 280),
-    SpendRow("2026-01-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2026-01-21", "Spotify", "Subscriptions", 149),
-    SpendRow("2026-01-25", "Apollo Pharmacy", "Health", 620),
-    # 2026-02
-    SpendRow("2026-02-06", "Big Basket", "Groceries", 3300),
-    SpendRow("2026-02-11", "Blue Tokai", "Food", 520, ("restaurant",)),
-    SpendRow("2026-02-15", "Uber", "Transport", 410),
-    SpendRow("2026-02-19", "Amazon", "Shopping", 2100, ("online",)),
-    SpendRow("2026-02-20", "Netflix", "Subscriptions", 649),
-    # 2026-03
-    SpendRow("2026-03-05", "Big Basket", "Groceries", 3500),
-    SpendRow("2026-03-10", "Zomato", "Food", 890, ("online",)),
-    SpendRow("2026-03-14", "Metro", "Transport", 320),
-    SpendRow("2026-03-18", "Myntra", "Shopping", 4200),
-    SpendRow("2026-03-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2026-03-26", "Airtel", "Utilities", 1150),
-    # 2026-04 — preserved verbatim (fingerprint-stable)
-    SpendRow("2026-04-04", "Big Basket", "Groceries", 3200),
-    SpendRow("2026-04-09", "Swiggy", "Food", 890, ("online",)),
-    SpendRow("2026-04-15", "Uber", "Transport", 450),
-    SpendRow("2026-04-22", "Amazon", "Shopping", 2400, ("online",)),
-    SpendRow("2026-04-27", "Apollo Pharmacy", "Health", 780),
-    # 2026-05 — preserved verbatim (fingerprint-stable)
-    SpendRow("2026-05-03", "Blue Tokai", "Food", 520, ("restaurant",)),
-    SpendRow("2026-05-08", "Metro", "Transport", 300),
-    SpendRow("2026-05-14", "Big Basket", "Groceries", 4100),
-    SpendRow("2026-05-20", "Netflix", "Subscriptions", 649),
-    SpendRow("2026-05-25", "Croma", "Shopping", 1200),
-    # 2026-06 — preserved verbatim (fingerprint-stable)
-    SpendRow("2026-06-03", "Blue Tokai", "Food", 450, ("restaurant",)),
-    SpendRow("2026-06-07", "Metro card", "Transport", 180),
-    SpendRow("2026-06-09", "Big Basket", "Groceries", 1200),
-    SpendRow("2026-06-12", "Swiggy", "Food", 895, ("online",)),
-    # 2026-07 — current partial month
-    SpendRow("2026-07-04", "Big Basket", "Groceries", 2600),
-    SpendRow("2026-07-09", "Swiggy", "Food", 740, ("online",)),
-    SpendRow("2026-07-14", "Uber", "Transport", 390),
-    SpendRow("2026-07-16", "Netflix", "Subscriptions", 649),
+class _SpendTemplate(NamedTuple):
+    """One recurring spend/refund slot. ``slot`` counts months back from the
+    anchor's month (0 = current month, 11 = oldest of the core cycle)."""
+
+    slot: int
+    day: int
+    merchant: str
+    category: str
+    rupees: int
+    labels: tuple[str, ...] = ()
+
+
+class _IncomeTemplate(NamedTuple):
+    slot: int
+    day: int
+    source: str
+    category: str
+    rupees: int
+    labels: tuple[str, ...] = ()
+    account: Literal["bank", "card"] = "bank"
+
+
+# Card spends across the 12-slot cycle. Merchants recur (Big Basket, Swiggy,
+# Uber, Netflix, …) so the top-merchants aggregate ranks meaningfully; slot 9
+# is a deliberate deficit slot (Travel + Shopping spike pushes spend above the
+# 50k salary) so the cashflow net line dips below 0 for that month.
+_SPEND_TEMPLATE: list[_SpendTemplate] = [
+    # slot 11 (oldest)
+    _SpendTemplate(11, 5, "Big Basket", "Groceries", 2800),
+    _SpendTemplate(11, 10, "Swiggy", "Food", 650, ("online",)),
+    _SpendTemplate(11, 14, "Uber", "Transport", 380),
+    _SpendTemplate(11, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(11, 24, "Amazon", "Shopping", 1500, ("online",)),
+    # slot 10
+    _SpendTemplate(10, 6, "Big Basket", "Groceries", 3100),
+    _SpendTemplate(10, 11, "Zomato", "Food", 720, ("online",)),
+    _SpendTemplate(10, 15, "Metro", "Transport", 250),
+    _SpendTemplate(10, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(10, 21, "Spotify", "Subscriptions", 149),
+    _SpendTemplate(10, 26, "Apollo Pharmacy", "Health", 540),
+    # slot 9 — deficit slot (spend > 50k salary → net < 0)
+    _SpendTemplate(9, 4, "Big Basket", "Groceries", 3600),
+    _SpendTemplate(9, 9, "Swiggy", "Food", 980, ("online",)),
+    _SpendTemplate(9, 12, "MakeMyTrip", "Travel", 32000, ("travel", "goa")),
+    _SpendTemplate(9, 18, "Croma", "Shopping", 18500, ("festive",)),
+    _SpendTemplate(9, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(9, 22, "Myntra", "Shopping", 6200, ("festive",)),
+    _SpendTemplate(9, 25, "Uber", "Transport", 720, ("travel",)),
+    # slot 8
+    _SpendTemplate(8, 5, "Big Basket", "Groceries", 2900),
+    _SpendTemplate(8, 9, "Blue Tokai", "Food", 480, ("restaurant",)),
+    _SpendTemplate(8, 14, "Swiggy", "Food", 610, ("online",)),
+    _SpendTemplate(8, 16, "Metro", "Transport", 300),
+    _SpendTemplate(8, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(8, 23, "BookMyShow", "Entertainment", 900, ("weekend",)),
+    # slot 7
+    _SpendTemplate(7, 6, "Big Basket", "Groceries", 3400),
+    _SpendTemplate(7, 11, "Zomato", "Food", 850, ("online",)),
+    _SpendTemplate(7, 15, "Uber", "Transport", 560),
+    _SpendTemplate(7, 19, "Amazon", "Shopping", 3200, ("online", "gifts")),
+    _SpendTemplate(7, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(7, 27, "Airtel", "Utilities", 1200),
+    # slot 6
+    _SpendTemplate(6, 5, "Big Basket", "Groceries", 3000),
+    _SpendTemplate(6, 10, "Swiggy", "Food", 700, ("online",)),
+    _SpendTemplate(6, 14, "Metro", "Transport", 280),
+    _SpendTemplate(6, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(6, 21, "Spotify", "Subscriptions", 149),
+    _SpendTemplate(6, 25, "Apollo Pharmacy", "Health", 620),
+    # slot 5
+    _SpendTemplate(5, 6, "Big Basket", "Groceries", 3300),
+    _SpendTemplate(5, 11, "Blue Tokai", "Food", 520, ("restaurant",)),
+    _SpendTemplate(5, 15, "Uber", "Transport", 410),
+    _SpendTemplate(5, 19, "Amazon", "Shopping", 2100, ("online",)),
+    _SpendTemplate(5, 20, "Netflix", "Subscriptions", 649),
+    # slot 4
+    _SpendTemplate(4, 5, "Big Basket", "Groceries", 3500),
+    _SpendTemplate(4, 10, "Zomato", "Food", 890, ("online",)),
+    _SpendTemplate(4, 14, "Metro", "Transport", 320),
+    _SpendTemplate(4, 18, "Myntra", "Shopping", 4200),
+    _SpendTemplate(4, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(4, 26, "Airtel", "Utilities", 1150),
+    # slot 3
+    _SpendTemplate(3, 4, "Big Basket", "Groceries", 3200),
+    _SpendTemplate(3, 9, "Swiggy", "Food", 890, ("online",)),
+    _SpendTemplate(3, 15, "Uber", "Transport", 450),
+    _SpendTemplate(3, 22, "Amazon", "Shopping", 2400, ("online",)),
+    _SpendTemplate(3, 27, "Apollo Pharmacy", "Health", 780),
+    # slot 2
+    _SpendTemplate(2, 3, "Blue Tokai", "Food", 520, ("restaurant",)),
+    _SpendTemplate(2, 8, "Metro", "Transport", 300),
+    _SpendTemplate(2, 14, "Big Basket", "Groceries", 4100),
+    _SpendTemplate(2, 20, "Netflix", "Subscriptions", 649),
+    _SpendTemplate(2, 25, "Croma", "Shopping", 1200),
+    # slot 1
+    _SpendTemplate(1, 3, "Blue Tokai", "Food", 450, ("restaurant",)),
+    _SpendTemplate(1, 7, "Metro card", "Transport", 180),
+    _SpendTemplate(1, 9, "Big Basket", "Groceries", 1200),
+    _SpendTemplate(1, 12, "Swiggy", "Food", 895, ("online",)),
+    # slot 0 (current month) — truncated to day <= anchor.day at generation time
+    _SpendTemplate(0, 4, "Big Basket", "Groceries", 2600),
+    _SpendTemplate(0, 9, "Swiggy", "Food", 740, ("online",)),
+    _SpendTemplate(0, 14, "Uber", "Transport", 390),
+    _SpendTemplate(0, 16, "Netflix", "Subscriptions", 649),
 ]
 
-# Card refunds: positive, same category as the spend they offset (PRD §F4a). The
-# 2026-05-18 row is preserved verbatim; 2025-10-28 partially returns Diwali
-# shopping (still leaves 2025-10 in deficit).
-CARD_REFUNDS: list[SpendRow] = [
-    SpendRow("2025-10-28", "Myntra refund", "Shopping", 2000, ("festive",)),
-    SpendRow("2026-05-18", "Amazon refund", "Shopping", 600, ("online",)),
+# Card refunds: `spend`-typed with a POSITIVE amount (ADR-0009 — a refund is not
+# its own type), same category as the spend they offset so the §F4a signed sum
+# nets. Slot 9's refund partially returns that slot's deficit-driving shopping
+# spike (still leaves slot 9 in deficit); slot 2's returns an Amazon order.
+_REFUND_TEMPLATE: list[_SpendTemplate] = [
+    _SpendTemplate(9, 28, "Myntra refund", "Shopping", 2000, ("festive",)),
+    _SpendTemplate(2, 18, "Amazon refund", "Shopping", 600, ("online",)),
 ]
 
-# Bank income: stored positive on the bank. Salary every month + a year-end and an
-# appraisal bonus (Salary), two freelancing payouts, and card cashback so
-# income-vs-spend isn't a flat band. The 2026-04 / -05 / -06 salary rows are
-# preserved verbatim (fingerprint-stable).
-BANK_INCOME: list[IncomeRow] = [
-    IncomeRow("2025-08-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2025-09-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2025-09-18", "Upwork", "Freelancing", 12000),
-    IncomeRow("2025-10-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2025-11-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2025-11-28", "Card Cashback", "Cashback", 350),
-    IncomeRow("2025-12-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2025-12-15", "Acme Year-End Bonus", "Salary", 45000),
-    IncomeRow("2026-01-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2026-01-30", "Card Cashback", "Cashback", 420),
-    IncomeRow("2026-02-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2026-02-22", "Consulting", "Freelancing", 15000),
-    IncomeRow("2026-03-01", "Acme Payroll", "Salary", 50000),
-    IncomeRow("2026-03-20", "Acme Appraisal Bonus", "Salary", 35000),
-    IncomeRow("2026-04-01", "Acme Payroll", "Salary", 50000),  # preserved verbatim
-    IncomeRow("2026-05-01", "Acme Payroll", "Salary", 50000),  # preserved verbatim
-    IncomeRow("2026-06-01", "Acme Payroll", "Salary", 50000),  # preserved verbatim
-    IncomeRow("2026-07-01", "Acme Payroll", "Salary", 50000),
+# Bank/card income: salary every slot + a year-end and an appraisal bonus
+# (Salary), two freelancing payouts, and card cashback so income-vs-spend isn't
+# a flat band. Cashback posts to the CARD (real Axis Flipkart behaviour — it's
+# credited on the card statement, not the linked bank account).
+_INCOME_TEMPLATE: list[_IncomeTemplate] = [
+    _IncomeTemplate(11, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(10, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(10, 18, "Upwork", "Freelancing", 12000),
+    _IncomeTemplate(9, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(8, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(8, 28, "Card Cashback", "Cashback", 350, (), "card"),
+    _IncomeTemplate(7, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(7, 15, "Acme Year-End Bonus", "Salary", 45000),
+    _IncomeTemplate(6, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(6, 30, "Card Cashback", "Cashback", 420, (), "card"),
+    _IncomeTemplate(5, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(5, 22, "Consulting", "Freelancing", 15000),
+    _IncomeTemplate(4, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(4, 20, "Acme Appraisal Bonus", "Salary", 35000),
+    _IncomeTemplate(3, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(2, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(1, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(0, 1, "Acme Payroll", "Salary", 50000),
 ]
 
-# Instruments + their transaction history. ``amount``/``fee`` are native paise;
-# ``units``/``price`` are exact-decimal strings (parsed losslessly to Decimal).
-# ``current_nav`` is set so holdings show value/P&L and the donut has slices.
-# A couple of txns carry a ``note`` (InvestmentTransaction also has the column).
+
+def _add_months(anchor: date_t, months_back: int) -> date_t:
+    """The first of the month that is ``months_back`` months before ``anchor``'s
+    own month (0 = anchor's own month)."""
+    total = anchor.year * 12 + (anchor.month - 1) - months_back
+    year, month0 = divmod(total, 12)
+    return date_t(year, month0 + 1, 1)
+
+
+def _day_in_month(year: int, month: int, day: int) -> date_t:
+    """``day`` clamped to that month's actual length (e.g. a day-30 template
+    row lands on Feb 28/29, not a ``ValueError``)."""
+    last_day = calendar.monthrange(year, month)[1]
+    return date_t(year, month, min(day, last_day))
+
+
+def build_demo_dataset(
+    anchor: date_t, *, window_months: int = DEMO_WINDOW_MONTHS
+) -> tuple[list[SpendRow], list[SpendRow], list[IncomeRow]]:
+    """Materialize ``(spends, refunds, income)`` dated rows for the trailing
+    ``window_months`` ending at ``anchor``'s month.
+
+    Pure function of ``anchor`` — callers supply ``clock.today()`` (never
+    computed in here) so this stays deterministic and testable. The template
+    cycles every 12 slots (``months_back % 12``); a wider window just repeats
+    the earliest slots again further back. Any row that would land after
+    ``anchor`` (only possible in the current, slot-0 month) is dropped so a
+    freshly-synced demo account never shows a future-dated transaction.
+    """
+    spends: list[SpendRow] = []
+    refunds: list[SpendRow] = []
+    income: list[IncomeRow] = []
+    for months_back in range(window_months - 1, -1, -1):
+        month_start = _add_months(anchor, months_back)
+        slot = months_back % 12
+        for tmpl in _SPEND_TEMPLATE:
+            if tmpl.slot != slot:
+                continue
+            on = _day_in_month(month_start.year, month_start.month, tmpl.day)
+            if on > anchor:
+                continue
+            spends.append(
+                SpendRow(on.isoformat(), tmpl.merchant, tmpl.category, tmpl.rupees, tmpl.labels)
+            )
+        for tmpl in _REFUND_TEMPLATE:
+            if tmpl.slot != slot:
+                continue
+            on = _day_in_month(month_start.year, month_start.month, tmpl.day)
+            if on > anchor:
+                continue
+            refunds.append(
+                SpendRow(on.isoformat(), tmpl.merchant, tmpl.category, tmpl.rupees, tmpl.labels)
+            )
+        for tmpl in _INCOME_TEMPLATE:
+            if tmpl.slot != slot:
+                continue
+            on = _day_in_month(month_start.year, month_start.month, tmpl.day)
+            if on > anchor:
+                continue
+            income.append(
+                IncomeRow(
+                    on.isoformat(),
+                    tmpl.source,
+                    tmpl.category,
+                    tmpl.rupees,
+                    tmpl.labels,
+                    tmpl.account,
+                )
+            )
+    return spends, refunds, income
+
+
+# Instruments + their transaction history. Unaffected by the rolling window —
+# holdings/XIRR need the full purchase history since inception, not a recent
+# slice, so these stay fixed find-or-create rows (app.services.demo_seed
+# ._seed_investments), seeded once and never wiped.
+#
+# ``amount``/``fee`` are native paise; ``units``/``price`` are exact-decimal
+# strings (parsed losslessly to Decimal). ``current_nav`` is set so holdings
+# show value/P&L and the donut has slices. A couple of txns carry a ``note``
+# (InvestmentTransaction also has the column).
 #
 # ``isin`` is optional and only present where a price source needs it: it is the ONLY
 # key AMFI NAVAll is matched on, so an ``indian_mf`` without one is a permanent

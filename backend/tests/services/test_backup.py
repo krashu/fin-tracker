@@ -15,6 +15,8 @@ against in-memory sessions (no TestClient). The load-bearing assertions:
 
 from __future__ import annotations
 
+import io
+import zipfile
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,7 +32,14 @@ from structlog.testing import capture_logs
 from app.core.config import get_settings
 from app.core.db import make_engine
 from app.models import Account, Base, Category, Transaction, User
-from app.parsers.backup_csv import _parse_dt, parse_backup_zip
+from app.parsers.backup_csv import (
+    ACCOUNTS_CSV,
+    CATEGORIES_CSV,
+    METADATA_JSON,
+    TRANSACTIONS_CSV,
+    _parse_dt,
+    parse_backup_zip,
+)
 from app.services.backup_import_service import persist_backup
 from app.services.export_service import build_backup_zip
 from app.services.fingerprint import transaction_fingerprint
@@ -102,7 +111,8 @@ def _add_txn(
 
 def _seed_source(session: Session, user_id: UUID) -> None:
     """A small but representative spend history: two accounts, two categories, a spend, a
-    refund, an income row, a linked transfer pair, and one pending (unconfirmed) row."""
+    refund (a `spend` row with a positive amount, ADR-0009), an income row, a linked
+    transfer pair, and one pending (unconfirmed) row."""
     axis = Account(
         user_id=user_id,
         name="Axis CC",
@@ -139,7 +149,7 @@ def _seed_source(session: Session, user_id: UUID) -> None:
         account_id=axis.id,
         day=2,
         amount=10000,
-        txn_type="refund",
+        txn_type="spend",  # refund: spend row, positive amount (ADR-0009)
         merchant_norm="bigbasket",
         category_id=food.id,
     )
@@ -709,3 +719,61 @@ def test_dedups_against_an_imported_row_moved_to_another_account(
         assert (
             _txn_count(target, target_uid, merchant_normalized="swiggy", amount_paise=-50000) == 1
         )
+
+
+# --- T4: the read-only legacy `refund` alias (ADR-0009) --------------------------------
+
+
+def _legacy_refund_zip() -> bytes:
+    """A hand-built zip standing in for a real backup exported BEFORE ADR-0009 —
+    ``transaction_type=refund``. Deliberately NOT a round trip through
+    ``build_backup_zip``: export dumps the column verbatim and never emits
+    ``refund`` any more, so there is no way to produce this shape from the
+    current export path. Mirrors the header/row shape ``tests/parsers/
+    test_backup_csv.py`` uses for the parser-level half of this test.
+    """
+    accounts = (
+        "name,type,issuer,last4,opening_balance_paise,currency,archived_at\n"
+        "Axis CC,credit_card,axis,1234,-50000,INR,\n"
+    )
+    categories = "name,kind,color,archived_at\nFood,spend,#4f46e5,\n"
+    transactions = (
+        "date,account_name,amount_paise,transaction_type,merchant_raw,"
+        "merchant_normalized,category_name,category_kind,labels,source,confirmed_at,"
+        "transfer_group\n"
+        "2026-07-01,Axis CC,50000,refund,SWIGGY,swiggy,Food,spend,,import,"
+        "2026-07-01T10:00:00,\n"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr(ACCOUNTS_CSV, accounts)
+        zf.writestr(CATEGORIES_CSV, categories)
+        zf.writestr(TRANSACTIONS_CSV, transactions)
+        zf.writestr(METADATA_JSON, "{}")
+    return buffer.getvalue()
+
+
+def test_restore_of_a_legacy_refund_typed_row_stores_it_as_spend(
+    session: Session, user_id: UUID
+) -> None:
+    """T4, end to end. ``tests/parsers/test_backup_csv.py`` proves the parser's
+    legacy alias maps ``refund`` → ``spend`` on the parsed row; this proves that
+    reaches the actual STORED transaction, not just the parsed intermediate —
+    ``_persist_transactions`` writes ``row.transaction_type`` verbatim
+    (``app/services/backup_import_service.py``), so the alias is the whole fix
+    and there is no second place a stale value could leak through.
+    """
+    result = persist_backup(
+        session,
+        user_id=user_id,
+        parsed=parse_backup_zip(_legacy_refund_zip()),
+        source_file_hash="legacy-refund-hash",
+    )
+    session.commit()
+    assert result.txns_imported == 1
+    assert not result.warnings
+
+    txn = session.scalar(select(Transaction).where(Transaction.user_id == user_id))
+    assert txn is not None
+    assert txn.transaction_type == "spend"
+    assert txn.amount_paise == 50000  # unchanged — the alias never re-signs.

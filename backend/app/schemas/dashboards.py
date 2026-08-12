@@ -4,8 +4,8 @@ v1 ships one view in this module: **monthly spend by category** (PRD §F8
 view 2). View 1 (portfolio tiles), view 3 (weekly/monthly bar), and view 4
 (net worth over time) are deferred until F7 (investments) lands.
 
-``SpendByCategoryResponse`` is a ``{month, rows}`` envelope rather than a
-flat list: the echoed ``month`` lets the frontend verify it got the period
+``SpendByCategoryResponse`` is a ``{period, rows}`` envelope rather than a
+flat list: the echoed ``period`` lets the frontend verify it got the period
 it asked for under stale-cache races. ``transaction_count`` is deliberately
 omitted from rows — PRD §F8 view 2 (bar/pie + drilldown) doesn't need it,
 and adding it now would be scope creep (CLAUDE.md §2).
@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, model_serializer
+from pydantic import BaseModel
 
 from app.models.account import AccountTypeStr, CurrencyStr
 
@@ -47,29 +47,21 @@ class AvailableYearsResponse(BaseModel):
 class SpendByCategoryResponse(BaseModel):
     """Envelope for ``GET /api/v1/dashboards/spend-by-category``.
 
-    ``month`` or ``year`` echoes the requested period. ``rows`` is
-    ordered most-negative first (= biggest spend first), with the
-    uncategorized row (``category_id is None``) pinned last regardless of
-    magnitude — see the route for the portable sort.
+    ``period`` echoes the requested ``month`` (``"YYYY-MM"``) or ``year``
+    (``"YYYY"``) verbatim — a single always-present field (``PeriodWindow.key``)
+    rather than an optional ``month``/``year`` pair, since exactly one of the
+    two was ever requested. ``rows`` is ordered most-negative first (= biggest
+    spend first), with the uncategorized row (``category_id is None``) pinned
+    last regardless of magnitude — see the route for the portable sort.
 
     ``label_id`` echoes the optional F3a tag filter (``None`` = unfiltered), so
     the client can confirm which tag the rows are scoped to under stale-cache
-    races — same rationale as ``month``.
+    races — same rationale as ``period``.
     """
 
-    month: str | None = None
-    year: str | None = None
+    period: str
     rows: list[SpendByCategoryRow]
     label_id: int | None = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        res = handler(self)
-        if self.year is None:
-            res.pop("year", None)
-        if self.month is None:
-            res.pop("month", None)
-        return res
 
 
 class SpendByTagRow(BaseModel):
@@ -94,7 +86,7 @@ class SpendByTagResponse(BaseModel):
     """Envelope for ``GET /api/v1/dashboards/spend-by-tag`` — the /spending
     spend-by-tag breakdown + its coverage guardrail (tag-analysis arc Phase B).
 
-    ``month`` echoes the requested YYYY-MM (stale-cache verification, cf.
+    ``period`` echoes the requested month or year (stale-cache verification, cf.
     ``SpendByCategoryResponse``).
 
     ``rows`` are the per-tag signed sums (most-negative first, ``label_id``
@@ -109,7 +101,7 @@ class SpendByTagResponse(BaseModel):
     Coverage (arc decisions #2 / #5 — the honesty guardrail; measured by amount,
     not count):
 
-    * ``total_spend_paise`` — the **honest** signed Σ(spend, refund) over the
+    * ``total_spend_paise`` — the **honest** signed Σ(spend) over the
       month, computed WITHOUT the tag join, so it does not double-count. This is
       the coverage denominator, not ``Σ(rows)``.
     * ``tagged_paise`` — signed Σ over txns carrying ≥ 1 label
@@ -126,21 +118,11 @@ class SpendByTagResponse(BaseModel):
       signed and are **never clamped** (arc decision #6).
     """
 
-    month: str | None = None
-    year: str | None = None
+    period: str
     rows: list[SpendByTagRow]
     total_spend_paise: int
     tagged_paise: int
     coverage_rate: float | None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        res = handler(self)
-        if self.year is None:
-            res.pop("year", None)
-        if self.month is None:
-            res.pop("month", None)
-        return res
 
 
 class SpendByPeriodBucket(BaseModel):
@@ -444,14 +426,14 @@ class TopMerchantsResponse(BaseModel):
     """Envelope for ``GET /api/v1/dashboards/top-merchants`` — the /spending
     top-merchants card (PRD §F8 view 3).
 
-    ``month`` echoes the requested YYYY-MM (stale-cache verification, cf.
+    ``period`` echoes the requested month or year (stale-cache verification, cf.
     ``SpendByCategoryResponse``). ``rows`` are ordered most-negative first (biggest
     spender first, ``merchant_normalized`` ascending as a stable tiebreak) and capped
     at the requested ``limit``; the no-merchant bucket (``merchant_normalized == ""``)
     is excluded so a blank manual row can't top the list.
 
     ``total_merchants`` is the count of distinct non-empty merchants with in-window
-    spend/refund activity (**before** the LIMIT), so the UI can honestly say "top 5
+    spend activity (**before** the LIMIT), so the UI can honestly say "top 5
     of 23"; ``truncated`` is ``total_merchants > limit``. ``total_merchants`` counts
     every such merchant regardless of sign, so it can exceed the number of *spend*
     rows the frontend renders as bars in the rare all-/mostly-refund month.
@@ -461,21 +443,11 @@ class TopMerchantsResponse(BaseModel):
     "top N of M" caption stays honest under the filter.
     """
 
-    month: str | None = None
-    year: str | None = None
+    period: str
     rows: list[TopMerchantRow]
     total_merchants: int
     truncated: bool
     label_id: int | None = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        res = handler(self)
-        if self.year is None:
-            res.pop("year", None)
-        if self.month is None:
-            res.pop("month", None)
-        return res
 
 
 class PeriodTotalsResponse(BaseModel):
@@ -504,28 +476,39 @@ class PeriodTotalsResponse(BaseModel):
 
 
 class TaggingStatsResponse(BaseModel):
-    """Envelope for ``GET /api/v1/dashboards/tagging-stats`` — the F3 auto-tag
-    acceptance metric (PRD §Success-metrics: ≥80% of imports pre-tagged
-    correctly).
+    """Envelope for ``GET /api/v1/dashboards/tagging-stats`` — two distinct F3
+    health metrics (PRD §Success-metrics), neither a replacement for the other:
+    ``acceptance_rate`` (of what we suggested, did it stick?) and
+    ``coverage_rate`` (of what we imported, did we suggest anything at all? —
+    the ≥80% pre-tag bar).
 
-    Board-only (``confirmed_at IS NOT NULL``). The denominator is rows the
-    import auto-tagged to a **still-live** category (``auto_category_id`` points
-    at a non-archived bucket); ``kept`` is the subset whose final ``category_id``
-    still equals that suggestion (final-state semantics — a change-then-change-back
-    counts as kept). Rows whose frozen suggestion points at a since-archived
-    category are excluded from both numerator and denominator (current-health
-    semantics — see the ``tagging_stats`` route + ADR-0004).
-
-    ``acceptance_rate`` is ``None`` when ``total_auto_tagged == 0`` to
-    distinguish "no data yet" from a genuine 0% — the UI shows "—", not "0%".
+    Board-only (``confirmed_at IS NOT NULL``). ``acceptance_rate``'s denominator
+    is rows the import auto-tagged to a **still-live** category (``auto_category_id``
+    points at a non-archived bucket); ``kept`` is the subset whose final
+    ``category_id`` still equals that suggestion (final-state semantics — a
+    change-then-change-back counts as kept). Rows whose frozen suggestion
+    points at a since-archived category are excluded from both numerator and
+    denominator (current-health semantics — see the ``tagging_stats`` route +
+    ADR-0004). ``acceptance_rate`` is ``None`` when ``total_auto_tagged == 0``
+    to distinguish "no data yet" from a genuine 0% — the UI shows "—", not "0%".
     ``rules_count`` is the size of the user's ``merchant_tag_map`` (context for
     the rate, not part of it).
+
+    ``imported_total`` is the count of board rows imported (``source ==
+    "import"``); ``pre_tagged`` is the subset auto-tagged to a still-live
+    category — the same population as ``total_auto_tagged``, exposed under its
+    own name because here it is the coverage *numerator*, not the acceptance
+    *denominator*. ``coverage_rate`` is ``None`` when ``imported_total == 0``
+    (same "no data" vs "0%" contract).
     """
 
     total_auto_tagged: int
     kept: int
     acceptance_rate: float | None
     rules_count: int
+    imported_total: int
+    pre_tagged: int
+    coverage_rate: float | None
 
 
 #: Account types whose ``balance_paise`` is **excluded** from ``net_worth_paise``.
@@ -569,7 +552,7 @@ class AccountBalanceRow(BaseModel):
     :data:`NET_WORTH_EXCLUDED_TYPES`; this row still reports the raw signed
     balance for every type, excluded or not.
 
-    ``spend_ytd_paise`` is the **signed net** Σ(spend + refund) over the
+    ``spend_ytd_paise`` is the **signed net** Σ(spend) over the
     calendar year-to-date window (Jan 1 of the requested month's year → end of
     that month). It is **populated only for ``credit_card`` rows**; ``None`` for
     every other type (``None`` pins "not applicable" vs a genuine ₹0 spend). It
@@ -600,7 +583,7 @@ class OverviewResponse(BaseModel):
     """Envelope for ``GET /api/v1/dashboards/overview`` — the Financial Overview
     home (PRD §F8 view 1 + view 4).
 
-    ``month`` is the echoed YYYY-MM (stale-cache verification, cf.
+    ``period`` echoes the requested month or year (stale-cache verification, cf.
     ``SpendByCategoryResponse``). Money fields are integer paise:
 
     * ``net_worth_paise`` — ``Σ(contributing accounts[].balance_paise) +
@@ -618,12 +601,13 @@ class OverviewResponse(BaseModel):
     * ``fx_unavailable_count`` — priced USD holdings excluded from the rollup
       because no FX rate is cached (honesty flag, cf. ``PortfolioSummary`` /
       ``HoldingsValueRollup`` — never silently shrinks net worth).
-    * ``income_paise`` / ``expense_paise`` / ``net_paise`` — the month's totals,
-      identical in meaning to ``PeriodTotalsResponse`` (``expense_paise`` is the
-      signed Σ(spend, refund) ≤ 0; ``net = income + expense``).
+    * ``income_paise`` / ``expense_paise`` / ``net_paise`` — the requested
+      period's totals, identical in meaning to ``PeriodTotalsResponse``
+      (``expense_paise`` is the signed Σ(spend) ≤ 0; ``net = income +
+      expense``).
     """
 
-    month: str
+    period: str
     net_worth_paise: int
     portfolio_value_paise: int
     fx_unavailable_count: int

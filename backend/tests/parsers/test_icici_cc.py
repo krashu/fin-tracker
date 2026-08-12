@@ -60,8 +60,38 @@ def test_parse_wrong_password_raises(encrypted_pdf_bytes: bytes) -> None:
 
 
 def test_parse_real_pdf_smoke(icici_real_pdf: bytes, icici_real_password: str) -> None:
-    rows = IciciCC.parse(icici_real_pdf, password=icici_real_password)
+    parsed = IciciCC.parse(icici_real_pdf, password=icici_real_password)
+    rows = parsed.rows
     assert rows, "real ICICI PDF returned zero rows — parser layout assumptions wrong?"
     first = rows[0]
     assert first.merchant_raw.strip()
     assert first.date.year >= 2020, f"implausible date on first row: {first.date}"
+    # No real ICICI PDF exists on this box (balance-reconciliation plan decision
+    # 8) — this fixture-driven skip means the summary assertion below has never
+    # actually run against real wording; it's a sentinel guess, not verified.
+
+
+def test_interpret_summary_snapshot(
+    icici_summary_lines: list[str],
+    icici_summary_expected: dict[str, Any],
+) -> None:
+    summary = IciciCC.interpret_summary(icici_summary_lines)
+    assert summary.period_start is not None
+    assert summary.period_end is not None
+    actual = {
+        **asdict(summary),
+        "period_start": summary.period_start.isoformat(),
+        "period_end": summary.period_end.isoformat(),
+    }
+    assert actual == icici_summary_expected
+
+
+def test_interpret_summary_cc_sign_credit_marker_is_positive() -> None:
+    """CC sign convention (negative = owed): a bare "Total Amount Due" is a
+    debit → negative (pinned by the snapshot fixture above). A CR-suffixed
+    closing balance must flip positive."""
+    lines = ["Total Amount Due          500.00 CR"]
+
+    summary = IciciCC.interpret_summary(lines)
+
+    assert summary.closing_balance_paise == 50000

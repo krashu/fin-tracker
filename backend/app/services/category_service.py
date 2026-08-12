@@ -25,16 +25,13 @@ from app.models import Category, CategoryKindStr, TransactionTypeStr
 def kind_for_type(transaction_type: TransactionTypeStr) -> CategoryKindStr:
     """The category ``kind`` a transaction of this type may carry.
 
-    ``income`` draws income categories; ``refund`` draws refund categories;
-    ``spend`` / ``transfer`` draw spend categories. Backend mirror of
+    ``income`` draws income categories; ``spend`` / ``refund`` / ``transfer``
+    draw spend (a refund nets against spend in the same category; a transfer
+    normally carries no category but falls back to spend). Backend mirror of
     the frontend ``categoryKindForType`` (``frontend/lib/categories.ts``) — the
     single source of truth for which kind each of the four types assigns.
     """
-    if transaction_type == "income":
-        return "income"
-    if transaction_type == "refund":
-        return "refund"
-    return "spend"
+    return "income" if transaction_type == "income" else "spend"
 
 
 def validate_category_ids(
@@ -60,3 +57,25 @@ def validate_category_ids(
     if kind is not None:
         stmt = stmt.where(Category.kind == kind)
     return set(session.scalars(stmt))
+
+
+def default_category_id(
+    session: Session, *, user_id: UUID, name: str, kind: CategoryKindStr = "spend"
+) -> int | None:
+    """The active category id named ``name``/``kind`` for ``user_id`` — the
+    single source of truth for a commit-time fallback bucket (PRD §F5): the
+    seeded spend "Other" for an untagged spend row (refunds included — they are
+    spend rows carrying a positive amount), income "Cashback" for an untagged
+    income row named cashback (``app.api.v1.imports.commit_import_batch``, both
+    callers). ``None`` if the user archived or renamed the category away — the
+    spend caller treats that as a hard failure (there's no further fallback);
+    the income/Cashback caller doesn't, since an uncategorized income row is
+    already legal."""
+    return session.scalar(
+        select(Category.id).where(
+            Category.user_id == user_id,
+            Category.name == name,
+            Category.kind == kind,
+            Category.archived_at.is_(None),
+        )
+    )

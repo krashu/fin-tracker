@@ -25,3 +25,22 @@ def confirmed_only[S: Select[Any]](stmt: S) -> S:
     statement must already select from / join ``transactions``.
     """
     return stmt.where(Transaction.confirmed_at.is_not(None))
+
+
+def board_or_pending_on_batch[S: Select[Any]](stmt: S, batch_id: int) -> S:
+    """Restrict to board rows plus this one batch's still-pending rows.
+
+    Second concrete consumer of this module (CLAUDE.md §2):
+    ``reconciliation_service.reconcile_batch`` (balance reconciliation,
+    PRD §F1/§F4a) needs the row-set decision 1 specifies — everything
+    already on the board, **plus** whatever this batch just staged but
+    hasn't committed yet, so a check run at upload (before the user has
+    confirmed anything) sees this batch's own rows.
+
+    Deliberately not built on :func:`confirmed_only` — that predicate
+    excludes exactly the rows this one exists to include. The caller's
+    statement must already select from / join ``transactions``.
+    """
+    return stmt.where(
+        Transaction.confirmed_at.is_not(None) | (Transaction.import_batch_id == batch_id)
+    )

@@ -1,22 +1,29 @@
 """Service-level tests for the direct-DB demo seeder (app.services.demo_seed).
 
 Exercises :func:`seed_demo_data` against an in-memory session — no TestClient,
-no lifespan. The empty-check gate that guards it lives in the app lifespan and is
-covered separately in ``tests/test_startup_seed.py``.
+no lifespan. The lifespan wiring itself is covered separately in
+``tests/test_startup_seed.py``.
 
 Locks the behaviours the frontend/demo depend on: correct row counts, labels
 written from the shared dataset, PRD §F4 fingerprints unique across seeded rows,
-and F3 tag learning fired for spend/refund only (not income).
+F3 tag learning fired for spend/refund only (not income), and — the point of
+the rolling-window redesign — that calling the seeder again with a later
+``clock.today()`` rolls the transaction window forward instead of accumulating.
+``clock.today`` is frozen for every test in this file so the generated dataset
+(and its expected counts) are deterministic.
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core import clock
 from app.core.config import get_settings
-from app.core.demo_data import BANK_INCOME, CARD_REFUNDS, CARD_SPENDS, INSTRUMENTS
+from app.core.demo_data import INSTRUMENTS, build_demo_dataset
 from app.models import (
     Account,
     Instrument,
@@ -31,8 +38,21 @@ from app.services.demo_seed import seed_demo_data
 from app.services.merchant_labels import LABEL_PREFILL_MIN
 from app.services.provisioning import provision_default_categories
 
-_TXN_TOTAL = len(CARD_SPENDS) + len(CARD_REFUNDS) + len(BANK_INCOME)
+# Fixed anchor so the generated dataset (and its expected counts) is
+# deterministic regardless of when the suite runs. Day 20 is comfortably mid-
+# month so the current-month truncation includes most of that slot's rows.
+_ANCHOR = date(2026, 8, 20)
+_SPENDS, _REFUNDS, _INCOME = build_demo_dataset(_ANCHOR)
+_TXN_TOTAL = len(_SPENDS) + len(_REFUNDS) + len(_INCOME)
 _INV_TXN_TOTAL = sum(len(spec["txns"]) for spec in INSTRUMENTS)
+
+
+@pytest.fixture(autouse=True)
+def _frozen_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze ``clock.today()`` to ``_ANCHOR`` for every test in this module —
+    ``seed_demo_data`` calls it internally, and must agree with the expected
+    dataset computed above."""
+    monkeypatch.setattr(clock, "today", lambda: _ANCHOR)
 
 
 @pytest.fixture
@@ -86,6 +106,20 @@ def test_seed_writes_labels(session: Session, seeded_user: User) -> None:
     assert inv_note == "Booked partial profit"
 
 
+def test_seed_cashback_posts_to_the_card_not_the_bank(session: Session, seeded_user: User) -> None:
+    """Card cashback is credited on the card statement itself (real Axis
+    Flipkart behaviour), not the linked bank account — see IncomeRow.account."""
+    seed_demo_data(session, user_id=seeded_user.id)
+
+    cashback = session.scalars(
+        select(Transaction).where(Transaction.merchant_raw == "Card Cashback")
+    ).all()
+    assert cashback  # dataset seeds at least one
+    card = session.scalar(select(Account).where(Account.name == "Axis Flipkart"))
+    assert card is not None
+    assert all(txn.account_id == card.id for txn in cashback)
+
+
 def test_seed_fingerprints_unique_and_present(session: Session, seeded_user: User) -> None:
     seed_demo_data(session, user_id=seeded_user.id)
 
@@ -107,8 +141,8 @@ def test_seed_records_tags_for_spend_refund_only(session: Session, seeded_user: 
 def test_seed_records_labels_for_prefill(session: Session, seeded_user: User) -> None:
     """demo_seed must learn merchant→label (not just link labels), else the shipped
     F3a Phase-2 prefill never fires in the 'Try the demo' account. Swiggy is seeded
-    with #online many times (≥ LABEL_PREFILL_MIN), so its map row must clear the
-    prefill bar."""
+    with #online many times (≥ LABEL_PREFILL_MIN) across the rolling window, so its
+    map row must clear the prefill bar."""
     seed_demo_data(session, user_id=seeded_user.id)
 
     online = session.scalar(select(Label).where(Label.name == "online"))
@@ -121,8 +155,7 @@ def test_seed_records_labels_for_prefill(session: Session, seeded_user: User) ->
 
 
 def test_seed_is_find_or_create_for_accounts(session: Session, seeded_user: User) -> None:
-    """Accounts are matched by name so a pre-existing demo account isn't duplicated
-    (the seeder itself only runs on an empty DB, but the guard is still correct)."""
+    """Accounts are matched by name so a pre-existing demo account isn't duplicated."""
     session.add(
         Account(
             user_id=seeded_user.id,
@@ -142,3 +175,39 @@ def test_seed_is_find_or_create_for_accounts(session: Session, seeded_user: User
         select(func.count()).select_from(Account).where(Account.name == "Axis Flipkart")
     )
     assert axis_rows == 1
+
+
+def test_seed_same_day_rerun_does_not_duplicate(session: Session, seeded_user: User) -> None:
+    """Calling the seeder twice with an unchanged ``clock.today()`` must land on
+    the same transaction count, not double it — the wipe-and-regenerate in
+    ``seed_demo_data`` is what replaces the old empty-DB-only gate."""
+    first = seed_demo_data(session, user_id=seeded_user.id)
+    second = seed_demo_data(session, user_id=seeded_user.id)
+
+    assert second.accounts == first.accounts == 2
+    assert second.transactions == first.transactions == _TXN_TOTAL
+    assert session.scalar(select(func.count()).select_from(Transaction)) == _TXN_TOTAL
+
+
+def test_seed_rolls_the_window_forward(
+    session: Session, seeded_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A boot a month later must replace the window, not accumulate on top of
+    it: the oldest transaction moves forward and the total matches a fresh
+    ``build_demo_dataset`` at the new anchor, not the old total plus the new one."""
+    seed_demo_data(session, user_id=seeded_user.id)
+    oldest_before = session.scalar(select(func.min(Transaction.date)))
+    assert oldest_before is not None
+
+    later_anchor = date(2026, 9, 20)
+    monkeypatch.setattr(clock, "today", lambda: later_anchor)
+    expected_spends, expected_refunds, expected_income = build_demo_dataset(later_anchor)
+    expected_total = len(expected_spends) + len(expected_refunds) + len(expected_income)
+
+    counts = seed_demo_data(session, user_id=seeded_user.id)
+
+    assert counts.transactions == expected_total
+    assert session.scalar(select(func.count()).select_from(Transaction)) == expected_total
+    oldest_after = session.scalar(select(func.min(Transaction.date)))
+    assert oldest_after is not None
+    assert oldest_after > oldest_before  # window rolled forward, not accumulated

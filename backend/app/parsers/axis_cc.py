@@ -29,10 +29,15 @@ from collections.abc import Sequence
 from typing import ClassVar
 
 from app.parsers.base import (
+    ParsedStatement,
     RawTransaction,
+    StatementSummary,
     TxnType,
     _decrypt,
     _extract_tables,
+    _extract_text,
+    _find_labelled_amount,
+    _find_period,
     _interpret_tables,
     _try_parse_amount,
     _try_parse_date,
@@ -49,6 +54,14 @@ _NON_PURCHASE_DEBIT_RE = re.compile(
 # row survives table extraction as an ordinary data row (it has no parseable
 # date, so the detective would otherwise just skip it).
 _FLIPKART_HEADER_RE = re.compile(r"CASHBACK\s+EARNED|MERCHANT\s+CATEGORY", re.IGNORECASE)
+
+# Summary-block labels (PRD §F4a decision 7 spike). Real Axis statements print
+# the closing balance under both "Total Payment Due" (summary-box header) and
+# "Total Amount Due" (restated later in the statement) — either wording closes
+# the same field, never ambiguously with "Minimum Amount/Payment Due".
+_PREVIOUS_BALANCE_RE = re.compile(r"Previous\s+Balance", re.IGNORECASE)
+_TOTAL_DUE_RE = re.compile(r"Total\s+(?:Amount|Payment)\s+Due", re.IGNORECASE)
+_STATEMENT_PERIOD_RE = re.compile(r"Statement\s+Period", re.IGNORECASE)
 
 
 def _classify(description: str, is_credit: bool) -> TxnType:
@@ -163,13 +176,34 @@ class AxisCC:
     )
 
     @classmethod
-    def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]:
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
         decrypted = _decrypt(pdf_bytes, password)
         pages = _extract_tables(decrypted)
-        return cls.interpret_tables(pages)
+        rows = cls.interpret_tables(pages)
+        lines = _extract_text(decrypted)
+        summary = cls.interpret_summary(lines)
+        return ParsedStatement(rows=rows, summary=summary)
 
     @classmethod
     def interpret_tables(cls, tables: list[list[list[str]]]) -> list[RawTransaction]:
         if _is_flipkart_layout(tables, cls.DATE_FORMATS):
             tables = _to_canonical_flipkart(tables, cls.DATE_FORMATS)
         return _interpret_tables(tables, cls.DATE_FORMATS, _classify)
+
+    @classmethod
+    def interpret_summary(cls, lines: Sequence[str]) -> StatementSummary:
+        opening = _find_labelled_amount(lines, _PREVIOUS_BALANCE_RE)
+        closing = _find_labelled_amount(lines, _TOTAL_DUE_RE)
+        period = _find_period(lines, _STATEMENT_PERIOD_RE, cls.DATE_FORMATS)
+        return StatementSummary(
+            # Same sign rule as _interpret_row: a credit marker (CR) flips the
+            # printed magnitude positive, otherwise it's a debit (negative).
+            opening_balance_paise=(
+                None if opening is None else (opening[0] if opening[1] else -opening[0])
+            ),
+            closing_balance_paise=(
+                None if closing is None else (closing[0] if closing[1] else -closing[0])
+            ),
+            period_start=period[0] if period is not None else None,
+            period_end=period[1] if period is not None else None,
+        )

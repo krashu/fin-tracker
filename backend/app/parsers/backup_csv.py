@@ -347,6 +347,15 @@ def _parse_transaction_row(
         return f"{TRANSACTIONS_CSV} row {line_no}: amount_paise must be an integer"
 
     txn_type = (_get(row, "transaction_type") or "").lower()
+    # Legacy alias, read-only. `refund` was a fourth transaction_type until
+    # ADR-0009 collapsed it into a positively-signed `spend`, and _TXN_TYPES
+    # derives from that Literal — so every backup zip exported before the
+    # collapse would fail the vocabulary check below on restore. The amount is
+    # already positive in those files (the old `refund > 0` rule), so remapping
+    # the type is the whole migration: the row lands as a refund by sign. Never
+    # emitted on export (export_service dumps the column verbatim).
+    if txn_type == "refund":
+        txn_type = "spend"
     if txn_type not in _TXN_TYPES:
         return f"{TRANSACTIONS_CSV} row {line_no}: unknown transaction type"
 

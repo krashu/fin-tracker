@@ -433,12 +433,14 @@ def test_list_flat_shape_omits_internal_fields(
     assert "auto_category_id" not in rows[0]
 
 
-def test_list_refund_serialises_correctly(
+def test_list_positive_spend_serialises_as_a_refund(
     client: TestClient,
     axis_account: Account,
     session: Session,
 ) -> None:
-    """Refund (positive amount_paise, refund type) alongside same-date spend."""
+    """A refund is `spend`-typed with a positive amount (ADR-0009), alongside
+    a same-date ordinary (negative) spend — both keep type `spend`, so the
+    row is identified by fingerprint, not by a distinct type value."""
     same_day = date(2026, 4, 20)
     session.add_all(
         [
@@ -456,7 +458,7 @@ def test_list_refund_serialises_correctly(
                 txn_date=same_day,
                 amount_paise=99950,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",
                 merchant_raw="REFUND MERCHANT",
             ),
         ]
@@ -465,9 +467,10 @@ def test_list_refund_serialises_correctly(
 
     resp = client.get("/api/v1/transactions")
     assert resp.status_code == 200
-    by_type = {row["transaction_type"]: row for row in resp.json()}
-    assert by_type["refund"]["amount_paise"] == 99950
-    assert by_type["spend"]["amount_paise"] == -45000
+    by_merchant = {row["merchant_raw"]: row for row in resp.json()}
+    refund = by_merchant["REFUND MERCHANT"]
+    assert refund["transaction_type"] == "spend"
+    assert refund["amount_paise"] == 99950
 
 
 def test_list_filter_by_transaction_type(
@@ -475,12 +478,12 @@ def test_list_filter_by_transaction_type(
     axis_account: Account,
     session: Session,
 ) -> None:
-    """`?transaction_type=spend&transaction_type=refund` excludes income.
+    """`?transaction_type=spend` excludes income and returns both signs.
 
     The /expenses board's server-side filter: income/transfer rows live on a
-    separate surface, so the board requests spend+refund only. Also locks the
-    §F4a sign invariant at the DB boundary (spend < 0, refund > 0) so the
-    frontend's `amount_paise > 0 ⇒ credit` render has guaranteed-correct input.
+    separate surface, so the board requests `spend` only — which nets refunds
+    (positive) and ordinary spends (negative) together, the same netting view
+    as before ADR-0009 collapsed the two into one type.
     """
     day = date(2026, 5, 12)
     session.add_all(
@@ -499,7 +502,7 @@ def test_list_filter_by_transaction_type(
                 txn_date=day,
                 amount_paise=12000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",
                 merchant_raw="REFUND MERCHANT",
             ),
             _make_txn(
@@ -515,13 +518,94 @@ def test_list_filter_by_transaction_type(
     )
     session.commit()
 
-    resp = client.get("/api/v1/transactions?transaction_type=spend&transaction_type=refund")
+    resp = client.get("/api/v1/transactions?transaction_type=spend")
     assert resp.status_code == 200
-    by_type = {row["transaction_type"]: row for row in resp.json()}
-    assert set(by_type) == {"spend", "refund"}  # income excluded
-    # §F4a sign invariant at the wire boundary.
-    assert by_type["spend"]["amount_paise"] < 0
-    assert by_type["refund"]["amount_paise"] > 0
+    rows = resp.json()
+    assert {row["transaction_type"] for row in rows} == {"spend"}  # income excluded
+    amounts = sorted(row["amount_paise"] for row in rows)
+    assert amounts == [-45000, 12000]
+
+
+def test_list_filter_by_transaction_type_and_amount_sign_isolates_refunds(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """`?transaction_type=spend&amount_sign=positive` is the refund-only view.
+
+    `amount_sign` is orthogonal to `transaction_type` — composing the two is
+    how the board's "Refunds" filter is expressed now that there is no
+    `refund` value to request (ADR-0009). Stays tenant-isolated: a positive
+    spend belonging to another user must never leak in (ADR-0003).
+    """
+    day = date(2026, 5, 12)
+    other_user = User(id=uuid4())
+    session.add(other_user)
+    session.flush()
+    other_account = Account(
+        user_id=other_user.id,
+        name="Foreign CC",
+        type="credit_card",
+        issuer="axis",
+        last4="9998",
+    )
+    session.add(other_account)
+    session.flush()
+    session.add_all(
+        [
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=day,
+                amount_paise=-45000,
+                fingerprint="fp-spend",
+                transaction_type="spend",
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=day,
+                amount_paise=12000,
+                fingerprint="fp-refund",
+                transaction_type="spend",
+                merchant_raw="REFUND MERCHANT",
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=day,
+                amount_paise=500000,
+                fingerprint="fp-income",
+                transaction_type="income",
+                merchant_raw="PAYROLL",
+            ),
+            # Another user's positive spend — must not leak into this user's
+            # refund-only view.
+            _make_txn(
+                user_id=other_user.id,
+                account_id=other_account.id,
+                txn_date=day,
+                amount_paise=30000,
+                fingerprint="fp-other-refund",
+                transaction_type="spend",
+                merchant_raw="OTHER USER REFUND",
+            ),
+        ]
+    )
+    session.commit()
+
+    resp = client.get("/api/v1/transactions?transaction_type=spend&amount_sign=positive")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["amount_paise"] == 12000
+    assert rows[0]["transaction_type"] == "spend"
+
+    resp_neg = client.get("/api/v1/transactions?transaction_type=spend&amount_sign=negative")
+    assert resp_neg.status_code == 200
+    neg_rows = resp_neg.json()
+    assert len(neg_rows) == 1
+    assert neg_rows[0]["amount_paise"] == -45000
 
 
 def test_list_filter_transaction_type_omitted_returns_all(
@@ -1293,22 +1377,25 @@ def test_post_income_positive_amount(
     assert resp.json()["amount_paise"] == 100000
 
 
-def test_post_refund_positive_amount(
+def test_post_spend_positive_amount_is_a_refund(
     client: TestClient,
     axis_account: Account,
     session: Session,  # noqa: ARG001
 ) -> None:
+    """A positive `spend` IS the refund representation (ADR-0009) — no distinct
+    type, no 422."""
     resp = client.post(
         "/api/v1/transactions",
         json=_post_body(
             account_id=axis_account.id,
             amount_paise=5000,
-            transaction_type="refund",
+            transaction_type="spend",
             merchant_raw="Amazon",
         ),
     )
     assert resp.status_code == 201
-    assert resp.json()["transaction_type"] == "refund"
+    assert resp.json()["transaction_type"] == "spend"
+    assert resp.json()["amount_paise"] == 5000
 
 
 @pytest.mark.parametrize("amount", [-50000, 50000])
@@ -1330,16 +1417,19 @@ def test_post_transfer_either_sign(
     assert resp.status_code == 201
 
 
-def test_post_spend_positive_amount_422(
+def test_post_spend_negative_amount_201(
     client: TestClient,
     axis_account: Account,
 ) -> None:
+    """The ordinary (non-refund) spend direction still works — `spend` accepts
+    either sign since ADR-0009 dropped the `< 0` guard, so this is now just
+    the happy path rather than a 422 case."""
     resp = client.post(
         "/api/v1/transactions",
-        json=_post_body(account_id=axis_account.id, amount_paise=5000, transaction_type="spend"),
+        json=_post_body(account_id=axis_account.id, amount_paise=-5000, transaction_type="spend"),
     )
-    assert resp.status_code == 422
-    assert "spend requires negative" in resp.text
+    assert resp.status_code == 201
+    assert resp.json()["amount_paise"] == -5000
 
 
 def test_post_income_negative_amount_422(
@@ -1354,7 +1444,7 @@ def test_post_income_negative_amount_422(
     assert "income requires positive" in resp.text
 
 
-@pytest.mark.parametrize("txn_type", ["spend", "income", "refund", "transfer"])
+@pytest.mark.parametrize("txn_type", ["spend", "income", "transfer"])
 def test_post_zero_amount_422(
     txn_type: str,
     client: TestClient,
@@ -1631,7 +1721,8 @@ def test_post_transfer_with_category_does_not_learn(
 ) -> None:
     """Manual entry is type-gated like the import auto-tag (PRD §F3).
 
-    Only spend/refund feed the merchant→category map. A transfer (or income)
+    Only `spend` (refunds included — positive-amount spend rows) feeds the
+    merchant→category map. A transfer (or income)
     row with a category must NOT learn a tag: income/transfer are hand-classified
     in a separate taxonomy and would only ever resurface as a cross-taxonomy
     spend suggestion. This reverses the earlier type-agnostic manual-entry rule;
@@ -1690,7 +1781,8 @@ def test_patch_income_category_does_not_learn(
     """PATCHing a category onto an income row must not write a tag-map row.
 
     Mirrors the POST gate on the update path — the merchant→category map is
-    spend/refund only (``AUTO_TAGGABLE_TYPES``). The category still persists on
+    `spend`-only (``AUTO_TAGGABLE_TYPES``); refunds are spend rows, so they're
+    included. The category still persists on
     the txn; only the tag-map learning is skipped.
     """
     income = _make_txn(
@@ -2399,7 +2491,7 @@ def test_create_income_on_usd_account_422(
     seeded_user: User,
     session: Session,
 ) -> None:
-    """Same gate applies to income (not just spend/refund)."""
+    """Same gate applies to income (not just spend)."""
     usd = _seed_usd_account(session, seeded_user.id, "US Cash")
     resp = client.post(
         "/api/v1/transactions",
@@ -3011,29 +3103,40 @@ def test_patch_colliding_amount_with_a_label_change_409s_not_500(
     assert resp.json()["detail"] == "transaction already exists"
 
 
-def test_patch_income_to_refund_with_a_refund_category(
+def test_patch_income_to_spend_with_a_spend_category_is_a_refund(
     client: TestClient,
     axis_account: Account,
     session: Session,
 ) -> None:
-    """An unmatched credit imports as income. Changing to refund requires a refund category."""
+    """The correctness case the whole ADR turns on.
+
+    ``_REFUND_RE`` cannot separate a merchant refund from a cashback credit, so an
+    unmatched credit imports as ``income``. Only the user knows which it was — and
+    since ADR-0009, that correction is a **category-kind** choice (a spend category
+    vs an income category in one merged list), not a type value: PATCHing
+    ``transaction_type`` to ``spend`` alongside a spend category is what makes the
+    row a refund, because its amount is already positive. The sign, not the type,
+    is what every F8 aggregate discriminates on now.
+    """
     txn = _seed_one(session, axis_account=axis_account)
     txn.transaction_type = "income"
     txn.amount_paise = 45000
     txn.category_id = _seed_category(session, axis_account.user_id, "Cashback", "income").id
     txn.fingerprint = _fp_of(txn)
     session.commit()
-    refund_cat = _seed_category(session, axis_account.user_id, "Refund", "refund")
+    food = _seed_category(session, axis_account.user_id, "Food", "spend")
 
     resp = client.patch(
         f"/api/v1/transactions/{txn.id}",
-        json={"transaction_type": "refund", "category_id": refund_cat.id},
+        json={"transaction_type": "spend", "category_id": food.id},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["transaction_type"] == "refund"
-    assert resp.json()["category_id"] == refund_cat.id
+    assert resp.json()["transaction_type"] == "spend"
+    assert resp.json()["amount_paise"] == 45000  # positive spend == a refund
+    assert resp.json()["category_id"] == food.id
 
     session.refresh(txn)
+    # The type is NOT in the ADR-0006 payload, so identity is untouched (rule 2).
     assert txn.fingerprint == _fp_of(txn)
 
 
@@ -3053,7 +3156,7 @@ def test_patch_type_kind_flip_without_a_compatible_category_422s(
     txn.category_id = _seed_category(session, axis_account.user_id, "Cashback", "income").id
     session.commit()
 
-    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"transaction_type": "refund"})
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"transaction_type": "spend"})
     assert resp.status_code == 422, resp.text
     assert "compatible category_id" in resp.json()["detail"]
 
@@ -3075,7 +3178,7 @@ def test_patch_type_kind_flip_with_an_explicit_null_category_succeeds(
 
     resp = client.patch(
         f"/api/v1/transactions/{txn.id}",
-        json={"transaction_type": "refund", "category_id": None},
+        json={"transaction_type": "spend", "category_id": None},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["category_id"] is None
@@ -3092,16 +3195,18 @@ def test_patch_type_kind_flip_with_no_category_at_all_succeeds(
     txn.amount_paise = 45000
     session.commit()
 
-    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"transaction_type": "refund"})
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"transaction_type": "spend"})
     assert resp.status_code == 200, resp.text
 
 
-def test_patch_same_kind_type_change_keeps_the_category(
+def test_patch_amount_sign_flip_to_a_refund_keeps_the_category(
     client: TestClient,
     axis_account: Account,
     session: Session,
 ) -> None:
-    """Changing fields within the same type keeps the category."""
+    """Flipping a spend row's amount to positive (making it a refund, ADR-0009)
+    is not a kind flip — there's no type change to trigger rule 5 — so the
+    spend category is untouched without needing to be resent."""
     txn = _seed_one(session, axis_account=axis_account)
     food = _seed_category(session, axis_account.user_id, "Food", "spend")
     txn.category_id = food.id
@@ -3109,9 +3214,11 @@ def test_patch_same_kind_type_change_keeps_the_category(
 
     resp = client.patch(
         f"/api/v1/transactions/{txn.id}",
-        json={"amount_paise": -9999},
+        json={"amount_paise": 12345},
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["transaction_type"] == "spend"
+    assert resp.json()["amount_paise"] == 12345
     assert resp.json()["category_id"] == food.id
 
 
@@ -3119,7 +3226,6 @@ def test_patch_same_kind_type_change_keeps_the_category(
     ("body", "expected"),
     [
         ({"transaction_type": "income"}, "income requires positive amount_paise"),
-        ({"amount_paise": 500}, "spend requires negative amount_paise"),
         ({"amount_paise": 0}, "amount_paise must be non-zero"),
     ],
 )
@@ -3133,13 +3239,32 @@ def test_patch_sign_and_type_are_validated_as_a_merged_pair(
     """Rule 4 — the F2 sign rule applied to the MERGED state.
 
     A schema validator cannot see the stored row, so each of these is legal in
-    isolation and wrong once merged with what is already there.
+    isolation and wrong once merged with what is already there. A merged
+    ``{"amount_paise": 500}`` against a spend row is NOT in this table — since
+    ADR-0009 that pair is legal (it turns the row into a refund); see
+    ``test_patch_spend_positive_amount_becomes_a_refund`` below.
     """
     txn = _seed_one(session, axis_account=axis_account)  # spend, -12345
 
     resp = client.patch(f"/api/v1/transactions/{txn.id}", json=body)
     assert resp.status_code == 422, resp.text
     assert expected in str(resp.json()["detail"])
+
+
+def test_patch_spend_positive_amount_becomes_a_refund(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """A merged pair that used to 422 under the old `spend < 0` guard is now
+    legal outright (ADR-0009) — no `transaction_type` change needed, since a
+    refund is not a distinct type."""
+    txn = _seed_one(session, axis_account=axis_account)  # spend, -12345
+
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"amount_paise": 500})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transaction_type"] == "spend"
+    assert resp.json()["amount_paise"] == 500
 
 
 def test_patch_type_and_amount_together_can_flip_the_sign(
@@ -3477,11 +3602,12 @@ def test_patch_labels_only_does_not_revalidate_an_untouched_sign(
 
     ``backup_csv`` validates the type vocabulary and that ``amount_paise`` parses,
     but not the sign pairing — and a hand-edited zip is its declared threat model —
-    so a stored ``refund`` carrying a negative amount is reachable. A labels-only
-    PATCH must not 422 on state it never touched.
+    so a stored ``income`` carrying a negative amount is reachable (``spend`` no
+    longer offers this scenario post-ADR-0009, since it accepts either sign). A
+    labels-only PATCH must not 422 on state it never touched.
     """
     txn = _seed_one(session, axis_account=axis_account)
-    txn.transaction_type = "refund"  # negative amount: violates the F2 rule
+    txn.transaction_type = "income"  # negative amount: violates the F2 rule
     session.commit()
 
     resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"labels": ["disputed"]})
@@ -3491,4 +3617,4 @@ def test_patch_labels_only_does_not_revalidate_an_untouched_sign(
     # But touching either half of the pair does re-validate it.
     still_bad = client.patch(f"/api/v1/transactions/{txn.id}", json={"amount_paise": -20000})
     assert still_bad.status_code == 422
-    assert "refund requires positive amount_paise" in str(still_bad.json()["detail"])
+    assert "income requires positive amount_paise" in str(still_bad.json()["detail"])

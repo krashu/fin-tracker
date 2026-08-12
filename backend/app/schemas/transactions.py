@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.models.transaction import TransactionTypeStr
 from app.schemas.labels import LabelRead
 
-ConfidenceStr = Literal["confident", "uncertain", "none"]
+ConfidenceStr = Literal["confident", "uncertain", "seeded", "none"]
 
 # Per-txn label bounds. Item cap 64 matches Label.name / LabelCreate — an
 # over-length name 422s at the boundary (consistent with POST /labels) instead of
@@ -46,9 +46,15 @@ def _stripped_or_none(v: str | None) -> str | None:
 def sign_error(transaction_type: TransactionTypeStr, amount_paise: int) -> str | None:
     """The F2 sign rule, or ``None`` when the pair is valid.
 
-    ``spend < 0``, ``income > 0``, ``refund > 0``, ``transfer`` any non-zero sign;
-    zero rejected for all four. Wrong-sign rows would silently distort the F8
+    ``income > 0``; ``spend`` and ``transfer`` take any non-zero sign; zero
+    rejected for all three. Wrong-sign rows would silently distort the F8
     signed-sum aggregates.
+
+    ``spend`` is deliberately asymmetric with ``income``: a **positive spend is a
+    refund** (ADR-0009), so the old ``spend < 0`` guard had to go. ``income``
+    keeps ``> 0`` because an income reversal (a salary clawback) is out of scope
+    for v1. The accepted cost: a fat-fingered positive spend now reads as a
+    refund instead of 422-ing.
 
     Returns a message rather than raising so both callers can raise in their own
     idiom — :meth:`TransactionCreate._check_sign` as a ``ValueError`` pydantic turns
@@ -59,11 +65,10 @@ def sign_error(transaction_type: TransactionTypeStr, amount_paise: int) -> str |
     """
     if amount_paise == 0:
         return "amount_paise must be non-zero"
-    if transaction_type == "spend" and amount_paise >= 0:
-        return "spend requires negative amount_paise"
-    if transaction_type in ("income", "refund") and amount_paise <= 0:
-        return f"{transaction_type} requires positive amount_paise"
-    # transfer: any non-zero sign accepted (zero already rejected above)
+    if transaction_type == "income" and amount_paise <= 0:
+        return "income requires positive amount_paise"
+    # spend / transfer: any non-zero sign accepted (zero already rejected above).
+    # A positive spend IS the refund representation — see the docstring.
     return None
 
 
@@ -96,16 +101,15 @@ class TransactionRead(BaseModel):
 class TransactionCreate(BaseModel):
     """Create body for ``POST /api/v1/transactions`` (PRD §F2 manual entry).
 
-    Sign rule (strict): ``spend < 0``, ``income > 0``, ``refund > 0``,
-    ``transfer`` accepts any non-zero amount. Zero rejected for all types.
-    Wrong-sign rows would silently distort dashboard signed-sum aggregates.
+    Sign rule: ``income > 0``; ``spend`` and ``transfer`` accept any non-zero
+    amount. Zero rejected for all types. Wrong-sign rows would silently distort
+    dashboard signed-sum aggregates.
 
-    NOTE: this schema is **stricter than the import path**. ``import_service``
-    persists parser-emitted refund rows with whatever sign the parser hands
-    over (``_map_type`` maps ``txn_type=="refund"`` → ``"refund"`` regardless
-    of sign). Parsers are trusted internals; F2 is user input that should
-    be defended. A future parser-author must not assume F2-style sign
-    guarding extends to parser output.
+    ``spend`` accepts both signs because a **positive spend is a refund**
+    (ADR-0009) — the UI still offers a three-way Spend/Refund/Income choice and
+    maps it to (type, sign) client-side. The consequence is that a mistyped
+    positive spend is now indistinguishable from a deliberate refund at this
+    boundary; that trade is recorded in ADR-0009.
 
     ``merchant_raw`` is optional (a manual row may legitimately have no
     merchant). It's stripped of leading/trailing whitespace; pure whitespace
@@ -203,22 +207,38 @@ class TransferRead(BaseModel):
 class TransactionCandidate(TransactionRead):
     """Per-row payload for ``GET /imports/{batch_id}/candidates``.
 
-    Extends :class:`TransactionRead` with the two review-only fields the
+    Extends :class:`TransactionRead` with the four review-only fields the
     frontend needs to render the queue:
 
-    * ``prior_matches`` — ``COALESCE(merchant_tag_map.hit_count, 0)`` for
-      this row's ``(user_id, merchant_normalized, category_id)``. LEFT-joined
-      at read time. For rows with ``category_id IS NULL`` (income/transfer
-      or new-merchant spend), ``NULL = NULL`` semantics collapse to "no
-      match" → ``prior_matches = 0``.
+    * ``prior_matches`` — the merchant memory behind this row's suggestion:
+      a dict lookup of ``(canonical, category_id)`` in
+      :func:`app.services.tag_service.prefetch_tag_strength`, so it is the
+      ``hit_count`` SUMMED across every raw descriptor the user's alias table
+      folds onto that canonical (ADR-0011), not one row's count. ``0`` when
+      there is no such pair — including when ``category_id IS NULL``
+      (income/transfer or new-merchant spend), and when the category has
+      since been ARCHIVED, since the aggregate inherits that filter.
     * ``confidence`` — derived from ``prior_matches`` at thresholds locked
-      in the route module (≥3 confident, 1-2 uncertain, 0 none).
-    * ``pinned`` — whether the winning ``merchant_tag_map`` row for this
-      ``(merchant, category)`` is user-authored (``pinned=True``). The prefill
+      in the route module (≥3 confident, 1-2 uncertain), **except** when the
+      resolved ``(canonical, category)`` pair is present in the merchant map
+      at ``hit_count == 0`` — a dictionary entry this user has never
+      confirmed (ADR-0011 decision 4) — which reads ``"seeded"`` regardless
+      of the threshold. ``"none"`` means the pair is *absent* entirely (no
+      rule at all); collapsing that with a present-at-zero seed is exactly
+      the distinction ``prefetch_tag_strength`` exists to preserve.
+    * ``pinned`` — whether any ``merchant_tag_map`` row behind this
+      ``(canonical, category)`` is user-authored (``pinned=True``). The prefill
       path is pinned-aware, so a freshly-pinned rule prefills at ``hit_count=1``;
       surfacing ``pinned`` here lets the picker render an "authored" state that
-      outranks the low ``prior_matches`` confidence tint. ``False`` when there is
-      no joined row (``NULL`` coalesced).
+      outranks the low ``prior_matches`` confidence tint. ``False`` when the pair
+      is absent. Note it can be ``True`` alongside ``confidence == "seeded"``:
+      pinning a seed row leaves ``hit_count`` at 0, because ``pin_tag`` never
+      bumps it on an existing row.
+    * ``cc_payment_candidate`` — the row is ``income`` and its merchant names
+      a card-bill payment, so F4a-1 may auto-link it to a bank debit at
+      commit. Does **not** assert the link will happen — the parent account
+      and a matching debit are checked at commit (``auto_link_cc_bill``
+      gates 4-6).
 
     Why a separate schema rather than widening :class:`TransactionRead`:
     these fields are review-only. The board endpoint deliberately omits
@@ -229,6 +249,7 @@ class TransactionCandidate(TransactionRead):
     prior_matches: int = Field(ge=0)
     confidence: ConfidenceStr
     pinned: bool
+    cc_payment_candidate: bool
 
 
 class TransactionUpdate(BaseModel):

@@ -56,10 +56,12 @@ import {
   type CategoryRuleRead,
   type LabelRead,
   type LabelRuleRead,
+  type MerchantRuleRead,
 } from "@/lib/api/client";
 import { invalidateRules } from "@/lib/queries/invalidate";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
+import { AliasManager } from "./alias-manager";
 import { ExistingLabelPicker } from "./existing-label-picker";
 import { NewRuleDialog } from "./new-rule-dialog";
 
@@ -75,12 +77,23 @@ export function RulesManager() {
 
   const [dialog, setDialog] = useState<RuleDialog>(null);
   const [newOpen, setNewOpen] = useState(false);
+  const [showSeeded, setShowSeeded] = useState(false);
+
+  // The seed dictionary (ADR-0011 Phase A5) puts ~95 unconfirmed entries in this
+  // list for a brand-new user, which buried their genuinely-learned merchants
+  // alphabetically and contradicted the page description ("what fin-tracker has
+  // learned from your imports"). They stay reachable — a user can still pin or
+  // forget one — but behind a disclosure, and out of the header count so it
+  // agrees with the dashboard's rules_count (which excludes them too).
+  const learned = rules.filter((r) => !r.seeded);
+  const seeded = rules.filter((r) => r.seeded);
 
   return (
+    <>
     <Card className="max-w-3xl">
       <CardHeader className="items-center border-b">
         <CardTitle className="text-[14px]">
-          {rules.length} {rules.length === 1 ? "merchant" : "merchants"}
+          {learned.length} {learned.length === 1 ? "merchant" : "merchants"}
         </CardTitle>
         <CardAction className="self-center">
           <Button
@@ -106,58 +119,54 @@ export function RulesManager() {
             and fin-tracker remembers them here, or add one with “New rule”.
           </Row>
         ) : (
-          rules.map((rule) => (
-            <div
-              key={rule.merchant_normalized}
-              className="border-b border-border/60 px-4 py-3 last:border-b-0"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <p className="font-mono text-[12px] font-medium text-foreground">
-                  {rule.merchant_normalized}
-                </p>
-                <AddTagControl
-                  merchant={rule.merchant_normalized}
-                  existingLabelIds={new Set(rule.labels.map((l) => l.label_id))}
+          <>
+            {learned.length === 0 ? (
+              <Row tone="muted">
+                Nothing learned yet — confirm categories and tags on imported
+                transactions and fin-tracker remembers them here, or add one with
+                “New rule”.
+              </Row>
+            ) : (
+              learned.map((rule) => (
+                <RuleGroup
+                  key={rule.merchant_normalized}
+                  rule={rule}
+                  onForget={setDialog}
                 />
-              </div>
+              ))
+            )}
 
-              {rule.categories.length > 0 ? (
-                <div className="mt-2 space-y-1.5">
-                  {rule.categories.map((cat) => (
-                    <CategoryRuleLine
-                      key={`c-${cat.id}`}
-                      rule={cat}
-                      onForget={() =>
-                        setDialog({
-                          kind: "category",
-                          merchant: rule.merchant_normalized,
-                          rule: cat,
-                        })
-                      }
-                    />
-                  ))}
-                </div>
-              ) : null}
-
-              {rule.labels.length > 0 ? (
-                <div className="mt-2 space-y-1.5">
-                  {rule.labels.map((lab) => (
-                    <LabelRuleLine
-                      key={`l-${lab.id}`}
-                      rule={lab}
-                      onForget={() =>
-                        setDialog({
-                          kind: "label",
-                          merchant: rule.merchant_normalized,
-                          rule: lab,
-                        })
-                      }
-                    />
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          ))
+            {seeded.length > 0 ? (
+              <>
+                <button
+                  type="button"
+                  aria-expanded={showSeeded}
+                  onClick={() => setShowSeeded((open) => !open)}
+                  className="flex w-full items-center gap-1.5 border-t border-border/60 px-4 py-2.5 text-left text-[12px] text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+                >
+                  <IconChevronDown
+                    className={cn(
+                      "size-3.5 shrink-0 transition-transform",
+                      showSeeded ? "" : "-rotate-90",
+                    )}
+                  />
+                  From the merchant dictionary ({seeded.length})
+                  <span className="ml-1 text-[11px] text-muted-foreground/70">
+                    starting suggestions, not yet confirmed
+                  </span>
+                </button>
+                {showSeeded
+                  ? seeded.map((rule) => (
+                      <RuleGroup
+                        key={rule.merchant_normalized}
+                        rule={rule}
+                        onForget={setDialog}
+                      />
+                    ))
+                  : null}
+              </>
+            ) : null}
+          </>
         )}
       </CardContent>
 
@@ -166,6 +175,74 @@ export function RulesManager() {
         <ForgetConfirm dialog={dialog} onClose={() => setDialog(null)} />
       ) : null}
     </Card>
+    <AliasManager />
+    </>
+  );
+}
+
+/** One canonical merchant's rules. Extracted so the list can render the learned
+ * groups and the seed-dictionary groups from the same markup. */
+function RuleGroup({
+  rule,
+  onForget,
+}: {
+  rule: MerchantRuleRead;
+  onForget: (dialog: RuleDialog) => void;
+}) {
+  return (
+    <div className="border-b border-border/60 px-4 py-3 last:border-b-0">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <p className="min-w-0 truncate font-mono text-[12px] font-medium text-foreground">
+            {rule.merchant_normalized}
+          </p>
+          {rule.alias_count > 1 ? (
+            <AliasCountBadge count={rule.alias_count} />
+          ) : null}
+          {rule.seeded ? <SeededBadge /> : null}
+        </div>
+        <AddTagControl
+          merchant={rule.merchant_normalized}
+          existingLabelIds={new Set(rule.labels.map((l) => l.label_id))}
+        />
+      </div>
+
+      {rule.categories.length > 0 ? (
+        <div className="mt-2 space-y-1.5">
+          {rule.categories.map((cat) => (
+            <CategoryRuleLine
+              key={`c-${cat.id}`}
+              rule={cat}
+              onForget={() =>
+                onForget({
+                  kind: "category",
+                  merchant: rule.merchant_normalized,
+                  rule: cat,
+                })
+              }
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {rule.labels.length > 0 ? (
+        <div className="mt-2 space-y-1.5">
+          {rule.labels.map((lab) => (
+            <LabelRuleLine
+              key={`l-${lab.id}`}
+              rule={lab}
+              onForget={() =>
+                onForget({
+                  kind: "label",
+                  merchant: rule.merchant_normalized,
+                  rule: lab,
+                })
+              }
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -195,6 +272,35 @@ function PinnedBadge() {
   return (
     <span className="rounded-sm bg-accent px-1 py-px text-[10px] font-medium uppercase tracking-wide text-accent-foreground">
       pinned
+    </span>
+  );
+}
+
+/** ADR-0011 merchant-alias layer (Phase A3): `count` alias patterns resolve to
+ * this canonical, so several raw descriptors fold into one merchant here (e.g.
+ * "bigbasket" and "big basket" both -> "big basket"). The number counts patterns,
+ * not descriptors seen in transactions — see `MerchantRuleRead.alias_count`. */
+function AliasCountBadge({ count }: { count: number }) {
+  return (
+    <span
+      className="shrink-0 rounded-sm bg-accent px-1 py-px text-[10px] font-medium tabular-nums uppercase tracking-wide text-accent-foreground"
+      title={`${count} alias patterns fold onto this merchant`}
+    >
+      ×{count}
+    </span>
+  );
+}
+
+/** ADR-0011 decision 4: every category rule in this group is an unconfirmed
+ * dictionary entry (hit_count === 0) — the seed dictionary (Phase A5), not
+ * anything this user has learned or authored yet. */
+function SeededBadge() {
+  return (
+    <span
+      className="shrink-0 rounded-sm border border-dashed border-ring/30 px-1 py-px text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+      title="Suggested from the merchant dictionary — not yet confirmed"
+    >
+      seeded
     </span>
   );
 }

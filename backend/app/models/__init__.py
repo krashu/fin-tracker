@@ -9,6 +9,7 @@ from app.models.import_batch import ImportBatch, ImportStatusStr
 from app.models.instrument import AssetClassStr, ExchangeStr, Instrument
 from app.models.investment_transaction import InvestmentTransaction, InvestmentTxnTypeStr
 from app.models.label import Label
+from app.models.merchant_alias import MerchantAlias
 from app.models.merchant_label_map import MerchantLabelMap
 from app.models.merchant_tag_map import MerchantTagMap
 from app.models.session import RefreshSession
@@ -35,6 +36,7 @@ __all__ = [
     "InvestmentTransaction",
     "InvestmentTxnTypeStr",
     "Label",
+    "MerchantAlias",
     "MerchantLabelMap",
     "MerchantTagMap",
     "RefreshSession",

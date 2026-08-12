@@ -35,11 +35,8 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { IconChevronRight } from "@/components/icons";
 import { listSpendByTag } from "@/lib/api/client";
 import { formatINR, formatMonthYear } from "@/lib/format";
-import { thisMonthAnchor, monthKey } from "@/lib/dates";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";

@@ -26,6 +26,7 @@ from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUserId, SessionDep
+from app.core import clock
 from app.models import Account, Category, Label, MerchantTagMap, Transaction, TransactionLabel
 from app.schemas import (
     NET_WORTH_EXCLUDED_TYPES,
@@ -55,101 +56,90 @@ from app.schemas import (
 )
 from app.services.fx_service import latest_rate
 from app.services.holdings_service import compute_holdings, summarize_holdings
+from app.services.tag_service import AUTO_TAGGABLE_TYPES
 from app.services.transaction_queries import confirmed_only
 
 router = APIRouter(prefix="/dashboards", tags=["dashboards"])
 
-# Anchored YYYY-MM with month in [01, 12]. Validated route-side rather than
-# via Query(pattern=) so FastAPI's RequestValidationError can't echo the
-# rejected input — matches the imports.py:80 input-echo discipline.
+# Anchored YYYY-MM with month in [01, 12], or a bare YYYY. Validated route-side
+# rather than via Query(pattern=) so FastAPI's RequestValidationError can't echo
+# the rejected input — matches the imports.py:80 input-echo discipline.
 _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_YEAR_RE = re.compile(r"^\d{4}$")
+# Bounds a shape-valid-but-nonsense year like "0000": ``_YEAR_RE`` alone accepts
+# it, and ``date(0, 1, 1)`` raises ValueError — an uncontrolled 500, not a 422.
+_MIN_YEAR = 1900
+_MAX_YEAR = 2100
 
 
 # ---------- route prologue ----------------------------------------------------
 #
-# The three shapes every route in this file opened with, hand-copied 4 / 5 / 2 times
-# (A1.2/A2.2). Extracted for the reason :448 already gives for `_bucket_of` and
-# `_iter_periods`: the next edit to any of them is a one-line diff here instead of a
-# four-block sweep that lands on three, after which /overview reports a different
-# month than /spend-by-category for the same ?month=.
+# The shape every period-taking route in this file opens with, hand-copied 4 / 5
+# times (A1.2/A2.2). Extracted for the reason :448 already gives for `_bucket_of`
+# and `_iter_periods`: the next edit is a one-line diff here instead of a
+# multi-block sweep that lands on one route slightly different from the rest —
+# which is exactly how `overview` used to report a different span than
+# `spend-by-category` for what the user thought was "the same period".
 
 
-class MonthWindow(NamedTuple):
-    """A validated ``YYYY-MM`` expanded to its calendar bounds."""
+class PeriodWindow(NamedTuple):
+    """A validated period — a calendar month (``YYYY-MM``) or a calendar year
+    (``YYYY``) — expanded to its inclusive calendar-date bounds.
 
-    year: int
-    mon: int
-    first: date
-    last: date
+    One shape for both request forms, replacing ``MonthWindow`` (month-only) +
+    ``PeriodBounds`` (month-or-year, but re-deriving the month case through
+    ``_month_window`` instead of owning it). ``mon`` is ``None`` for a year
+    window. ``key`` is the canonical wire echo — ``month`` or ``year`` as given,
+    verbatim — the single ``period`` field every period-taking response now
+    carries instead of an optional ``month``/``year`` pair plus a pop-if-absent
+    ``@model_serializer``.
 
-
-def _month_window(month: str) -> MonthWindow:
-    """Validate ``YYYY-MM`` and expand it to the calendar month's inclusive bounds.
-
-    422s on a malformed value with a generic detail — the rejected input is never
-    echoed back (input-echo discipline; see imports.py:80).
-
-    The boundary is calendar-local: ``Transaction.date`` is a naive calendar date and
-    ``confirmed_at`` (UTC) is **not** consulted, so a row dated ``2026-05-31`` lands in
-    the May bucket regardless of its ``confirmed_at`` instant. No route defaults to
-    "current month" — the user's timezone is the frontend's concern, so ``month`` is
-    always required.
-
-    ``year`` rides along with ``first`` / ``last`` because :func:`overview` derives its
-    calendar-YTD floor from it. The window derives strictly from ``month``, never
-    ``date.today()`` (ADR-0001 rule 5) — returning only the bounds would push that route
-    back to re-parsing the string, which is how that guarantee gets lost.
+    The boundary is calendar-local: ``Transaction.date`` is a naive calendar
+    date and ``confirmed_at`` (UTC) is **not** consulted, so a row dated
+    ``2026-05-31`` lands in the May bucket regardless of its ``confirmed_at``
+    instant. No route defaults to "current period" — the user's timezone is the
+    frontend's concern, so one of ``month`` / ``year`` is always required.
     """
-    if not _MONTH_RE.match(month):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="month must match YYYY-MM",
-        )
-    year, mon = int(month[:4]), int(month[5:7])
-    return MonthWindow(
-        year=year,
-        mon=mon,
-        first=date(year, mon, 1),
-        last=date(year, mon, calendar.monthrange(year, mon)[1]),
-    )
-_YEAR_RE = re.compile(r"^\d{4}$")
 
-
-class PeriodBounds(NamedTuple):
     first: date
     last: date
-    month: str | None
-    year: str | None
+    year: int
+    mon: int | None
+    key: str
 
 
-def _parse_period_window(month: str | None, year: str | None) -> PeriodBounds:
-    """Parse either month (YYYY-MM) or year (YYYY) into inclusive calendar bounds."""
+def _period_window(month: str | None, year: str | None) -> PeriodWindow:
+    """Validate ``month`` xor ``year`` into a :class:`PeriodWindow`.
+
+    422s on a malformed or missing value with a generic detail — the rejected
+    input is never echoed back (input-echo discipline; see imports.py:80).
+    """
     if year is not None:
-        if not _YEAR_RE.match(year):
+        if not _YEAR_RE.match(year) or not (_MIN_YEAR <= int(year) <= _MAX_YEAR):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="year must match YYYY",
             )
         y = int(year)
-        return PeriodBounds(
-            first=date(y, 1, 1),
-            last=date(y, 12, 31),
-            month=None,
-            year=year,
+        return PeriodWindow(first=date(y, 1, 1), last=date(y, 12, 31), year=y, mon=None, key=year)
+    if month is not None:
+        if not _MONTH_RE.match(month):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="month must match YYYY-MM",
+            )
+        y, mon = int(month[:4]), int(month[5:7])
+        return PeriodWindow(
+            first=date(y, mon, 1),
+            last=date(y, mon, calendar.monthrange(y, mon)[1]),
+            year=y,
+            mon=mon,
+            key=month,
         )
-    elif month is not None:
-        win = _month_window(month)
-        return PeriodBounds(
-            first=win.first,
-            last=win.last,
-            month=month,
-            year=None,
-        )
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="month or year is required",
-        )
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail="month or year is required",
+    )
 
 
 @router.get("/available-years", response_model=AvailableYearsResponse)
@@ -157,21 +147,27 @@ def available_years(
     session: SessionDep,
     user_id: CurrentUserId,
 ) -> AvailableYearsResponse:
-    """Return distinct calendar years with confirmed transactions up to current year."""
-    min_date = session.scalar(
+    """Distinct calendar years worth offering in a year picker.
+
+    Every year spanned by the user's confirmed transactions, plus the current
+    year always — so a just-registered user with no data yet still sees this
+    year as an option, and a future-dated row (a manual entry, or a backfilled
+    import) is still reachable rather than clipped off. One MIN/MAX pass, not a
+    separate current-year comparison computed twice against itself (which is
+    a no-op ``max(x, x)`` and can silently return ``[]`` when every row
+    predates or postdates ``current_year``).
+    """
+    min_date, max_date = session.execute(
         confirmed_only(
-            select(func.min(Transaction.date)).where(Transaction.user_id == user_id)
+            select(func.min(Transaction.date), func.max(Transaction.date)).where(
+                Transaction.user_id == user_id
+            )
         )
-    )
-    current_year = date.today().year
-    if not min_date:
-        return AvailableYearsResponse(years=[current_year])
-
-    start_year = min_date.year
-    end_year = max(current_year, date.today().year)
-    years = list(range(end_year, start_year - 1, -1))
-    return AvailableYearsResponse(years=years)
-
+    ).one()
+    current_year = clock.today().year
+    start_year = min(current_year, min_date.year) if min_date else current_year
+    end_year = max(current_year, max_date.year) if max_date else current_year
+    return AvailableYearsResponse(years=list(range(end_year, start_year - 1, -1)))
 
 
 def _require_ordered(start: date, end: date) -> None:
@@ -189,7 +185,7 @@ def _require_ordered(start: date, end: date) -> None:
 
 
 class IncomeExpense(NamedTuple):
-    """Signed totals over a date range. ``expense_paise`` is Σ(spend, refund)."""
+    """Signed totals over a date range. ``expense_paise`` is Σ(spend, signed)."""
 
     income_paise: int
     expense_paise: int
@@ -200,7 +196,7 @@ def _income_expense_sums(
 ) -> IncomeExpense:
     """Signed income / expense totals over the inclusive ``[start, end]``, confirmed only.
 
-    ``expense_paise`` is the signed Σ(spend, refund): negative on an ordinary window and
+    ``expense_paise`` is the signed Σ(spend, signed): negative on an ordinary window and
     legitimately **positive** on a refund-dominant one, so callers must not clamp it.
     ``transfer`` is excluded — intra-account movement is neither income nor spend.
     Server-computed so no client can drift on the sign.
@@ -212,7 +208,7 @@ def _income_expense_sums(
     expense_sum = func.sum(
         case(
             (
-                Transaction.transaction_type.in_(("spend", "refund")),
+                Transaction.transaction_type == "spend",
                 Transaction.amount_paise,
             ),
             else_=0,
@@ -223,7 +219,7 @@ def _income_expense_sums(
     )
     stmt = select(expense_sum, income_sum).where(
         Transaction.user_id == user_id,
-        Transaction.transaction_type.in_(("spend", "refund", "income")),
+        Transaction.transaction_type.in_(("spend", "income")),
         Transaction.date >= start,
         Transaction.date <= end,
     )
@@ -242,8 +238,8 @@ def spend_by_category(
     label_id: Annotated[int | None, Query(gt=0)] = None,
 ) -> SpendByCategoryResponse:
     """Signed-sum spend per category for the given calendar month or year."""
-    bounds = _parse_period_window(month, year)
-    first, last = bounds.first, bounds.last
+    window = _period_window(month, year)
+    first, last = window.first, window.last
 
     total_paise = func.sum(Transaction.amount_paise).label("total_paise")
 
@@ -275,7 +271,7 @@ def spend_by_category(
         )
         .where(
             Transaction.user_id == user_id,
-            Transaction.transaction_type.in_(("spend", "refund")),
+            Transaction.transaction_type == "spend",
             Transaction.date >= first,
             Transaction.date <= last,
         )
@@ -308,7 +304,7 @@ def spend_by_category(
         )
         for cat_id, cat_name, total in session.execute(stmt).all()
     ]
-    return SpendByCategoryResponse(month=bounds.month, year=bounds.year, rows=rows, label_id=label_id)
+    return SpendByCategoryResponse(period=window.key, rows=rows, label_id=label_id)
 
 
 @router.get("/spend-by-tag", response_model=SpendByTagResponse)
@@ -319,8 +315,8 @@ def spend_by_tag(
     year: Annotated[str | None, Query()] = None,
 ) -> SpendByTagResponse:
     """Signed-sum spend per tag for the given calendar month or year."""
-    bounds = _parse_period_window(month, year)
-    first, last = bounds.first, bounds.last
+    window = _period_window(month, year)
+    first, last = window.first, window.last
 
     tag_total = func.sum(Transaction.amount_paise).label("total_paise")
     # Per-tag grouped sums — arc decision #7's group-by shape, which INTENTIONALLY
@@ -346,7 +342,7 @@ def spend_by_tag(
         )
         .where(
             Transaction.user_id == user_id,
-            Transaction.transaction_type.in_(("spend", "refund")),
+            Transaction.transaction_type == "spend",
             Transaction.date >= first,
             Transaction.date <= last,
         )
@@ -365,7 +361,7 @@ def spend_by_tag(
     # the honest total (coverage denominator) and the untagged complement.
     month_where = [
         Transaction.user_id == user_id,
-        Transaction.transaction_type.in_(("spend", "refund")),
+        Transaction.transaction_type == "spend",
         Transaction.date >= first,
         Transaction.date <= last,
     ]
@@ -395,8 +391,7 @@ def spend_by_tag(
     coverage_rate = rate if (rate is not None and 0.0 <= rate <= 1.0) else None
 
     return SpendByTagResponse(
-        month=bounds.month,
-        year=bounds.year,
+        period=window.key,
         rows=rows,
         total_spend_paise=total_spend_paise,
         tagged_paise=tagged_paise,
@@ -414,34 +409,37 @@ def top_merchants(
     limit: Annotated[int, Query(ge=1, le=50)] = 5,
 ) -> TopMerchantsResponse:
     """Biggest-spender merchants for the given calendar month or year."""
-    bounds = _parse_period_window(month, year)
-    first, last = bounds.first, bounds.last
+    window = _period_window(month, year)
+    first, last = window.first, window.last
 
     total_paise = func.sum(Transaction.amount_paise).label("total_paise")
     merchant_label = func.coalesce(
         func.max(Transaction.merchant_raw), Transaction.merchant_normalized
     ).label("merchant_label")
+    # Window function over the grouped result set — evaluated before ORDER
+    # BY/LIMIT truncate it, so every surviving row carries the PRE-limit group
+    # count. Folds what used to be a second COUNT(DISTINCT ...) query (a full
+    # extra scan) into the one already-grouped pass, worth it now that a year
+    # request is 12x the row volume of a month.
+    total_merchants_col = func.count().over().label("total_merchants")
 
-    # Shared WHERE for the grouped list and the distinct-count; merchant_normalized
-    # != "" drops the no-merchant bucket from both, so total_merchants counts only
-    # merchants that can actually appear in `rows`. A list (not a tuple) so the
-    # optional F3a tag filter appends onto BOTH queries — keeping total_merchants
-    # (hence "top N of M") scoped to the same tagged set as the rows.
-    base_where = [
+    # merchant_normalized != "" drops the no-merchant bucket, so total_merchants
+    # counts only merchants that can actually appear in `rows`.
+    where = [
         Transaction.user_id == user_id,
-        Transaction.transaction_type.in_(("spend", "refund")),
+        Transaction.transaction_type == "spend",
         Transaction.date >= first,
         Transaction.date <= last,
         Transaction.merchant_normalized != "",
     ]
     if label_id is not None:
         # EXISTS subquery (see spend_by_category / transactions.py) — no join-row
-        # duplication of the grouped sum or the distinct count.
-        base_where.append(Transaction.labels.any(Label.id == label_id))
+        # duplication of the grouped sum.
+        where.append(Transaction.labels.any(Label.id == label_id))
 
     stmt = (
-        select(Transaction.merchant_normalized, merchant_label, total_paise)
-        .where(*base_where)
+        select(Transaction.merchant_normalized, merchant_label, total_paise, total_merchants_col)
+        .where(*where)
         .group_by(Transaction.merchant_normalized)
         # Most-negative (biggest spend) first; normalized key asc is a stable
         # tiebreak for equal totals (deterministic across runs / dialects).
@@ -449,23 +447,15 @@ def top_merchants(
         .limit(limit)
     )
     stmt = confirmed_only(stmt)
+    result = session.execute(stmt).all()
     rows = [
-        TopMerchantRow(
-            merchant_normalized=mn,
-            merchant_label=label,
-            total_paise=int(total),
-        )
-        for mn, label, total in session.execute(stmt).all()
+        TopMerchantRow(merchant_normalized=mn, merchant_label=label, total_paise=int(total))
+        for mn, label, total, _ in result
     ]
-
-    count_stmt = confirmed_only(
-        select(func.count(func.distinct(Transaction.merchant_normalized))).where(*base_where)
-    )
-    total_merchants = int(session.scalar(count_stmt) or 0)
+    total_merchants = int(result[0].total_merchants) if result else 0
 
     return TopMerchantsResponse(
-        month=bounds.month,
-        year=bounds.year,
+        period=window.key,
         rows=rows,
         total_merchants=total_merchants,
         truncated=total_merchants > limit,
@@ -531,7 +521,8 @@ def spend_by_period(
     passes aligned dates. Buckets with no in-window spend are zero-filled, so
     the bar chart has no gaps.
 
-    Type filter ``("spend", "refund")``, board-only (``confirmed_at``), and the
+    Type filter ``transaction_type == "spend"`` (refunds are the positive rows),
+    board-only (``confirmed_at``), and the
     INR-only signed-sum convention are identical to ``spend_by_category``;
     ``income`` and ``transfer`` are excluded for the same reasons.
 
@@ -550,7 +541,7 @@ def spend_by_period(
 
     stmt = select(Transaction.date, Transaction.amount_paise).where(
         Transaction.user_id == user_id,
-        Transaction.transaction_type.in_(("spend", "refund")),
+        Transaction.transaction_type == "spend",
         Transaction.date >= start,
         Transaction.date <= end,
     )
@@ -594,9 +585,9 @@ def cashflow_by_period(
     periods" — all identical to ``spend_by_period``. The reduce is Python-side for
     the same portability reason (no dialect-neutral ISO-week GROUP BY).
 
-    Type filter ``("spend", "refund", "income")`` and board-only
+    Type filter ``("spend", "income")`` and board-only
     (``confirmed_at``) match ``period_totals``: ``income_paise`` = Σ income (≥ 0);
-    ``expense_paise`` = **signed** Σ(spend, refund) (≤ 0 in the common case but
+    ``expense_paise`` = **signed** Σ(spend, signed) (≤ 0 in the common case but
     legitimately > 0 in a refund-dominant bucket — never clamped, or the
     ``net = income + expense`` identity breaks); ``net_paise`` = income + expense
     (server-computed so the client can't drift on the sign, and negative on a
@@ -610,7 +601,7 @@ def cashflow_by_period(
         Transaction.transaction_type,
     ).where(
         Transaction.user_id == user_id,
-        Transaction.transaction_type.in_(("spend", "refund", "income")),
+        Transaction.transaction_type.in_(("spend", "income")),
         Transaction.date >= start,
         Transaction.date <= end,
     )
@@ -626,7 +617,8 @@ def cashflow_by_period(
         period = _bucket_of(d, bucket).period
         if ttype == "income":
             income_totals[period] += amt
-        elif ttype in ("spend", "refund"):
+        elif ttype == "spend":
+            # Signed: refunds are the positive spend rows, so they net here.
             expense_totals[period] += amt
 
     buckets = [
@@ -662,7 +654,8 @@ def spend_by_category_by_period(
     The category×time generalization of ``spend_by_category``: same LEFT JOIN
     Category (with the cross-user-safe ``Category.user_id == user_id`` predicate
     on the join, guarding the foreign-category name leak), same
-    ``("spend", "refund")`` type filter, same board-only (``confirmed_at``) and
+    ``transaction_type == "spend"`` type filter (refunds are the positive
+    rows), same board-only (``confirmed_at``) and
     INR-only signed-sum convention. Window / bucketing / zero-fill are identical
     to ``spend_by_period`` / ``cashflow_by_period`` (clipped ``[start, end]``,
     Python-side ``_bucket_of`` / ``_iter_periods`` for portability, ``income`` and
@@ -695,7 +688,7 @@ def spend_by_category_by_period(
         )
         .where(
             Transaction.user_id == user_id,
-            Transaction.transaction_type.in_(("spend", "refund")),
+            Transaction.transaction_type == "spend",
             Transaction.date >= start,
             Transaction.date <= end,
         )
@@ -779,7 +772,7 @@ def spend_by_tag_by_period(
     double-counts a multi-tagged txn across its tags) and the clipped-window
     Python-side ``_bucket_of`` / ``_iter_periods`` bucketing + zero-fill from
     ``spend_by_period`` / ``spend_by_category_by_period``. Window / type filter
-    (``("spend", "refund")``) / board-only (``confirmed_at``) / INR-only signed-int
+    (``transaction_type == "spend"``) / board-only (``confirmed_at``) / INR-only signed-int
     convention are all identical to those routes (``income`` and ``transfer``
     excluded).
 
@@ -831,7 +824,7 @@ def spend_by_tag_by_period(
         )
         .where(
             Transaction.user_id == user_id,
-            Transaction.transaction_type.in_(("spend", "refund")),
+            Transaction.transaction_type == "spend",
             Transaction.date >= start,
             Transaction.date <= end,
         )
@@ -893,7 +886,7 @@ def period_totals(
     """Income vs spend over ``[start, end]`` — the /expenses summary strip's
     income figure (its spend total already comes from ``spend-by-period``).
 
-    Board-only signed sums in one pass: ``expense`` = Σ(spend, refund) (signed,
+    Board-only signed sums in one pass: ``expense`` = Σ(spend, signed) (signed,
     refunds net against spend — same rule as the spend aggregates); ``income``
     = Σ(income); ``net`` = income + expense (computed server-side so the client
     can't drift on the sign). ``transfer`` is excluded — intra-account movement
@@ -917,13 +910,18 @@ def period_totals(
 def overview(
     session: SessionDep,
     user_id: CurrentUserId,
-    month: Annotated[str, Query()],
+    month: Annotated[str | None, Query()] = None,
+    year: Annotated[str | None, Query()] = None,
 ) -> OverviewResponse:
     """Financial Overview home aggregate (PRD §F8 view 1 + view 4).
 
     One call backs the /dashboard landing: per-account current balances, net
-    worth, current portfolio value, and the requested month's income / expense
-    / net.
+    worth, current portfolio value, and the requested period's income / expense
+    / net. Takes the same month-or-year period every other dashboard route
+    does (:func:`_period_window`) — previously this was the one route stuck on
+    a required ``month``, which is what pushed the frontend to fake a year by
+    sending ``YYYY-12``: ``income_paise`` came back December-only while a
+    sibling call's ``spend_ytd_paise`` for the same "year" was the full year.
 
     **Balances** are board-only (``confirmed_at IS NOT NULL``) signed sums added
     to each account's ``opening_balance_paise``. Archived accounts are **not**
@@ -954,12 +952,12 @@ def overview(
     ``fx_unavailable_count`` (cf. /holdings, /portfolio), never silently dropped.
 
     **income / expense / net** come from the same :func:`_income_expense_sums` helper
-    ``period-totals`` calls, over this month's window — one implementation, so the two
-    endpoints cannot report different totals for the same month. ``expense`` is the
-    signed Σ(spend, refund) ≤ 0, ``net`` = income + expense. ``transfer`` is excluded
-    everywhere.
+    ``period-totals`` calls, over this period's window — one implementation, so the
+    two endpoints cannot report different totals for the same period. ``expense`` is
+    the signed Σ(spend, signed) ≤ 0, ``net`` = income + expense. ``transfer`` is
+    excluded everywhere.
     """
-    window = _month_window(month)
+    window = _period_window(month, year)
     first, last = window.first, window.last
 
     # Per-account board-only signed sum. No accounts JOIN and no archived_at
@@ -974,44 +972,68 @@ def overview(
         acct_id: int(total or 0) for acct_id, total in session.execute(balance_stmt).all()
     }
 
-    # Per-CC calendar year-to-date spend: signed net Σ(spend, refund) over
-    # [Jan 1 of the requested month's year, end of the requested month]. Window
-    # derives strictly from `month` (`window.year` / `window.last`, both parsed by
-    # _month_window), never date.today() — the route stays deterministic on its input.
+    # Per-CC calendar year-to-date spend: signed net Σ(spend, signed) over
+    # [Jan 1 of the requested period's year, end of the requested period]. Window
+    # derives strictly from `month`/`year` (`window.year` / `window.last`, both
+    # parsed by _period_window), never date.today() — the route stays deterministic
+    # on its input. A year request's "YTD" is the whole year (window.last is
+    # already Dec 31), so this generalizes without a special case.
     # Signed and never clamped here (a refund-dominant window is legitimately
     # positive; the frontend floors to a non-negative "spent" magnitude). Only
     # credit-card accounts get a value; every other type maps to None below.
+    # gross_spend and refund split the SAME spend-typed rows by SIGN, not by type
+    # (ADR-0009: a refund is a `spend` row with a positive amount). The two
+    # predicates are exhaustive over spend rows because zero-paise amounts are
+    # rejected at every write path, so gross_spend + refund == the signed net.
+    # `cashback` still keys off the type — an income row is a different taxonomy,
+    # not a differently-signed spend. The predicate is inlined rather than
+    # extracted: this is its only backend consumer (AGENTS.md §Simplicity first).
     ytd_first = date(window.year, 1, 1)
-    ytd_stmt = (
-        select(
-            Transaction.account_id,
-            func.sum(case((Transaction.transaction_type == "spend", Transaction.amount_paise), else_=0)).label("gross_spend"),
-            func.sum(case((Transaction.transaction_type == "refund", Transaction.amount_paise), else_=0)).label("refund"),
-            func.sum(case((Transaction.transaction_type == "income", Transaction.amount_paise), else_=0)).label("cashback"),
+    gross_spend_sum = func.sum(
+        case(
+            (
+                and_(Transaction.transaction_type == "spend", Transaction.amount_paise < 0),
+                Transaction.amount_paise,
+            ),
+            else_=0,
         )
+    ).label("gross_spend")
+    refund_sum = func.sum(
+        case(
+            (
+                and_(Transaction.transaction_type == "spend", Transaction.amount_paise > 0),
+                Transaction.amount_paise,
+            ),
+            else_=0,
+        )
+    ).label("refund")
+    cashback_sum = func.sum(
+        case((Transaction.transaction_type == "income", Transaction.amount_paise), else_=0)
+    ).label("cashback")
+    ytd_stmt = (
+        select(Transaction.account_id, gross_spend_sum, refund_sum, cashback_sum)
         .where(
             Transaction.user_id == user_id,
-            Transaction.transaction_type.in_(("spend", "refund", "income")),
+            Transaction.transaction_type.in_(("spend", "income")),
             Transaction.date >= ytd_first,
             Transaction.date <= last,
         )
         .group_by(Transaction.account_id)
     )
     ytd_stmt = confirmed_only(ytd_stmt)
-    ytd_spend: dict[int, int] = {}
+    # Three accumulators, not four: `spend_ytd_paise` below is the signed net
+    # gross_spend + refund, derived inline at the point of use rather than
+    # carried as its own dict that has to be kept in lockstep with the other
+    # three on every write.
     ytd_gross_spend: dict[int, int] = {}
     ytd_refund: dict[int, int] = {}
     ytd_cashback: dict[int, int] = {}
     for row in session.execute(ytd_stmt).all():
         m = row._mapping
         acct_id = m["account_id"]
-        gs = int(m["gross_spend"] or 0)
-        rf = int(m["refund"] or 0)
-        cb = int(m["cashback"] or 0)
-        ytd_spend[acct_id] = gs + rf
-        ytd_gross_spend[acct_id] = gs
-        ytd_refund[acct_id] = rf
-        ytd_cashback[acct_id] = cb
+        ytd_gross_spend[acct_id] = int(m["gross_spend"] or 0)
+        ytd_refund[acct_id] = int(m["refund"] or 0)
+        ytd_cashback[acct_id] = int(m["cashback"] or 0)
 
     accounts = [
         AccountBalanceRow(
@@ -1020,8 +1042,14 @@ def overview(
             type=a.type,
             currency=a.currency,
             balance_paise=a.opening_balance_paise + summed.get(a.id, 0),
-            spend_ytd_paise=(ytd_spend.get(a.id, 0) if a.type == "credit_card" else None),
-            gross_spend_ytd_paise=(ytd_gross_spend.get(a.id, 0) if a.type == "credit_card" else None),
+            spend_ytd_paise=(
+                ytd_gross_spend.get(a.id, 0) + ytd_refund.get(a.id, 0)
+                if a.type == "credit_card"
+                else None
+            ),
+            gross_spend_ytd_paise=(
+                ytd_gross_spend.get(a.id, 0) if a.type == "credit_card" else None
+            ),
             refund_ytd_paise=(ytd_refund.get(a.id, 0) if a.type == "credit_card" else None),
             cashback_ytd_paise=(ytd_cashback.get(a.id, 0) if a.type == "credit_card" else None),
             archived=a.archived_at is not None,
@@ -1043,8 +1071,8 @@ def overview(
         a.balance_paise for a in accounts if a.type not in NET_WORTH_EXCLUDED_TYPES
     )
 
-    # Month income / expense — the SAME helper period_totals calls, so the landing-page
-    # tile and the drill-down route can no longer disagree for one ?month=.
+    # Period income / expense — the SAME helper period_totals calls, so the landing-page
+    # tile and the drill-down route can no longer disagree for one period.
     income_paise, expense_paise = _income_expense_sums(
         session, user_id=user_id, start=first, end=last
     )
@@ -1063,7 +1091,7 @@ def overview(
     portfolio_value_paise = portfolio_rollup.current_value_paise
 
     return OverviewResponse(
-        month=month,
+        period=window.key,
         net_worth_paise=net_worth_accounts + portfolio_value_paise,
         portfolio_value_paise=portfolio_value_paise,
         fx_unavailable_count=portfolio_rollup.fx_unavailable_count,
@@ -1079,15 +1107,19 @@ def tagging_stats(
     session: SessionDep,
     user_id: CurrentUserId,
 ) -> TaggingStatsResponse:
-    """Auto-tag acceptance rate (PRD §F3 / §Success-metrics: ≥80% pre-tagged).
+    """Two distinct F3 health metrics (PRD §F3 / §Success-metrics), neither a
+    replacement for the other: ``acceptance_rate`` (of what we suggested, did
+    it stick?) and ``coverage_rate`` (of what we imported, did we suggest
+    anything at all? — the ≥80% pre-tag bar).
 
-    Of board rows the import auto-tagged to a **still-live** category
-    (``auto_category_id`` points at a non-archived bucket), the fraction whose
-    final ``category_id`` still equals the frozen suggestion — final-state
-    semantics (a change-then-change-back counts as kept). No transaction_type
-    filter is needed: ``auto_category_id`` is only ever set for AUTO_TAGGABLE_TYPES
-    rows by construction (import_service). ``acceptance_rate`` is ``None`` at zero
-    denominator so the UI shows "no data", not "0%".
+    ``acceptance_rate``: of board rows the import auto-tagged to a
+    **still-live** category (``auto_category_id`` points at a non-archived
+    bucket), the fraction whose final ``category_id`` still equals the frozen
+    suggestion — final-state semantics (a change-then-change-back counts as
+    kept). No transaction_type filter is needed: ``auto_category_id`` is only
+    ever set for AUTO_TAGGABLE_TYPES rows by construction (import_service).
+    ``acceptance_rate`` is ``None`` at zero denominator so the UI shows "no
+    data", not "0%".
 
     Current-health semantics: rows whose frozen suggestion points at a
     since-archived category are excluded from BOTH numerator and denominator via
@@ -1099,6 +1131,23 @@ def tagging_stats(
     counted as not-kept. Deliberately asymmetric with spend-by-category (which
     keeps archived buckets): that answers "where did money go, ever"; this answers
     "is auto-tagging healthy now". See ADR-0004.
+
+    ``coverage_rate``: ``imported_total`` is every AUTO-TAGGABLE board row
+    imported (``source == "import"`` and ``transaction_type`` in
+    ``AUTO_TAGGABLE_TYPES``), regardless of whether it was auto-tagged;
+    ``pre_tagged`` is the exact same "auto-tagged to a still-live category"
+    population as ``total_auto`` above — acceptance's denominator and
+    coverage's numerator are identical by construction, just answering
+    different questions. ``coverage_rate`` is ``None`` at zero
+    ``imported_total``, same "no data" contract as ``acceptance_rate``.
+
+    The type filter is load-bearing here, unlike on ``acceptance_rate`` above:
+    ``import_service`` sets ``auto_category_id`` only for ``AUTO_TAGGABLE_TYPES``,
+    so income and transfer rows can never enter the numerator. Counting them in
+    the denominator made the metric structurally unable to reach 100% and
+    under-report by each statement's income/transfer share — 40 of 40 spend rows
+    pre-tagged alongside 10 bill-payment credits read 0.80, exactly the PRD
+    §Success-metrics bar it was added to measure.
     """
     kept_expr = func.sum(
         case((Transaction.category_id == Transaction.auto_category_id, 1), else_=0)
@@ -1124,12 +1173,46 @@ def tagging_stats(
     total_auto = int(total_raw or 0)
     kept = int(kept_raw or 0)
 
+    # pre_tagged is the exact same "auto-tagged to a still-live category"
+    # population as total_auto — acceptance_rate's denominator and
+    # coverage_rate's numerator are identical by construction (auto_category_id
+    # is only ever set by import_service). Exposed separately because each
+    # answers a different question: of what we suggested, did it stick? vs of
+    # what we imported, did we suggest anything at all?
+    pre_tagged = total_auto
+
+    imported_total = int(
+        session.scalar(
+            confirmed_only(
+                select(func.count()).where(
+                    Transaction.user_id == user_id,
+                    Transaction.source == "import",
+                    # Sorted for a stable, cacheable IN list.
+                    Transaction.transaction_type.in_(sorted(AUTO_TAGGABLE_TYPES)),
+                )
+            )
+        )
+        or 0
+    )
+
     rules_count = session.scalar(
-        select(func.count()).select_from(MerchantTagMap).where(MerchantTagMap.user_id == user_id)
+        select(func.count())
+        .select_from(MerchantTagMap)
+        .where(
+            MerchantTagMap.user_id == user_id,
+            # hit_count == 0 marks a seeded dictionary entry the user has
+            # never confirmed (a later phase backfills ~100 of these at
+            # registration). Excluded so a fresh user's unconfirmed seed rows
+            # don't inflate "learned rules" before any import runs.
+            MerchantTagMap.hit_count != 0,
+        )
     )
     return TaggingStatsResponse(
         total_auto_tagged=total_auto,
         kept=kept,
         acceptance_rate=(kept / total_auto) if total_auto else None,
         rules_count=int(rules_count or 0),
+        imported_total=imported_total,
+        pre_tagged=pre_tagged,
+        coverage_rate=(pre_tagged / imported_total) if imported_total else None,
     )

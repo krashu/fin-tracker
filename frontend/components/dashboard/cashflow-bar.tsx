@@ -11,7 +11,6 @@
  * would be mostly income=0 noise. Owns its own window, independent of the other
  * /spending cards (each child holds its own period state).
  */
-import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Bar,
@@ -33,9 +32,9 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { listCashflowByPeriod } from "@/lib/api/client";
-import { trailingMonths } from "@/lib/dates";
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel } from "@/lib/charts";
+import { periodRange } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
 
@@ -46,15 +45,14 @@ const CHART_CONFIG = {
 } satisfies ChartConfig;
 
 // `tagActive` = the /spending tag filter is set. CashflowBar is deliberately NOT
-// tag-scoped: labels apply to spend/refund only, so filtering would zero out all
-// income and collapse "am I solvent" into a flat income line. Instead it stays
-// whole-account and shows a caption saying so (below) — honest rather than
-// silently ignoring the shared selector.
+// tag-scoped: labels apply to spend rows only (a refund included — ADR-0009),
+// so filtering would zero out all income and collapse "am I solvent" into a
+// flat income line. Instead it stays whole-account and shows a caption saying
+// so (below) — honest rather than silently ignoring the shared selector.
 export function CashflowBar({ tagActive = false, year }: { tagActive?: boolean; year: number }) {
   const { hidden } = useBalanceHidden();
 
-  const start = `${year}-01-01`;
-  const end = `${year}-12-31`;
+  const { start, end } = periodRange({ year });
   const query = useQuery({
     queryKey: [
       "dashboards",

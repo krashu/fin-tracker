@@ -1,23 +1,30 @@
-"""Direct-DB demo seeder — populates a fresh DB with the demo dataset on boot.
+"""Direct-DB demo seeder — keeps the demo account's transactions fresh on every boot.
 
-The app lifespan calls :func:`seed_demo_data` after migrations bring a fresh DB
-to ``head`` (see :mod:`app.main`). Unlike :mod:`scripts.seed_dev_data` — which
-drives the *running* HTTP API and so can't run before the server is listening —
-this writes straight to the ORM in-process, on the same engine, so a plain
-``make backend`` comes up with a populated app and no separate seed step.
+The app lifespan calls :func:`seed_demo_data` on every boot (see :mod:`app.main`),
+not just once on an empty DB — that's what keeps the "Try the demo" account's
+dashboards non-stale without a separate reseed step. Restarting `main.py` is
+now the only way to refresh the demo data; the HTTP-driving manual script this
+module used to share its dataset with (``scripts/seed_dev_data.py``) was
+deleted once that made it redundant.
 
-Dataset lives in :mod:`app.core.demo_data` (shared with the HTTP script so the
-two never drift). The load-bearing invariants — merchant normalization, the
-PRD §F4 fingerprint, and F3 tag learning — are reused verbatim from their
-existing single-source-of-truth functions (``normalize_merchant``,
-``transaction_fingerprint``, ``record_tag``); re-implementing them here would let
-the fingerprint inputs drift from the POST route and silently break dedup.
+Dataset lives in :mod:`app.core.demo_data`:
+:func:`app.core.demo_data.build_demo_dataset` materializes a rolling window of
+spend/income rows relative to ``clock.today()``. The load-bearing invariants —
+merchant normalization, the PRD §F4 fingerprint, and F3 tag learning — are
+reused verbatim from their existing single-source-of-truth functions
+(``normalize_merchant``, ``transaction_fingerprint``, ``record_tag``);
+re-implementing them here would let the fingerprint inputs drift from the POST
+route and silently break dedup.
 
-Only ever invoked on an empty DB (the lifespan gates on zero accounts /
-transactions / investment-txns), so there are no fingerprint conflicts to handle
-and a single commit is enough. Network is deliberately untouched — the benchmark
-NAV backfill (mfapi) stays in the HTTP script; blocking boot on an external fetch
-is not worth it, and benchmark history isn't needed for the core demo.
+Idempotency is by wipe-and-regenerate, not by diffing: this account carries only
+seed data (SEED_DEMO_ON_STARTUP is a dev/demo-only convenience, off by default
+for the self-host stacks that hold real data — see ``app.core.demo``), so each
+call hard-deletes the demo accounts' existing transactions and reinserts a fresh
+window, rather than reconciling row-by-row. Accounts/instruments stay
+find-or-create — instrument purchase history is NOT wiped (XIRR needs it since
+inception). Network is deliberately untouched — the benchmark NAV backfill
+(mfapi) stays in the HTTP script; blocking boot on an external fetch is not
+worth it, and benchmark history isn't needed for the core demo.
 """
 
 from __future__ import annotations
@@ -27,11 +34,11 @@ from decimal import Decimal
 from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.core.demo_data import BANK_INCOME, CARD_REFUNDS, CARD_SPENDS, INSTRUMENTS
+from app.core.demo_data import INSTRUMENTS, build_demo_dataset
 from app.core.log_config import get_logger
 from app.models import Account, Category, Instrument, InvestmentTransaction, Transaction
 from app.services.fingerprint import transaction_fingerprint
@@ -113,13 +120,14 @@ def _add_transaction(
 ) -> None:
     """Build + add one confirmed manual transaction, mirroring the POST route.
 
-    Resolves labels and learns the merchant → category/label memory (spend/refund
+    Resolves labels and learns the merchant → category/label memory (spend-typed rows
     only, via :func:`learn_merchant_memory`) BEFORE adding the row — same slot and
     ordering as ``create_transaction``, so the seeder exercises the same path and
     the demo user's ``merchant_tag_map`` / ``merchant_label_map`` are populated for
     a later import to prefill. Labels are linked after a flush assigns the txn id.
-    Caller owns the commit (the empty-DB single-commit seeder has no 409 handler,
-    but a fresh DB has no fingerprint conflicts).
+    Caller owns the commit — no 409 handler here, because the caller wipes the
+    demo accounts' existing rows before regenerating (see
+    ``_reset_demo_transactions``), so there is nothing an insert could collide with.
     """
     merchant_normalized = normalize_merchant(merchant_raw) if merchant_raw else ""
     resolved = resolve_label_names(session, user_id=user_id, names=labels) if labels else []
@@ -156,11 +164,40 @@ def _add_transaction(
         set_labels_on_transaction(session, txn=txn, labels=resolved)
 
 
-def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
-    """Seed accounts, spending, and investments for ``user_id`` in one commit.
+def _reset_demo_transactions(
+    session: Session, *, user_id: UUID, account_ids: tuple[int, ...]
+) -> None:
+    """Hard-delete every existing transaction on the demo accounts before the
+    caller regenerates the rolling window.
 
-    Idempotent for accounts/instruments (find-or-create); transactions are added
-    unconditionally, which is safe because the lifespan only calls this on an
+    Null ``transfer_pair_id`` first: that self-referential FK
+    (``fk_transactions_transfer_pair_same_user``) has no ``ondelete`` action, so
+    deleting one leg of a pair while its partner still points at it would raise
+    ``IntegrityError``. Nothing seeded pairs a transfer today, but this keeps the
+    wipe safe if F2/F4a demo data ever does. ``transaction_labels`` needs no such
+    step — its FKs are ``ondelete="CASCADE"`` and SQLite has
+    ``PRAGMA foreign_keys=ON`` (core/db.py), so the label links go with the row.
+    """
+    session.execute(
+        update(Transaction)
+        .where(Transaction.user_id == user_id, Transaction.account_id.in_(account_ids))
+        .values(transfer_pair_id=None)
+    )
+    session.execute(
+        delete(Transaction).where(
+            Transaction.user_id == user_id, Transaction.account_id.in_(account_ids)
+        )
+    )
+
+
+def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
+    """Find-or-create the demo accounts/instruments, then wipe and regenerate
+    the demo accounts' transactions for a rolling window ending today, all in
+    one commit.
+
+    Accounts/instruments are idempotent (find-or-create) as before. Transactions
+    are NOT diffed — see the module docstring for why a full wipe-and-regenerate
+    is the right call here — so this is safe to call on every boot, not just an
     empty DB. Returns the inserted counts for logging.
     """
     cc = _get_or_create_account(
@@ -189,7 +226,10 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
     other_spend, other_income = spend_cats["other"], income_cats["other"]
     txn_count = 0
 
-    for row in CARD_SPENDS:
+    _reset_demo_transactions(session, user_id=user_id, account_ids=(cc.id, bank.id))
+    spends, refunds, income = build_demo_dataset(clock.today())
+
+    for row in spends:
         _add_transaction(
             session,
             user_id=user_id,
@@ -202,26 +242,33 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
             labels=row.labels,
         )
         txn_count += 1
-    for row in CARD_REFUNDS:
+    for row in refunds:
         _add_transaction(
             session,
             user_id=user_id,
             account_id=cc.id,
             on=date_t.fromisoformat(row.date),
-            amount_paise=row.rupees * 100,  # refund = positive, same category
-            transaction_type="refund",
+            # A refund IS a spend row with a positive amount (ADR-0009), filed
+            # under the SAME category as the spend it reverses — which is what
+            # makes the §F4a signed sum net. The seed demonstrates exactly that.
+            amount_paise=row.rupees * 100,
+            transaction_type="spend",
             merchant_raw=row.merchant,
             category_id=spend_cats.get(row.category.lower(), other_spend),
             labels=row.labels,
         )
         txn_count += 1
-    for inc in BANK_INCOME:
+    for inc in income:
+        # Almost everything is bank-credited salary; card cashback is credited
+        # on the card statement itself (real Axis Flipkart behaviour) — see
+        # IncomeRow.account in app.core.demo_data.
+        account_id = cc.id if inc.account == "card" else bank.id
         _add_transaction(
             session,
             user_id=user_id,
-            account_id=bank.id,
+            account_id=account_id,
             on=date_t.fromisoformat(inc.date),
-            amount_paise=inc.rupees * 100,  # income = positive on the bank
+            amount_paise=inc.rupees * 100,  # income = positive
             transaction_type="income",
             merchant_raw=inc.source,
             category_id=income_cats.get(inc.category.lower(), other_income),

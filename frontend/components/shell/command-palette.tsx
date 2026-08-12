@@ -10,8 +10,9 @@
  * - Nav destinations — `NAV_GROUPS` (single source of truth, disabled items dropped).
  * - Accounts — `["accounts"]` query; selecting deep-links to `/expenses?account=<id>`.
  * - Categories — `["categories"]`, **spend kind only**: the expenses board defaults
- *   to the spend+refund view, so an income-category deep-link would land on a board
- *   that never queries it (empty table). Income categories are out of scope here.
+ *   to the Spending view (every `spend` row, either sign), so an income-category
+ *   deep-link would land on a board that never queries it (empty table). Income
+ *   categories are out of scope here.
  *
  * The account/category queries are `enabled: open` — the palette is mounted
  * globally in the top-bar, so without the gate it would fetch on every page that

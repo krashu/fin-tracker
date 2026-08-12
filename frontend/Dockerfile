@@ -1,5 +1,5 @@
 # fin-tracker frontend — Next.js 16 (App Router), Node 24 (build 24.18.1, run 24.18.0),
-# pnpm via corepack (11.14.0, resolved from package.json's `packageManager`).
+# pnpm via corepack (11.21.0, resolved from package.json's `packageManager`).
 #
 # The Node major matches the rest of the repo — .nvmrc (24.18.1),
 # .github/workflows/ci.yml (node-version "24"), PRD §Production-grade essentials

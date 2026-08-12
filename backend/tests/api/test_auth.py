@@ -37,7 +37,18 @@ def _demo_enabled() -> Settings:
 
 
 def _demo_disabled() -> Settings:
-    return Settings(demo_login_enabled=False, cors_allowed_origins="http://localhost:3000")
+    """The shipped default: no operator opt-in.
+
+    ``_env_file=None`` skips the ambient dotenv file, so ``demo_login_enabled``
+    genuinely resolves through to the field's Python default (``False``)
+    rather than being forced via a constructor kwarg (which would pass even if
+    that default silently flipped to ``True``). Callers must ALSO
+    ``monkeypatch.delenv("DEMO_LOGIN_ENABLED")`` — this box's repo-root
+    ``.env`` sets it ``true`` for the local demo seeder, and
+    ``tests/conftest.py`` copies that into real ``os.environ`` at session
+    start, which pydantic-settings reads regardless of ``_env_file``.
+    """
+    return Settings(_env_file=None, cors_allowed_origins="http://localhost:3000")
 
 
 # --- register ----------------------------------------------------------------
@@ -73,7 +84,6 @@ _EXPECTED_SPEND = frozenset(
         "Other",
     }
 )
-_EXPECTED_REFUND = frozenset({"Refund"})
 _EXPECTED_INCOME = frozenset({"Salary", "Freelancing", "Cashback", "Other"})
 
 
@@ -81,12 +91,10 @@ def test_register_provisions_default_categories(unauth_client: TestClient) -> No
     _register(unauth_client)
     cats = unauth_client.get("/api/v1/categories").json()
     spend = {c["name"] for c in cats if c["kind"] == "spend"}
-    refund = {c["name"] for c in cats if c["kind"] == "refund"}
     income = {c["name"] for c in cats if c["kind"] == "income"}
     assert spend == _EXPECTED_SPEND  # 13 active spend
-    assert refund == _EXPECTED_REFUND  # 1 active refund
     assert income == _EXPECTED_INCOME  # 4 active income
-    assert len(cats) == 18
+    assert len(cats) == 17
     assert all(c["is_seeded"] for c in cats)  # app defaults, not user-created
     assert all(c["color"] for c in cats)  # colors provisioned, none null
 
@@ -154,6 +162,12 @@ def test_demo_login_refused_by_default_and_config_agrees(
     """B9.1: on PLAIN HTTP with DEMO_LOGIN_ENABLED unset, the demo creds must 401 AND
     GET /auth/config must advertise the same answer.
     """
+    # tests/conftest.py's _load_dotenv() copies this box's repo-root .env
+    # (DEMO_LOGIN_ENABLED=true, for the local demo seeder) into os.environ at
+    # session start — an explicit env var pydantic-settings reads regardless
+    # of _demo_disabled's `_env_file=None`. Unset it so this test genuinely
+    # exercises the shipped default, not whatever dev convenience is ambient.
+    monkeypatch.delenv("DEMO_LOGIN_ENABLED", raising=False)
     monkeypatch.setattr("app.api.v1.auth.get_settings", _demo_disabled)
     monkeypatch.setattr("app.services.auth_service.get_settings", _demo_disabled)
     assert get_settings().cookie_secure is False, "must exercise the plain-http case"
@@ -456,6 +470,9 @@ def test_auth_config_demo_disabled_by_default(
 ) -> None:
     """The shipped default is CLOSED, on plain http as much as anywhere else — so the
     login page hides 'Try the demo' until an operator opts in."""
+    # See test_demo_login_refused_by_default_and_config_agrees — this box's .env
+    # leaks DEMO_LOGIN_ENABLED=true into os.environ via tests/conftest.py.
+    monkeypatch.delenv("DEMO_LOGIN_ENABLED", raising=False)
     monkeypatch.setattr("app.api.v1.auth.get_settings", _demo_disabled)
     r = unauth_client.get("/api/v1/auth/config")
     assert r.status_code == 200

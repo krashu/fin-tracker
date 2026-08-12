@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Account, Category, ImportBatch, Transaction, User
-from app.parsers import RawTransaction
+from app.parsers import ParsedStatement, RawTransaction, StatementSummary
 from app.parsers.base import InvalidPasswordError, ParserError
 from app.services import import_service
 
@@ -98,8 +98,8 @@ class _StubAxisParser:
     rows: ClassVar[list[RawTransaction]] = []
 
     @classmethod
-    def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]:
-        return list(cls.rows)
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+        return ParsedStatement(rows=list(cls.rows), summary=StatementSummary())
 
 
 @pytest.fixture
@@ -175,6 +175,7 @@ def test_import_persists_transactions(
         "pending_count": 7,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
 
     with session_factory() as s:
@@ -210,6 +211,7 @@ def test_reimport_same_file_reconciles_no_new_rows(
         "pending_count": 7,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
     assert second == {
         "batch_id": 1,
@@ -219,6 +221,7 @@ def test_reimport_same_file_reconciles_no_new_rows(
         "pending_count": 7,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
 
     with session_factory() as s:
@@ -247,6 +250,7 @@ def test_reimport_different_bytes_row_level_dedupes(
         "pending_count": 7,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
 
     _StubAxisParser.rows = list(_AXIS_ROWS_B)
@@ -259,6 +263,7 @@ def test_reimport_different_bytes_row_level_dedupes(
         "pending_count": 2,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
 
     with session_factory() as s:
@@ -296,6 +301,7 @@ def test_reimport_resurfaces_rows_missing_from_the_db(
         "pending_count": 7,  # 5 remaining + 2 resurfaced
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
 
     with session_factory() as s:
@@ -316,10 +322,10 @@ class _PasswordGatedParser:
     rows: ClassVar[list[RawTransaction]] = list(_AXIS_ROWS_A)
 
     @classmethod
-    def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]:
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
         if not password:
             raise InvalidPasswordError("encrypted PDF requires a password")
-        return list(cls.rows)
+        return ParsedStatement(rows=list(cls.rows), summary=StatementSummary())
 
 
 def test_reimport_encrypted_pdf_without_password_422s(
@@ -445,6 +451,7 @@ def test_import_empty_statement_skips_dupcheck(
         "pending_count": 0,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
+        "reconciliation_delta_paise": None,
     }
 
 

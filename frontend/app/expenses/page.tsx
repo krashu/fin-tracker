@@ -1,10 +1,11 @@
 /**
- * /expenses — the spend + refund board (PRD §F8 / F2). Design baseline chosen
- * 2026-05-25 after a 4-variant exploration (see git history of
- * `frontend/app/looks/*`): content-first, Hanken Grotesk + JetBrains Mono for
- * tabular amounts, indigo --primary (locked 2026-05-24).
+ * /expenses — the spend board (PRD §F8 / F2), every `spend` row regardless of
+ * sign (a refund included — ADR-0009). Design baseline chosen 2026-05-25 after
+ * a 4-variant exploration (see git history of `frontend/app/looks/*`):
+ * content-first, Hanken Grotesk + JetBrains Mono for tabular amounts, indigo
+ * --primary (locked 2026-05-24).
  *
- * Renamed /transactions → /expenses (2026-05-25), narrowed to spend+refund rows;
+ * Renamed /transactions → /expenses (2026-05-25), narrowed to spend rows;
  * income/transfer live elsewhere. Pending-tag rows live at
  * /imports/review/[batchId] only — this board shows confirmed txns.
  *

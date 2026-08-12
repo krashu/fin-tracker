@@ -50,7 +50,7 @@ or self-inflate its ``/candidates`` confidence.
 from __future__ import annotations
 
 from datetime import date as date_t
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -103,6 +103,7 @@ def list_transactions(
     category_id: Annotated[int | None, Query(gt=0)] = None,
     label_id: Annotated[int | None, Query(gt=0)] = None,
     transaction_type: Annotated[list[TransactionTypeStr] | None, Query()] = None,
+    amount_sign: Annotated[Literal["positive", "negative"] | None, Query()] = None,
     date_from: Annotated[date_t | None, Query()] = None,
     date_to: Annotated[date_t | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
@@ -120,11 +121,18 @@ def list_transactions(
     # confirmed_only() (services/transaction_queries.py).
     #
     # `transaction_type`, by contrast, IS a knob with a real consumer: the
-    # /expenses board's Type filter requests spend+refund (its default view) or
-    # income; transfers stay entry-only and aren't browsed here. It filters
-    # server-side to keep offset/limit pagination correct. Lives here, not in
-    # confirmed_only() — that predicate stays the shared confirmed-gate and must
-    # not couple to the board's display rule.
+    # /expenses board's Type filter requests spend (its default view, which shows
+    # spends and refunds together) or income; transfers stay entry-only and
+    # aren't browsed here. It filters server-side to keep offset/limit pagination
+    # correct. Lives here, not in confirmed_only() — that predicate stays the
+    # shared confirmed-gate and must not couple to the board's display rule.
+    #
+    # `amount_sign` is deliberately ORTHOGONAL to `transaction_type` rather than
+    # folded into it. Since ADR-0009 a refund is a `spend` row with a positive
+    # amount, so the board's "Refunds" view is expressed as the composition
+    # `?transaction_type=spend&amount_sign=positive` — there is no `refund`
+    # value to request any more. Keeping it a separate axis means the two
+    # compose for any future sign-scoped view without re-cutting the type enum.
     stmt = confirmed_only(select(Transaction).where(Transaction.user_id == user_id))
     if account_id is not None:
         stmt = stmt.where(Transaction.account_id == account_id)
@@ -136,6 +144,14 @@ def list_transactions(
         # belt-and-braces for a programmatic `[]` caller. The Literal type
         # bounds each value (unknown → 422), so no manual validation is needed.
         stmt = stmt.where(Transaction.transaction_type.in_(transaction_type))
+    if amount_sign is not None:
+        # Zero is rejected at every write path, so these two are exhaustive and
+        # `positive` is exactly the refund set when composed with type=spend.
+        stmt = stmt.where(
+            Transaction.amount_paise > 0
+            if amount_sign == "positive"
+            else Transaction.amount_paise < 0
+        )
     if category_id is not None:
         # Drilldown filter for the F8 spend-by-category surface. No
         # ?uncategorized=true sentinel in v1 — defer until a real consumer
@@ -570,8 +586,10 @@ def update_transaction(
     # Only when the request actually puts that pair in play. Validating an untouched
     # pair would strand a row the caller is not changing: `backup_csv` checks the type
     # vocabulary and that the amount parses, but NOT the sign pairing, and a
-    # hand-edited zip is its declared threat model — so a stored `refund` carrying a
+    # hand-edited zip is its declared threat model — so a stored `income` carrying a
     # negative amount is reachable, and a labels-only PATCH on it must not 422.
+    # (A stored `spend` with a positive amount needs no such exemption since
+    # ADR-0009: that IS a refund, and sign_error accepts it outright.)
     merged_type = updates.get("transaction_type", txn.transaction_type)
     if {"transaction_type", "amount_paise"} & updates.keys():
         sign_problem = sign_error(merged_type, updates.get("amount_paise", txn.amount_paise))
@@ -665,7 +683,7 @@ def update_transaction(
     # count the user's own in-session pick as prior history. Category: skip when
     # unchanged (a re-PATCH of the same value isn't a new decision → no hit_count
     # inflation under frontend retries); labels: additions only. The helper applies
-    # the shared spend/refund gate against the POST-patch type and merchant — both
+    # the shared spend-type gate against the POST-patch type and merchant — both
     # read after the setattr loop, so re-typing a row to income in the same request
     # correctly stops it learning, and a merchant rename teaches the corrected name
     # (ADR-0007 rule 8: learning is unchanged, and these two consequences are

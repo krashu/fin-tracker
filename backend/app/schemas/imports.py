@@ -12,12 +12,19 @@
   Account-less and commits directly (no review queue — investments have no
   categories); the summary carries the counts plus PII-safe per-row reject
   warnings (line number + reason, never cell contents).
+* :class:`BatchReconciliation` — response body of
+  ``GET /api/v1/imports/{batch_id}/reconciliation`` (PRD §F1/§F4a statement
+  balance reconciliation). Recomputed fresh on every call; see the route's
+  docstring.
 
 ``POST /imports`` + ``/imports/investments`` upload fields are multipart
 ``Form()`` / ``File()`` parameters in the route, not a JSON body — no create schema.
 """
 
 from __future__ import annotations
+
+from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -37,6 +44,11 @@ class ImportSummary(BaseModel):
     ``duplicate_of_account_archived`` says whether that account is archived, because
     ``GET /accounts`` filters archived rows out and the id would otherwise be
     unresolvable to a label.
+
+    ``reconciliation_delta_paise`` mirrors ``ImportBatch.reconciliation_delta_paise``
+    as of this import (PRD §F1/§F4a): ``None`` = not checked, ``0`` = reconciled,
+    non-zero = mismatch, this many paise. See
+    ``reconciliation_service.reconcile_batch`` for the formula.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -48,6 +60,7 @@ class ImportSummary(BaseModel):
     pending_count: int
     duplicate_of_account_id: int | None = None
     duplicate_of_account_archived: bool = False
+    reconciliation_delta_paise: int | None = None
 
 
 class ImportCommit(BaseModel):
@@ -80,12 +93,18 @@ class PendingImportBatch(BaseModel):
     which is exactly what a join on a plain ``account_id`` FK is not, so the read
     restates ``Account.user_id`` in its ON clause. A foreign account yields a null
     label rather than another user's name and last4.
+
+    ``reconciliation_delta_paise`` is the batch's stored (not recomputed)
+    reconciliation verdict — see ``ImportSummary`` and
+    ``reconciliation_service.reconcile_batch``. Feeds the notification-bell
+    badge for a mismatched batch.
     """
 
     batch_id: int
     account_name: str | None
     account_last4: str | None
     pending_count: int
+    reconciliation_delta_paise: int | None
 
 
 class InvestmentCsvImportSummary(BaseModel):
@@ -105,3 +124,44 @@ class InvestmentCsvImportSummary(BaseModel):
     rows_rejected: int
     already_imported: bool
     warnings: list[str]
+
+
+class BatchReconciliation(BaseModel):
+    """Response body of ``GET /api/v1/imports/{batch_id}/reconciliation``.
+
+    Recomputed fresh on every call by the route (not just a read of the
+    stored column) — a commit or a discard since the last check can flip a
+    stale mismatch to matched. ``status`` is derived, never stored:
+    ``"unavailable"`` when ``delta_paise`` is ``None`` (no usable statement
+    metadata, or the batch is account-less), else ``"matched"``
+    (``delta_paise == 0``) or ``"mismatched"``.
+
+    ``expected_paise`` (``closing − opening``) and ``actual_paise`` are
+    derived algebraically from ``delta_paise`` at the route (``actual =
+    expected + delta``), not from a second query — they cannot drift from
+    the persisted delta by construction. All fields but ``batch_id``,
+    ``status`` and ``rows_removed_since_import`` are ``None`` in the
+    "unavailable" case.
+
+    ``rows_removed_since_import`` is the discard-noise qualifier
+    (:func:`app.services.reconciliation_service.rows_removed_since_import`):
+    how many of the batch's originally-staged rows no longer exist, against
+    its frozen ``imported_count``. Computed and returned regardless of
+    ``status`` — it's independent of whether the balance check itself could
+    run — but only meaningful paired with a ``"mismatched"`` status: it
+    explains a false positive from a routine discard (e.g. an
+    investment-transfer SIP debit discarded at review) rather than leaving
+    it an unexplained mismatch. It is a count, never a correction to
+    ``delta_paise`` — a hard delete leaves no amount to correct with.
+    """
+
+    batch_id: int
+    opening_balance_paise: int | None
+    closing_balance_paise: int | None
+    period_start: date | None
+    period_end: date | None
+    expected_paise: int | None
+    actual_paise: int | None
+    delta_paise: int | None
+    status: Literal["unavailable", "matched", "mismatched"]
+    rows_removed_since_import: int

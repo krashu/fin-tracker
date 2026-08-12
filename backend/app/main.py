@@ -19,13 +19,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from uuid import UUID
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.api.v1.router import api_router
 from app.core.config import API_V1_PREFIX, Settings, get_settings
@@ -38,7 +36,7 @@ from app.middleware import (
     SecurityHeadersMiddleware,
     apply_security_headers,
 )
-from app.models import Account, InvestmentTransaction, Transaction, User
+from app.models import User
 from app.services.demo_seed import seed_demo_data
 
 logger = get_logger(__name__)
@@ -80,49 +78,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-def _user_has_data(session: Session, user_id: UUID) -> bool:
-    """True if ``user_id`` owns any account, transaction, or investment txn.
-
-    The empty-check for the demo seed — a strict OR across the three tables so
-    the seed fires only on a genuinely pristine DB (an AND would let a DB with,
-    say, transactions but no accounts re-seed and duplicate them).
-
-    NB the tuple below does **not** include ``Instrument``, so this predicate
-    cannot detect an instruments-only DB. It does not need to: the seeder
-    find-or-creates each instrument by ``(user, symbol, currency)``
-    (``demo_seed._seed_instruments``), so an instrument that already exists is
-    reused rather than colliding on its unique key.
-
-    NB this predicate is *has-data*; :func:`_maybe_seed_demo` negates it, so its
-    docstring describes the complementary *is-empty* condition as a strict AND.
-    Both are correct — OR over has-data == AND over is-empty. Read together, not
-    as a contradiction.
-    """
-    return any(
-        session.scalar(select(model.id).where(model.user_id == user_id).limit(1)) is not None
-        for model in (Account, Transaction, InvestmentTransaction)
-    )
-
-
 def _maybe_seed_demo(settings: Settings) -> None:
-    """Seed the demo dataset when enabled AND the DB is empty.
+    """Sync the demo dataset into place when SEED_DEMO_ON_STARTUP is enabled.
 
-    Local-first convenience: a fresh `make backend` comes up populated. The
-    empty-check is a strict AND across accounts / transactions / investment-txns
-    for the v1 user — an OR would re-seed a DB that has, say, transactions but no
-    accounts and duplicate them. So this fires exactly
-    once on a pristine DB and is a cheap no-op on every subsequent boot. Gated
-    off for the self-host stacks (real data) and the test suite via
+    Runs on EVERY boot, not just once on an empty DB:
+    :func:`app.services.demo_seed.seed_demo_data` find-or-creates the demo
+    accounts/instruments and wipes + regenerates the demo accounts'
+    transactions for a rolling window ending at ``clock.today()`` (see that
+    module's docstring for why a full wipe-and-regenerate is safe here — this
+    account carries only seed data). So a `main.py` restart is what keeps the
+    "Try the demo" account looking current, with no separate reseed step.
+    Gated off for the self-host stacks (real data) and the test suite via
     SEED_DEMO_ON_STARTUP. A seed failure is logged, not swallowed silently, and
-    re-raised — a broken static dataset is a code bug to surface at boot.
+    re-raised — a broken dataset is a code bug to surface at boot.
     """
     if not settings.seed_demo_on_startup:
         return
     user_id = settings.v1_user_id
     with SessionLocal() as session:
-        if _user_has_data(session, user_id):
-            logger.info("demo_seed_skipped", reason="db_not_empty")
-            return
         try:
             seeded = seed_demo_data(session, user_id=user_id)
         except Exception:

@@ -131,6 +131,27 @@ def test_integer_paise_round_trips() -> None:
     assert parsed.transactions[0].amount_paise == 123456  # not 12345600 — no rupee scaling
 
 
+def test_legacy_refund_type_is_aliased_to_spend() -> None:
+    """T4: a backup zip exported before ADR-0009 carries ``transaction_type=refund``
+    — a value ``_TXN_TYPES`` no longer contains, since it derives from the narrowed
+    ``TransactionTypeStr``. The read-only legacy alias maps it to ``spend`` on
+    read, so an old export still restores cleanly instead of every row 422ing on
+    "unknown transaction type". The amount is untouched (already positive under
+    the old ``refund >= 0`` rule), so the row lands as a refund BY SIGN, matching
+    what a fresh export of the same data would produce today.
+    """
+    transactions = (
+        f"{_TRANSACTIONS_HEADER}\n"
+        "2026-07-01,Axis CC,50000,refund,SWIGGY,swiggy,Food,spend,,import,2026-07-01T10:00:00,\n"
+    )
+    parsed = parse_backup_zip(_valid_zip(transactions=transactions))
+    assert not parsed.warnings
+    assert len(parsed.transactions) == 1
+    txn = parsed.transactions[0]
+    assert txn.transaction_type == "spend"
+    assert txn.amount_paise == 50000  # unchanged — the alias never re-signs.
+
+
 def test_decimal_paise_is_rejected_not_scaled() -> None:
     transactions = (
         f"{_TRANSACTIONS_HEADER}\n"

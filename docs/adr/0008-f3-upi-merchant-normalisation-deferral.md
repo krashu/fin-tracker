@@ -1,6 +1,6 @@
 # ADR-0008: F3 UPI merchant normalisation — measured non-convergence, deferred with a trigger
 
-**Status**: Proposed
+**Status**: Superseded — see [ADR-0011](0011-merchant-alias-layer.md)
 **Date**: 2026-08-03
 
 ## Problem
@@ -73,4 +73,8 @@ The limitation is already documented. What is new is its **magnitude**, and the 
 
 - `PRD.md` §F3's "Future: stripping trailing transaction IDs / dates / reference numbers via regex" stays accurate and stays future. This ADR adds the measurement and the trigger, not a change of plan.
 - Assembling the tuning corpus when the trigger fires does **not** require the `scripts/redact_fixture.py` pipeline: a VPA is a payment handle, not one of the identifiers `PRD.md` §Production-grade essentials requires masking (PAN, account number, card last-4). That standing rule is unchanged — none of PAN, account number or card last-4 belongs in a log, a fixture, or an error event.
-- The top-merchants dashboard is a second beneficiary whenever this is reopened; whichever key it groups on is part of that decision, not a separate one.
+- The top-merchants dashboard is a second beneficiary whenever this is reopened; whichever key it groups on is part of that decision, not a separate one. **Correction (2026-08-12):** false for [ADR-0011](0011-merchant-alias-layer.md)'s Stage A specifically — `app/api/v1/dashboards.py` still groups the top-merchants chart on `Transaction.merchant_normalized`, unchanged by Stage A, since Stage A never touches a transaction's stored key. This chart is not a beneficiary of Stage A; regrouping it onto `merchant_canonical` (joining through the alias resolver at query time, or persisting the canonical) remains an open, later decision.
+
+## Superseding note (2026-08-12)
+
+[ADR-0011](0011-merchant-alias-layer.md) ships the split-key shape this ADR's own Decision section named as the preferred fallback ("when it fires, prefer the split-key shape"): a separate `merchant_alias` table resolves a canonical key downstream of `normalize_merchant`, and F3/F3a re-key on it at read time. This routes *around* the deferral above rather than reversing it — `normalize_merchant` itself is still frozen, which is what this ADR actually decided. The trigger recorded in §Decision (a real merchant corpus, or tagging precision measured below 80%) did not need to fire; ADR-0011's decision 11 found the ≥80% bar itself was not yet computable, which was reason enough to build the cheaper, non-regex route now instead of waiting on either trigger.

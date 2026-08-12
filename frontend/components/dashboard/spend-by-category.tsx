@@ -21,15 +21,12 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { IconChevronRight } from "@/components/icons";
 import {
   listCategories,
   listSpendByCategory,
   type CategoryColor,
 } from "@/lib/api/client";
 import { formatINR, formatMonthYear, formatPercent } from "@/lib/format";
-import { thisMonthAnchor, monthKey } from "@/lib/dates";
 import { categoryColorVar } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
@@ -71,6 +68,10 @@ export function SpendByCategory({
   const prevQuery = useQuery({
     queryKey: ["dashboards", "spend-by-category", { ...prevParams, label_id: labelId }],
     queryFn: () => listSpendByCategory({ ...prevParams, label_id: labelId }),
+    // The delta chip is a "vs last month" comparison (see DeltaChip's copy) —
+    // in year mode there's no chip to render this for, so fetching a whole
+    // second year here would be pure waste with no cache path that warms it.
+    enabled: month != null,
   });
 
   const prevMagById = new Map<number | null, number>();

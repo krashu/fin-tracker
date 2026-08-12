@@ -215,10 +215,11 @@ def test_investment_read_models_are_isolated_per_user(unauth_client: TestClient)
     assert summary["holding_xirr"] == []
 
 
-def test_import_batch_commit_and_cancel_are_scoped(
+def test_import_batch_commit_cancel_and_reconciliation_are_scoped(
     client: TestClient, seeded_user: User, session: Session
 ) -> None:
-    """B (seeded_user) cannot commit or cancel A's import batch — both 404."""
+    """B (seeded_user) cannot commit, cancel, or read A's import batch's
+    reconciliation — all three 404 via ``_get_batch_or_404``."""
     other = User(id=_OTHER_USER_ID)
     session.add(other)
     session.commit()
@@ -242,6 +243,7 @@ def test_import_batch_commit_and_cancel_are_scoped(
     commit = client.post(f"/api/v1/imports/{batch.id}/commit", json={"transaction_ids": [1]})
     assert commit.status_code == 404, commit.text
     assert client.delete(f"/api/v1/imports/{batch.id}").status_code == 404
+    assert client.get(f"/api/v1/imports/{batch.id}/reconciliation").status_code == 404
 
 
 def test_backup_export_excludes_other_users_spend(
@@ -347,6 +349,44 @@ def test_merchant_tags_do_not_leak_across_users(
     stats = client.get("/api/v1/dashboards/tagging-stats")
     assert stats.status_code == 200, stats.text
     assert stats.json()["rules_count"] == 0
+
+
+def test_merchant_aliases_are_isolated_per_user(unauth_client: TestClient) -> None:
+    """A new owned table (ADR-0011 merchant-alias layer, Phase A4): B can
+    neither list A's aliases nor address one of A's alias ids (scoped 404,
+    never 403 -- no existence leak).
+
+    Pattern/canonical deliberately DON'T match anything in the Phase A5 seed dictionary —
+    every user (A and B) already has ~96 seeded aliases post-registration, including a
+    "swiggy"->"swiggy" identity row, so a canonical of "swiggy" here would 422 on rule 4
+    (decision 7: no cascades -- a submitted canonical already matched by an existing pattern
+    is rejected) for a reason that has nothing to do with what THIS test checks.
+    """
+    _register(unauth_client, "alias-owner@example.com")
+    create = unauth_client.post(
+        "/api/v1/rules/aliases",
+        json={"pattern": "localkirana998877", "canonical": "local kirana store"},
+    )
+    assert create.status_code == 201, create.text
+    alias_id = create.json()["id"]
+
+    # Become a second user.
+    unauth_client.cookies.clear()
+    _register(unauth_client, "alias-intruder@example.com")
+
+    # B's own registration seeds ~96 is_seeded=True aliases (Phase A5) — the list is not
+    # empty by design. Isolation means B has none of A's USER-AUTHORED ones: no alias at
+    # B's own pattern, and no non-seeded row at all (B never created one).
+    b_aliases = unauth_client.get("/api/v1/rules/aliases").json()
+    assert not any(a["pattern"] == "localkirana998877" for a in b_aliases)
+    assert not any(a["is_seeded"] is False for a in b_aliases)
+    assert (
+        unauth_client.patch(
+            f"/api/v1/rules/aliases/{alias_id}", json={"canonical": "hijacked"}
+        ).status_code
+        == 404
+    )
+    assert unauth_client.delete(f"/api/v1/rules/aliases/{alias_id}").status_code == 404
 
 
 def _minimal_backup_zip() -> bytes:

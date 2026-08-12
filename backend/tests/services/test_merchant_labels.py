@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Label, MerchantLabelMap, User
 from app.services import merchant_labels
+from app.services.merchant_alias import EMPTY_RESOLVER, AliasResolver
 from app.services.merchant_labels import (
     LABEL_PREFILL_MIN,
     pin_label,
@@ -41,7 +42,7 @@ def _make_label(session: Session, user_id: uuid.UUID, name: str) -> Label:
 
 
 def test_prefetch_returns_empty_dict_for_empty_map(session: Session, user: User) -> None:
-    assert prefetch_label_map(session, user_id=user.id) == {}
+    assert prefetch_label_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {}
 
 
 def test_prefetch_includes_labels_at_threshold_excludes_below(session: Session, user: User) -> None:
@@ -73,7 +74,7 @@ def test_prefetch_includes_labels_at_threshold_excludes_below(session: Session, 
     )
     session.flush()
 
-    result = prefetch_label_map(session, user_id=user.id)
+    result = prefetch_label_map(session, user_id=user.id, resolver=EMPTY_RESOLVER)
     # Both threshold-clearing labels present, ordered hit_count DESC; the one-off
     # gift label is excluded.
     assert result == {"swiggy": [food.id, online.id]}
@@ -104,7 +105,9 @@ def test_prefetch_user_scoped(session: Session, user: User) -> None:
     )
     session.flush()
 
-    assert prefetch_label_map(session, user_id=user.id) == {"amazon": [mine.id]}
+    assert prefetch_label_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {
+        "amazon": [mine.id]
+    }
 
 
 # ---------- record_label --------------------------------------------------
@@ -340,7 +343,9 @@ def test_prefetch_pinned_label_below_threshold_prefills(session: Session, user: 
         )
     )
     session.flush()
-    assert prefetch_label_map(session, user_id=user.id) == {"amazon": [online.id]}
+    assert prefetch_label_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {
+        "amazon": [online.id]
+    }
 
 
 def test_pin_label_inserts_new_pinned_row(session: Session, user: User) -> None:
@@ -443,16 +448,20 @@ def test_set_label_pinned_toggle_preserves_hit_count(session: Session, user: Use
         select(MerchantLabelMap).where(MerchantLabelMap.merchant_normalized == "amazon")
     )
     assert row is not None
-    assert prefetch_label_map(session, user_id=user.id) == {}  # below bar, unpinned
+    assert (
+        prefetch_label_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {}
+    )  # below bar, unpinned
 
     set_label_pinned(session, user_id=user.id, map_id=row.id, pinned=True)
     session.flush()
-    assert prefetch_label_map(session, user_id=user.id) == {"amazon": [online.id]}
+    assert prefetch_label_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {
+        "amazon": [online.id]
+    }
     assert row.hit_count == 1  # untouched
 
     set_label_pinned(session, user_id=user.id, map_id=row.id, pinned=False)
     session.flush()
-    assert prefetch_label_map(session, user_id=user.id) == {}  # reverted
+    assert prefetch_label_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {}  # reverted
     assert row.hit_count == 1  # still untouched
 
 
@@ -475,3 +484,31 @@ def test_record_label_bump_preserves_pinned(session: Session, user: User) -> Non
     assert row is not None
     assert row.pinned is True
     assert row.hit_count == 2  # 1 (authored floor) + 1 (learned)
+
+
+# ---------- Phase A2: aggregation across an alias --------------------------
+
+
+def test_prefetch_label_map_sums_hit_count_across_aliased_merchants(
+    session: Session, user: User
+) -> None:
+    """Three raw descriptors at hit_count=1 each cannot individually clear
+    LABEL_PREFILL_MIN, but their alias-summed canonical does — the label-side
+    half of required test 3."""
+    online = _make_label(session, user.id, "online")
+    resolver = AliasResolver(((("swiggy",), "food"),))
+    session.add_all(
+        [
+            MerchantLabelMap(
+                user_id=user.id, merchant_normalized="swiggy blr 1", label_id=online.id
+            ),
+            MerchantLabelMap(
+                user_id=user.id, merchant_normalized="swiggy blr 2", label_id=online.id
+            ),
+            MerchantLabelMap(
+                user_id=user.id, merchant_normalized="upi swiggy 3", label_id=online.id
+            ),
+        ]
+    )
+    session.flush()
+    assert prefetch_label_map(session, user_id=user.id, resolver=resolver) == {"food": [online.id]}

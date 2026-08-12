@@ -6,11 +6,14 @@
  * has its own dialog).
  *
  * The amount is entered as a positive rupee magnitude; the sign is applied by
- * type (spend negative, refund/income positive — PRD §F4a), mirroring the
- * accounts create form. A created row is auto-confirmed server-side, but the
- * board only shows spend+refund by default (and filters by account/category/
- * month), so a new row may be out of view — income especially — and the dialog
- * confirms inline rather than relying on the row appearing.
+ * entry direction (spend negative, refund/income positive — PRD §F4a), mirroring
+ * the accounts create form. A refund is not its own stored type (ADR-0009) — it's
+ * a `spend` row with a positive amount, so `EntryDirection` is the local state and
+ * `directionToType`/`signedPaise` derive the two fields the API actually wants. A
+ * created row is auto-confirmed server-side, but the board only shows spend
+ * (either sign) by default (and filters by account/category/month), so a new row
+ * may be out of view — income especially — and the dialog confirms inline rather
+ * than relying on the row appearing.
  */
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -39,10 +42,11 @@ import { rupeesToPaise } from "@/lib/format";
 import { accountLabel } from "@/lib/accounts";
 import { categoryKindForType } from "@/lib/categories";
 import {
-  EDITABLE_TRANSACTION_TYPES,
-  TRANSACTION_TYPE_LABELS,
+  ENTRY_DIRECTIONS,
+  ENTRY_DIRECTION_LABELS,
+  directionToType,
   signedPaise,
-  type EditableTransactionType,
+  type EntryDirection,
 } from "@/lib/transaction-types";
 import { toLocalYMD } from "@/lib/dates";
 import { invalidateRules } from "@/lib/queries/invalidate";
@@ -98,7 +102,7 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
   );
   const categories = categoriesQuery.data ?? [];
 
-  const [type, setType] = useState<EditableTransactionType>("spend");
+  const [direction, setDirection] = useState<EntryDirection>("spend");
   const [accountId, setAccountId] = useState<number | null>(null);
   const [amount, setAmount] = useState("");
   const [merchant, setMerchant] = useState("");
@@ -107,6 +111,7 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
   const [labels, setLabels] = useState<string[]>([]);
   const [justAdded, setJustAdded] = useState<string | null>(null);
 
+  const type = directionToType(direction);
   const selectedAccount = accounts.find((a) => a.id === accountId) ?? null;
   // Lookup stays over the full list; only the picker options are kind-filtered.
   const selectedCategory = categories.find((c) => c.id === categoryId) ?? null;
@@ -115,13 +120,14 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
   // Single source for both the guard and the request body.
   const magnitude = rupeesToPaise(amount);
 
-  // Switching type swaps the category scope; drop a now-mismatched selection
-  // so an income category can't ride along on a spend row (and vice versa).
-  function handleTypeChange(next: EditableTransactionType) {
-    setType(next);
+  // Switching direction swaps the category scope; drop a now-mismatched
+  // selection so an income category can't ride along on a spend row (and
+  // vice versa). Spend → refund is a no-op here — both share the spend scope.
+  function handleDirectionChange(next: EntryDirection) {
+    setDirection(next);
     if (
       selectedCategory &&
-      selectedCategory.kind !== categoryKindForType(next)
+      selectedCategory.kind !== categoryKindForType(directionToType(next))
     ) {
       setCategoryId(null);
     }
@@ -132,7 +138,7 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
       const body: TransactionCreate = {
         date,
         account_id: accountId!,
-        amount_paise: signedPaise(type, magnitude),
+        amount_paise: signedPaise(direction, magnitude),
         transaction_type: type,
         merchant_raw: merchant.trim() || null,
         category_id: categoryId,
@@ -193,13 +199,13 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
         <div className="grid gap-3">
           <div className="grid grid-cols-2 gap-3">
             <Field label="Type">
-              <PickerButton label={TRANSACTION_TYPE_LABELS[type]}>
-                {EDITABLE_TRANSACTION_TYPES.map((t) => (
+              <PickerButton label={ENTRY_DIRECTION_LABELS[direction]}>
+                {ENTRY_DIRECTIONS.map((d) => (
                   <DropdownMenuItem
-                    key={t}
-                    onSelect={() => handleTypeChange(t)}
+                    key={d}
+                    onSelect={() => handleDirectionChange(d)}
                   >
-                    {TRANSACTION_TYPE_LABELS[t]}
+                    {ENTRY_DIRECTION_LABELS[d]}
                   </DropdownMenuItem>
                 ))}
               </PickerButton>

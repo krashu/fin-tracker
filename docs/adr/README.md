@@ -59,4 +59,7 @@ Do *not* write an ADR for:
 | [0005](0005-type-checker-ty.md) | `ty` replaces `mypy` as the backend type-check gate | Accepted | 2026-07-29 |
 | [0006](0006-f4-dedup-key.md) | The F4 dedup key — separator, occurrence ordinal, and the shared `normalize_merchant` contract | Accepted | 2026-07-30 |
 | [0007](0007-transaction-field-editability.md) | Transaction field editability on PATCH — the mutable set, identity recompute, and `origin_fingerprint` | Accepted | 2026-08-03 |
-| [0008](0008-f3-upi-merchant-normalisation-deferral.md) | F3 UPI merchant normalisation — measured non-convergence, deferred with a trigger | Proposed | 2026-08-03 |
+| [0008](0008-f3-upi-merchant-normalisation-deferral.md) | F3 UPI merchant normalisation — measured non-convergence, deferred with a trigger | Superseded | 2026-08-03 |
+| [0009](0009-refund-as-signed-spend.md) | A refund is a signed spend, not a `transaction_type` | Accepted | 2026-08-12 |
+| [0010](0010-parsed-statement-return.md) | `parse()` returns `ParsedStatement`, not `list[RawTransaction]` | Accepted | 2026-08-12 |
+| [0011](0011-merchant-alias-layer.md) | Merchant alias / canonicalisation layer + seeded Indian merchant dictionary | Accepted | 2026-08-12 |

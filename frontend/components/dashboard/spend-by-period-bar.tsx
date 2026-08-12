@@ -32,9 +32,9 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { listSpendByPeriod } from "@/lib/api/client";
-import { trailingMonths, trailingWeeksWindow } from "@/lib/dates";
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel, type Grain } from "@/lib/charts";
+import { periodRange } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
 
@@ -52,8 +52,7 @@ export function SpendByPeriodBar({
   const [grain, setGrain] = useState<Grain>("week");
   const { hidden } = useBalanceHidden();
 
-  const start = `${year}-01-01`;
-  const end = `${year}-12-31`;
+  const { start, end } = periodRange({ year });
 
   const query = useQuery({
     queryKey: [

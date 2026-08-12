@@ -5,11 +5,13 @@ import { useQuery } from "@tanstack/react-query";
 
 import { listPendingImports } from "@/lib/api/client";
 import { pendingBatchLabel } from "@/lib/accounts";
+import { Sensitive } from "@/components/balance-visibility";
 import {
   IconAlert,
   IconCheckAll,
   IconChevronRight,
 } from "@/components/icons";
+import { formatINR } from "@/lib/format";
 
 /** Shared card shell so the loading / error / empty / list states share one frame. */
 function Card({ children }: { children: React.ReactNode }) {
@@ -97,6 +99,19 @@ export function PendingBatches() {
               <span className="shrink-0 tabular-nums text-[12px] text-muted-foreground">
                 {b.pending_count} pending
               </span>
+              {/* PRD §F1/§F4a: a non-zero (and non-null) delta means the
+                  statement's own closing balance doesn't match our record.
+                  Null ("not checked") and zero ("reconciled") both render
+                  nothing — this is a mismatch flag, not a status readout. */}
+              {b.reconciliation_delta_paise ? (
+                <span className="flex shrink-0 items-center gap-1 rounded-full bg-warn-soft-bg px-2 py-0.5 text-[11px] font-medium text-warn">
+                  <IconAlert className="size-3" />
+                  <Sensitive>
+                    {formatINR(Math.abs(b.reconciliation_delta_paise))}
+                  </Sensitive>{" "}
+                  off
+                </span>
+              ) : null}
               <IconChevronRight className="size-4 shrink-0 text-muted-foreground/60" />
             </Link>
           </li>

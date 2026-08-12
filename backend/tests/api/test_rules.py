@@ -18,8 +18,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Category, Label, MerchantLabelMap, MerchantTagMap, User
-from app.services.merchant_labels import LABEL_PREFILL_MIN
+from app.models import Category, Label, MerchantAlias, MerchantLabelMap, MerchantTagMap, User
+from app.services.merchant_alias import EMPTY_RESOLVER, load_alias_resolver
+from app.services.merchant_labels import LABEL_PREFILL_MIN, prefetch_label_map
 from app.services.tag_service import prefetch_tag_map
 
 
@@ -72,8 +73,17 @@ def test_list_response_shape(
     body = client.get("/api/v1/rules").json()
     assert len(body) == 1
     rule = body[0]
-    assert set(rule.keys()) == {"merchant_normalized", "categories", "labels"}
+    assert set(rule.keys()) == {
+        "merchant_normalized",
+        "categories",
+        "labels",
+        "alias_count",
+        "seeded",
+    }
     assert "user_id" not in rule
+    # Unaliased, hit_count defaults to 1 -> not a seed; exactly one raw merchant.
+    assert rule["alias_count"] == 1
+    assert rule["seeded"] is False
     assert set(rule["categories"][0].keys()) == {
         "id",
         "category_id",
@@ -213,6 +223,48 @@ def test_list_label_prefills_threshold(
     # Each label carries the prefill bar so the client renders "n/N" from server
     # truth instead of a hardcoded 3 (#10).
     assert all(lab["prefill_threshold"] == LABEL_PREFILL_MIN for lab in labels)
+
+
+def test_list_label_prefills_on_summed_hit_count_across_aliases(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """``prefills`` must agree with the import, which evaluates the bar on the
+    canonical's SUMMED hit_count (``prefetch_label_map``).
+
+    Three raw descriptors at hit_count=1 each fold onto ``swiggy`` and reach the
+    bar at 3, so the label auto-applies on the next import. Reporting
+    ``prefills: false`` per raw row told the user the opposite — and rendered
+    three identical rows where the group holds one label.
+    """
+    eating_out = _label(session, seeded_user.id, "eating-out")
+    _alias(session, seeded_user.id, "swiggy", "swiggy")
+    session.add_all(
+        [
+            MerchantLabelMap(
+                user_id=seeded_user.id,
+                merchant_normalized=f"swiggy blr {n}",
+                label_id=eating_out.id,
+                hit_count=1,
+            )
+            for n in (1, 2, 3)
+        ]
+    )
+    session.commit()
+    assert LABEL_PREFILL_MIN == 3  # the sum below is calibrated to the bar
+
+    labels = _merchant(client.get("/api/v1/rules").json(), "swiggy")["labels"]
+    assert len(labels) == 1  # deduped, not three identical rows
+    assert labels[0]["label_name"] == "eating-out"
+    assert labels[0]["hit_count"] == 3  # summed, not 1
+    assert labels[0]["prefills"] is True
+
+    # And it matches what the import would actually apply.
+    resolver = load_alias_resolver(session, user_id=seeded_user.id)
+    assert prefetch_label_map(session, user_id=seeded_user.id, resolver=resolver) == {
+        "swiggy": [eating_out.id]
+    }
 
 
 def test_prefill_threshold_is_single_source_of_truth() -> None:
@@ -441,10 +493,302 @@ def test_list_winner_matches_prefetch_tag_map(
     )
     session.commit()
 
-    prefill_winner = prefetch_tag_map(session, user_id=seeded_user.id)["SWIGGY"]
+    prefill_winner = prefetch_tag_map(session, user_id=seeded_user.id, resolver=EMPTY_RESOLVER)[
+        "SWIGGY"
+    ]
     cats = _merchant(client.get("/api/v1/rules").json(), "SWIGGY")["categories"]
     api_winner = next(c for c in cats if c["is_winner"])
     assert api_winner["category_id"] == prefill_winner
+
+
+# ---------------------------------------------------------------------------
+# GET /rules — canonical grouping (ADR-0011 merchant-alias layer, Phase A3)
+# ---------------------------------------------------------------------------
+
+
+def _alias(session: Session, user_id, pattern: str, canonical: str) -> None:
+    session.add(MerchantAlias(user_id=user_id, pattern=pattern, canonical=canonical))
+    session.commit()
+
+
+def test_list_folds_aliased_merchants_into_one_group(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """Two raw descriptors under one alias surface as ONE MerchantRuleRead, and
+    alias_count counts the alias patterns resolving to that canonical."""
+    food = _cat(session, seeded_user.id, "Food")
+    _alias(session, seeded_user.id, "swiggy blr 12345", "swiggy")
+    _alias(session, seeded_user.id, "swiggy blr 67890", "swiggy")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy blr 12345",
+                category_id=food.id,
+                hit_count=1,
+            ),
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy blr 67890",
+                category_id=food.id,
+                hit_count=1,
+            ),
+        ]
+    )
+    session.commit()
+
+    body = client.get("/api/v1/rules").json()
+    assert _merchant(body, "swiggy blr 12345") is None
+    assert _merchant(body, "swiggy blr 67890") is None
+    rule = _merchant(body, "swiggy")
+    assert rule is not None
+    assert rule["alias_count"] == 2
+    assert len(rule["categories"]) == 2
+
+
+def test_list_alias_count_counts_patterns_not_map_rows(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """The seeded fan-in shape: several patterns, ONE map row on the canonical.
+
+    ``bigbasket`` and ``big basket`` both fold onto ``big basket``, but the seed
+    inserts a single ``merchant_tag_map`` row keyed on the canonical — so counting
+    distinct map-table keys read 1 and the badge never fired for the very case it
+    exists to surface.
+    """
+    groceries = _cat(session, seeded_user.id, "Groceries")
+    _alias(session, seeded_user.id, "bigbasket", "big basket")
+    _alias(session, seeded_user.id, "big basket", "big basket")
+    session.add(
+        MerchantTagMap(
+            user_id=seeded_user.id,
+            merchant_normalized="big basket",
+            category_id=groceries.id,
+            hit_count=0,
+        )
+    )
+    session.commit()
+
+    rule = _merchant(client.get("/api/v1/rules").json(), "big basket")
+    assert rule is not None
+    assert len(rule["categories"]) == 1  # one map row...
+    assert rule["alias_count"] == 2  # ...but two patterns fold in
+
+
+def test_list_is_winner_reflects_aggregate_not_any_single_raw_row(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """The motivating case for this phase: two raw rows summing to a higher
+    canonical total than any single raw row must win, even though a naive
+    per-row pick would have chosen the other category."""
+    food = _cat(session, seeded_user.id, "Food")
+    gift = _cat(session, seeded_user.id, "Gift")
+    # A single-token pattern matches ANY merchant containing "swiggy" as a
+    # token, anywhere — this is the realistic shape (contiguous subsequence,
+    # not an exact-string alias per raw descriptor).
+    _alias(session, seeded_user.id, "swiggy", "swiggy")
+    session.add_all(
+        [
+            # Two raw rows -> Food, canonical sum = 4.
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy blr 12345",
+                category_id=food.id,
+                hit_count=2,
+            ),
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy blr 67890",
+                category_id=food.id,
+                hit_count=2,
+            ),
+            # One raw row -> Gift, hit_count = 3: higher than either Food row
+            # alone, but lower than Food's aggregate.
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy hyd 99999",
+                category_id=gift.id,
+                hit_count=3,
+            ),
+        ]
+    )
+    session.commit()
+
+    cats = _merchant(client.get("/api/v1/rules").json(), "swiggy")["categories"]
+    winners = {c["category_name"] for c in cats if c["is_winner"]}
+    assert winners == {"Food"}
+    non_winners = {c["category_name"] for c in cats if not c["is_winner"]}
+    assert non_winners == {"Gift"}
+
+
+def test_list_alias_count_is_one_for_unaliased_merchant(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    food = _cat(session, seeded_user.id, "Food")
+    session.add(
+        MerchantTagMap(user_id=seeded_user.id, merchant_normalized="SWIGGY", category_id=food.id)
+    )
+    session.commit()
+
+    rule = _merchant(client.get("/api/v1/rules").json(), "SWIGGY")
+    assert rule["alias_count"] == 1
+
+
+def test_list_seeded_true_when_every_category_row_is_hit_count_zero(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """Simulates what Phase A5's seed dictionary will insert: every category
+    row for a canonical at hit_count == 0 (decision 4's unconfirmed marker)."""
+    food = _cat(session, seeded_user.id, "Food")
+    _alias(session, seeded_user.id, "swiggy blr 12345", "swiggy")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy",
+                category_id=food.id,
+                hit_count=0,
+            ),
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy blr 12345",
+                category_id=food.id,
+                hit_count=0,
+            ),
+        ]
+    )
+    session.commit()
+
+    rule = _merchant(client.get("/api/v1/rules").json(), "swiggy")
+    assert rule["seeded"] is True
+
+
+def test_list_seeded_false_once_any_row_has_hit_count(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    food = _cat(session, seeded_user.id, "Food")
+    row = MerchantTagMap(
+        user_id=seeded_user.id,
+        merchant_normalized="swiggy",
+        category_id=food.id,
+        hit_count=0,
+    )
+    session.add(row)
+    session.commit()
+    assert _merchant(client.get("/api/v1/rules").json(), "swiggy")["seeded"] is True
+
+    # Confirming it (a real import learning it) bumps hit_count -> no longer seeded.
+    row.hit_count = 1
+    session.add(row)
+    session.commit()
+    assert _merchant(client.get("/api/v1/rules").json(), "swiggy")["seeded"] is False
+
+
+def test_list_seeded_false_once_a_seed_row_is_pinned(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """Pinning a seed row makes it user-authored, not an unconfirmed dictionary
+    entry — even though ``hit_count`` stays 0, since ``pin_tag`` never bumps it on
+    an existing row. Without the ``pinned`` clause the user's own rule renders
+    with the dashed badge titled "not yet confirmed".
+    """
+    food = _cat(session, seeded_user.id, "Food")
+    row = MerchantTagMap(
+        user_id=seeded_user.id,
+        merchant_normalized="swiggy",
+        category_id=food.id,
+        hit_count=0,
+    )
+    session.add(row)
+    session.commit()
+    assert _merchant(client.get("/api/v1/rules").json(), "swiggy")["seeded"] is True
+
+    resp = client.post(
+        "/api/v1/rules/categories", json={"merchant": "swiggy", "category_id": food.id}
+    )
+    assert resp.status_code == 201, resp.text
+    session.expire_all()
+    # pin_tag hit the existing row rather than inserting: still hit_count 0.
+    assert session.get(MerchantTagMap, row.id).hit_count == 0
+    assert session.get(MerchantTagMap, row.id).pinned is True
+
+    rule = _merchant(client.get("/api/v1/rules").json(), "swiggy")
+    assert rule["seeded"] is False
+    assert rule["categories"][0]["pinned"] is True
+
+
+def test_list_seeded_false_for_labels_only_group(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """A canonical with labels but no category rows at all is not "seeded" —
+    the empty-categories vacuous-truth guard (the seed dictionary only ever
+    seeds categories, Phase A5)."""
+    label = _label(session, seeded_user.id, "online")
+    session.add(
+        MerchantLabelMap(user_id=seeded_user.id, merchant_normalized="AMAZON", label_id=label.id)
+    )
+    session.commit()
+
+    rule = _merchant(client.get("/api/v1/rules").json(), "AMAZON")
+    assert rule["categories"] == []
+    assert rule["seeded"] is False
+
+
+def test_list_alias_does_not_fold_across_tenants(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """User B's alias table never influences user A's grouping."""
+    other = User(id=uuid4())
+    session.add(other)
+    session.flush()
+    other_cat = _cat(session, other.id, "Food")
+    mine_cat = _cat(session, seeded_user.id, "Food")
+    # Other user aliases BOTH descriptors to "swiggy"; I have no aliases at all.
+    _alias(session, other.id, "swiggy blr 12345", "swiggy")
+    _alias(session, other.id, "swiggy blr 67890", "swiggy")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=other.id, merchant_normalized="swiggy blr 12345", category_id=other_cat.id
+            ),
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy blr 12345",
+                category_id=mine_cat.id,
+            ),
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="swiggy blr 67890",
+                category_id=mine_cat.id,
+            ),
+        ]
+    )
+    session.commit()
+
+    body = client.get("/api/v1/rules").json()
+    # My two raw descriptors stay UNFOLDED — I have no alias, so each is its
+    # own MerchantRuleRead, unaffected by the other user's alias table.
+    assert _merchant(body, "swiggy blr 12345") is not None
+    assert _merchant(body, "swiggy blr 67890") is not None
+    assert _merchant(body, "swiggy") is None
 
 
 # ---------------------------------------------------------------------------
@@ -917,3 +1261,237 @@ def test_list_rule_merchants_distinct_sorted_scoped(
     resp = client.get("/api/v1/rules/merchants")
     assert resp.status_code == 200
     assert resp.json() == ["amazon", "zomato"]  # distinct, sorted, scoped, no blank
+
+
+# ---------------------------------------------------------------------------
+# GET/POST/PATCH/DELETE /rules/aliases  (ADR-0011 merchant-alias layer, Phase A4)
+# ---------------------------------------------------------------------------
+
+
+def test_list_aliases_empty(client: TestClient, seeded_user: User) -> None:
+    resp = client.get("/api/v1/rules/aliases")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_aliases_sorted_and_scoped(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    _alias(session, seeded_user.id, "zomato blr", "zomato")
+    _alias(session, seeded_user.id, "amazon pay", "amazon")
+    other = User(id=uuid4())
+    session.add(other)
+    session.flush()
+    _alias(session, other.id, "theirs", "theirs")
+
+    resp = client.get("/api/v1/rules/aliases")
+    assert resp.status_code == 200
+    patterns = [row["pattern"] for row in resp.json()]
+    assert patterns == ["amazon pay", "zomato blr"]  # pattern ASC, scoped to caller
+
+
+def test_create_alias_success(client: TestClient, seeded_user: User) -> None:
+    resp = client.post(
+        "/api/v1/rules/aliases",
+        json={"pattern": "  SWIGGY BLR 12345  ", "canonical": "  Swiggy  "},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["pattern"] == "swiggy blr 12345"  # server-normalized, echoed back
+    assert body["canonical"] == "swiggy"
+    assert body["is_seeded"] is False
+
+    listed = client.get("/api/v1/rules/aliases").json()
+    assert [row["pattern"] for row in listed] == ["swiggy blr 12345"]
+
+
+def test_create_alias_blank_pattern_422(client: TestClient, seeded_user: User) -> None:
+    resp = client.post("/api/v1/rules/aliases", json={"pattern": "   ", "canonical": "swiggy"})
+    assert resp.status_code == 422
+
+
+def test_create_alias_blank_canonical_422(client: TestClient, seeded_user: User) -> None:
+    resp = client.post("/api/v1/rules/aliases", json={"pattern": "swiggy", "canonical": "   "})
+    assert resp.status_code == 422
+
+
+def test_create_alias_zero_token_pattern_422(client: TestClient, seeded_user: User) -> None:
+    """The false-merge hazard: '***' normalizes to a non-blank string but
+    tokenizes to () -- unguarded, it would match every merchant (contiguous
+    subsequence of every sequence) and, sorted last, fire on exactly the
+    merchants nothing else matched."""
+    resp = client.post("/api/v1/rules/aliases", json={"pattern": "***", "canonical": "everything"})
+    assert resp.status_code == 422
+
+
+def test_create_alias_duplicate_pattern_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    _alias(session, seeded_user.id, "netflix", "Netflix")
+    resp = client.post(
+        "/api/v1/rules/aliases", json={"pattern": "NETFLIX", "canonical": "Streaming"}
+    )
+    assert resp.status_code == 422
+
+
+def test_create_alias_canonical_matched_by_existing_pattern_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """Decision 7, direction 1: the new canonical must not itself be caught by
+    an existing pattern (a false two-hop appearance)."""
+    _alias(session, seeded_user.id, "uber", "rideshare")
+    resp = client.post("/api/v1/rules/aliases", json={"pattern": "ola", "canonical": "uber rides"})
+    assert resp.status_code == 422
+
+
+def test_create_alias_pattern_matches_existing_canonical_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """Decision 7, direction 2: the new pattern must not catch an existing
+    alias's canonical."""
+    _alias(session, seeded_user.id, "swiggy blr", "swiggy delivery")
+    resp = client.post(
+        "/api/v1/rules/aliases", json={"pattern": "delivery", "canonical": "anything"}
+    )
+    assert resp.status_code == 422
+
+
+def test_create_alias_redundant_against_identity_seed_succeeds(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """Direction 1 must NOT reject a canonical merely matched by an existing
+    pattern. Phase A5 seeds an identity row per brand (``swiggy -> swiggy``), so
+    the earlier per-row ``tokens_match`` check 422'd every alias targeting any of
+    the ~94 seeded brands — the feature's headline authoring flow. The
+    submission is redundant, not chained: longest-pattern-first resolution sends
+    the raw descriptor to ``swiggy`` either way.
+    """
+    _alias(session, seeded_user.id, "swiggy", "swiggy")
+    resp = client.post(
+        "/api/v1/rules/aliases", json={"pattern": "swiggy blr 998877", "canonical": "swiggy"}
+    )
+    assert resp.status_code == 201, resp.text
+
+
+def test_create_alias_narrowing_split_succeeds_and_diverges(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """The remediation for an over-folding seed: a LONGER pattern claiming its own
+    canonical. ``uber -> uber`` alone folds Uber Eats onto Uber rides; adding
+    ``uber eats -> uber eats`` must be accepted (it is a fixed point) and must
+    actually split resolution, since it out-ranks the shorter pattern.
+    """
+    _alias(session, seeded_user.id, "uber", "uber")
+    resp = client.post(
+        "/api/v1/rules/aliases", json={"pattern": "uber eats", "canonical": "uber eats"}
+    )
+    assert resp.status_code == 201, resp.text
+
+    resolver = load_alias_resolver(session, user_id=seeded_user.id)
+    assert resolver.canonical("uber eats blr 12345") == "uber eats"
+    assert resolver.canonical("uber trip 998") == "uber"
+
+
+def test_create_alias_genuine_chain_still_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """Direction 1 still rejects a canonical that another rule REWRITES: rows
+    would fold onto ``bar`` while ``bar`` itself resolves to ``baz``, so the
+    fan-in lands somewhere the author didn't ask for.
+    """
+    _alias(session, seeded_user.id, "bar", "baz")
+    resp = client.post("/api/v1/rules/aliases", json={"pattern": "foo", "canonical": "bar"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "canonical would be rewritten by another alias"
+
+
+def test_patch_alias_clears_is_seeded(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """A user edit makes the row user data. Leaving ``is_seeded`` set would keep
+    the "dictionary" badge on it and expose it to migration 0032's
+    ``DELETE FROM merchant_alias WHERE is_seeded = TRUE``."""
+    alias = MerchantAlias(
+        user_id=seeded_user.id, pattern="swiggy", canonical="swiggy", is_seeded=True
+    )
+    session.add(alias)
+    session.commit()
+    session.refresh(alias)
+
+    resp = client.patch(f"/api/v1/rules/aliases/{alias.id}", json={"canonical": "swiggy india"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_seeded"] is False
+    session.expire_all()
+    assert session.get(MerchantAlias, alias.id).is_seeded is False
+
+
+def test_patch_alias_renames_canonical(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    alias = MerchantAlias(user_id=seeded_user.id, pattern="ola", canonical="ola cabs")
+    session.add(alias)
+    session.commit()
+    session.refresh(alias)
+
+    resp = client.patch(f"/api/v1/rules/aliases/{alias.id}", json={"canonical": "  Ola  "})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pattern"] == "ola"  # unchanged
+    assert body["canonical"] == "ola"
+
+
+def test_patch_alias_blank_canonical_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    alias = MerchantAlias(user_id=seeded_user.id, pattern="ola", canonical="ola cabs")
+    session.add(alias)
+    session.commit()
+    session.refresh(alias)
+
+    resp = client.patch(f"/api/v1/rules/aliases/{alias.id}", json={"canonical": "   "})
+    assert resp.status_code == 422
+
+
+def test_patch_alias_conflict_422(client: TestClient, seeded_user: User, session: Session) -> None:
+    ola = MerchantAlias(user_id=seeded_user.id, pattern="ola", canonical="ola cabs")
+    rapido = MerchantAlias(user_id=seeded_user.id, pattern="rapido", canonical="rapido bike")
+    session.add_all([ola, rapido])
+    session.commit()
+    session.refresh(rapido)
+
+    resp = client.patch(f"/api/v1/rules/aliases/{rapido.id}", json={"canonical": "ola rides"})
+    assert resp.status_code == 422
+
+
+def test_patch_alias_self_pattern_does_not_conflict(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """A row's own (unchanged) pattern must not block renaming its own
+    canonical, even when the new canonical still contains the pattern's own
+    token -- exclude_id must skip the row being edited."""
+    ola = MerchantAlias(user_id=seeded_user.id, pattern="ola", canonical="ola cabs")
+    session.add(ola)
+    session.commit()
+    session.refresh(ola)
+
+    resp = client.patch(f"/api/v1/rules/aliases/{ola.id}", json={"canonical": "ola cabs blr"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_patch_alias_unknown_404(client: TestClient, seeded_user: User) -> None:
+    resp = client.patch("/api/v1/rules/aliases/9999", json={"canonical": "x"})
+    assert resp.status_code == 404
+
+
+def test_delete_alias(client: TestClient, seeded_user: User, session: Session) -> None:
+    alias = MerchantAlias(user_id=seeded_user.id, pattern="ola", canonical="ola cabs")
+    session.add(alias)
+    session.commit()
+    session.refresh(alias)
+
+    resp = client.delete(f"/api/v1/rules/aliases/{alias.id}")
+    assert resp.status_code == 204
+    assert client.get("/api/v1/rules/aliases").json() == []
+
+    # Idempotent-404 on re-delete.
+    assert client.delete(f"/api/v1/rules/aliases/{alias.id}").status_code == 404

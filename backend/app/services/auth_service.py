@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.core.config import get_settings
+from app.core.db_errors import is_unique_violation
 from app.core.demo import DEMO_EMAIL
 from app.core.security import (
     generate_refresh_token,
@@ -37,7 +38,10 @@ from app.core.security import (
     verify_password,
 )
 from app.models import RefreshSession, User
-from app.services.provisioning import provision_default_categories
+from app.services.provisioning import (
+    provision_default_categories,
+    provision_seed_merchant_dictionary,
+)
 
 # A throwaway argon2 hash verified against on the user-not-found login path so a
 # missing email and a wrong password take the same time (no timing oracle). Minted
@@ -63,7 +67,7 @@ def normalize_email(email: str) -> str:
 def register_user(
     session: Session, *, email: str, password: str, display_name: str | None = None
 ) -> User:
-    """Create a fresh user + provision default categories. Commits.
+    """Create a fresh user + provision default categories + seed merchant dictionary. Commits.
 
     Raises :class:`EmailAlreadyExistsError` on a duplicate email (checked
     up-front and again via the partial unique index, which wins any race).
@@ -83,16 +87,26 @@ def register_user(
         # flush() emits the INSERT — the partial unique index on email is enforced
         # HERE, not at commit(), so it must be inside the try to catch the race
         # (pre-check passed, a concurrent register committed the same email during
-        # our hash_password window). The only IntegrityError reachable in this
-        # block is that email collision: user.id is a fresh uuid4 and the
-        # provisioned categories are unique per (user_id, name, kind). The commit()
-        # is here too so a Postgres-v2 deferred constraint surfacing there is caught.
+        # our hash_password window). The commit() is here too so a Postgres-v2
+        # deferred constraint surfacing there is caught.
         session.flush()  # also assigns user.id before provisioning FKs against it
         provision_default_categories(session, user.id)
+        # A SECOND flush, load-bearing: this session is autoflush=False (app.core.db's
+        # SessionLocal), so without this, provision_seed_merchant_dictionary's category
+        # lookup can't see the just-added, still-pending Category rows — it would
+        # silently find none and skip every dictionary entry. That failure raises
+        # nothing; register_user would still succeed with an empty merchant dictionary.
+        session.flush()
+        provision_seed_merchant_dictionary(session, user.id)
         session.commit()
-    except IntegrityError as e:  # lost the unique-index race
+    except IntegrityError as e:
         session.rollback()
-        raise EmailAlreadyExistsError from e
+        # provision_seed_merchant_dictionary also inserts here, under its own unique
+        # constraints (merchant_alias / merchant_tag_map) — narrow by the email index
+        # rather than assuming email is the only reachable IntegrityError.
+        if is_unique_violation(e.orig, index_name="uq_users_email", columns=["users.email"]):
+            raise EmailAlreadyExistsError from e
+        raise
     session.refresh(user)
     return user
 

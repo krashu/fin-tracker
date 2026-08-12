@@ -29,7 +29,7 @@
  * existing transaction/account mutations (which invalidate those prefixes)
  * refresh the bands without a reload (PRD §F9).
  */
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 
@@ -43,15 +43,16 @@ import {
   type OverviewResponse,
   type TransactionRead,
 } from "@/lib/api/client";
-import { formatDate, formatINR, formatMonthYear } from "@/lib/format";
-import { monthKey, thisMonthAnchor } from "@/lib/dates";
+import { formatDate, formatINR } from "@/lib/format";
+import { periodParams, type Period } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
 import { Sensitive } from "@/components/balance-visibility";
 import { MONO } from "@/components/ui/table";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SummaryStrip } from "@/components/dashboard/summary-strip";
-import { IconChevronLeft, IconChevronRight } from "@/components/icons";
+import { PeriodPicker } from "@/components/dashboard/period-picker";
+import { useAvailableYears } from "@/components/dashboard/use-available-years";
 
 // Hand-mirror of the backend's NET_WORTH_EXCLUDED_TYPES
 // (app/schemas/dashboards.py), which is the source of truth. tsc cannot catch
@@ -75,20 +76,20 @@ const ACCOUNT_GROUPS: { type: AccountBalanceRow["type"]; label: string }[] = [
 ];
 
 export function Overview() {
-  const now = new Date();
-  const [selectedYear, setSelectedYear] = useState<number>(now.getFullYear());
-  const [autoDetectDone, setAutoDetectDone] = useState(false);
-
-  // If selectedYear is current calendar year, pass current YYYY-MM; else pass YYYY-12
-  const currentYear = now.getFullYear();
-  const month =
-    selectedYear === currentYear
-      ? `${selectedYear}-${String(now.getMonth() + 1).padStart(2, "0")}`
-      : `${selectedYear}-12`;
+  // Year-only — this page has never had month granularity (the Accounts
+  // card's CC spend is always a calendar-year figure). `pickedYear` is null
+  // until the user picks one; until then the period defaults to the newest
+  // year with data, per `useAvailableYears()` — replacing the old
+  // autoDetectDone effect's per-transaction heuristic with the same answer
+  // the backend already computes for the picker itself.
+  const yearsQuery = useAvailableYears();
+  const [pickedYear, setPickedYear] = useState<number | null>(null);
+  const year = pickedYear ?? yearsQuery.years[0] ?? new Date().getUTCFullYear();
+  const period: Period = { year };
 
   const overviewQuery = useQuery({
-    queryKey: ["dashboards", "overview", { month, selectedYear }],
-    queryFn: () => getOverview({ month }),
+    queryKey: ["dashboards", "overview", periodParams(period)],
+    queryFn: () => getOverview(periodParams(period)),
   });
   // Recent activity — own cache entry, still `["transactions"]`-prefixed so txn
   // mutations invalidate it. The board's confirmed-only list is newest-first.
@@ -109,29 +110,6 @@ export function Overview() {
     queryKey: ["categories"],
     queryFn: listCategories,
   });
-
-  // Auto-detect year if current year yields 0 credit card spend and recent txns exist
-  useEffect(() => {
-    if (autoDetectDone || !overviewQuery.isSuccess || !recentQuery.isSuccess) return;
-    const data = overviewQuery.data;
-    const recent = recentQuery.data;
-    if (!data) return;
-
-    const hasCardActivity = (data.accounts ?? []).some(
-      (a) => a.type === "credit_card" && (a.spend_ytd_paise ?? 0) !== 0,
-    );
-
-    if (!hasCardActivity && recent && recent.length > 0) {
-      const latestTxn = recent[0];
-      if (latestTxn?.date) {
-        const parts = latestTxn.date.split("-").map(Number);
-        if (parts.length >= 1 && parts[0]) {
-          setSelectedYear(parts[0]);
-        }
-      }
-    }
-    setAutoDetectDone(true);
-  }, [autoDetectDone, overviewQuery.isSuccess, overviewQuery.data, recentQuery.isSuccess, recentQuery.data]);
 
   const data = overviewQuery.data;
   const accountsById = new Map<number, string>(
@@ -168,13 +146,14 @@ export function Overview() {
     <div className="flex flex-col gap-5">
       <h1 className="sr-only">Overview</h1>
       <NetWorthHero data={data} />
-      <SummaryStrip />
+      <SummaryStrip year={year} allDates />
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <AccountsCard
           accounts={data?.accounts ?? []}
           ready={data !== undefined}
-          year={selectedYear}
-          onYearChange={(y) => setSelectedYear(y)}
+          period={period}
+          availableYears={yearsQuery.years}
+          onPeriodChange={(p) => setPickedYear(p.year)}
         />
         <PortfolioCard
           valuePaise={data?.portfolio_value_paise ?? 0}
@@ -278,39 +257,27 @@ function GroupLabel({ children }: { children: ReactNode }) {
 function AccountsCard({
   accounts,
   ready,
-  year,
-  onYearChange,
+  period,
+  availableYears,
+  onPeriodChange,
 }: {
   accounts: AccountBalanceRow[];
   ready: boolean;
-  year: number;
-  onYearChange: (y: number) => void;
+  period: Period;
+  availableYears: number[];
+  onPeriodChange: (p: Period) => void;
 }) {
+  const year = period.year;
   return (
     <section className="rounded-lg border border-border bg-card">
       <div className="flex h-10 items-center justify-between px-4">
         <Eyebrow as="h2">Accounts</Eyebrow>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => onYearChange(year - 1)}
-            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            title="Previous year"
-          >
-            <IconChevronLeft className="h-3.5 w-3.5" />
-          </button>
-          <span className="px-1 text-[12px] font-medium tabular-nums text-foreground">
-            {year}
-          </span>
-          <button
-            type="button"
-            onClick={() => onYearChange(year + 1)}
-            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            title="Next year"
-          >
-            <IconChevronRight className="h-3.5 w-3.5" />
-          </button>
-        </div>
+        <PeriodPicker
+          period={period}
+          availableYears={availableYears}
+          onChange={onPeriodChange}
+          allowMonth={false}
+        />
       </div>
       {!ready ? (
         <p className="px-4 pb-4 text-[13px] text-muted-foreground">Loading…</p>

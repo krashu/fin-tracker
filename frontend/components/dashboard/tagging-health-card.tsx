@@ -1,14 +1,21 @@
 "use client";
 
 /**
- * Auto-tag acceptance metric (PRD §F3 / §Success-metrics: ≥80% of imports
- * pre-tagged correctly). Of board rows the import auto-tagged, the share whose
- * final category still equals the suggestion. Deliberately a modest card, not a
- * headline tile — the PRD treats this as a periodic health check (a quarterly
- * "is exact-match auto-tag still good enough, or pull fuzzy/rules forward?"),
- * not a daily number. `acceptance_rate === null` means no auto-tagged imports
- * yet → "—", never "0%". Shares the `["dashboards"]` invalidation prefix, so it
- * refreshes after an import commit or a category edit.
+ * Auto-tag health (PRD §F3 / §Success-metrics). Two distinct board-row
+ * metrics, not to be confused:
+ *  - `acceptance_rate` (headline %) — of rows we DID suggest a category for,
+ *    the share whose final category still matches the suggestion.
+ *  - `coverage_rate` (body line) — of ALL imported rows, the share we
+ *    suggested a category for at all. This is the PRD's ≥80% *pre-tag* bar;
+ *    before Phase A0 `tagging-stats` had no denominator to measure it, and
+ *    `acceptance_rate` cannot carry it (it excludes untagged rows by
+ *    construction).
+ * Deliberately a modest card, not a headline tile — the PRD treats this as a
+ * periodic health check (a quarterly "is exact-match auto-tag still good
+ * enough, or pull fuzzy/rules forward?"), not a daily number. Both rates are
+ * `null` at their own zero-denominator case ("no data", never "0%"). Shares
+ * the `["dashboards"]` invalidation prefix, so it refreshes after an import
+ * commit or a category edit.
  */
 import { useQuery } from "@tanstack/react-query";
 
@@ -26,6 +33,10 @@ export function TaggingHealthCard() {
     stats?.acceptance_rate == null
       ? null
       : Math.round(stats.acceptance_rate * 100);
+  const coveragePct =
+    stats?.coverage_rate == null
+      ? null
+      : Math.round(stats.coverage_rate * 100);
   const rateColor =
     pct == null
       ? "text-muted-foreground"
@@ -44,7 +55,7 @@ export function TaggingHealthCard() {
             Auto-tag accuracy
           </span>
           <span className="text-[11.5px] text-muted-foreground">
-            Imported rows kept with their suggested category · target ≥ 80%
+            Imported rows kept with their suggested category
           </span>
         </div>
         <span
@@ -54,15 +65,25 @@ export function TaggingHealthCard() {
           {query.isPending ? " " : pct == null ? "—" : `${pct}%`}
         </span>
       </CardHeader>
-      <CardContent className="py-3 text-[12px] text-muted-foreground">
-        {query.isError
-          ? "Couldn’t load — is the API running?"
-          : stats == null
+      <CardContent className="space-y-1 py-3 text-[12px] text-muted-foreground">
+        <div>
+          {query.isError
+            ? "Couldn’t load — is the API running?"
+            : stats == null
+              ? " "
+              : stats.imported_total === 0
+                ? "No imports yet."
+                : `${stats.pre_tagged} of ${stats.imported_total} imported rows pre-tagged` +
+                  (coveragePct == null ? "" : ` (${coveragePct}%, target ≥ 80%)`)}
+        </div>
+        <div>
+          {query.isError || stats == null
             ? " "
             : stats.total_auto_tagged === 0
               ? "No auto-tagged imports yet."
               : `${stats.kept} of ${stats.total_auto_tagged} auto-tagged rows kept · ` +
                 `${stats.rules_count} learned ${stats.rules_count === 1 ? "rule" : "rules"}`}
+        </div>
       </CardContent>
     </Card>
   );

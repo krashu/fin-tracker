@@ -65,13 +65,16 @@ def _make_txn(
     auto_category_id: int | None = None,
     import_batch_id: int | None = None,
     confirmed_at: datetime | None = _DEFAULT_CONFIRMED,
+    source: str = "import",
 ) -> Transaction:
     """Mirrors test_transactions._make_txn with extra dashboard-relevant kwargs.
 
     Copied rather than promoted to conftest: two callers in sibling test
     files; promote on third use per CLAUDE.md §2. The end-to-end commit
     test also needs ``import_batch_id``, which the original helper doesn't
-    expose either.
+    expose either. ``source`` defaults to "import" (every prior caller relied
+    on that default); pass "manual" to build a row the coverage_rate metric
+    (Phase A0) must exclude.
     """
     return Transaction(
         user_id=user_id,
@@ -84,7 +87,7 @@ def _make_txn(
         category_id=category_id,
         auto_category_id=auto_category_id,
         fingerprint=fingerprint,
-        source="import",
+        source=source,
         import_batch_id=import_batch_id,
         confirmed_at=(datetime.now(UTC) if confirmed_at is _DEFAULT_CONFIRMED else confirmed_at),
     )
@@ -101,7 +104,7 @@ def test_empty_month_returns_zero_rows(
 ) -> None:
     resp = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
     assert resp.status_code == 200
-    assert resp.json() == {"month": "2026-05", "rows": [], "label_id": None}
+    assert resp.json() == {"period": "2026-05", "rows": [], "label_id": None}
 
 
 def test_single_spend_returns_one_negative_row(
@@ -126,7 +129,7 @@ def test_single_spend_returns_one_negative_row(
     resp = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["month"] == "2026-05"
+    assert body["period"] == "2026-05"
     assert body["rows"] == [
         {"category_id": food.id, "category_name": "Food", "total_paise": -15000},
     ]
@@ -156,7 +159,7 @@ def test_spend_plus_refund_same_category_signed_sum_nets(
                 txn_date=date(2026, 5, 12),
                 amount_paise=5000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 category_id=food.id,
             ),
         ]
@@ -169,6 +172,49 @@ def test_spend_plus_refund_same_category_signed_sum_nets(
     assert len(rows) == 1
     assert rows[0]["category_id"] == food.id
     assert rows[0]["total_paise"] == -10000
+
+
+def test_spend_plus_equal_refund_same_category_nets_to_exactly_zero(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """A full refund of the same spend nets to precisely 0, not just "small" —
+    the exact-zero edge case `test_spend_plus_refund_same_category_signed_sum_nets`
+    doesn't cover. The row still surfaces (server does not drop zero-total
+    categories); the frontend's own "no signal" filter is a display decision,
+    not a server one (PRD §F4a rule 3)."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    session.add_all(
+        [
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 10),
+                amount_paise=-15000,
+                fingerprint="fp-spend-full",
+                category_id=food.id,
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 12),
+                amount_paise=15000,
+                fingerprint="fp-refund-full",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
+                category_id=food.id,
+            ),
+        ]
+    )
+    session.commit()
+
+    resp = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
+    assert resp.status_code == 200
+    rows = resp.json()["rows"]
+    assert len(rows) == 1
+    assert rows[0]["category_id"] == food.id
+    assert rows[0]["total_paise"] == 0
 
 
 def test_two_categories_sorted_most_negative_first(
@@ -282,7 +328,7 @@ def test_refund_only_category_sorts_between_spends_and_uncategorized(
                 txn_date=date(2026, 5, 11),
                 amount_paise=5000,
                 fingerprint="fp-food-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 category_id=food.id,
             ),
             _make_txn(
@@ -784,7 +830,7 @@ def test_aggregate_total_matches_transaction_list_for_window(
                 txn_date=date(2026, 5, 9),
                 amount_paise=3000,
                 fingerprint="fp-food-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 category_id=food.id,
             ),
             # Uncategorized spend — counts toward both sides.
@@ -815,9 +861,7 @@ def test_aggregate_total_matches_transaction_list_for_window(
     dash_total = sum(r["total_paise"] for r in dash.json()["rows"])
 
     listing = client.get("/api/v1/transactions?date_from=2026-05-01&date_to=2026-05-31&limit=500")
-    list_total = sum(
-        t["amount_paise"] for t in listing.json() if t["transaction_type"] in ("spend", "refund")
-    )
+    list_total = sum(t["amount_paise"] for t in listing.json() if t["transaction_type"] == "spend")
 
     assert dash_total == list_total
     # Sanity: the income row exists on the board but is in neither total.
@@ -1017,7 +1061,7 @@ def test_period_month_refund_nets_within_bucket(
                 txn_date=date(2026, 2, 20),
                 amount_paise=5000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
         ]
     )
@@ -1420,7 +1464,7 @@ def test_period_total_matches_window_sum_and_category_dashboard(
                 txn_date=date(2026, 5, 9),
                 amount_paise=3000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 category_id=food.id,
             ),
             _make_txn(
@@ -1448,9 +1492,7 @@ def test_period_total_matches_window_sum_and_category_dashboard(
     period_total = sum(b["total_paise"] for b in period.json()["buckets"])
 
     listing = client.get("/api/v1/transactions?date_from=2026-05-01&date_to=2026-05-31&limit=500")
-    list_total = sum(
-        t["amount_paise"] for t in listing.json() if t["transaction_type"] in ("spend", "refund")
-    )
+    list_total = sum(t["amount_paise"] for t in listing.json() if t["transaction_type"] == "spend")
 
     category = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
     category_total = sum(r["total_paise"] for r in category.json()["rows"])
@@ -1487,7 +1529,7 @@ def test_period_week_total_matches_window_sum(
                 txn_date=date(2026, 1, 2),  # 2026-W01
                 amount_paise=3000,
                 fingerprint="fp-w01-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
             _make_txn(
                 user_id=axis_account.user_id,
@@ -1517,9 +1559,7 @@ def test_period_week_total_matches_window_sum(
     ]
 
     listing = client.get("/api/v1/transactions?date_from=2025-12-29&date_to=2026-01-11&limit=500")
-    list_total = sum(
-        t["amount_paise"] for t in listing.json() if t["transaction_type"] in ("spend", "refund")
-    )
+    list_total = sum(t["amount_paise"] for t in listing.json() if t["transaction_type"] == "spend")
     assert sum(b["total_paise"] for b in buckets) == list_total == -21000
 
 
@@ -1609,7 +1649,7 @@ def test_period_totals_income_spend_refund_net_and_transfer_excluded(
                 txn_date=date(2026, 5, 9),
                 amount_paise=5000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
             _make_txn(
                 user_id=axis_account.user_id,
@@ -1785,6 +1825,9 @@ def test_tagging_stats_no_auto_tagged_rows_returns_none(
         "kept": 0,
         "acceptance_rate": None,
         "rules_count": 0,
+        "imported_total": 0,
+        "pre_tagged": 0,
+        "coverage_rate": None,
     }
 
 
@@ -1800,6 +1843,11 @@ def test_tagging_stats_kept_changed_cleared_and_manual(
     not kept), manual (auto=NULL → excluded from denominator). Only the first
     keeps its suggestion, so kept == 1. One merchant_tag_map row drives
     rules_count.
+
+    All 4 rows are ``source="import"`` (the "manual" row is really an import
+    row with no tag-map match, not a source="manual" row — see
+    test_tagging_stats_coverage_excludes_manual_rows for that case), so
+    imported_total == 4 and pre_tagged mirrors total_auto_tagged == 3.
     """
     food = next(c for c in seeded_categories if c.name == "Food")
     shopping = next(c for c in seeded_categories if c.name == "Shopping")
@@ -1860,6 +1908,9 @@ def test_tagging_stats_kept_changed_cleared_and_manual(
     assert body["kept"] == 1  # only fp-kept (cat==auto)
     assert body["acceptance_rate"] == pytest.approx(1 / 3)
     assert body["rules_count"] == 1
+    assert body["imported_total"] == 4
+    assert body["pre_tagged"] == 3
+    assert body["coverage_rate"] == pytest.approx(3 / 4)
 
 
 def test_tagging_stats_excludes_pending_rows(
@@ -1869,7 +1920,8 @@ def test_tagging_stats_excludes_pending_rows(
     session: Session,
 ) -> None:
     """A pending (confirmed_at IS NULL) auto-tagged row is not yet accepted —
-    it must not count toward the denominator."""
+    it must not count toward the acceptance denominator, nor toward the
+    coverage denominator (it isn't on the board at all yet)."""
     food = next(c for c in seeded_categories if c.name == "Food")
     session.add(
         _make_txn(
@@ -1889,6 +1941,8 @@ def test_tagging_stats_excludes_pending_rows(
     body = resp.json()
     assert body["total_auto_tagged"] == 0
     assert body["acceptance_rate"] is None
+    assert body["imported_total"] == 0
+    assert body["coverage_rate"] is None
 
 
 def test_tagging_stats_excludes_archived_suggestion_rows(
@@ -2038,6 +2092,136 @@ def test_tagging_stats_excludes_foreign_category_suggestion(
     assert body["kept"] == 1
 
 
+def test_tagging_stats_coverage_excludes_manual_rows(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """coverage_rate's denominator (imported_total) is source == "import" board
+    rows only. A manual row must not count, even though it's confirmed and has
+    no auto_category_id — same exclusion source="manual" already gets
+    everywhere else, just applied to the new metric.
+    """
+    food = next(c for c in seeded_categories if c.name == "Food")
+    session.add_all(
+        [
+            _make_txn(  # import row with no tag-map match → counts, untagged
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 1),
+                amount_paise=-1000,
+                fingerprint="fp-import-untagged",
+                category_id=food.id,
+                auto_category_id=None,
+            ),
+            _make_txn(  # manual row → must not count toward imported_total
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 2),
+                amount_paise=-2000,
+                fingerprint="fp-manual-row",
+                category_id=food.id,
+                auto_category_id=None,
+                source="manual",
+            ),
+        ]
+    )
+    session.commit()
+
+    resp = client.get(_TAGGING_URL)
+    body = resp.json()
+    assert body["imported_total"] == 1  # only fp-import-untagged
+    assert body["pre_tagged"] == 0
+    assert body["coverage_rate"] == pytest.approx(0.0)
+    assert body["total_auto_tagged"] == 0
+    assert body["acceptance_rate"] is None
+
+
+def test_tagging_stats_coverage_excludes_non_auto_taggable_types(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """coverage_rate's denominator counts only AUTO_TAGGABLE_TYPES rows.
+
+    ``import_service`` sets ``auto_category_id`` for spend rows only, so an
+    income row (a CC bill payment, say) can never enter the numerator. Counting
+    it in the denominator made the metric structurally unable to reach 100%:
+    fully-covered spend alongside one income row read 0.5, so a bank statement
+    dominated by transfers could report "0% pre-tagged" while auto-tagging
+    worked perfectly.
+    """
+    food = next(c for c in seeded_categories if c.name == "Food")
+    salary = next(c for c in seeded_categories if c.kind == "income")
+    session.add_all(
+        [
+            _make_txn(  # spend, auto-tagged and kept → numerator + denominator
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 1),
+                amount_paise=-1000,
+                fingerprint="fp-spend-tagged",
+                category_id=food.id,
+                auto_category_id=food.id,
+            ),
+            _make_txn(  # imported income → neither, since it can't be auto-tagged
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 2),
+                amount_paise=50000,
+                fingerprint="fp-income-row",
+                transaction_type="income",
+                category_id=salary.id,
+                auto_category_id=None,
+            ),
+        ]
+    )
+    session.commit()
+
+    body = client.get(_TAGGING_URL).json()
+    assert body["imported_total"] == 1  # the income row is not a coverage miss
+    assert body["pre_tagged"] == 1
+    assert body["coverage_rate"] == pytest.approx(1.0)  # 0.5 before the fix
+
+
+def test_tagging_stats_rules_count_excludes_zero_hit_rows(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """A merchant_tag_map row at hit_count == 0 is the seeded-and-never-confirmed
+    marker (merchant-alias arc decision 4) — excluded from rules_count so a
+    fresh user's seeded dictionary doesn't inflate this count before any
+    import runs. A learned row (hit_count >= 1) still counts.
+    """
+    food = next(c for c in seeded_categories if c.name == "Food")
+    shopping = next(c for c in seeded_categories if c.name == "Shopping")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="seeded-merchant",
+                category_id=food.id,
+                hit_count=0,
+            ),
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="learned-merchant",
+                category_id=shopping.id,
+                hit_count=2,
+            ),
+        ]
+    )
+    session.commit()
+
+    resp = client.get(_TAGGING_URL)
+    body = resp.json()
+    assert body["rules_count"] == 1
+
+
 # =============================================================================
 # overview (Financial Overview home — PRD §F8 view 1 + view 4)
 #
@@ -2054,7 +2238,7 @@ def test_overview_empty_no_accounts(client: TestClient, seeded_user: User) -> No
     resp = client.get(f"{_OVERVIEW_URL}?month=2026-05")
     assert resp.status_code == 200
     assert resp.json() == {
-        "month": "2026-05",
+        "period": "2026-05",
         "net_worth_paise": 0,
         "portfolio_value_paise": 0,
         "fx_unavailable_count": 0,
@@ -2447,7 +2631,7 @@ def test_overview_income_expense_match_period_totals(
                 txn_date=date(2026, 5, 9),
                 amount_paise=5000,
                 fingerprint="fp-ov-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
             _make_txn(
                 user_id=axis_account.user_id,
@@ -2627,7 +2811,7 @@ def test_overview_cc_spend_ytd_is_signed_net_within_year(
                 txn_date=date(2026, 4, 15),
                 amount_paise=8000,
                 fingerprint="fp-ytd-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
             # Prior year: in the all-time balance, but NOT in the 2026 YTD figure.
             _make_txn(
@@ -2724,7 +2908,7 @@ def test_overview_spend_ytd_is_per_credit_card(
                 txn_date=date(2026, 3, 8),
                 amount_paise=7000,
                 fingerprint="fp-two-icici-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
         ]
     )
@@ -2838,7 +3022,7 @@ def test_cashflow_month_income_spend_refund_net(
                 txn_date=date(2026, 5, 9),
                 amount_paise=5000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
             _make_txn(
                 user_id=axis_account.user_id,
@@ -2928,7 +3112,7 @@ def test_cashflow_refund_dominant_bucket_expense_positive_not_clamped(
                 txn_date=date(2026, 5, 9),
                 amount_paise=8000,
                 fingerprint="fp-big-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
         ]
     )
@@ -3170,7 +3354,7 @@ def test_cashflow_reconciles_with_period_totals_and_spend_by_period(
                 txn_date=date(2026, 5, 9),
                 amount_paise=3000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
             ),
             _make_txn(
                 user_id=axis_account.user_id,
@@ -3213,7 +3397,7 @@ def test_cashflow_reconciles_with_period_totals_and_spend_by_period(
 # PRD §F8 view 3 — "how is my category mix shifting?")
 #
 # The category×time generalization of spend-by-category: same LEFT JOIN Category
-# (with the cross-user-safe join predicate), same ("spend","refund") filter,
+# (with the cross-user-safe join predicate), same `transaction_type == "spend"` filter,
 # board-only, signed sums. Reuses spend_by_period's _bucket_of / _iter_periods /
 # window-filter / zero-fill. Headline behaviours: the DENSE category×period grid
 # (a cell per echoed category per bucket, zero-filled), the stable series order
@@ -3416,7 +3600,7 @@ def test_spend_by_category_by_period_refund_nets_within_category_and_bucket(
                 txn_date=date(2026, 5, 12),
                 amount_paise=5000,
                 fingerprint="fp-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 category_id=food.id,
             ),
         ]
@@ -3459,7 +3643,7 @@ def test_spend_by_category_by_period_net_credit_category_not_clamped(
                 txn_date=date(2026, 5, 12),
                 amount_paise=5000,
                 fingerprint="fp-food-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 category_id=food.id,
             ),
         ]
@@ -3505,7 +3689,7 @@ def test_spend_by_category_by_period_reconciles_with_spend_by_period(
                 txn_date=date(2026, 5, 9),
                 amount_paise=3000,
                 fingerprint="fp-food-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 category_id=food.id,
             ),
             _make_txn(
@@ -3770,7 +3954,7 @@ def test_top_merchants_empty_month_returns_empty(
     resp = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05")
     assert resp.status_code == 200
     assert resp.json() == {
-        "month": "2026-05",
+        "period": "2026-05",
         "rows": [],
         "total_merchants": 0,
         "truncated": False,
@@ -3798,7 +3982,7 @@ def test_top_merchants_single_merchant(
     resp = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["month"] == "2026-05"
+    assert body["period"] == "2026-05"
     assert body["total_merchants"] == 1
     assert body["truncated"] is False
     assert body["rows"] == [
@@ -4013,7 +4197,7 @@ def test_top_merchants_net_credit_merchant_sorts_last(
                 txn_date=date(2026, 5, 5),
                 amount_paise=5000,
                 fingerprint="fp-flipkart-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 merchant_raw="Flipkart",
             ),
         ]
@@ -4044,7 +4228,7 @@ def test_top_merchants_all_net_credit_month(
                 txn_date=date(2026, 5, 3),
                 amount_paise=3000,
                 fingerprint="fp-amazon-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 merchant_raw="Amazon",
             ),
             _make_txn(
@@ -4053,7 +4237,7 @@ def test_top_merchants_all_net_credit_month(
                 txn_date=date(2026, 5, 5),
                 amount_paise=5000,
                 fingerprint="fp-flipkart-refund",
-                transaction_type="refund",
+                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
                 merchant_raw="Flipkart",
             ),
         ]
@@ -4565,7 +4749,7 @@ def test_spend_by_tag_empty_month_all_zero(
     """No txns → no rows, zero totals, and coverage None (no denominator)."""
     body = client.get(f"{_SBT_URL}?month=2026-05").json()
     assert body == {
-        "month": "2026-05",
+        "period": "2026-05",
         "rows": [],
         "total_spend_paise": 0,
         "tagged_paise": 0,
@@ -4600,7 +4784,7 @@ def test_spend_by_tag_single_tag_plus_untagged_bucket(
     travel = _tag_txns(session, user_id=axis_account.user_id, name="travel", txns=[tagged])
 
     body = client.get(f"{_SBT_URL}?month=2026-05").json()
-    assert body["month"] == "2026-05"
+    assert body["period"] == "2026-05"
     assert body["rows"] == [
         {"label_id": travel.id, "label_name": "travel", "total_paise": -15000},
         {"label_id": None, "label_name": None, "total_paise": -5000},
@@ -4669,7 +4853,7 @@ def test_spend_by_tag_refund_nets_within_a_tag(
         txn_date=date(2026, 5, 12),
         amount_paise=5000,
         fingerprint="fp-refund",
-        transaction_type="refund",
+        transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
     )
     session.add_all([spend, refund])
     session.commit()
@@ -4710,7 +4894,7 @@ def test_spend_by_tag_net_credit_tag_surfaces_positive_after_spends(
         txn_date=date(2026, 5, 12),
         amount_paise=8000,
         fingerprint="fp-trefund",
-        transaction_type="refund",
+        transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
     )
     session.add_all([food_spend, travel_spend, travel_refund])
     session.commit()
@@ -4788,7 +4972,7 @@ def test_spend_by_tag_coverage_none_when_refund_skew_exceeds_one(
         txn_date=date(2026, 5, 12),
         amount_paise=20000,
         fingerprint="fp-urefund",
-        transaction_type="refund",
+        transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
     )
     session.add_all([tagged_spend, untagged_refund])
     session.commit()
@@ -4840,7 +5024,7 @@ def test_spend_by_tag_excludes_income_and_transfer(
     session: Session,
 ) -> None:
     """A tag linked to income / transfer rows counts only the spend — the
-    ``("spend","refund")`` type filter applies to the grouped query too."""
+    ``transaction_type == "spend"`` type filter applies to the grouped query too."""
     spend = _make_txn(
         user_id=axis_account.user_id,
         account_id=axis_account.id,
@@ -5227,7 +5411,7 @@ def test_spend_by_tag_by_period_net_credit_cell_surfaces_positive(
         txn_date=date(2026, 5, 20),
         amount_paise=8000,
         fingerprint="fp-refund",
-        transaction_type="refund",
+        transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
     )
     session.add_all([spend, refund])
     session.commit()
@@ -5339,7 +5523,7 @@ def test_spend_by_tag_by_period_excludes_income_and_transfer(
     axis_account: Account,
     session: Session,
 ) -> None:
-    """The ``("spend","refund")`` type filter applies to the trend query too.
+    """The ``transaction_type == "spend"`` type filter applies to the trend query too.
 
     Its single-month twin pins this; the by-period version did not, and the filter
     it depends on sits in the same prologue a later consolidation rewrites. Note
@@ -5419,22 +5603,25 @@ def test_spend_by_tag_by_period_excludes_pending_rows(
     ]
 
 
-def test_retyping_a_miscategorised_income_to_refund_reduces_the_months_expense(
+def test_retyping_a_miscategorised_income_to_spend_reduces_the_months_expense(
     client: TestClient,
     axis_account: Account,
     session: Session,
 ) -> None:
-    """ADR-0007 §Verification 2 — the correctness claim the whole ADR rests on.
+    """ADR-0007 §Verification 2, amended by ADR-0009 — the correctness claim
+    the whole ADR rests on, now expressed in the post-collapse vocabulary.
 
-    ``PRD.md`` §F4a-3 used to assert "the type is informational only; reporting math
-    is sign-based regardless". That is false in this codebase: every F8 aggregate
-    filters ``transaction_type.in_(("spend","refund"))`` and routes ``income`` to a
-    separate bucket. So a merchant refund the parser could only classify as ``income``
-    — ``_REFUND_RE`` can never separate a refund from a cashback credit — never enters
-    the expense sum, and displayed spend is inflated by the refund's full magnitude.
+    Every F8 aggregate filters on ``transaction_type == "spend"`` and routes
+    ``income`` to a separate bucket — the SIGN, not the type, is what makes a
+    positive spend row a refund, but the *type* is still what decides which
+    bucket a row's amount lands in. So a merchant refund the parser could only
+    classify as ``income`` — ``_REFUND_RE`` can never separate a refund from a
+    cashback credit — never enters the expense sum, and displayed spend is
+    inflated by the credit's full magnitude (§F4a note 3).
 
-    Re-typing it is the fix, and this asserts the money actually moves: the refund
-    leaves the income bucket and nets against the month's spend.
+    Re-typing it to ``spend`` is the fix (its positive amount is what makes it
+    a refund), and this asserts the money actually moves: the credit leaves
+    the income bucket and nets against the month's spend.
     """
     session.add(
         _make_txn(
@@ -5458,11 +5645,12 @@ def test_retyping_a_miscategorised_income_to_refund_reduces_the_months_expense(
     session.refresh(credit)
 
     before = client.get(f"{_OVERVIEW_URL}?month=2026-05").json()
-    assert before["expense_paise"] == -100000  # the refund is invisible to spend
+    assert before["expense_paise"] == -100000  # the credit is invisible to spend
     assert before["income_paise"] == 40000
 
-    resp = client.patch(f"/api/v1/transactions/{credit.id}", json={"transaction_type": "refund"})
+    resp = client.patch(f"/api/v1/transactions/{credit.id}", json={"transaction_type": "spend"})
     assert resp.status_code == 200, resp.text
+    assert resp.json()["amount_paise"] == 40000  # unchanged — the sign was already a refund's
 
     after = client.get(f"{_OVERVIEW_URL}?month=2026-05").json()
     # Spend drops by exactly the refund magnitude; the income bucket empties.
@@ -5512,16 +5700,88 @@ def test_year_parameter_dashboards(
     r1 = client.get("/api/v1/dashboards/spend-by-category?year=2025")
     assert r1.status_code == 200
     data1 = r1.json()
-    assert data1["year"] == "2025"
+    assert data1["period"] == "2025"
     assert len(data1["rows"]) >= 1
 
     r2 = client.get("/api/v1/dashboards/spend-by-tag?year=2025")
     assert r2.status_code == 200
     data2 = r2.json()
-    assert data2["year"] == "2025"
+    assert data2["period"] == "2025"
 
     r3 = client.get("/api/v1/dashboards/top-merchants?year=2025")
     assert r3.status_code == 200
     data3 = r3.json()
-    assert data3["year"] == "2025"
+    assert data3["period"] == "2025"
 
+
+def test_available_years_reaches_a_future_dated_row(
+    client: TestClient,
+    session: Session,
+    axis_account: Account,
+) -> None:
+    """A future-dated row (a backfilled import, or a clock-skewed manual entry)
+    must still be reachable — the fix for the old `max(current_year,
+    current_year)` tautology, which was a no-op and could silently return `[]`
+    when every row was outside the current year."""
+    session.add(
+        _make_txn(
+            user_id=axis_account.user_id,
+            account_id=axis_account.id,
+            txn_date=date(2030, 1, 15),
+            amount_paise=-5000,
+            fingerprint="fp-future",
+        )
+    )
+    session.commit()
+    resp = client.get("/api/v1/dashboards/available-years")
+    assert resp.status_code == 200
+    years = resp.json()["years"]
+    assert 2030 in years
+    assert 2026 in years  # current year is always offered, even mid-range
+    assert years == sorted(years, reverse=True)
+
+
+def test_year_query_param_out_of_range_rejected(client: TestClient) -> None:
+    """``year=0000`` is shape-valid against ``^\\d{4}$`` but out of any
+    plausible range — ``date(0, 1, 1)`` raises ``ValueError``, which must
+    surface as a controlled 422, not an uncaught 500."""
+    resp = client.get("/api/v1/dashboards/spend-by-category?year=0000")
+    assert resp.status_code == 422
+    assert "0000" not in resp.text  # input-echo discipline
+
+
+def test_overview_on_a_year_period_covers_the_whole_year(
+    client: TestClient,
+    session: Session,
+    axis_account: Account,
+) -> None:
+    """``overview`` accepts a ``year`` period, not just ``month`` — the fix for
+    the frontend's old ``YYYY-12`` fake-a-year workaround, under which
+    ``income_paise`` was December-only. A February income row must count."""
+    session.add_all(
+        [
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2025, 2, 10),
+                amount_paise=100000,
+                fingerprint="fp-feb-income",
+                transaction_type="income",
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2025, 11, 5),
+                amount_paise=-30000,
+                fingerprint="fp-nov-spend",
+            ),
+        ]
+    )
+    session.commit()
+
+    resp = client.get(f"{_OVERVIEW_URL}?year=2025")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["period"] == "2025"
+    assert body["income_paise"] == 100000
+    assert body["expense_paise"] == -30000

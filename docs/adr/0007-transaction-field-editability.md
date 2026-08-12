@@ -142,6 +142,19 @@ The principle comes before the mechanics: it is what pre-decides the next "why c
   coalesced fingerprint, for the same reason.
   Pinned by `test_date_edit_outside_the_statement_window_does_not_restage` and
   `test_row_moved_to_another_account_is_not_restaged`.
+- **Rule 4's sign/type table is amended by [ADR-0009](0009-refund-as-signed-spend.md).**
+  `refund` is no longer a `transaction_type` — a refund is a `spend` row carrying a positive
+  `amount_paise`, derived at read time rather than stored. The merged post-patch validation
+  this rule describes is unchanged in mechanism (sign and type are still checked together, in
+  the route, via the one shared helper); only the table collapses from four rows to three:
+  `spend` now accepts *either* sign (negative = outflow, positive = refund), `income` still
+  requires `> 0`, `transfer` still requires non-zero. Rules 1, 2, 5, 7 and rule 10 bullet 3
+  each name `transaction_type` in passing (the mutable set, the free-vs-recompute split, the
+  kind-flip category guard, the transfer-pair guard, and the F4a auto-link gate,
+  respectively) — none of their mechanics change, because none of them singled out `refund`
+  specifically; they simply inherit the narrower three-value vocabulary.
+  `sign_error()` (`app/schemas/transactions.py`) is the one place the rule is actually
+  enforced, and its docstring is the amendment's source of truth going forward.
 
 ---
 

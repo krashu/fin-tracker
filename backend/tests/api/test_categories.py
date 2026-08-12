@@ -619,6 +619,7 @@ def test_delete_keeps_merchant_tag_map_rows_but_hides_them(
     user-authored ``pinned`` one) — no silent data loss — while the
     archived-category filter hides them from both the rules list and F3 prefill.
     """
+    from app.services.merchant_alias import EMPTY_RESOLVER
     from app.services.tag_service import prefetch_tag_map
 
     target = Category(user_id=seeded_user.id, name="Coffee", is_seeded=False)
@@ -660,7 +661,7 @@ def test_delete_keeps_merchant_tag_map_rows_but_hides_them(
         assert len(remaining) == 3
         # But F3 prefill no longer resurrects the archived bucket (the JOIN
         # filters archived categories); only the live category's merchant maps.
-        prefill = prefetch_tag_map(s, user_id=seeded_user.id)
+        prefill = prefetch_tag_map(s, user_id=seeded_user.id, resolver=EMPTY_RESOLVER)
         assert prefill == {"crossword": other.id}
 
     # And the rules list hides the archived category's rules.

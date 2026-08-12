@@ -32,6 +32,8 @@ import {
   type ImportSummary,
 } from "@/lib/api/client";
 import { accountLabel } from "@/lib/accounts";
+import { Sensitive } from "@/components/balance-visibility";
+import { formatINR } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 export function UploadForm() {
@@ -226,6 +228,20 @@ export function UploadForm() {
             </Link>
             .
           </p>
+          {/* PRD §F1/§F4a: with nothing pending, the review queue — the usual
+              mismatch banner — is never visited for this batch, so this is
+              the only surface left to say the statement's own closing
+              balance doesn't match. Null (not checked) and 0 (reconciled)
+              both render nothing. */}
+          {summary.reconciliation_delta_paise ? (
+            <p className="mt-1.5 text-warn">
+              Its statement closing balance doesn’t match your expenses:{" "}
+              <Sensitive>
+                {formatINR(Math.abs(summary.reconciliation_delta_paise))}
+              </Sensitive>{" "}
+              unaccounted for.
+            </p>
+          ) : null}
         </div>
       ) : null}
 

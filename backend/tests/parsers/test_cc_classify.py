@@ -22,11 +22,16 @@ review judges independently agreed. So this module has two halves:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import date
+
 import pytest
 
+from app.parsers import RawTransaction
 from app.parsers.axis_cc import _classify as axis_classify
 from app.parsers.base import TxnType
 from app.parsers.icici_cc import _classify as icici_classify
+from app.services.import_service import _map_type
 
 # (description, is_credit, expected) — must hold for BOTH parsers.
 _SHARED: list[tuple[str, bool, TxnType]] = [
@@ -113,3 +118,39 @@ def test_service_charge_is_shared_even_though_service_tax_is_not() -> None:
     """
     assert axis_classify("SERVICE CHARGE", False) == "other"
     assert icici_classify("SERVICE CHARGE", False) == "other"
+
+
+@pytest.mark.parametrize(
+    ("issuer", "classify"),
+    [("axis", axis_classify), ("icici", icici_classify)],
+)
+def test_chargeback_credit_stores_as_a_positive_spend(
+    issuer: str,
+    classify: Callable[[str, bool], TxnType],
+) -> None:
+    """The stored-type half of the executable §Verification step 1 rewrite
+    (ADR-0009): a CHARGEBACK credit must NOT store ``transaction_type = refund``,
+    because that value no longer exists on the model. It stores ``spend`` with a
+    positive amount — a refund, by sign, not by type.
+
+    ``_classify`` (T3, per AGENTS.md — parser-level statement vocabulary) still
+    yields ``"refund"`` for this token, on both issuers (see ``_SHARED`` above),
+    and that is correct and unchanged: ``TxnType`` keeps ``refund`` forever. The
+    STORED type only appears one layer up, after ``_map_type`` — so this test
+    composes the two rather than asserting on ``_classify`` alone, which is the
+    seam a fixture-only test would miss.
+    """
+    assert callable(classify)
+    txn_type = classify("CHARGEBACK SENTINEL MERCHANT", True)
+    # _classify's own vocabulary — unchanged, T3.
+    assert txn_type == "refund", f"{issuer} classified a CHARGEBACK credit as {txn_type!r}"
+
+    row = RawTransaction(
+        date=date(2026, 3, 26),
+        amount_paise=250000,
+        merchant_raw="CHARGEBACK SENTINEL MERCHANT",
+        txn_type=txn_type,
+    )
+    stored_type = _map_type(row)
+    assert stored_type == "spend", f"{issuer}: CHARGEBACK stored as {stored_type!r}, not spend"
+    assert row.amount_paise > 0  # positive spend == a refund (ADR-0009).

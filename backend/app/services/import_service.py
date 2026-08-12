@@ -50,6 +50,7 @@ Decisions locked in for v1 (see :file:`docs/` ADRs when they land):
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -62,8 +63,10 @@ from app.models.transaction import TransactionTypeStr
 from app.parsers import AxisCC, IciciCC, RawTransaction, StatementParser
 from app.services.fingerprint import transaction_fingerprint
 from app.services.merchant import normalize_merchant
+from app.services.merchant_alias import EMPTY_RESOLVER, load_alias_resolver
 from app.services.merchant_labels import prefetch_label_map
 from app.services.occurrence import OccurrenceAllocator
+from app.services.reconciliation_service import reconcile_batch
 from app.services.tag_service import AUTO_TAGGABLE_TYPES, prefetch_tag_map
 from app.services.transaction_labels import link_labels
 
@@ -122,6 +125,10 @@ class ImportResult:
     # ``archived_at IS NULL``, so the id alone is not resolvable to a label by the
     # frontend in that case — it falls back to "an archived account".
     duplicate_of_account_archived: bool = False
+    # Balance reconciliation (PRD §F1/§F4a): None = not checked (no usable
+    # statement metadata, or an account-less batch); 0 = reconciled; non-zero =
+    # mismatch, this many paise. See reconciliation_service.reconcile_batch.
+    reconciliation_delta_paise: int | None = None
 
 
 def import_statement(
@@ -230,7 +237,8 @@ def import_statement(
         session.add(batch)
         session.flush()
 
-    rows = parser_cls.parse(file_bytes, password)
+    parsed_statement = parser_cls.parse(file_bytes, password)
+    rows = parsed_statement.rows
 
     # Pass 1 — identity only. Normalizing and fingerprinting before the persist loop
     # is what lets the prefetch below scope itself to THIS FILE's fingerprints (see
@@ -317,14 +325,18 @@ def import_statement(
             max_occ[fingerprint] = max(max_occ.get(fingerprint, -1), row_max_occ)
         existing_counts = {fp: (counts.get(fp, 0), max_occ.get(fp, -1)) for fp in file_fps}
 
-    # Auto-tag prefetch (PRD §F3). One SELECT, dict lookup per row. Mirrors the
-    # dedup prefetch above, including its empty-parse guard — nothing to look up
-    # when the file yielded no rows. v2 Postgres: could batch with the dedup
-    # prefetch in a CTE; not worth it in v1 SQLite.
-    tag_map = prefetch_tag_map(session, user_id=user_id) if rows else {}
+    # Auto-tag prefetch (PRD §F3 / ADR-0011 merchant-alias layer). One
+    # user-scoped SELECT for the alias table (empty guard mirrors the two
+    # prefetches below — nothing to resolve when the file yielded no rows),
+    # then both prefetches aggregate onto whichever canonical it resolves to.
+    # v2 Postgres: could batch with the dedup prefetch in a CTE; not worth it
+    # in v1 SQLite.
+    resolver = load_alias_resolver(session, user_id=user_id) if rows else EMPTY_RESOLVER
+    tag_map = prefetch_tag_map(session, user_id=user_id, resolver=resolver) if rows else {}
     # F3a Phase 2: prefetch the merchant→label map (labels with hit_count ≥
-    # LABEL_PREFILL_MIN). Same one-SELECT-then-dict-lookup shape as tag_map.
-    label_map = prefetch_label_map(session, user_id=user_id) if rows else {}
+    # LABEL_PREFILL_MIN, summed across every raw descriptor an alias folds
+    # together). Same one-SELECT-then-dict-lookup shape as tag_map.
+    label_map = prefetch_label_map(session, user_id=user_id, resolver=resolver) if rows else {}
     # Collected (txn, [label_id, ...]) for prefilled rows — the join rows are
     # inserted after the post-loop flush assigns txn.id (below).
     label_prefills: list[tuple[Transaction, list[int]]] = []
@@ -343,7 +355,12 @@ def import_statement(
             continue
 
         txn_type = _map_type(row)
-        auto_category_id = tag_map.get(normalized) if txn_type in AUTO_TAGGABLE_TYPES else None
+        # Resolved once per row, reused for both lookups below — the two
+        # prefetches are keyed on the canonical, never the raw
+        # merchant_normalized (ADR-0011). merchant_normalized itself is never
+        # overwritten with the canonical; it still feeds the F4 fingerprint.
+        canonical = resolver.canonical(normalized)
+        auto_category_id = tag_map.get(canonical) if txn_type in AUTO_TAGGABLE_TYPES else None
 
         txn = Transaction(
             user_id=user_id,
@@ -369,10 +386,10 @@ def import_statement(
             import_batch_id=batch.id,
         )
         session.add(txn)
-        # F3a Phase 2 prefill: same spend/refund gate as the category auto-tag.
+        # F3a Phase 2 prefill: same spend-type gate as the category auto-tag.
         # Labels come from the user's own map, so no get-or-create is needed —
         # just the join inserts, staged until txn.id exists (post-loop flush).
-        prefill_label_ids = label_map.get(normalized, []) if txn_type in AUTO_TAGGABLE_TYPES else []
+        prefill_label_ids = label_map.get(canonical, []) if txn_type in AUTO_TAGGABLE_TYPES else []
         if prefill_label_ids:
             label_prefills.append((txn, prefill_label_ids))
         imported += 1
@@ -403,6 +420,19 @@ def import_statement(
     for txn, prefill_label_ids in label_prefills:
         link_labels(session, txn_id=txn.id, user_id=user_id, label_ids=prefill_label_ids)
 
+    # Balance reconciliation (PRD §F1/§F4a, migration 0030). Stamp the statement's
+    # own metadata on EVERY import, including a re-upload — unlike imported_count /
+    # skipped_count / status above, this isn't "the first import's outcome": same
+    # file in, same metadata out, and a re-upload repairs a batch stamped before
+    # this shipped. reconcile_batch may itself stamp period_start/period_end via
+    # the window fallback (see its docstring) before computing the delta, so this
+    # assignment runs first.
+    batch.statement_opening_balance_paise = parsed_statement.summary.opening_balance_paise
+    batch.statement_closing_balance_paise = parsed_statement.summary.closing_balance_paise
+    batch.period_start = parsed_statement.summary.period_start
+    batch.period_end = parsed_statement.summary.period_end
+    batch.reconciliation_delta_paise = reconcile_batch(session, user_id=user_id, batch=batch)
+
     # Rows on this batch still awaiting review after the import — the frontend's
     # routing signal. user_id guard is defense-in-depth (batch id is already
     # user-scoped), matching the other scoped queries in the imports router.
@@ -431,6 +461,8 @@ def import_statement(
         rows_skipped=skipped,
         already_imported=already_imported,
         pending_count=pending_count,
+        # Aggregate rupee figure, not a merchant or account number — PII-safe.
+        reconciliation_delta_paise=batch.reconciliation_delta_paise,
     )
 
     return ImportResult(
@@ -441,19 +473,53 @@ def import_statement(
         pending_count=pending_count,
         duplicate_of_account_id=duplicate_of_account_id,
         duplicate_of_account_archived=duplicate_of_account_archived,
+        reconciliation_delta_paise=batch.reconciliation_delta_paise,
     )
+
+
+_CASHBACK_RE = re.compile(r"CASHBACK", re.IGNORECASE)
+
+
+def is_cashback_credit(merchant_raw: str) -> bool:
+    """Whether ``merchant_raw`` names this credit as cashback (PRD §F5).
+
+    A plain keyword, not per-issuer regex vocabulary (unlike ``_REFUND_RE`` in
+    each parser) — the word appears verbatim across issuers, so one check here
+    covers every parser rather than duplicating it per statement format.
+    Exported so ``app.api.v1.imports.commit_import_batch`` can re-run the same
+    check at commit time for its category default (PRD §F5 fallback) — one
+    rule, not two copies that can drift.
+    """
+    return bool(_CASHBACK_RE.search(merchant_raw))
 
 
 def _map_type(row: RawTransaction) -> TransactionTypeStr:
     """Parser TxnType → model transaction_type (CC-only, v1).
 
-    Zero-paise rows are filtered out upstream, so the ``other`` branch
-    always lands on a strictly-signed comparison.
+    Only two types are reachable from a CC statement: ``payment`` folds to
+    ``income`` (the F4a input contract) and a cashback-named credit is
+    ``income``; **everything else is ``spend``**. A parser ``refund`` needs no
+    branch of its own — a refund IS a ``spend`` row with a positive amount
+    (ADR-0009), and the parser already hands over that positive sign
+    (``RawTransaction.__post_init__`` enforces ``refund >= 0``). So the sign
+    carries refund-ness and this function never has to guess at it.
+
+    Zero-paise rows are filtered out upstream, so the ``other`` branch is
+    always strictly signed: negative is a spend the parser's vocabulary didn't
+    otherwise match; positive is a cashback credit (see ``is_cashback_credit``)
+    or, failing that, a merchant refund — which is the ``spend`` default below
+    (PRD §F5).
     """
-    if row.txn_type == "purchase":
-        return "spend"
     if row.txn_type == "payment":
         return "income"  # F4a input contract — see module docstring; do NOT change to "transfer"
-    if row.txn_type == "refund":
-        return "refund"
-    return "spend" if row.amount_paise < 0 else "income"
+    # An unmatched credit-card credit named cashback in its own description is
+    # income, not a merchant refund — the one case where the sign alone is not
+    # enough, since a refund and a cashback credit are both positive.
+    if row.amount_paise > 0 and is_cashback_credit(row.merchant_raw):
+        return "income"
+    # Everything else is spend-typed and keeps the parser's sign: negative is an
+    # ordinary spend, positive is a refund. An unmatched positive credit (not a
+    # "payment", not matched by _REFUND_RE, not named cashback) therefore lands
+    # as a refund rather than income — defaulting it to income would inflate
+    # spend by the credit's full magnitude (PRD §F4a note 3).
+    return "spend"

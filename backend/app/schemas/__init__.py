@@ -44,6 +44,7 @@ from app.schemas.dashboards import (
 )
 from app.schemas.fx import FxRefreshSummary
 from app.schemas.imports import (
+    BatchReconciliation,
     ImportCommit,
     ImportSummary,
     InvestmentCsvImportSummary,
@@ -72,6 +73,9 @@ from app.schemas.rules import (
     CategoryRuleRead,
     LabelRuleCreate,
     LabelRuleRead,
+    MerchantAliasCreate,
+    MerchantAliasRead,
+    MerchantAliasUpdate,
     MerchantRuleRead,
     RulePinPatch,
     RuleWriteResult,
@@ -92,7 +96,9 @@ __all__ = [
     "AccountUpdate",
     "AssetClassAllocation",
     "AuthConfig",
+    "AvailableYearsResponse",
     "BackupImportSummary",
+    "BatchReconciliation",
     "BenchmarkRead",
     "BenchmarkRefreshSummary",
     "CashflowByPeriodBucket",
@@ -124,6 +130,9 @@ __all__ = [
     "LabelRuleRead",
     "LabelUpdate",
     "LoginRequest",
+    "MerchantAliasCreate",
+    "MerchantAliasRead",
+    "MerchantAliasUpdate",
     "MerchantRuleRead",
     "NET_WORTH_EXCLUDED_TYPES",
     "NavRefreshSummary",

@@ -49,9 +49,9 @@ import {
   listSpendByCategoryByPeriod,
   type CategoryColor,
 } from "@/lib/api/client";
-import { trailingMonths } from "@/lib/dates";
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel } from "@/lib/charts";
+import { periodRange } from "@/lib/period";
 import { categoryColorVar } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
@@ -67,8 +67,7 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
   const { hidden } = useBalanceHidden();
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
-  const start = `${year}-01-01`;
-  const end = `${year}-12-31`;
+  const { start, end } = periodRange({ year });
   const query = useQuery({
     queryKey: [
       "dashboards",

@@ -15,7 +15,7 @@
  * against the backend schema, not against a green `tsc`.
  */
 
-export type TransactionType = "spend" | "income" | "transfer" | "refund";
+export type TransactionType = "spend" | "income" | "transfer";
 
 /** A freeform user tag on a transaction (PRD §F3a — user-facing "Tags"). Stored
  * as a plain lowercased word (no leading `#`); the UI prepends `#` for display
@@ -62,7 +62,12 @@ export type TransactionUpdate = {
   category_id?: number | null;
 };
 
-export type ConfidenceLabel = "confident" | "uncertain" | "none";
+// "seeded" (ADR-0011 merchant-alias layer, Phase A3): the (canonical, category)
+// pair is present in the merchant map at hit_count === 0 — a dictionary entry
+// this user has never confirmed — distinct from "none" (no rule at all). Must
+// move together with tag-picker.tsx's `TagConfidence` (structurally, not by a
+// shared import — see review-queue.tsx's TagPicker usage).
+export type ConfidenceLabel = "confident" | "uncertain" | "seeded" | "none";
 
 /** A pending import row: TransactionRead + the F3 auto-tag confidence signal. */
 export type TransactionCandidate = TransactionRead & {
@@ -71,6 +76,11 @@ export type TransactionCandidate = TransactionRead & {
   /** Winning rule for this (merchant, category) is user-authored (pinned) —
    * the picker renders an "authored" state that outranks the confidence tint. */
   pinned: boolean;
+  /** Row is `income` and its merchant names a card-bill payment (PRD §F4a-1) —
+   * the review queue can offer "Card bill payment" instead of a category.
+   * Does NOT assert the auto-link will fire at commit; that also needs a
+   * matching bank debit and an imported parent account. */
+  cc_payment_candidate: boolean;
 };
 
 /** Response body of `POST /imports`. `already_imported` means the file hash was
@@ -80,7 +90,10 @@ export type TransactionCandidate = TransactionRead & {
  * `duplicate_of_account_id` is *an* OTHER account this exact file was already
  * imported into (the wrong-account mis-import the per-account dedup can't catch) —
  * an id, never a name; `duplicate_of_account_archived` flags that `GET /accounts`
- * won't return it, so it can't be resolved to a label. */
+ * won't return it, so it can't be resolved to a label.
+ * `reconciliation_delta_paise` (PRD §F1/§F4a) is this import's statement-balance
+ * check as of upload: `null` = not checked (no usable statement metadata),
+ * `0` = reconciled, non-zero = mismatch, this many paise. */
 export type ImportSummary = {
   batch_id: number;
   imported: number;
@@ -89,6 +102,7 @@ export type ImportSummary = {
   pending_count: number;
   duplicate_of_account_id: number | null;
   duplicate_of_account_archived: boolean;
+  reconciliation_delta_paise: number | null;
 };
 
 /** Response body of `POST /imports/investments` (PRD §F7). `warnings` are PII-safe
@@ -116,9 +130,10 @@ export type AccountRead = {
   archived_at: string | null;
 };
 
-/** Spend categories serve spend+refund transactions; income categories serve
- * income. Set at create, immutable thereafter (the backend has no PATCH kind). */
-export type CategoryKind = "spend" | "income" | "refund";
+/** Spend categories serve `spend`-typed transactions, of either sign (a refund
+ * is a positive `spend`); income categories serve `income`. Set at create,
+ * immutable thereafter (the backend has no PATCH kind). */
+export type CategoryKind = "spend" | "income";
 
 /** A user-picked `#rrggbb` hex color for a category's dot/bar (the backend
  * validates and lower-cases it). `null` = derive the color from the id — the
@@ -386,6 +401,10 @@ export function getAuthConfig(): Promise<AuthConfig> {
 
 export type ListTransactionsParams = {
   transaction_type?: TransactionType[];
+  // Orthogonal to transaction_type, not a replacement for it — composes as an
+  // AND. `{transaction_type: ["spend"], amount_sign: "positive"}` is the
+  // refund-only view now that refund is a sign on a spend row, not its own type.
+  amount_sign?: "positive" | "negative";
   account_id?: number;
   category_id?: number;
   label_id?: number;
@@ -397,9 +416,10 @@ export type ListTransactionsParams = {
 
 function buildQuery(params: ListTransactionsParams): string {
   const qs = new URLSearchParams();
-  // Repeated key for the list-valued filter: ?transaction_type=spend&transaction_type=refund.
+  // Repeated key for the list-valued filter: ?transaction_type=spend&transaction_type=income.
   // Omit entirely when absent — sending an empty value 422s on the Literal.
   params.transaction_type?.forEach((t) => qs.append("transaction_type", t));
+  if (params.amount_sign) qs.set("amount_sign", params.amount_sign);
   if (params.account_id != null)
     qs.set("account_id", String(params.account_id));
   if (params.category_id != null)
@@ -555,7 +575,12 @@ export type CategoryRuleRead = {
   category_name: string;
   hit_count: number;
   last_used: string;
-  is_winner: boolean; // the row import prefills for this merchant
+  // This row's category is the AGGREGATE winner for its canonical merchant
+  // (ADR-0011 Phase A3: summed hit_count across every raw merchant_normalized
+  // an alias folds together) — not "this exact row has the highest
+  // hit_count"; two raw rows can share the winning category and both read
+  // true.
+  is_winner: boolean;
   pinned: boolean; // user-authored: wins regardless of hit_count
 };
 
@@ -570,10 +595,15 @@ export type LabelRuleRead = {
   pinned: boolean; // user-authored: prefills even below the learned bar
 };
 
+// As of Phase A3 (ADR-0011) `merchant_normalized` is the CANONICAL merchant —
+// an unaliased merchant resolves to itself, so this keeps its name but its
+// value now depends on the user's alias table.
 export type MerchantRuleRead = {
   merchant_normalized: string;
   categories: CategoryRuleRead[];
   labels: LabelRuleRead[];
+  alias_count: number; // distinct raw merchant_normalized keys folded in; always >=1
+  seeded: boolean; // every category row in the group is an unconfirmed seed (hit_count === 0)
 };
 
 // Result of a pin/create/toggle write. `merchant_normalized` is the server's
@@ -646,6 +676,46 @@ export function deleteLabelRule(id: number): Promise<void> {
   return request<void>(`/rules/labels/${id}`, { method: "DELETE" });
 }
 
+// One user-authored `pattern -> canonical` row (ADR-0011 merchant-alias
+// layer, Phase A4). `is_seeded` flags a dictionary entry from Phase A5,
+// distinct from a merchant_tag_map row at hit_count === 0.
+export type MerchantAliasRead = {
+  id: number;
+  pattern: string;
+  canonical: string;
+  is_seeded: boolean;
+};
+
+export function listAliases(): Promise<MerchantAliasRead[]> {
+  return request<MerchantAliasRead[]>("/rules/aliases");
+}
+
+// Add a pattern -> canonical rule. The server 422s on a blank field after
+// normalization, a zero-token pattern (the false-merge hazard), a duplicate
+// pattern, or decision 7's no-chaining conflict in either direction.
+export function createAlias(body: {
+  pattern: string;
+  canonical: string;
+}): Promise<MerchantAliasRead> {
+  return request<MerchantAliasRead>("/rules/aliases", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+// Rename an alias's canonical target. `pattern` is immutable — delete and
+// recreate to change it.
+export function patchAliasCanonical(id: number, canonical: string): Promise<MerchantAliasRead> {
+  return request<MerchantAliasRead>(`/rules/aliases/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ canonical }),
+  });
+}
+
+export function deleteAlias(id: number): Promise<void> {
+  return request<void>(`/rules/aliases/${id}`, { method: "DELETE" });
+}
+
 export function patchTransaction(
   id: number,
   body: TransactionUpdate,
@@ -673,9 +743,10 @@ export function unlinkTransaction(id: number): Promise<void> {
 
 /**
  * Manual transaction entry (PRD §F2). `amount_paise` is signed — the caller
- * applies the sign by type (spend negative, refund/income positive). Auto-
- * confirmed server-side, so it lands on the board immediately. 409 if it
- * duplicates an existing fingerprint.
+ * applies the sign by entry direction (spend negative, income positive; a
+ * refund is a `spend` with a positive amount — see `EntryDirection` in
+ * `lib/transaction-types.ts`). Auto-confirmed server-side, so it lands on the
+ * board immediately. 409 if it duplicates an existing fingerprint.
  */
 export type TransactionCreate = {
   date: string;
@@ -773,16 +844,53 @@ export function listCandidates(
  * notification bell. `account_*` label the batch (both null for the
  * account-less investment batches, which never surface here as they commit
  * directly). The only batch-list surface in v1: it's the way back to a review
- * queue after navigating away from a fresh upload. */
+ * queue after navigating away from a fresh upload.
+ * `reconciliation_delta_paise` is the batch's stored (not recomputed)
+ * statement-balance verdict — see `ImportSummary` and `BatchReconciliation`. */
 export type PendingImportBatch = {
   batch_id: number;
   account_name: string | null;
   account_last4: string | null;
   pending_count: number;
+  reconciliation_delta_paise: number | null;
 };
 
 export function listPendingImports(): Promise<PendingImportBatch[]> {
   return request<PendingImportBatch[]>("/imports/pending");
+}
+
+/** Response body of `GET /imports/{batchId}/reconciliation` (PRD §F1/§F4a).
+ * The backend recomputes this on every call (not just a read of a stored
+ * column) — a commit or a discard since the last check can flip the verdict —
+ * and persists the fresh delta before returning. `expected_paise`
+ * (closing − opening) and `actual_paise` are derived server-side from
+ * `delta_paise`, not fetched independently, so they can't disagree with it.
+ * `status` is derived from `delta_paise`: `"unavailable"` when it's null (no
+ * usable statement metadata, or an account-less batch), else `"matched"`
+ * (`delta_paise === 0`) or `"mismatched"`. Every field but `batch_id`,
+ * `status` and `rows_removed_since_import` is null in the "unavailable" case.
+ * `rows_removed_since_import` is a discard-noise qualifier — how many of the
+ * batch's originally-staged rows no longer exist (most commonly an
+ * investment-transfer SIP debit discarded at review) — computed regardless
+ * of `status`, but only meaningful alongside `"mismatched"`: it explains the
+ * mismatch rather than leaving it a bare, unexplained number. */
+export type BatchReconciliation = {
+  batch_id: number;
+  opening_balance_paise: number | null;
+  closing_balance_paise: number | null;
+  period_start: string | null;
+  period_end: string | null;
+  expected_paise: number | null;
+  actual_paise: number | null;
+  delta_paise: number | null;
+  status: "unavailable" | "matched" | "mismatched";
+  rows_removed_since_import: number;
+};
+
+export function getBatchReconciliation(
+  batchId: number,
+): Promise<BatchReconciliation> {
+  return request<BatchReconciliation>(`/imports/${batchId}/reconciliation`);
 }
 
 // --- Backup (PRD §F10) --------------------------------------------------------
@@ -1059,12 +1167,12 @@ export function listAvailableYears(): Promise<AvailableYearsResponse> {
   return request<AvailableYearsResponse>("/dashboards/available-years");
 }
 
-/** Response body of `GET /dashboards/spend-by-category`. `month` or `year` echoes the
- * requested period; `rows` are most-negative-first (biggest spend first) with
- * the uncategorized row pinned last — server-ordered, render as received. */
+/** Response body of `GET /dashboards/spend-by-category`. `period` echoes the
+ * requested month (`"YYYY-MM"`) or year (`"YYYY"`) verbatim; `rows` are
+ * most-negative-first (biggest spend first) with the uncategorized row pinned
+ * last — server-ordered, render as received. */
 export type SpendByCategoryResponse = {
-  month?: string;
-  year?: string;
+  period: string;
   rows: SpendByCategoryRow[];
   label_id: number | null;
 };
@@ -1103,8 +1211,7 @@ export type SpendByTagRow = {
  * else null (zero-spend month, or refund-skew pushes it out of range → render
  * "—" + raw amounts). Signed figures are never clamped. */
 export type SpendByTagResponse = {
-  month?: string;
-  year?: string;
+  period: string;
   rows: SpendByTagRow[];
   total_spend_paise: number;
   tagged_paise: number;
@@ -1137,8 +1244,7 @@ export type TopMerchantRow = {
  * merchant count (pre-LIMIT) for the "top N of M" label; `truncated` =
  * total_merchants > limit. */
 export type TopMerchantsResponse = {
-  month?: string;
-  year?: string;
+  period: string;
   rows: TopMerchantRow[];
   total_merchants: number;
   truncated: boolean;
@@ -1184,12 +1290,21 @@ export function listPeriodTotals(params: {
 /** F3 auto-tag acceptance metric (PRD §Success-metrics). Of board rows the
  * import auto-tagged, the fraction whose final category still equals the
  * suggestion. `acceptance_rate` is null when `total_auto_tagged === 0`
- * ("no data" — render "—", not "0%"). */
+ * ("no data" — render "—", not "0%").
+ *
+ * `coverage_rate` is a DISTINCT metric, not a replacement: of ALL imported
+ * board rows (`imported_total`), the fraction that got a category suggestion
+ * at all (`pre_tagged`) — PRD §Success-metrics' ≥80% pre-tag bar, which
+ * `acceptance_rate` has no denominator to measure. Null when
+ * `imported_total === 0`, same "no data" contract. */
 export type TaggingStatsResponse = {
   total_auto_tagged: number;
   kept: number;
   acceptance_rate: number | null;
   rules_count: number;
+  imported_total: number;
+  pre_tagged: number;
+  coverage_rate: number | null;
 };
 
 export function getTaggingStats(): Promise<TaggingStatsResponse> {
@@ -1205,8 +1320,9 @@ export function getTaggingStats(): Promise<TaggingStatsResponse> {
  * opposite reason: it's a placeholder whose balance is pinned to 0 at create,
  * because the money it would hold is already counted as holdings. This row still
  * reports the raw signed balance for every type, excluded or not.
- * `spend_ytd_paise` is the signed net Σ(spend + refund)
- * over the calendar year-to-date window, populated only for `credit_card` rows
+ * `spend_ytd_paise` is the signed net Σ(spend, signed) — spend rows of either
+ * sign, refunds netting in as the positive ones — over the calendar
+ * year-to-date window, populated only for `credit_card` rows
  * (`null` otherwise, never `0`); it may be positive in a refund-dominant window,
  * so display floors it via `max(0, −value)`. Archived accounts are included
  * (flagged) so net worth doesn't change on archive. */
@@ -1230,13 +1346,14 @@ export type AccountBalanceRow = {
  * accounts are excluded (placeholders — their value is already the portfolio term,
  * so counting both double-counts it). `portfolio_value_paise` skips null-NAV holdings (they
  * count as 0). `income_paise` / `expense_paise` / `net_paise` mirror
- * PeriodTotalsResponse for the month (`expense_paise` ≤ 0; net = income + expense).
- * Account balances are all-time; only the income/expense/net figures are
- * month-scoped. `fx_unavailable_count` is an honesty flag: priced USD holdings left
- * out of the rollup because no FX rate is cached, so net worth never silently
- * shrinks — render it, don't drop it. */
+ * PeriodTotalsResponse for the requested period (`expense_paise` ≤ 0; net = income
+ * + expense). Account balances are all-time; only the income/expense/net figures
+ * are period-scoped. `period` echoes the requested month or year verbatim.
+ * `fx_unavailable_count` is an honesty flag: priced USD holdings left out of the
+ * rollup because no FX rate is cached, so net worth never silently shrinks —
+ * render it, don't drop it. */
 export type OverviewResponse = {
-  month: string;
+  period: string;
   net_worth_paise: number;
   portfolio_value_paise: number;
   fx_unavailable_count: number;
@@ -1247,9 +1364,12 @@ export type OverviewResponse = {
 };
 
 export function getOverview(params: {
-  month: string;
+  month?: string;
+  year?: string;
 }): Promise<OverviewResponse> {
-  const qs = new URLSearchParams({ month: params.month });
+  const qs = new URLSearchParams();
+  if (params.month) qs.set("month", params.month);
+  if (params.year) qs.set("year", params.year);
   return request<OverviewResponse>(`/dashboards/overview?${qs}`);
 }
 

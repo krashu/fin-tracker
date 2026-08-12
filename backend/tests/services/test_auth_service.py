@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import Engine, create_engine, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import clock, demo
@@ -49,6 +50,31 @@ def test_register_duplicate_email_race(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(auth_service, "hash_password", racing_hash)
     with Session(eng) as b, pytest.raises(auth_service.EmailAlreadyExistsError):
         auth_service.register_user(b, email="race@example.com", password=_PW)
+
+
+def test_register_non_email_integrity_error_is_not_mislabeled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A constraint failure unrelated to the email index — e.g. Phase A5's seed-dictionary
+    inserts colliding on something other than uq_users_email — must surface as the original
+    IntegrityError, not get mislabeled EmailAlreadyExistsError. Direct test of the narrowed
+    ``except IntegrityError`` handler (trap 4): the comment it replaced asserted email was the
+    only reachable IntegrityError in that block, which adding the seed-dictionary inserts made
+    false."""
+    eng = _engine()
+
+    def _boom(_session: Session, _user_id: object) -> None:
+        raise IntegrityError(
+            "INSERT INTO merchant_alias ...",
+            {},
+            BaseException(
+                "UNIQUE constraint failed: merchant_alias.user_id, merchant_alias.pattern"
+            ),
+        )
+
+    monkeypatch.setattr(auth_service, "provision_seed_merchant_dictionary", _boom)
+    with Session(eng) as s, pytest.raises(IntegrityError):
+        auth_service.register_user(s, email="nonemail@example.com", password=_PW)
 
 
 def test_authenticate_rejects_demo_login_when_secure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -99,7 +125,16 @@ def test_authenticate_rejects_demo_login_by_default_on_plain_http(
         auth_service.register_user(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD)
         auth_service.register_user(s, email="real@example.com", password=_PW)
 
-    default = Settings(demo_login_enabled=False, cors_allowed_origins="http://localhost:3000")
+    # tests/conftest.py's _load_dotenv() copies this box's repo-root .env
+    # (DEMO_LOGIN_ENABLED=true, for the local demo seeder) into os.environ at
+    # session start — an explicit env var pydantic-settings reads regardless of
+    # `_env_file=None` below, which only skips re-reading the file itself.
+    # Both together are what let `demo_login_enabled` genuinely resolve through
+    # to the field's Python default, rather than being forced via a
+    # constructor kwarg that would pass even if that default silently flipped.
+    monkeypatch.delenv("DEMO_LOGIN_ENABLED", raising=False)
+    default = Settings(_env_file=None, cors_allowed_origins="http://localhost:3000")
+    assert default.demo_login_enabled is False, "must exercise the shipped default, not an override"
     assert default.cookie_secure is False, "this test must exercise the plain-http case"
     monkeypatch.setattr(auth_service, "get_settings", lambda: default)
     with Session(eng) as s:

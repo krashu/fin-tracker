@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from app.parsers import AxisCC, InvalidPasswordError, ParserError
+from app.parsers.base import StatementSummary
 
 
 def _serialize(rows: list[Any]) -> list[dict[str, Any]]:
@@ -103,8 +104,54 @@ def test_parse_wrong_password_raises(encrypted_pdf_bytes: bytes) -> None:
 
 def test_parse_real_pdf_smoke(axis_real_pdf: bytes, axis_real_password: str) -> None:
     """End-to-end: decrypt + extract + interpret. Lightweight sanity, not a snapshot."""
-    rows = AxisCC.parse(axis_real_pdf, password=axis_real_password)
+    parsed = AxisCC.parse(axis_real_pdf, password=axis_real_password)
+    rows = parsed.rows
     assert rows, "real Axis PDF returned zero rows — parser layout assumptions wrong?"
     first = rows[0]
     assert first.merchant_raw.strip(), "first row has empty merchant"
     assert first.date.year >= 2020, f"implausible date on first row: {first.date}"
+    # Balance-reconciliation plan Phase 0 spike confirmed "Total Amount Due" /
+    # "Total Payment Due" always prints on a real Axis statement; opening
+    # balance and period are not asserted here — Phase 0 found the opening
+    # figure sits inside a formula-legend line on the real layout with no
+    # clean trailing value, so StatementSummary legitimately reports it None.
+    assert parsed.summary.closing_balance_paise is not None, (
+        "real Axis PDF returned no closing balance — label wording changed?"
+    )
+
+
+def test_interpret_summary_snapshot(
+    axis_summary_lines: list[str],
+    axis_summary_expected: dict[str, Any],
+) -> None:
+    summary = AxisCC.interpret_summary(axis_summary_lines)
+    assert summary.period_start is not None
+    assert summary.period_end is not None
+    actual = {
+        **asdict(summary),
+        "period_start": summary.period_start.isoformat(),
+        "period_end": summary.period_end.isoformat(),
+    }
+    assert actual == axis_summary_expected
+
+
+def test_interpret_summary_cc_sign_credit_marker_is_positive() -> None:
+    """CC sign convention (negative = owed): a bare "Total Amount Due" is a
+    debit → negative (pinned by the snapshot fixture above). A CR-suffixed
+    closing balance (the card is in credit / overpaid) must flip positive —
+    the one branch the snapshot fixture, which carries no CR, can't reach."""
+    lines = ["Total Amount Due          500.00 CR"]
+
+    summary = AxisCC.interpret_summary(lines)
+
+    assert summary.closing_balance_paise == 50000
+
+
+def test_interpret_summary_no_labels_returns_all_none() -> None:
+    """The Flipkart layout's real closing text — no summary block at all.
+    Must degrade to an all-None StatementSummary, never a ParserError."""
+    lines = ["**** End of Statement ****"]
+
+    summary = AxisCC.interpret_summary(lines)
+
+    assert summary == StatementSummary()

@@ -33,7 +33,7 @@ from app.models import (
     TransactionLabel,
     User,
 )
-from app.parsers import RawTransaction
+from app.parsers import ParsedStatement, RawTransaction, StatementSummary
 from app.services import import_service
 from app.services.merchant_labels import LABEL_PREFILL_MIN
 
@@ -59,8 +59,8 @@ class _StubAxisParser:
     rows: ClassVar[list[RawTransaction]] = []
 
     @classmethod
-    def parse(cls, pdf_bytes: bytes, password: str | None) -> list[RawTransaction]:
-        return list(cls.rows)
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+        return ParsedStatement(rows=list(cls.rows), summary=StatementSummary())
 
 
 @pytest.fixture

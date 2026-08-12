@@ -26,12 +26,14 @@ import { useQuery } from "@tanstack/react-query";
 
 import { CashflowBar } from "@/components/dashboard/cashflow-bar";
 import { CategoryTrendBar } from "@/components/dashboard/category-trend-bar";
+import { PeriodPicker } from "@/components/dashboard/period-picker";
 import { SpendByCategory } from "@/components/dashboard/spend-by-category";
 import { SpendByPeriodBar } from "@/components/dashboard/spend-by-period-bar";
 import { SpendByTag } from "@/components/dashboard/spend-by-tag";
 import { SpendByTagHeatmap } from "@/components/dashboard/spend-by-tag-heatmap";
 import { TaggingHealthCard } from "@/components/dashboard/tagging-health-card";
 import { TopMerchants } from "@/components/dashboard/top-merchants";
+import { useAvailableYears } from "@/components/dashboard/use-available-years";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -40,35 +42,16 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Pill } from "@/components/ui/pill";
 import { IconChevronDown } from "@/components/icons";
-import { listAvailableYears, listLabels } from "@/lib/api/client";
+import { listLabels } from "@/lib/api/client";
 import { labelDisplay } from "@/lib/labels";
-
-const MONTH_OPTIONS = [
-  { value: undefined, label: "All months" },
-  { value: "01", label: "January" },
-  { value: "02", label: "February" },
-  { value: "03", label: "March" },
-  { value: "04", label: "April" },
-  { value: "05", label: "May" },
-  { value: "06", label: "June" },
-  { value: "07", label: "July" },
-  { value: "08", label: "August" },
-  { value: "09", label: "September" },
-  { value: "10", label: "October" },
-  { value: "11", label: "November" },
-  { value: "12", label: "December" },
-] as const;
+import { periodKey, type Period } from "@/lib/period";
 
 export function SpendingDashboard() {
-  const [selectedYear, setSelectedYear] = useState<number>(() => new Date().getFullYear());
-  const [selectedMonth, setSelectedMonth] = useState<string | undefined>(undefined);
+  const yearsQuery = useAvailableYears();
+  const [period, setPeriod] = useState<Period>(() => ({
+    year: new Date().getFullYear(),
+  }));
   const [labelId, setLabelId] = useState<number | undefined>(undefined);
-
-  const yearsQuery = useQuery({
-    queryKey: ["dashboards", "available-years"],
-    queryFn: listAvailableYears,
-  });
-  const availableYears = yearsQuery.data?.years ?? [new Date().getFullYear()];
 
   const labelsQuery = useQuery({ queryKey: ["labels"], queryFn: listLabels });
   const labels = labelsQuery.data ?? [];
@@ -82,56 +65,18 @@ export function SpendingDashboard() {
   }, [labelId, labelsQuery.data]);
 
   const selectedTag = labels.find((l) => l.id === labelId);
-  const monthParam = selectedMonth ? `${selectedYear}-${selectedMonth}` : undefined;
+  const selectedYear = period.year;
+  const monthParam = period.mon != null ? periodKey(period) : undefined;
 
   return (
     <div className="flex flex-col gap-5">
-      {/* Top Filter Controls: Year selector + Month selector + Tag selector */}
+      {/* Top Filter Controls: Period selector + Tag selector */}
       <div className="flex items-center gap-4 flex-wrap">
-        <div className="flex items-center gap-2">
-          <span className="text-[12.5px] text-muted-foreground">Year</span>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Pill active={true}>
-                {selectedYear}
-                <IconChevronDown className="size-3 opacity-70" />
-              </Pill>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="max-h-72 w-32">
-              {availableYears.map((yr) => (
-                <DropdownMenuItem key={yr} onSelect={() => setSelectedYear(yr)}>
-                  {yr}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <span className="text-[12.5px] text-muted-foreground">Month</span>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Pill active={selectedMonth != null}>
-                {selectedMonth
-                  ? MONTH_OPTIONS.find((m) => m.value === selectedMonth)?.label
-                  : "All months"}
-                <IconChevronDown className="size-3 opacity-70" />
-              </Pill>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="max-h-72 w-40">
-              {MONTH_OPTIONS.map((m) => (
-                <DropdownMenuItem
-                  key={m.value ?? "all"}
-                  onSelect={() => setSelectedMonth(m.value)}
-                >
-                  <span className={m.value == null ? "text-muted-foreground" : ""}>
-                    {m.label}
-                  </span>
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+        <PeriodPicker
+          period={period}
+          availableYears={yearsQuery.years}
+          onChange={setPeriod}
+        />
 
         {labels.length > 0 ? (
           <div className="flex items-center gap-2">
