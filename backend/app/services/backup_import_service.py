@@ -235,8 +235,9 @@ def _upsert_categories(
 ) -> tuple[int, int, dict[tuple[str, str], Category]]:
     """Resolve each backup ``(name, kind)`` to a ``Category``, creating missing ones.
 
-    Restored categories carry ``is_seeded=False`` (user data, not app seeds). Returns
-    ``(created, matched, {(name, kind): Category})``.
+    Restored categories carry ``is_seeded=False`` (user data, not app seeds). Subcategories
+    link to their parent category via ``parent_id`` when ``parent_name`` is present.
+    Returns ``(created, matched, {(name, kind): Category})``.
     """
     existing_active: dict[tuple[str, str], Category] = {
         (c.name, c.kind): c
@@ -247,7 +248,11 @@ def _upsert_categories(
     resolved: dict[tuple[str, str], Category] = {}
     created = 0
     matched = 0
-    for row in sorted(rows, key=lambda r: r.archived_at is not None):
+
+    roots = [r for r in rows if not r.parent_name]
+    subcats = [r for r in rows if r.parent_name]
+
+    for row in sorted(roots, key=lambda r: r.archived_at is not None):
         key = (row.name, row.kind)
         if key in resolved:
             continue
@@ -262,10 +267,42 @@ def _upsert_categories(
             kind=row.kind,
             color=row.color,
             archived_at=row.archived_at,
+            parent_id=None,
         )
         session.add(category)
         resolved[key] = category
         created += 1
+
+    session.flush()  # assign root ids so subcategories can link to them
+
+    for row in sorted(subcats, key=lambda r: r.archived_at is not None):
+        key = (row.name, row.kind)
+        if key in resolved:
+            continue
+        existing = existing_active.get(key)
+        if existing is not None:
+            resolved[key] = existing
+            matched += 1
+            continue
+        parent = (
+            resolved.get((row.parent_name, row.kind))
+            or existing_active.get((row.parent_name, row.kind))
+            if row.parent_name
+            else None
+        )
+        parent_id = parent.id if parent is not None else None
+        category = Category(
+            user_id=user_id,
+            name=row.name,
+            kind=row.kind,
+            color=row.color,
+            archived_at=row.archived_at,
+            parent_id=parent_id,
+        )
+        session.add(category)
+        resolved[key] = category
+        created += 1
+
     session.flush()  # assign ids for the transaction FK
     return created, matched, resolved
 

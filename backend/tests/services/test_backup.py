@@ -777,3 +777,84 @@ def test_restore_of_a_legacy_refund_typed_row_stores_it_as_spend(
     assert txn is not None
     assert txn.transaction_type == "spend"
     assert txn.amount_paise == 50000  # unchanged — the alias never re-signs.
+
+
+def test_backup_restore_hierarchical_categories_roundtrip(
+    session: Session, user_id: UUID
+) -> None:
+    """Two-level category hierarchy preserves parent-child relationships
+    through export and import.
+    """
+    axis = Account(
+        user_id=user_id,
+        name="Axis Bank",
+        type="bank",
+        opening_balance_paise=100000,
+    )
+    parent_cat = Category(
+        user_id=user_id,
+        name="Food & Dining",
+        kind="spend",
+        color="#4f46e5",
+    )
+    session.add_all([axis, parent_cat])
+    session.flush()
+
+    sub_cat = Category(
+        user_id=user_id,
+        name="Groceries",
+        kind="spend",
+        parent_id=parent_cat.id,
+    )
+    session.add(sub_cat)
+    session.flush()
+
+    _add_txn(
+        session,
+        user_id=user_id,
+        account_id=axis.id,
+        day=10,
+        amount=-35000,
+        txn_type="spend",
+        merchant_norm="blinkit",
+        category_id=sub_cat.id,
+    )
+    session.commit()
+
+    zip_bytes = build_backup_zip(session, user_id=user_id)
+
+    # Restore into fresh DB
+    with fresh_db() as (target_session, target_uid):
+        parsed = parse_backup_zip(zip_bytes)
+        result = persist_backup(
+            target_session,
+            user_id=target_uid,
+            parsed=parsed,
+            source_file_hash="hierarchy-hash",
+        )
+        target_session.commit()
+
+        assert result.categories_new == 2
+        assert result.txns_imported == 1
+        assert not result.warnings
+
+        restored_parent = target_session.scalar(
+            select(Category).where(
+                Category.user_id == target_uid, Category.name == "Food & Dining"
+            )
+        )
+        restored_sub = target_session.scalar(
+            select(Category).where(
+                Category.user_id == target_uid, Category.name == "Groceries"
+            )
+        )
+        assert restored_parent is not None
+        assert restored_sub is not None
+        assert restored_parent.parent_id is None
+        assert restored_sub.parent_id == restored_parent.id
+
+        restored_txn = target_session.scalar(
+            select(Transaction).where(Transaction.user_id == target_uid)
+        )
+        assert restored_txn is not None
+        assert restored_txn.category_id == restored_sub.id

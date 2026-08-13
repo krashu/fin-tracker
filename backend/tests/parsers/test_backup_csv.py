@@ -261,3 +261,18 @@ def test_transaction_invalid_category_kind_leaves_it_uncategorized() -> None:
     parsed = parse_backup_zip(_valid_zip(transactions=f"{_TRANSACTIONS_HEADER}\n{txn}\n"))
     assert len(parsed.transactions) == 1
     assert parsed.transactions[0].category_kind is None
+
+
+def test_category_with_parent_name_is_parsed() -> None:
+    categories_csv = (
+        "name,kind,color,archived_at,parent_name\n"
+        "Food & Dining,spend,#4f46e5,,\n"
+        "Groceries,spend,#4f46e5,,Food & Dining\n"
+    )
+    parsed = parse_backup_zip(_valid_zip(categories=categories_csv))
+    assert len(parsed.categories) == 2
+    assert not parsed.warnings
+    assert parsed.categories[0].name == "Food & Dining"
+    assert parsed.categories[0].parent_name is None
+    assert parsed.categories[1].name == "Groceries"
+    assert parsed.categories[1].parent_name == "Food & Dining"

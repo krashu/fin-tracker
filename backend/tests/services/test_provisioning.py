@@ -80,7 +80,7 @@ def test_seed_skips_existing_map_row(session: Session, user: User) -> None:
     never merged, never bumped, never overwritten with the seed's hit_count=0."""
     provision_default_categories(session, user.id)
     session.flush()
-    food_id = _category_id(session, user.id, "Food")
+    food_id = _category_id(session, user.id, "Online Food Delivery")
     learned = MerchantTagMap(
         user_id=user.id, merchant_normalized="swiggy", category_id=food_id, hit_count=1
     )
@@ -107,7 +107,7 @@ def test_seed_skips_existing_map_row(session: Session, user: User) -> None:
 def test_seed_skips_existing_pinned_row(session: Session, user: User) -> None:
     provision_default_categories(session, user.id)
     session.flush()
-    food_id = _category_id(session, user.id, "Food")
+    food_id = _category_id(session, user.id, "Online Food Delivery")
     pinned = MerchantTagMap(
         user_id=user.id,
         merchant_normalized="swiggy",
@@ -176,7 +176,7 @@ def test_cold_start_prefill_resolves_from_seed(engine: Engine) -> None:
         assert canon == "swiggy"
 
         tag_map = prefetch_tag_map(s, user_id=u.id, resolver=resolver)
-        food_id = _category_id(s, u.id, "Food")
+        food_id = _category_id(s, u.id, "Online Food Delivery")
         assert tag_map[canon] == food_id
 
 
@@ -202,5 +202,34 @@ def test_seed_does_not_fold_uber_eats_onto_uber(engine: Engine) -> None:
         assert ride == "uber"
 
         tag_map = prefetch_tag_map(s, user_id=u.id, resolver=resolver)
-        assert tag_map[eats] == _category_id(s, u.id, "Food")
-        assert tag_map[ride] == _category_id(s, u.id, "Transport")
+        assert tag_map[eats] == _category_id(s, u.id, "Online Food Delivery")
+        assert tag_map[ride] == _category_id(s, u.id, "Ride-Hailing & Taxis")
+
+
+def test_provision_default_categories_creates_two_level_tree(session: Session, user: User) -> None:
+    """Verify that provision_default_categories constructs a valid 2-level hierarchy
+    with 10 parents (9 spend + 1 income) and properly linked subcategories."""
+    provision_default_categories(session, user.id)
+    session.flush()
+
+    cats = list(session.scalars(select(Category).where(Category.user_id == user.id)))
+    parents = [c for c in cats if c.parent_id is None]
+    children = [c for c in cats if c.parent_id is not None]
+
+    assert len(parents) == 10
+    assert len(children) > 0
+
+    # Ensure every child has a valid parent of matching kind
+    parent_ids = {p.id: p for p in parents}
+    for child in children:
+        assert child.parent_id in parent_ids
+        parent = parent_ids[child.parent_id]
+        assert child.kind == parent.kind
+
+    # Assert pure English names - no Hinglish words present
+    disallowed_hinglish = {"auto", "fastag", "dth", "maid", "chulha", "kirana", "dhaba"}
+    for cat in cats:
+        words = set(cat.name.lower().split())
+        msg = f"Found Hinglish word in category name: {cat.name}"
+        assert disallowed_hinglish.isdisjoint(words), msg
+

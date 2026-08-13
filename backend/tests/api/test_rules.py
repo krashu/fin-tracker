@@ -88,6 +88,8 @@ def test_list_response_shape(
         "id",
         "category_id",
         "category_name",
+        "parent_id",
+        "parent_name",
         "hit_count",
         "last_used",
         "is_winner",
@@ -104,6 +106,8 @@ def test_list_response_shape(
         "pinned",
     }
     assert rule["categories"][0]["category_name"] == "Food"
+    assert rule["categories"][0]["parent_id"] is None
+    assert rule["categories"][0]["parent_name"] is None
     assert rule["labels"][0]["label_name"] == "online"
 
 
@@ -130,6 +134,43 @@ def test_list_groups_and_sorts_by_merchant(
     assert len(_merchant(body, "AMAZON")["labels"]) == 1
     assert len(_merchant(body, "ZOMATO")["categories"]) == 1
     assert _merchant(body, "ZOMATO")["labels"] == []
+
+
+def test_list_rule_with_subcategory(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    parent = _cat(session, seeded_user.id, "Food & Dining")
+    child = Category(
+        user_id=seeded_user.id,
+        name="Groceries",
+        kind="spend",
+        parent_id=parent.id,
+        is_seeded=False,
+    )
+    session.add(child)
+    session.commit()
+    session.refresh(child)
+
+    session.add(
+        MerchantTagMap(
+            user_id=seeded_user.id,
+            merchant_normalized="blinkit",
+            category_id=child.id,
+            hit_count=3,
+        )
+    )
+    session.commit()
+
+    body = client.get("/api/v1/rules").json()
+    rule = _merchant(body, "blinkit")
+    assert rule is not None
+    assert len(rule["categories"]) == 1
+    cat_rule = rule["categories"][0]
+    assert cat_rule["category_name"] == "Groceries"
+    assert cat_rule["parent_id"] == parent.id
+    assert cat_rule["parent_name"] == "Food & Dining"
 
 
 def test_list_category_winner_is_highest_hit_count(

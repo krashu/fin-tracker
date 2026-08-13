@@ -45,7 +45,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.api.deps import CurrentUserId, SessionDep
 from app.core.db_errors import is_unique_violation
@@ -132,9 +132,24 @@ def list_rules(
     # uses for the real import prefill; is_winner below must agree with it.
     winners = prefetch_tag_map(session, user_id=user_id, resolver=resolver)
 
+    ParentCategory = aliased(Category)
     cat_stmt = (
-        select(MerchantTagMap, Category.name)
-        .join(Category, Category.id == MerchantTagMap.category_id)
+        select(
+            MerchantTagMap,
+            Category.name,
+            Category.parent_id,
+            ParentCategory.name.label("parent_name"),
+        )
+        .join(
+            Category,
+            (Category.id == MerchantTagMap.category_id)
+            & (Category.user_id == MerchantTagMap.user_id),
+        )
+        .outerjoin(
+            ParentCategory,
+            (ParentCategory.id == Category.parent_id)
+            & (ParentCategory.user_id == Category.user_id),
+        )
         .where(
             MerchantTagMap.user_id == user_id,
             Category.user_id == user_id,
@@ -173,7 +188,7 @@ def list_rules(
             grouped[canonical] = rule
         return rule
 
-    for row, category_name in session.execute(cat_stmt):
+    for row, category_name, parent_id, parent_name in session.execute(cat_stmt):
         canonical = resolver.canonical(row.merchant_normalized)
         rule = _bucket(canonical)
         rule.categories.append(
@@ -181,6 +196,8 @@ def list_rules(
                 id=row.id,
                 category_id=row.category_id,
                 category_name=category_name,
+                parent_id=parent_id,
+                parent_name=parent_name,
                 hit_count=row.hit_count,
                 last_used=row.last_used,
                 is_winner=row.category_id == winners.get(canonical),

@@ -127,9 +127,23 @@ def build_backup_zip(session: Session, *, user_id: UUID) -> bytes:
         if category_ids
         else []
     )
+    # If any referenced category is a subcategory, also fetch its parent category so
+    # parent_name can be resolved and the parent category exists on backup restore.
+    parent_ids = {c.parent_id for c in categories if c.parent_id is not None} - category_ids
+    if parent_ids:
+        parent_cats = list(
+            session.scalars(
+                select(Category)
+                .where(Category.id.in_(parent_ids), Category.user_id == user_id)
+                .order_by(Category.id)
+            )
+        )
+        categories.extend(parent_cats)
+        categories.sort(key=lambda c: c.id)
 
     account_name_by_id = {a.id: a.name for a in accounts}
     category_by_id = {c.id: c for c in categories}
+    category_name_by_id = {c.id: c.name for c in categories}
 
     account_rows: list[tuple[object, ...]] = [
         (
@@ -144,7 +158,14 @@ def build_backup_zip(session: Session, *, user_id: UUID) -> bytes:
         for a in accounts
     ]
     category_rows: list[tuple[object, ...]] = [
-        (c.name, c.kind, c.color, c.archived_at) for c in categories
+        (
+            c.name,
+            c.kind,
+            c.color,
+            c.archived_at,
+            category_name_by_id.get(c.parent_id) if c.parent_id is not None else None,
+        )
+        for c in categories
     ]
     transaction_rows: list[tuple[object, ...]] = []
     for t in transactions:

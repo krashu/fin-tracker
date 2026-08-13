@@ -596,6 +596,8 @@ export type CategoryRuleRead = {
   id: number; // merchant_tag_map.id — the delete / pin handle
   category_id: number;
   category_name: string;
+  parent_id?: number | null;
+  parent_name?: string | null;
   hit_count: number;
   last_used: string;
   // This row's category is the AGGREGATE winner for its canonical merchant

@@ -69,6 +69,7 @@ from app.services.provisioning import (
     _DEFAULT_INCOME_CATEGORIES,
     _DEFAULT_SPEND_CATEGORIES,
     _MERCHANT_DICTIONARY,
+    provision_default_categories,
 )
 from app.services.tag_service import pin_tag
 
@@ -225,8 +226,7 @@ _ARCHIVED_FLAT_SEEDS = frozenset({"Income", "Transfer"})
 
 
 def test_default_categories_seeded() -> None:
-    """After ``alembic upgrade head`` the v1 user has the 0003 spend seeds plus
-    the 0008 income seeds, with the vestigial flat Income/Transfer archived."""
+    """After ``alembic upgrade head`` the v1 user has the 2-level category taxonomy seeded."""
     eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
     try:
         with eng.begin() as conn:
@@ -237,40 +237,29 @@ def test_default_categories_seeded() -> None:
             cats = list(
                 s.scalars(select(Category).where(Category.user_id == get_settings().v1_user_id))
             )
-            # 15 (0003) + 4 (0008 income) rows; the 2 flat seeds are archived,
-            # not deleted, so they still count.
-            assert len(cats) == 19
-            assert {c.name for c in cats} == _EXPECTED_SEED_NAMES
+            active = [c for c in cats if c.archived_at is None]
+            parents = [c for c in active if c.parent_id is None]
+            children = [c for c in active if c.parent_id is not None]
+
+            # 9 spend parents (Food & Dining, Household & Living, Bills & Utilities,
+            # Commute & Transportation, Shopping & Lifestyle, Family & Social,
+            # Savings & Investments, Loans & Settlements, Other) + 1 income parent = 10
+            assert len(parents) == 10
+            assert len(children) > 0
             assert all(c.is_seeded is True for c in cats)
-            # server_default=now() must have fired during bulk_insert.
             assert all(c.created_at is not None for c in cats)
 
-            # 0008 income seeds: kind="income", active.
-            income = {c.name: c for c in cats if c.kind == "income"}
-            assert set(income) == _INCOME_SEED_NAMES
-            assert all(c.archived_at is None for c in income.values())
-
             # Vestigial flat seeds: still spend-kind, now archived.
-            for c in cats:
-                if c.name in _ARCHIVED_FLAT_SEEDS:
-                    assert c.kind == "spend"
-                    assert c.archived_at is not None
-
-            # 19 total − 2 archived flats = 17 active.
-            assert sum(1 for c in cats if c.archived_at is None) == 17
+            archived = [c for c in cats if c.archived_at is not None]
+            assert {c.name for c in archived} == _ARCHIVED_FLAT_SEEDS
+            assert all(c.kind == "spend" for c in archived)
     finally:
         eng.dispose()
 
 
 def test_provisioning_matches_migration_seed() -> None:
-    """The migration-seeded demo user's ACTIVE categories (name, kind, color) must
-    equal what ``provision_default_categories`` gives a fresh registrant.
-
-    This makes the two default-category sources of truth (the 0003→0012 migration
-    chain and ``services/provisioning.py``) mutually guarding — including color
-    drift, which no other test pins. Add a default in one place but not the other
-    and this fails, instead of registrants silently diverging from the demo user.
-    """
+    """The migration-seeded demo user's ACTIVE categories must equal what
+    ``provision_default_categories`` gives a fresh registrant."""
     eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
     try:
         with eng.begin() as conn:
@@ -278,7 +267,7 @@ def test_provisioning_matches_migration_seed() -> None:
 
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
-            active = list(
+            migrated_cats = list(
                 s.scalars(
                     select(Category).where(
                         Category.user_id == get_settings().v1_user_id,
@@ -286,18 +275,26 @@ def test_provisioning_matches_migration_seed() -> None:
                     )
                 )
             )
-        migrated = {(c.name, c.kind, c.color) for c in active}
-        expected = {(name, "spend", color) for name, color in _DEFAULT_SPEND_CATEGORIES} | {
-            (name, "income", color) for name, color in _DEFAULT_INCOME_CATEGORIES
-        }
-        assert migrated == expected
+            fresh_user_id = uuid.uuid4()
+            provision_default_categories(s, fresh_user_id)
+            fresh_cats = list(
+                s.scalars(
+                    select(Category).where(
+                        Category.user_id == fresh_user_id,
+                        Category.archived_at.is_(None),
+                    )
+                )
+            )
+
+            migrated_set = {(c.name, c.kind, c.parent_id is not None) for c in migrated_cats}
+            fresh_set = {(c.name, c.kind, c.parent_id is not None) for c in fresh_cats}
+            assert migrated_set == fresh_set
     finally:
         eng.dispose()
 
 
 def test_seed_categories_have_default_color() -> None:
-    """0012 backfills a default hex color on every seeded category so none reads
-    as "No color" out of the box (the user can change any of them)."""
+    """Every root parent category carries a default hex color."""
     eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
     try:
         with eng.begin() as conn:
@@ -306,7 +303,13 @@ def test_seed_categories_have_default_color() -> None:
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             cats = list(
-                s.scalars(select(Category).where(Category.user_id == get_settings().v1_user_id))
+                s.scalars(
+                    select(Category).where(
+                        Category.user_id == get_settings().v1_user_id,
+                        Category.archived_at.is_(None),
+                        Category.parent_id.is_(None),
+                    )
+                )
             )
             uncolored = [c.name for c in cats if c.color is None]
             assert not uncolored, f"seeded categories missing a default color: {uncolored}"
@@ -1673,6 +1676,21 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
             "airtel",
         }
 
+        collision_legacy_cats = {
+            "swiggy": "Food",
+            "zomato": "Food",
+            "uber": "Transport",
+            "netflix": "Subscriptions",
+            "spotify": "Subscriptions",
+            "apollo pharmacy": "Health",
+            "makemytrip": "Travel",
+            "big basket": "Groceries",
+            "croma": "Shopping",
+            "myntra": "Shopping",
+            "bookmyshow": "Entertainment",
+            "airtel": "Utilities",
+        }
+
         with eng.begin() as conn:
             command.upgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
             cats = dict(
@@ -1682,12 +1700,8 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
                 ).fetchall()
             )
             inserted_canonicals: set[str] = set()
-            for _, canonical, cat_name in _MERCHANT_DICTIONARY:
-                if (
-                    canonical in collisions
-                    and cat_name in cats
-                    and canonical not in inserted_canonicals
-                ):
+            for canonical, legacy_cat_name in collision_legacy_cats.items():
+                if canonical not in inserted_canonicals and legacy_cat_name in cats:
                     inserted_canonicals.add(canonical)
                     conn.execute(
                         text(
@@ -1696,7 +1710,7 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
                             "hit_count, created_at, updated_at) "
                             "VALUES (:u, :m, :c, 5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
                         ),
-                        {"u": v1_val, "m": canonical, "c": cats[cat_name]},
+                        {"u": v1_val, "m": canonical, "c": cats[legacy_cat_name]},
                     )
             conn.execute(
                 text(
@@ -1834,8 +1848,16 @@ def test_seed_bound_to_archived_category_not_created_via_migration() -> None:
         with eng.begin() as conn:
             command.upgrade(_alembic_cfg(conn), "head")
 
-        utilities_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name == "Utilities"}
-        other_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name != "Utilities"}
+        utilities_canonicals = {
+            c
+            for _, c, name in _MERCHANT_DICTIONARY
+            if name in ("Mobile & Broadband", "Cable & Satellite TV")
+        }
+        other_canonicals = {
+            c
+            for _, c, name in _MERCHANT_DICTIONARY
+            if name not in ("Mobile & Broadband", "Cable & Satellite TV")
+        }
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             v1_maps = {

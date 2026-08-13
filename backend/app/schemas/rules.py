@@ -32,6 +32,8 @@ class CategoryRuleRead(BaseModel):
     id: int  # merchant_tag_map.id — the DELETE / PATCH handle
     category_id: int
     category_name: str
+    parent_id: int | None = None
+    parent_name: str | None = None
     hit_count: int
     last_used: datetime
     # True when this row's category is the AGGREGATE winner for its canonical

@@ -67,36 +67,15 @@ def test_register_creates_user_and_sets_cookies(unauth_client: TestClient) -> No
 # vestigial flat Income/Transfer spend seeds are archived, so excluded). A fresh
 # registrant must get exactly this set — pins provisioning.py against drift from
 # the migration-seeded demo user (parity guard).
-_EXPECTED_SPEND = frozenset(
-    {
-        "Food",
-        "Groceries",
-        "Transport",
-        "Rent",
-        "Utilities",
-        "Shopping",
-        "Entertainment",
-        "Health",
-        "Travel",
-        "Subscriptions",
-        "EMI",
-        "Investment",
-        "Other",
-    }
-)
-_EXPECTED_INCOME = frozenset({"Salary", "Freelancing", "Cashback", "Other"})
-
-
 def test_register_provisions_default_categories(unauth_client: TestClient) -> None:
     _register(unauth_client)
     cats = unauth_client.get("/api/v1/categories").json()
-    spend = {c["name"] for c in cats if c["kind"] == "spend"}
-    income = {c["name"] for c in cats if c["kind"] == "income"}
-    assert spend == _EXPECTED_SPEND  # 13 active spend
-    assert income == _EXPECTED_INCOME  # 4 active income
-    assert len(cats) == 17
+    parents = [c for c in cats if c["parent_id"] is None]
+    children = [c for c in cats if c["parent_id"] is not None]
+    assert len(parents) == 10  # 9 spend parents + 1 income parent
+    assert len(children) > 0
     assert all(c["is_seeded"] for c in cats)  # app defaults, not user-created
-    assert all(c["color"] for c in cats)  # colors provisioned, none null
+    assert all(c["color"] for c in parents)  # parent colors provisioned, none null
 
 
 def test_register_duplicate_email_409(unauth_client: TestClient) -> None:

@@ -16,7 +16,7 @@
  * prior-match confidence live from the maps). Not ["labels"] — this page never
  * creates a tag (pins reference existing ones only).
  */
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
@@ -45,20 +45,25 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { IconChevronDown, IconPlus } from "@/components/icons";
 import { LabelChip } from "@/components/labels/label-chip";
+import { CategorySelector } from "@/components/categories/category-selector";
 import {
   ApiError,
+  createCategoryRule,
   createLabelRule,
   deleteCategoryRule,
   deleteLabelRule,
+  listCategories,
   listRules,
   patchCategoryRulePinned,
   patchLabelRulePinned,
+  type CategoryRead,
   type CategoryRuleRead,
   type LabelRead,
   type LabelRuleRead,
   type MerchantRuleRead,
 } from "@/lib/api/client";
 import { invalidateRules } from "@/lib/queries/invalidate";
+import { categoryColorVar, resolveCategoryColor } from "@/lib/categories";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import { AliasManager } from "./alias-manager";
@@ -212,6 +217,7 @@ function RuleGroup({
           {rule.categories.map((cat) => (
             <CategoryRuleLine
               key={`c-${cat.id}`}
+              merchant={rule.merchant_normalized}
               rule={cat}
               onForget={() =>
                 onForget({
@@ -361,54 +367,157 @@ function RowMenu({
   );
 }
 
+function ChangeCategoryDialog({
+  open,
+  onClose,
+  merchant,
+  currentCategoryId,
+}: {
+  open: boolean;
+  onClose: () => void;
+  merchant: string;
+  currentCategoryId: number;
+}) {
+  const [selectedId, setSelectedId] = useState<number | null>(currentCategoryId);
+  const [err, setErr] = useState<string | null>(null);
+  const qc = useQueryClient();
+
+  const mutation = useMutation({
+    mutationFn: async (categoryId: number) => {
+      await createCategoryRule({ merchant, category_id: categoryId });
+    },
+    onSuccess: () => {
+      invalidateRules(qc);
+      onClose();
+    },
+    onError: (e) => {
+      setErr(e instanceof ApiError ? e.detail : "Failed to change category");
+    },
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle className="text-[15px]">Change Category Rule</DialogTitle>
+          <DialogDescription className="text-[12.5px]">
+            Reassign the suggested category for{" "}
+            <span className="font-mono font-medium text-foreground">{merchant}</span>.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4 py-2">
+          <div className="space-y-1.5">
+            <label className="text-[12px] font-medium text-foreground">Category</label>
+            <CategorySelector
+              kind="spend"
+              value={selectedId}
+              onChange={(id) => setSelectedId(id)}
+              disabled={mutation.isPending}
+            />
+          </div>
+
+          {err ? <p className="text-[12px] text-destructive">{err}</p> : null}
+        </div>
+
+        <DialogFooter className="gap-2 sm:gap-0">
+          <Button type="button" variant="outline" onClick={onClose} disabled={mutation.isPending}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={() => {
+              if (selectedId != null) {
+                mutation.mutate(selectedId);
+              }
+            }}
+            disabled={mutation.isPending || selectedId == null || selectedId === currentCategoryId}
+          >
+            {mutation.isPending ? "Saving…" : "Save Rule"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function CategoryRuleLine({
+  merchant,
   rule,
   onForget,
 }: {
+  merchant: string;
   rule: CategoryRuleRead;
   onForget: () => void;
 }) {
   const qc = useQueryClient();
+  const [changeOpen, setChangeOpen] = useState(false);
+  const categoriesQuery = useQuery({ queryKey: ["categories"], queryFn: listCategories });
+  const categories = categoriesQuery.data ?? [];
+  const categoryMap = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
+  const cat = categoryMap.get(rule.category_id);
+  const color = resolveCategoryColor(cat, categoryMap);
+
   const pin = useMutation({
     mutationFn: (pinned: boolean) => patchCategoryRulePinned(rule.id, pinned),
     onSuccess: () => invalidateRules(qc),
   });
 
   return (
-    <RuleLine
-      hitCount={rule.hit_count}
-      menu={
-        <RowMenu label={`Actions for ${rule.category_name}`}>
-          {rule.pinned ? (
-            <DropdownMenuItem onSelect={() => pin.mutate(false)}>
-              Unpin (revert to learned)
+    <>
+      <RuleLine
+        hitCount={rule.hit_count}
+        menu={
+          <RowMenu label={`Actions for ${rule.category_name}`}>
+            {rule.pinned ? (
+              <DropdownMenuItem onSelect={() => pin.mutate(false)}>
+                Unpin (revert to learned)
+              </DropdownMenuItem>
+            ) : rule.is_winner ? (
+              <DropdownMenuItem onSelect={() => pin.mutate(true)}>
+                Pin this suggestion
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem onSelect={() => pin.mutate(true)}>
+                Make the suggestion
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem onSelect={() => setChangeOpen(true)}>
+              Change category…
             </DropdownMenuItem>
-          ) : rule.is_winner ? (
-            <DropdownMenuItem onSelect={() => pin.mutate(true)}>
-              Pin this suggestion
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" onSelect={onForget}>
+              Forget rule
             </DropdownMenuItem>
-          ) : (
-            <DropdownMenuItem onSelect={() => pin.mutate(true)}>
-              Make the suggestion
-            </DropdownMenuItem>
-          )}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem variant="destructive" onSelect={onForget}>
-            Forget rule
-          </DropdownMenuItem>
-        </RowMenu>
-      }
-    >
-      <Badge variant="secondary" className="font-normal">
-        {rule.category_name}
-      </Badge>
-      {rule.pinned ? <PinnedBadge /> : null}
-      {rule.is_winner ? (
-        <StatusText>suggested</StatusText>
-      ) : (
-        <StatusText>also learned</StatusText>
-      )}
-    </RuleLine>
+          </RowMenu>
+        }
+      >
+        <Badge variant="secondary" className="inline-flex items-center gap-1.5 font-normal">
+          <span
+            className="size-2 shrink-0 rounded-full"
+            style={{ backgroundColor: categoryColorVar(rule.category_id, color) }}
+          />
+          {rule.parent_name ? (
+            <span className="text-muted-foreground">{rule.parent_name} → </span>
+          ) : null}
+          <span>{rule.category_name}</span>
+        </Badge>
+        {rule.pinned ? <PinnedBadge /> : null}
+        {rule.is_winner ? (
+          <StatusText>suggested</StatusText>
+        ) : (
+          <StatusText>also learned</StatusText>
+        )}
+      </RuleLine>
+      {changeOpen ? (
+        <ChangeCategoryDialog
+          open={changeOpen}
+          onClose={() => setChangeOpen(false)}
+          merchant={merchant}
+          currentCategoryId={rule.category_id}
+        />
+      ) : null}
+    </>
   );
 }
 

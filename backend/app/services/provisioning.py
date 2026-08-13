@@ -56,7 +56,7 @@ _DEFAULT_INCOME_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Other", "#94a3b8"),
 )
 
-# (parent_name, color, subcategories) — 2-level English taxonomy for Indian personal finance.
+# (parent_name, color, subcategories) — 2-level pure English taxonomy for Indian personal finance.
 _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "Food & Dining",
@@ -66,8 +66,8 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "Groceries",
             "Online Food Delivery",
             "Restaurants & Cafes",
-            "Street Food & Snacks",
-            "Tea & Beverages",
+            "Quick Bites & Snacks",
+            "Coffee & Tea",
         ),
     ),
     (
@@ -76,9 +76,9 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "Rent",
             "Rent & Maintenance",
-            "Quick Commerce",
-            "Domestic Staff / Household Help",
-            "Home Improvements",
+            "Instant Grocery Delivery",
+            "Household Help & Domestic Staff",
+            "Home Improvements & Repairs",
             "Furniture & Appliances",
         ),
     ),
@@ -87,11 +87,11 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "#0e97c4",
         (
             "Utilities",
-            "Mobile & Wi-Fi Recharge",
+            "Mobile & Broadband",
             "Electricity",
-            "LPG / Piped Gas",
-            "DTH / Cable",
-            "Water & Municipal Bills",
+            "Cooking Gas & LPG",
+            "Cable & Satellite TV",
+            "Water & Municipal Taxes",
         ),
     ),
     (
@@ -100,10 +100,10 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "Transport",
             "Travel",
-            "Fuel / Petrol",
+            "Fuel & Petrol",
             "Metro & Public Transit",
-            "Auto / Cab / Ride-Hailing",
-            "FASTag & Tolls",
+            "Ride-Hailing & Taxis",
+            "Highway Tolls & Parking",
             "Vehicle Service & Repairs",
         ),
     ),
@@ -119,15 +119,15 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "Electronics & Gadgets",
             "Personal Care & Grooming",
             "Footwear & Accessories",
-            "OTT & Subscriptions",
+            "Digital Subscriptions & Streaming",
         ),
     ),
     (
         "Family & Social",
         "#b246c0",
         (
-            "Gifts & Festival Celebrations",
-            "Family Support / Remittance",
+            "Gifts & Celebrations",
+            "Family Support & Transfers",
             "Education & Tuition",
             "Charity & Donations",
         ),
@@ -137,11 +137,11 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "#008300",
         (
             "Investment",
-            "Mutual Funds / SIP",
-            "Gold",
+            "Mutual Funds & SIPs",
             "Stocks & Securities",
-            "Term & Health Insurance",
-            "Fixed Deposits / Savings",
+            "Precious Metals & Gold",
+            "Health & Life Insurance",
+            "Fixed Deposits & Savings",
         ),
     ),
     (
@@ -149,17 +149,16 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "#c23b6b",
         (
             "EMI",
-            "Credit Card Bill",
-            "Personal & Home Loan EMI",
-            "Friend & Group Splits",
+            "Credit Card Payments",
+            "Loan EMIs & Repayments",
+            "Home & Personal Loans",
+            "Shared Expenses & Splits",
         ),
     ),
     (
         "Other",
         "#94a3b8",
-        (
-            "Other",
-        ),
+        (),
     ),
 )
 
@@ -170,10 +169,9 @@ _DEFAULT_INCOME_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "Salary",
             "Freelancing",
-            "Freelancing / Consulting",
             "Cashback",
             "Investment Returns",
-            "Cashback & Rewards",
+            "Rental Income",
             "Other",
         ),
     ),
@@ -192,34 +190,34 @@ _DEFAULT_INCOME_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # only covers a string that already equals a canonical outright, not one that merely
 # contains it as a token. See provision_seed_merchant_dictionary.
 _MERCHANT_DICTIONARY: tuple[tuple[str, str, str], ...] = (
-    # Food
-    ("swiggy", "swiggy", "Food"),
-    ("zomato", "zomato", "Food"),
-    ("eatsure", "eatsure", "Food"),
-    ("box8", "box8", "Food"),
-    ("faasos", "faasos", "Food"),
-    ("dominos", "dominos", "Food"),
-    ("pizza hut", "pizza hut", "Food"),
-    ("mcdonalds", "mcdonalds", "Food"),
-    ("kfc", "kfc", "Food"),
-    ("burger king", "burger king", "Food"),
-    ("subway", "subway", "Food"),
-    ("starbucks", "starbucks", "Food"),
-    ("barista", "barista", "Food"),
-    ("chaayos", "chaayos", "Food"),
-    # Groceries
+    # Food & Dining
+    ("swiggy", "swiggy", "Online Food Delivery"),
+    ("zomato", "zomato", "Online Food Delivery"),
+    ("eatsure", "eatsure", "Online Food Delivery"),
+    ("box8", "box8", "Online Food Delivery"),
+    ("faasos", "faasos", "Online Food Delivery"),
+    ("dominos", "dominos", "Online Food Delivery"),
+    ("pizza hut", "pizza hut", "Online Food Delivery"),
+    ("mcdonalds", "mcdonalds", "Quick Bites & Snacks"),
+    ("kfc", "kfc", "Quick Bites & Snacks"),
+    ("burger king", "burger king", "Quick Bites & Snacks"),
+    ("subway", "subway", "Quick Bites & Snacks"),
+    ("starbucks", "starbucks", "Coffee & Tea"),
+    ("barista", "barista", "Coffee & Tea"),
+    ("chaayos", "chaayos", "Coffee & Tea"),
+    # Groceries & Quick Commerce
     ("bigbasket", "big basket", "Groceries"),
     ("big basket", "big basket", "Groceries"),
-    ("swiggy instamart", "swiggy instamart", "Groceries"),
+    ("swiggy instamart", "swiggy instamart", "Instant Grocery Delivery"),
     ("dmart", "dmart", "Groceries"),
     ("jiomart", "jiomart", "Groceries"),
     ("natures basket", "natures basket", "Groceries"),
     ("reliance fresh", "reliance fresh", "Groceries"),
-    ("milkbasket", "milkbasket", "Groceries"),
+    ("milkbasket", "milkbasket", "Instant Grocery Delivery"),
     ("licious", "licious", "Groceries"),
     ("country delight", "country delight", "Groceries"),
-    # Transport
-    ("uber", "uber", "Transport"),
+    # Commute & Transportation
+    ("uber", "uber", "Ride-Hailing & Taxis"),
     # Narrower than "uber" and therefore matched first (decision 2's longest-first sort), so
     # Uber Eats gets its OWN canonical instead of folding onto Uber rides. Without it a single
     # shared merchant memory decides the category for both and whichever the user confirms
@@ -229,29 +227,29 @@ _MERCHANT_DICTIONARY: tuple[tuple[str, str, str], ...] = (
     # Payments Bank). Both are wallet-load / transfer shaped, so any category would be
     # invented, and a wrong seeded suggestion still costs the user a correction (AGENTS.md
     # §Simplicity first).
-    ("uber eats", "uber eats", "Food"),
-    ("ola", "ola", "Transport"),
-    ("rapido", "rapido", "Transport"),
-    ("namma yatri", "namma yatri", "Transport"),
-    ("yulu", "yulu", "Transport"),
-    # Subscriptions
-    ("netflix", "netflix", "Subscriptions"),
-    ("spotify", "spotify", "Subscriptions"),
-    ("hotstar", "hotstar", "Subscriptions"),
-    ("disney hotstar", "hotstar", "Subscriptions"),
-    ("sonyliv", "sonyliv", "Subscriptions"),
-    ("zee5", "zee5", "Subscriptions"),
-    ("jiocinema", "jiocinema", "Subscriptions"),
-    ("youtube premium", "youtube premium", "Subscriptions"),
-    ("amazon prime", "amazon prime", "Subscriptions"),
-    ("amazon prime video", "amazon prime video", "Subscriptions"),
-    ("wynk music", "wynk music", "Subscriptions"),
-    ("audible", "audible", "Subscriptions"),
-    ("kindle unlimited", "kindle unlimited", "Subscriptions"),
-    ("icloud", "icloud", "Subscriptions"),
-    ("office 365", "office 365", "Subscriptions"),
-    ("google one", "google one", "Subscriptions"),
-    ("linkedin premium", "linkedin premium", "Subscriptions"),
+    ("uber eats", "uber eats", "Online Food Delivery"),
+    ("ola", "ola", "Ride-Hailing & Taxis"),
+    ("rapido", "rapido", "Ride-Hailing & Taxis"),
+    ("namma yatri", "namma yatri", "Ride-Hailing & Taxis"),
+    ("yulu", "yulu", "Ride-Hailing & Taxis"),
+    # Digital Subscriptions & Streaming
+    ("netflix", "netflix", "Digital Subscriptions & Streaming"),
+    ("spotify", "spotify", "Digital Subscriptions & Streaming"),
+    ("hotstar", "hotstar", "Digital Subscriptions & Streaming"),
+    ("disney hotstar", "hotstar", "Digital Subscriptions & Streaming"),
+    ("sonyliv", "sonyliv", "Digital Subscriptions & Streaming"),
+    ("zee5", "zee5", "Digital Subscriptions & Streaming"),
+    ("jiocinema", "jiocinema", "Digital Subscriptions & Streaming"),
+    ("youtube premium", "youtube premium", "Digital Subscriptions & Streaming"),
+    ("amazon prime", "amazon prime", "Digital Subscriptions & Streaming"),
+    ("amazon prime video", "amazon prime video", "Digital Subscriptions & Streaming"),
+    ("wynk music", "wynk music", "Digital Subscriptions & Streaming"),
+    ("audible", "audible", "Digital Subscriptions & Streaming"),
+    ("kindle unlimited", "kindle unlimited", "Digital Subscriptions & Streaming"),
+    ("icloud", "icloud", "Digital Subscriptions & Streaming"),
+    ("office 365", "office 365", "Digital Subscriptions & Streaming"),
+    ("google one", "google one", "Digital Subscriptions & Streaming"),
+    ("linkedin premium", "linkedin premium", "Digital Subscriptions & Streaming"),
     # Travel
     ("makemytrip", "makemytrip", "Travel"),
     ("irctc", "irctc", "Travel"),
@@ -282,26 +280,26 @@ _MERCHANT_DICTIONARY: tuple[tuple[str, str, str], ...] = (
     ("manipal hospitals", "manipal hospitals", "Health"),
     ("apollo hospitals", "apollo hospitals", "Health"),
     ("medlife", "medlife", "Health"),
-    # Shopping
+    # Shopping & Lifestyle
     ("flipkart", "flipkart", "Shopping"),
-    ("myntra", "myntra", "Shopping"),
-    ("ajio", "ajio", "Shopping"),
-    ("nykaa", "nykaa", "Shopping"),
-    ("croma", "croma", "Shopping"),
+    ("myntra", "myntra", "Clothing & Apparel"),
+    ("ajio", "ajio", "Clothing & Apparel"),
+    ("nykaa", "nykaa", "Personal Care & Grooming"),
+    ("croma", "croma", "Electronics & Gadgets"),
     ("tata cliq", "tata cliq", "Shopping"),
     ("meesho", "meesho", "Shopping"),
-    ("lenskart", "lenskart", "Shopping"),
-    ("decathlon", "decathlon", "Shopping"),
-    ("ikea", "ikea", "Shopping"),
-    ("pepperfry", "pepperfry", "Shopping"),
-    ("urban company", "urban company", "Shopping"),
-    # Utilities
-    ("airtel", "airtel", "Utilities"),
-    ("bsnl", "bsnl", "Utilities"),
-    ("tata play", "tata play", "Utilities"),
-    ("act fibernet", "act fibernet", "Utilities"),
-    ("jiofiber", "jiofiber", "Utilities"),
-    ("vodafone idea", "vodafone idea", "Utilities"),
+    ("lenskart", "lenskart", "Footwear & Accessories"),
+    ("decathlon", "decathlon", "Clothing & Apparel"),
+    ("ikea", "ikea", "Furniture & Appliances"),
+    ("pepperfry", "pepperfry", "Furniture & Appliances"),
+    ("urban company", "urban company", "Household Help & Domestic Staff"),
+    # Bills & Utilities
+    ("airtel", "airtel", "Mobile & Broadband"),
+    ("bsnl", "bsnl", "Mobile & Broadband"),
+    ("tata play", "tata play", "Cable & Satellite TV"),
+    ("act fibernet", "act fibernet", "Mobile & Broadband"),
+    ("jiofiber", "jiofiber", "Mobile & Broadband"),
+    ("vodafone idea", "vodafone idea", "Mobile & Broadband"),
     # Entertainment
     ("bookmyshow", "bookmyshow", "Entertainment"),
     ("inox", "inox", "Entertainment"),
@@ -311,20 +309,71 @@ _MERCHANT_DICTIONARY: tuple[tuple[str, str, str], ...] = (
 
 
 def provision_default_categories(session: Session, user_id: UUID) -> None:
-    """Insert the default spend + income categories for ``user_id``.
+    """Insert the default spend + income 2-level category taxonomy for ``user_id``.
 
     Does NOT commit — the caller (register) commits the user + categories in one
     transaction. ``is_seeded=True`` so they read as app defaults, not
     user-created.
     """
-    rows = [
-        Category(user_id=user_id, name=name, kind="spend", is_seeded=True, color=color)
-        for name, color in _DEFAULT_SPEND_CATEGORIES
-    ] + [
-        Category(user_id=user_id, name=name, kind="income", is_seeded=True, color=color)
-        for name, color in _DEFAULT_INCOME_CATEGORIES
-    ]
-    session.add_all(rows)
+    # 1. Insert spend and income parent categories first
+    parent_rows: list[Category] = []
+    for parent_name, color, _ in _DEFAULT_SPEND_TAXONOMY:
+        parent_rows.append(
+            Category(
+                user_id=user_id,
+                name=parent_name,
+                kind="spend",
+                is_seeded=True,
+                color=color,
+                parent_id=None,
+            )
+        )
+    for parent_name, color, _ in _DEFAULT_INCOME_TAXONOMY:
+        parent_rows.append(
+            Category(
+                user_id=user_id,
+                name=parent_name,
+                kind="income",
+                is_seeded=True,
+                color=color,
+                parent_id=None,
+            )
+        )
+    session.add_all(parent_rows)
+    session.flush()
+
+    spend_parents = {c.name: c.id for c in parent_rows if c.kind == "spend"}
+    income_parents = {c.name: c.id for c in parent_rows if c.kind == "income"}
+
+    # 2. Insert child subcategories linked to their respective parents
+    child_rows: list[Category] = []
+    for parent_name, _, subcategories in _DEFAULT_SPEND_TAXONOMY:
+        pid = spend_parents.get(parent_name)
+        for sub_name in subcategories:
+            child_rows.append(
+                Category(
+                    user_id=user_id,
+                    name=sub_name,
+                    kind="spend",
+                    is_seeded=True,
+                    color=None,
+                    parent_id=pid,
+                )
+            )
+    for parent_name, _, subcategories in _DEFAULT_INCOME_TAXONOMY:
+        pid = income_parents.get(parent_name)
+        for sub_name in subcategories:
+            child_rows.append(
+                Category(
+                    user_id=user_id,
+                    name=sub_name,
+                    kind="income",
+                    is_seeded=True,
+                    color=None,
+                    parent_id=pid,
+                )
+            )
+    session.add_all(child_rows)
 
 
 def provision_seed_merchant_dictionary(session: Session, user_id: UUID) -> None:

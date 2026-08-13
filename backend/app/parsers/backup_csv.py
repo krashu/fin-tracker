@@ -48,7 +48,7 @@ ACCOUNT_COLUMNS = (
     "currency",
     "archived_at",
 )
-CATEGORY_COLUMNS = ("name", "kind", "color", "archived_at")
+CATEGORY_COLUMNS = ("name", "kind", "color", "archived_at", "parent_name")
 TRANSACTION_COLUMNS = (
     "date",
     "account_name",
@@ -98,6 +98,7 @@ class ParsedBackupCategory:
     kind: CategoryKindStr
     color: str | None
     archived_at: datetime | None
+    parent_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,12 +302,14 @@ def _parse_category_row(row: dict[str, str | None], line_no: int) -> ParsedBacku
         color = color.lower()
         if not _HEX_COLOR_RE.match(color):
             color = None  # cosmetic — revert to derive-from-id rather than reject
+    parent_name = _get(row, "parent_name")
     return ParsedBackupCategory(
         line_no=line_no,
         name=name,
         kind=cast("CategoryKindStr", kind),
         color=color,
         archived_at=_parse_dt(_get(row, "archived_at")),
+        parent_name=parent_name,
     )
 
 
