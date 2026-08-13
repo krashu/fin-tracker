@@ -34,6 +34,11 @@ import {
   type CategoryKind,
   type CategoryRead,
 } from "@/lib/api/client";
+import {
+  buildCategoryTree,
+  resolveCategoryColor,
+} from "@/lib/categories";
+import { CategoryDot } from "@/components/category-dot";
 import { invalidateRules } from "@/lib/queries/invalidate";
 import { cn } from "@/lib/utils";
 
@@ -152,14 +157,34 @@ export function SelectionBar({
               {categorize.isPending ? "Categorizing…" : "Categorize"}
             </SelectionAction>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="max-h-72 w-48">
-            {visibleCategories.map((c) => (
-              <DropdownMenuItem
-                key={c.id}
-                onSelect={() => categorize.mutate(c.id)}
-              >
-                {c.name}
-              </DropdownMenuItem>
+          <DropdownMenuContent align="start" className="max-h-72 w-56 overflow-y-auto">
+            {buildCategoryTree(visibleCategories).map((parent) => (
+              <div key={parent.id} className="py-0.5">
+                <DropdownMenuItem
+                  onSelect={() => categorize.mutate(parent.id)}
+                  className="flex items-center gap-2 font-medium"
+                >
+                  <CategoryDot
+                    categoryId={parent.id}
+                    color={resolveCategoryColor(parent, categories)}
+                  />
+                  <span className="truncate">{parent.name}</span>
+                </DropdownMenuItem>
+                {parent.subcategories.map((sub) => (
+                  <DropdownMenuItem
+                    key={sub.id}
+                    onSelect={() => categorize.mutate(sub.id)}
+                    className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
+                  >
+                    <CategoryDot
+                      categoryId={sub.id}
+                      color={resolveCategoryColor(sub, categories)}
+                      className="size-1.5"
+                    />
+                    <span className="truncate">{sub.name}</span>
+                  </DropdownMenuItem>
+                ))}
+              </div>
             ))}
           </DropdownMenuContent>
         </DropdownMenu>

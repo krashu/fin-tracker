@@ -33,6 +33,7 @@ import { IconArrowRight, IconSearch } from "@/components/icons";
 import { CategoryDot } from "@/components/category-dot";
 import { listAccounts, listCategories } from "@/lib/api/client";
 import { accountLabel } from "@/lib/accounts";
+import { categoryDisplayName, resolveCategoryColor } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 
 import { NAV_GROUPS } from "./nav-config";
@@ -112,20 +113,19 @@ export function CommandPalette({
     [accountsQuery.data],
   );
 
-  const categoryItems = useMemo<PaletteItem[]>(
-    () =>
-      (categoriesQuery.data ?? [])
-        .filter((c) => c.kind === "spend" && c.archived_at == null)
-        .map((c) => ({
-          kind: "category",
-          key: `category:${c.id}`,
-          label: c.name,
-          href: `/expenses?category=${c.id}`,
-          categoryId: c.id,
-          color: c.color,
-        })),
-    [categoriesQuery.data],
-  );
+  const categoryItems = useMemo<PaletteItem[]>(() => {
+    const raw = categoriesQuery.data ?? [];
+    return raw
+      .filter((c) => c.kind === "spend" && c.archived_at == null)
+      .map((c) => ({
+        kind: "category",
+        key: `category:${c.id}`,
+        label: categoryDisplayName(c, raw),
+        href: `/expenses?category=${c.id}`,
+        categoryId: c.id,
+        color: resolveCategoryColor(c, raw),
+      }));
+  }, [categoriesQuery.data]);
 
   const q = query.trim().toLowerCase();
   const groups = useMemo<PaletteGroup[]>(() => {

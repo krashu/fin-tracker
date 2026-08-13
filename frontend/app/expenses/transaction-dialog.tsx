@@ -42,6 +42,7 @@ import {
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { LabelInput } from "@/components/labels/label-input";
 import { Field, PickerButton, TextInput } from "@/components/form/fields";
+import { CategorySelector } from "@/components/categories/category-selector";
 import {
   ApiError,
   patchTransaction,
@@ -309,19 +310,14 @@ export function TransactionDialog({
               />
             </Field>
             <Field label="Category">
-              <PickerButton
-                label={selectedCategory ? selectedCategory.name : UNCATEGORIZED}
-                muted={selectedCategory == null}
-              >
-                <DropdownMenuItem onSelect={() => setCategoryId(null)}>
-                  <span className="text-muted-foreground">{UNCATEGORIZED}</span>
-                </DropdownMenuItem>
-                {visibleCategories.map((c) => (
-                  <DropdownMenuItem key={c.id} onSelect={() => setCategoryId(c.id)}>
-                    {c.name}
-                  </DropdownMenuItem>
-                ))}
-              </PickerButton>
+              <CategorySelector
+                value={categoryId}
+                onChange={setCategoryId}
+                categories={categories}
+                kind={categoryKind}
+                disabled={isPaired}
+                placeholder={UNCATEGORIZED}
+              />
             </Field>
           </div>
 

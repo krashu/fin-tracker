@@ -52,7 +52,7 @@ import {
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel } from "@/lib/charts";
 import { periodRange } from "@/lib/period";
-import { categoryColorVar } from "@/lib/categories";
+import { categoryColorVar, resolveCategoryColor } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
 
@@ -90,12 +90,13 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
     queryKey: ["categories"],
     queryFn: listCategories,
   });
+  const allCategories = categoriesQuery.data ?? [];
   const colorById = useMemo(
     () =>
       new Map<number, CategoryColor | null>(
-        (categoriesQuery.data ?? []).map((c) => [c.id, c.color]),
+        allCategories.map((c) => [c.id, resolveCategoryColor(c, allCategories)]),
       ),
-    [categoriesQuery.data],
+    [allCategories],
   );
 
   const cats = query.data?.categories ?? [];

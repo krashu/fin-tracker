@@ -22,6 +22,12 @@ import { PeriodPicker } from "@/components/dashboard/period-picker";
 import { IconChevronDown, IconChevronRight, IconX } from "@/components/icons";
 import { formatMonth } from "@/lib/format";
 import { labelDisplay } from "@/lib/labels";
+import {
+  buildCategoryTree,
+  categoryDisplayName,
+  resolveCategoryColor,
+} from "@/lib/categories";
+import { CategoryDot } from "@/components/category-dot";
 import { cn } from "@/lib/utils";
 import type {
   AccountRead,
@@ -163,21 +169,43 @@ export function FilterRow({
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Pill active={categoryId != null}>
-            {category ? category.name : "All categories"}
+            {category
+              ? categoryDisplayName(category, categories)
+              : "All categories"}
             <IconChevronDown className="size-3 opacity-70" />
           </Pill>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="max-h-72 w-48">
+        <DropdownMenuContent align="start" className="max-h-72 w-56 overflow-y-auto">
           <DropdownMenuItem onSelect={() => onCategoryChange(undefined)}>
             <span className="text-muted-foreground">All categories</span>
           </DropdownMenuItem>
-          {visibleCategories.map((c) => (
-            <DropdownMenuItem
-              key={c.id}
-              onSelect={() => onCategoryChange(c.id)}
-            >
-              {c.name}
-            </DropdownMenuItem>
+          {buildCategoryTree(visibleCategories).map((parent) => (
+            <div key={parent.id} className="py-0.5">
+              <DropdownMenuItem
+                onSelect={() => onCategoryChange(parent.id)}
+                className="flex items-center gap-2 font-medium"
+              >
+                <CategoryDot
+                  categoryId={parent.id}
+                  color={resolveCategoryColor(parent, categories)}
+                />
+                <span className="truncate">{parent.name}</span>
+              </DropdownMenuItem>
+              {parent.subcategories.map((sub) => (
+                <DropdownMenuItem
+                  key={sub.id}
+                  onSelect={() => onCategoryChange(sub.id)}
+                  className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
+                >
+                  <CategoryDot
+                    categoryId={sub.id}
+                    color={resolveCategoryColor(sub, categories)}
+                    className="size-1.5"
+                  />
+                  <span className="truncate">{sub.name}</span>
+                </DropdownMenuItem>
+              ))}
+            </div>
           ))}
         </DropdownMenuContent>
       </DropdownMenu>

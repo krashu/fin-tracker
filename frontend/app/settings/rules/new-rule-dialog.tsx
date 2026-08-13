@@ -45,6 +45,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { Field, PickerButton } from "@/components/form/fields";
+import { CategorySelector } from "@/components/categories/category-selector";
 import { LabelChip } from "@/components/labels/label-chip";
 import { IconCheck, IconChevronDown, IconPlus } from "@/components/icons";
 import {
@@ -247,22 +248,13 @@ export function NewRuleDialog({
           </Field>
 
           <Field label="Category (optional)">
-            <PickerButton
-              label={selectedCategory ? selectedCategory.name : "No category"}
-              muted={selectedCategory == null}
-            >
-              <DropdownMenuItem onSelect={() => setCategoryId(null)}>
-                <span className="text-muted-foreground">No category</span>
-              </DropdownMenuItem>
-              {spendCategories.map((c) => (
-                <DropdownMenuItem
-                  key={c.id}
-                  onSelect={() => setCategoryId(c.id)}
-                >
-                  {c.name}
-                </DropdownMenuItem>
-              ))}
-            </PickerButton>
+            <CategorySelector
+              value={categoryId}
+              onChange={setCategoryId}
+              categories={spendCategories}
+              kind="spend"
+              placeholder="No category"
+            />
           </Field>
 
           <div className="flex flex-col gap-1.5">

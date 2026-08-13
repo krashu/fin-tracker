@@ -38,6 +38,7 @@ import {
 import { accountLabel } from "@/lib/accounts";
 import { formatINR, formatDate } from "@/lib/format";
 import { thisMonthAnchor, monthKey, monthRange, yearRange } from "@/lib/dates";
+import { resolveCategoryColor } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
 import { LabelChip } from "@/components/labels/label-chip";
@@ -359,6 +360,10 @@ export function ExpensesBoard() {
                     t.category_id != null
                       ? categoriesById.get(t.category_id)
                       : undefined;
+                  const parentCategory =
+                    category?.parent_id != null
+                      ? categoriesById.get(category.parent_id)
+                      : undefined;
                   const categoryName = category?.name ?? "Uncategorized";
                   const merchant = t.merchant_raw?.trim() || "—";
                   return (
@@ -370,7 +375,8 @@ export function ExpensesBoard() {
                       labels={t.labels}
                       categoryId={t.category_id}
                       categoryName={categoryName}
-                      categoryColor={category?.color ?? null}
+                      parentCategoryName={parentCategory?.name ?? null}
+                      categoryColor={resolveCategoryColor(category, categoriesById)}
                       accountName={account?.name ?? "—"}
                       accountLast4={account?.last4 ?? null}
                       amountPaise={t.amount_paise}
@@ -444,6 +450,7 @@ function TxnRow({
   labels,
   categoryId,
   categoryName,
+  parentCategoryName,
   categoryColor,
   accountName,
   accountLast4,
@@ -458,6 +465,7 @@ function TxnRow({
   labels: LabelRead[];
   categoryId: number | null;
   categoryName: string;
+  parentCategoryName?: string | null;
   categoryColor: CategoryColor | null;
   accountName: string;
   accountLast4: string | null;
@@ -544,12 +552,22 @@ function TxnRow({
       <Td borderClass={border}>
         <div className="flex min-w-0 items-center gap-2">
           <CategoryDot categoryId={categoryId} color={categoryColor} />
-          <span
-            className="truncate text-[12.5px] text-foreground/80"
-            style={{ letterSpacing: "-0.003em" }}
-          >
-            {categoryName}
-          </span>
+          <div className="flex min-w-0 flex-col">
+            <span
+              className="truncate text-[12.5px] font-medium text-foreground/90"
+              style={{ letterSpacing: "-0.003em" }}
+            >
+              {categoryName}
+            </span>
+            {parentCategoryName ? (
+              <span
+                className="truncate text-[10.5px] text-muted-foreground/70"
+                style={{ letterSpacing: "-0.002em" }}
+              >
+                {parentCategoryName}
+              </span>
+            ) : null}
+          </div>
         </div>
       </Td>
 

@@ -148,6 +148,11 @@ export type CategoryRead = {
   is_seeded: boolean;
   archived_at: string | null;
   color: CategoryColor | null;
+  parent_id: number | null;
+};
+
+export type CategoryTreeRead = CategoryRead & {
+  subcategories: CategoryRead[];
 };
 
 const BASE_URL =
@@ -443,8 +448,21 @@ export function listAccounts(): Promise<AccountRead[]> {
   return request<AccountRead[]>("/accounts");
 }
 
-export function listCategories(): Promise<CategoryRead[]> {
-  return request<CategoryRead[]>("/categories");
+export function listCategories(params?: {
+  kind?: CategoryKind;
+  tree?: boolean;
+} | unknown): Promise<CategoryRead[]> {
+  const qs = new URLSearchParams();
+  if (params && typeof params === "object") {
+    if ("kind" in params && typeof params.kind === "string") {
+      qs.set("kind", params.kind);
+    }
+    if ("tree" in params && params.tree) {
+      qs.set("tree", "true");
+    }
+  }
+  const s = qs.toString();
+  return request<CategoryRead[]>(`/categories${s ? `?${s}` : ""}`);
 }
 
 // --- Account mutations (PRD §F6) ----------------------------------------------
@@ -504,8 +522,13 @@ export type CategoryCreate = {
   name: string;
   kind?: CategoryKind;
   color?: CategoryColor | null;
+  parent_id?: number | null;
 };
-export type CategoryUpdate = { name?: string; color?: CategoryColor | null };
+export type CategoryUpdate = {
+  name?: string;
+  color?: CategoryColor | null;
+  parent_id?: number | null;
+};
 
 export function createCategory(body: CategoryCreate): Promise<CategoryRead> {
   return request<CategoryRead>("/categories", {

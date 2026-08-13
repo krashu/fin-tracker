@@ -27,7 +27,7 @@ import {
   type CategoryColor,
 } from "@/lib/api/client";
 import { formatINR, formatMonthYear, formatPercent } from "@/lib/format";
-import { categoryColorVar } from "@/lib/categories";
+import { categoryColorVar, resolveCategoryColor } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
@@ -84,8 +84,9 @@ export function SpendByCategory({
     queryKey: ["categories"],
     queryFn: listCategories,
   });
+  const allCategories = categoriesQuery.data ?? [];
   const colorById = new Map<number, CategoryColor | null>(
-    (categoriesQuery.data ?? []).map((c) => [c.id, c.color]),
+    allCategories.map((c) => [c.id, resolveCategoryColor(c, allCategories)]),
   );
   const colorFor = (id: number | null): CategoryColor | null =>
     id != null ? (colorById.get(id) ?? null) : null;

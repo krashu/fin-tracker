@@ -1,6 +1,7 @@
 import type {
   CategoryColor,
   CategoryKind,
+  CategoryRead,
   TransactionType,
 } from "@/lib/api/client";
 
@@ -78,3 +79,118 @@ export function nextCategoryColor(
     CATEGORY_PALETTE[taken.size % CATEGORY_PALETTE.length]
   );
 }
+
+export type CategoryTreeNode = CategoryRead & {
+  subcategories: CategoryRead[];
+};
+
+/** Convert a flat list of categories into a two-level tree.
+ * Roots (parent_id === null) own a subcategories array.
+ * Orphaned subcategories (parent not found) are returned at root level so they are not lost. */
+export function buildCategoryTree(
+  categories: readonly CategoryRead[],
+): CategoryTreeNode[] {
+  const byId = new Map<number, CategoryRead>();
+  const childrenByParent = new Map<number, CategoryRead[]>();
+  const roots: CategoryTreeNode[] = [];
+
+  for (const c of categories) {
+    byId.set(c.id, c);
+    if (c.parent_id != null) {
+      const list = childrenByParent.get(c.parent_id) ?? [];
+      list.push(c);
+      childrenByParent.set(c.parent_id, list);
+    }
+  }
+
+  for (const c of categories) {
+    if (c.parent_id === null) {
+      roots.push({
+        ...c,
+        subcategories: childrenByParent.get(c.id) ?? [],
+      });
+    }
+  }
+
+  // Handle any orphan subcategories whose parent_id does not exist in categories
+  for (const c of categories) {
+    if (c.parent_id !== null && !byId.has(c.parent_id)) {
+      roots.push({
+        ...c,
+        subcategories: [],
+      });
+    }
+  }
+
+  return roots;
+}
+
+/** Lookup helper ensuring a Map<number, CategoryRead> is available */
+function ensureCategoryMap(
+  lookup: Map<number, CategoryRead> | readonly CategoryRead[],
+): Map<number, CategoryRead> {
+  if (lookup instanceof Map) return lookup;
+  return new Map(lookup.map((c) => [c.id, c]));
+}
+
+/** Resolve category color with inheritance: if a subcategory has no explicit color,
+ * it inherits its parent category's color. */
+export function resolveCategoryColor(
+  category: CategoryRead | null | undefined,
+  lookup: Map<number, CategoryRead> | readonly CategoryRead[],
+): CategoryColor | null {
+  if (!category) return null;
+  if (category.color) return category.color;
+  if (category.parent_id != null) {
+    const map = ensureCategoryMap(lookup);
+    const parent = map.get(category.parent_id);
+    if (parent?.color) return parent.color;
+  }
+  return null;
+}
+
+/** Format a category name as "Parent → Subcategory" or "Parent". */
+export function categoryDisplayName(
+  category: CategoryRead | null | undefined,
+  lookup: Map<number, CategoryRead> | readonly CategoryRead[],
+): string {
+  if (!category) return "Uncategorized";
+  if (category.parent_id != null) {
+    const map = ensureCategoryMap(lookup);
+    const parent = map.get(category.parent_id);
+    if (parent) return `${parent.name} → ${category.name}`;
+  }
+  return category.name;
+}
+
+/** Get eligible parent categories for reparenting a given category.
+ * Rules:
+ * 1. Must be same kind (spend vs income).
+ * 2. Must be a root category (parent_id === null) — max 2 levels.
+ * 3. Cannot be the category itself.
+ * 4. If current category already has subcategories, it cannot be assigned a parent (cannot nest). */
+export function getReparentingOptions(
+  currentCategory: CategoryRead | null,
+  allCategories: readonly CategoryRead[],
+): CategoryRead[] {
+  if (!currentCategory) {
+    // For creating a new category
+    return allCategories.filter((c) => c.parent_id === null);
+  }
+
+  // Check if current category already has active children
+  const hasChildren = allCategories.some(
+    (c) => c.parent_id === currentCategory.id,
+  );
+  if (hasChildren) {
+    return [];
+  }
+
+  return allCategories.filter(
+    (c) =>
+      c.parent_id === null &&
+      c.kind === currentCategory.kind &&
+      c.id !== currentCategory.id,
+  );
+}
+

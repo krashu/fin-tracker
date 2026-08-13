@@ -81,7 +81,12 @@ import {
   type LabelRead,
   type TransactionCandidate,
 } from "@/lib/api/client";
-import { categoryKindForType } from "@/lib/categories";
+import {
+  buildCategoryTree,
+  categoryKindForType,
+  resolveCategoryColor,
+} from "@/lib/categories";
+import { CategoryDot } from "@/components/category-dot";
 import { formatINR, formatDateWithYear } from "@/lib/format";
 import { sameLabelSet } from "@/lib/labels";
 import { invalidateRules } from "@/lib/queries/invalidate";
@@ -1538,26 +1543,68 @@ function ReviewRow({
                 </CommandGroup>
                 <CommandSeparator />
                 <CommandGroup heading="Spend (refund)">
-                  {spendCategories.map((cat) => (
-                    <CommandItem
-                      key={cat.id}
-                      value={cat.name}
-                      onSelect={() => selectCredit("spend", cat.id)}
-                    >
-                      {cat.name}
-                    </CommandItem>
+                  {buildCategoryTree(spendCategories).map((parent) => (
+                    <div key={parent.id} className="py-0.5">
+                      <CommandItem
+                        value={`spend-${parent.name}`}
+                        onSelect={() => selectCredit("spend", parent.id)}
+                        className="flex items-center gap-2 font-medium"
+                      >
+                        <CategoryDot
+                          categoryId={parent.id}
+                          color={resolveCategoryColor(parent, categories)}
+                        />
+                        <span className="truncate">{parent.name}</span>
+                      </CommandItem>
+                      {parent.subcategories.map((sub) => (
+                        <CommandItem
+                          key={sub.id}
+                          value={`spend-${parent.name}-${sub.name}`}
+                          onSelect={() => selectCredit("spend", sub.id)}
+                          className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
+                        >
+                          <CategoryDot
+                            categoryId={sub.id}
+                            color={resolveCategoryColor(sub, categories)}
+                            className="size-1.5"
+                          />
+                          <span className="truncate">{sub.name}</span>
+                        </CommandItem>
+                      ))}
+                    </div>
                   ))}
                 </CommandGroup>
                 <CommandSeparator />
                 <CommandGroup heading="Income">
-                  {incomeCategories.map((cat) => (
-                    <CommandItem
-                      key={cat.id}
-                      value={cat.name}
-                      onSelect={() => selectCredit("income", cat.id)}
-                    >
-                      {cat.name}
-                    </CommandItem>
+                  {buildCategoryTree(incomeCategories).map((parent) => (
+                    <div key={parent.id} className="py-0.5">
+                      <CommandItem
+                        value={`income-${parent.name}`}
+                        onSelect={() => selectCredit("income", parent.id)}
+                        className="flex items-center gap-2 font-medium"
+                      >
+                        <CategoryDot
+                          categoryId={parent.id}
+                          color={resolveCategoryColor(parent, categories)}
+                        />
+                        <span className="truncate">{parent.name}</span>
+                      </CommandItem>
+                      {parent.subcategories.map((sub) => (
+                        <CommandItem
+                          key={sub.id}
+                          value={`income-${parent.name}-${sub.name}`}
+                          onSelect={() => selectCredit("income", sub.id)}
+                          className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
+                        >
+                          <CategoryDot
+                            categoryId={sub.id}
+                            color={resolveCategoryColor(sub, categories)}
+                            className="size-1.5"
+                          />
+                          <span className="truncate">{sub.name}</span>
+                        </CommandItem>
+                      ))}
+                    </div>
                   ))}
                 </CommandGroup>
               </CommandList>
@@ -1591,16 +1638,38 @@ function ReviewRow({
                   >
                     <span className="text-muted-foreground">Uncategorized</span>
                   </CommandItem>
-                  {visibleCategories.map((cat) => (
-                    <CommandItem
-                      key={cat.id}
-                      value={cat.name}
-                      onSelect={() => selectCategory(cat.id)}
-                    >
-                      {cat.name}
-                    </CommandItem>
-                  ))}
                 </CommandGroup>
+                <CommandSeparator />
+                {buildCategoryTree(visibleCategories).map((parent) => (
+                  <CommandGroup key={parent.id} className="p-0.5">
+                    <CommandItem
+                      value={`cat-${parent.name}`}
+                      onSelect={() => selectCategory(parent.id)}
+                      className="flex items-center gap-2 font-medium"
+                    >
+                      <CategoryDot
+                        categoryId={parent.id}
+                        color={resolveCategoryColor(parent, categories)}
+                      />
+                      <span className="truncate">{parent.name}</span>
+                    </CommandItem>
+                    {parent.subcategories.map((sub) => (
+                      <CommandItem
+                        key={sub.id}
+                        value={`sub-${parent.name}-${sub.name}`}
+                        onSelect={() => selectCategory(sub.id)}
+                        className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
+                      >
+                        <CategoryDot
+                          categoryId={sub.id}
+                          color={resolveCategoryColor(sub, categories)}
+                          className="size-1.5"
+                        />
+                        <span className="truncate">{sub.name}</span>
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                ))}
               </CommandList>
             </Command>
           </PopoverContent>
@@ -1772,19 +1841,39 @@ function CommitBar({
               {bulkBusy ? "Categorizing…" : "Categorize"}
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" side="top" className="max-h-72 w-56">
+          <DropdownMenuContent align="start" side="top" className="max-h-72 w-56 overflow-y-auto">
             {bulkSkippedHint ? (
               <div className="px-2 py-1.5 text-[11px] text-muted-foreground">
                 {bulkSkippedHint}
               </div>
             ) : null}
-            {visibleCategories.map((cat) => (
-              <DropdownMenuItem
-                key={cat.id}
-                onSelect={() => onCategorize(cat.id)}
-              >
-                {cat.name}
-              </DropdownMenuItem>
+            {buildCategoryTree(visibleCategories).map((parent) => (
+              <div key={parent.id} className="py-0.5">
+                <DropdownMenuItem
+                  onSelect={() => onCategorize(parent.id)}
+                  className="flex items-center gap-2 font-medium"
+                >
+                  <CategoryDot
+                    categoryId={parent.id}
+                    color={resolveCategoryColor(parent, categories)}
+                  />
+                  <span className="truncate">{parent.name}</span>
+                </DropdownMenuItem>
+                {parent.subcategories.map((sub) => (
+                  <DropdownMenuItem
+                    key={sub.id}
+                    onSelect={() => onCategorize(sub.id)}
+                    className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
+                  >
+                    <CategoryDot
+                      categoryId={sub.id}
+                      color={resolveCategoryColor(sub, categories)}
+                      className="size-1.5"
+                    />
+                    <span className="truncate">{sub.name}</span>
+                  </DropdownMenuItem>
+                ))}
+              </div>
             ))}
           </DropdownMenuContent>
         </DropdownMenu>

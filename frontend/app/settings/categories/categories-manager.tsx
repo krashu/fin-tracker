@@ -6,10 +6,10 @@
  * create/rename/archive propagates everywhere on invalidate (PRD §F9).
  *
  * Seeded defaults are renamed/archived like any other (the backend permits it);
- * the "default" tag is display-only. Archiving a category also clears its
- * merchant→category auto-tag mappings server-side.
+ * the "default" tag is display-only. Archiving a parent category also cascades
+ * to archive its child subcategories server-side.
  */
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { IconArchive, IconPlus } from "@/components/icons";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { IconArchive, IconChevronDown, IconPlus } from "@/components/icons";
 import { Field, TextInput } from "@/components/form/fields";
 import {
   ApiError,
@@ -38,39 +44,61 @@ import {
 import {
   CATEGORY_KIND_LABELS,
   CATEGORY_PALETTE,
+  buildCategoryTree,
+  getReparentingOptions,
   nextCategoryColor,
+  resolveCategoryColor,
+  type CategoryTreeNode,
 } from "@/lib/categories";
 import { invalidateRules } from "@/lib/queries/invalidate";
 import { cn } from "@/lib/utils";
 
 const KINDS: readonly CategoryKind[] = ["spend", "income"];
 
-/** The one open dialog (or none). `edit`/`archive` always carry their row. */
+/** The one open dialog (or none). */
 type CategoryDialog =
   | null
-  | { kind: "create" }
+  | {
+      kind: "create";
+      defaultParentId?: number | null;
+      defaultKind?: CategoryKind;
+    }
   | { kind: "edit"; category: CategoryRead }
-  | { kind: "archive"; category: CategoryRead };
+  | {
+      kind: "archive";
+      category: CategoryRead;
+      subcategories: CategoryRead[];
+    };
 
 export function CategoriesManager() {
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
   });
   const categories = categoriesQuery.data ?? [];
 
-  // One dialog at a time; a single discriminated state makes "edit/archive
-  // without a row" unrepresentable.
   const [dialog, setDialog] = useState<CategoryDialog>(null);
   const closeDialog = () => setDialog(null);
+
+  const rootCategoriesCount = useMemo(
+    () => categories.filter((c) => c.parent_id === null).length,
+    [categories],
+  );
 
   return (
     <Card className="max-w-3xl">
       <CardHeader className="flex flex-row items-center justify-between border-b">
-        <CardTitle className="text-[14px]">
-          {categories.length}{" "}
-          {categories.length === 1 ? "category" : "categories"}
-        </CardTitle>
+        <div>
+          <CardTitle className="text-[14px]">
+            {categories.length}{" "}
+            {categories.length === 1 ? "category" : "categories"}
+          </CardTitle>
+          <p className="mt-0.5 text-[12px] text-muted-foreground">
+            {rootCategoriesCount} parent{" "}
+            {rootCategoriesCount === 1 ? "category" : "categories"} ·{" "}
+            {categories.length - rootCategoriesCount} subcategories
+          </p>
+        </div>
         <Button
           type="button"
           onClick={() => setDialog({ kind: "create" })}
@@ -94,9 +122,18 @@ export function CategoriesManager() {
             <CategorySection
               key={kind}
               kind={kind}
-              categories={categories.filter((c) => c.kind === kind)}
+              allCategories={categories}
+              onAddSubcategory={(parent) =>
+                setDialog({
+                  kind: "create",
+                  defaultParentId: parent.id,
+                  defaultKind: parent.kind,
+                })
+              }
               onEdit={(c) => setDialog({ kind: "edit", category: c })}
-              onArchive={(c) => setDialog({ kind: "archive", category: c })}
+              onArchive={(c, subcategories) =>
+                setDialog({ kind: "archive", category: c, subcategories })
+              }
             />
           ))
         )}
@@ -105,6 +142,9 @@ export function CategoriesManager() {
       {dialog?.kind === "create" ? (
         <CategoryFormDialog
           mode="create"
+          allCategories={categories}
+          defaultParentId={dialog.defaultParentId ?? null}
+          defaultKind={dialog.defaultKind ?? "spend"}
           existingColors={categories.map((c) => c.color)}
           onClose={closeDialog}
         />
@@ -113,10 +153,16 @@ export function CategoriesManager() {
           key={dialog.category.id}
           mode="edit"
           category={dialog.category}
+          allCategories={categories}
+          existingColors={categories.map((c) => c.color)}
           onClose={closeDialog}
         />
       ) : dialog?.kind === "archive" ? (
-        <ArchiveConfirm category={dialog.category} onClose={closeDialog} />
+        <ArchiveConfirm
+          category={dialog.category}
+          subcategories={dialog.subcategories}
+          onClose={closeDialog}
+        />
       ) : null}
     </Card>
   );
@@ -143,50 +189,122 @@ function Row({
 
 function CategorySection({
   kind,
-  categories,
+  allCategories,
+  onAddSubcategory,
   onEdit,
   onArchive,
 }: {
   kind: CategoryKind;
-  categories: CategoryRead[];
+  allCategories: CategoryRead[];
+  onAddSubcategory: (parent: CategoryRead) => void;
   onEdit: (c: CategoryRead) => void;
-  onArchive: (c: CategoryRead) => void;
+  onArchive: (c: CategoryRead, subcategories: CategoryRead[]) => void;
 }) {
-  if (categories.length === 0) return null;
+  const kindCategories = useMemo(
+    () => allCategories.filter((c) => c.kind === kind),
+    [allCategories, kind],
+  );
+
+  const tree = useMemo(
+    () => buildCategoryTree(kindCategories),
+    [kindCategories],
+  );
+
+  if (tree.length === 0) return null;
+
   return (
     <>
       <p className="border-b border-border/60 bg-muted/30 px-4 py-1.5 text-xs font-medium uppercase tracking-wide text-foreground/70">
         {CATEGORY_KIND_LABELS[kind]}
       </p>
-      {categories.map((c) => (
-        <div
-          key={c.id}
-          className="flex items-center gap-3 border-b border-border/60 px-4 py-2.5 last:border-b-0"
-        >
-          {/* COLOR leads the name — the same position the dot occupies on the
-              board and the spend-by-category bar. Filled swatch when the user
-              picked a color; a dashed outline when none is set (color is the
-              user's choice, nothing auto-assigned). A fixed size keeps the swatch
-              in a straight, aligned column down the list. */}
-          {c.color ? (
-            <span
-              className="size-4 shrink-0 rounded-[5px] border border-border"
-              style={{ backgroundColor: c.color }}
-            />
-          ) : (
-            <span
-              className="size-4 shrink-0 rounded-[5px] border border-dashed border-border"
-              title="No color"
-            />
-          )}
-          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground">
-            {c.name}
+      {tree.map((parent) => (
+        <ParentCategoryCard
+          key={parent.id}
+          parent={parent}
+          allCategories={allCategories}
+          onAddSubcategory={() => onAddSubcategory(parent)}
+          onEditParent={() => onEdit(parent)}
+          onArchiveParent={() => onArchive(parent, parent.subcategories)}
+          onEditSubcategory={(sub) => onEdit(sub)}
+          onArchiveSubcategory={(sub) => onArchive(sub, [])}
+        />
+      ))}
+    </>
+  );
+}
+
+function ParentCategoryCard({
+  parent,
+  allCategories,
+  onAddSubcategory,
+  onEditParent,
+  onArchiveParent,
+  onEditSubcategory,
+  onArchiveSubcategory,
+}: {
+  parent: CategoryTreeNode;
+  allCategories: CategoryRead[];
+  onAddSubcategory: () => void;
+  onEditParent: () => void;
+  onArchiveParent: () => void;
+  onEditSubcategory: (sub: CategoryRead) => void;
+  onArchiveSubcategory: (sub: CategoryRead) => void;
+}) {
+  return (
+    <div className="border-b border-border/60 last:border-b-0">
+      {/* Root Category Row */}
+      <div className="flex items-center gap-3 bg-card px-4 py-2.5 transition-colors hover:bg-muted/30">
+        {parent.color ? (
+          <span
+            className="size-4 shrink-0 rounded-[5px] border border-border"
+            style={{ backgroundColor: parent.color }}
+          />
+        ) : (
+          <span
+            className="size-4 shrink-0 rounded-[5px] border border-dashed border-border"
+            title="No color (neutral dot)"
+          />
+        )}
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="truncate text-[13px] font-semibold text-foreground">
+            {parent.name}
           </span>
+          {parent.is_seeded ? (
+            <span
+              className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+              title="Seeded default category"
+            >
+              default
+            </span>
+          ) : null}
+          {parent.subcategories.length > 0 ? (
+            <span className="shrink-0 text-[11px] text-muted-foreground/70">
+              ({parent.subcategories.length}{" "}
+              {parent.subcategories.length === 1
+                ? "subcategory"
+                : "subcategories"}
+              )
+            </span>
+          ) : null}
+        </div>
+
+        <div className="flex items-center gap-1">
           <Button
             type="button"
             variant="ghost"
-            onClick={() => onEdit(c)}
-            aria-label={`Edit ${c.name}`}
+            onClick={onAddSubcategory}
+            aria-label={`Add subcategory to ${parent.name}`}
+            title="Add subcategory"
+            className="h-7 gap-1 px-2 text-[12px] text-muted-foreground hover:text-foreground"
+          >
+            <IconPlus className="size-3" />
+            <span className="hidden sm:inline">Subcategory</span>
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={onEditParent}
+            aria-label={`Edit ${parent.name}`}
             className="h-7 px-2.5 text-[12px]"
           >
             Edit
@@ -194,45 +312,138 @@ function CategorySection({
           <Button
             type="button"
             variant="ghost"
-            onClick={() => onArchive(c)}
-            className="h-7 gap-1 px-2 text-[12px] text-muted-foreground hover:text-neg"
-            aria-label={`Archive ${c.name}`}
+            onClick={onArchiveParent}
+            className="h-7 px-2 text-[12px] text-muted-foreground hover:text-neg"
+            aria-label={`Archive ${parent.name}`}
             title="Archive"
           >
             <IconArchive className="size-3.5" />
           </Button>
         </div>
-      ))}
-    </>
+      </div>
+
+      {/* Subcategories */}
+      {parent.subcategories.length > 0 ? (
+        <div className="bg-muted/15 pb-1">
+          {parent.subcategories.map((sub) => {
+            const subColor = resolveCategoryColor(sub, allCategories);
+            return (
+              <div
+                key={sub.id}
+                className="ml-6 flex items-center gap-3 border-l-2 border-border/60 py-1.5 pl-4 pr-4 transition-colors hover:bg-muted/40"
+              >
+                {sub.color ? (
+                  <span
+                    className="size-3.5 shrink-0 rounded-[4px] border border-border"
+                    style={{ backgroundColor: sub.color }}
+                  />
+                ) : (
+                  <span
+                    className="size-3.5 shrink-0 rounded-[4px] border border-dashed border-border"
+                    style={{ backgroundColor: subColor ?? undefined }}
+                    title={
+                      subColor
+                        ? "Inheriting color from parent"
+                        : "No color (neutral dot)"
+                    }
+                  />
+                )}
+                <span className="min-w-0 flex-1 truncate text-[12.5px] font-normal text-foreground/90">
+                  {sub.name}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => onEditSubcategory(sub)}
+                  aria-label={`Edit ${sub.name}`}
+                  className="h-6 px-2 text-[11.5px]"
+                >
+                  Edit
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => onArchiveSubcategory(sub)}
+                  className="h-6 px-1.5 text-[11.5px] text-muted-foreground hover:text-neg"
+                  aria-label={`Archive ${sub.name}`}
+                  title="Archive"
+                >
+                  <IconArchive className="size-3" />
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
 type CategoryFormDialogProps =
   | {
       mode: "create";
+      allCategories: CategoryRead[];
+      defaultParentId?: number | null;
+      defaultKind?: CategoryKind;
       existingColors: (CategoryColor | null)[];
       onClose: () => void;
     }
-  | { mode: "edit"; category: CategoryRead; onClose: () => void };
+  | {
+      mode: "edit";
+      category: CategoryRead;
+      allCategories: CategoryRead[];
+      existingColors: (CategoryColor | null)[];
+      onClose: () => void;
+    };
 
 function CategoryFormDialog(props: CategoryFormDialogProps) {
-  const { onClose } = props;
-  // Present only in edit mode. Narrowed `props.category` is used wherever a
-  // definite value is required (no non-null assertions).
+  const { onClose, allCategories } = props;
   const category = props.mode === "edit" ? props.category : undefined;
   const queryClient = useQueryClient();
+
   const [name, setName] = useState(category?.name ?? "");
-  // Kind is immutable after create (the backend has no PATCH kind), so it's a
-  // picker on create and a read-only label on edit.
-  const [kind, setKind] = useState<CategoryKind>(category?.kind ?? "spend");
-  // A new category auto-picks the first unused palette color so it reads
-  // distinctly without the user choosing; edit keeps the stored color.
-  // null = no color (a neutral dot).
+  const [kind, setKind] = useState<CategoryKind>(
+    category?.kind ??
+      (props.mode === "create" ? (props.defaultKind ?? "spend") : "spend"),
+  );
+  const [parentId, setParentId] = useState<number | null>(() => {
+    if (props.mode === "create") {
+      return props.defaultParentId ?? null;
+    }
+    return props.category.parent_id ?? null;
+  });
+
   const [color, setColor] = useState<CategoryColor | null>(() =>
     props.mode === "edit"
       ? (props.category.color ?? null)
       : nextCategoryColor(props.existingColors),
   );
+
+  // Eligible parent options
+  const eligibleParents = useMemo(() => {
+    return getReparentingOptions(category ?? null, allCategories).filter(
+      (c) => c.kind === kind,
+    );
+  }, [category, allCategories, kind]);
+
+  const selectedParent = useMemo(
+    () => allCategories.find((c) => c.id === parentId) ?? null,
+    [allCategories, parentId],
+  );
+
+  // Check if current category has children (preventing nesting)
+  const isParentWithChildren = useMemo(() => {
+    if (!category) return false;
+    return allCategories.some((c) => c.parent_id === category.id);
+  }, [category, allCategories]);
+
+  function handleKindChange(nextKind: CategoryKind) {
+    setKind(nextKind);
+    // If switching kind and selected parent is of different kind, reset parent
+    if (selectedParent && selectedParent.kind !== nextKind) {
+      setParentId(null);
+    }
+  }
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -241,26 +452,22 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
         return createCategory({
           name: trimmedName,
           kind,
+          parent_id: parentId,
           ...(color != null ? { color } : {}),
         });
       }
-      // Send ONLY changed fields: the PATCH route short-circuits when `name` is
-      // present and unchanged, which would otherwise silently drop a color-only
-      // edit. An explicit `color: null` reverts to Auto.
+      // Send ONLY changed fields
       const body: CategoryUpdate = {};
       if (trimmedName !== props.category.name) body.name = trimmedName;
       if (color !== (props.category.color ?? null)) body.color = color;
+      if (parentId !== (props.category.parent_id ?? null)) {
+        body.parent_id = parentId;
+      }
       return patchCategory(props.category.id, body);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["categories"] });
-      // Category names/scopes feed the spend-by-category breakdown and tagging
-      // health on /dashboard (PRD §F9); refresh those on a rename/create too.
       queryClient.invalidateQueries({ queryKey: ["dashboards"] });
-      // A rename changes the server-joined category_name in /settings/rules and
-      // in any open import review queue — the identical reasoning the labels
-      // manager records for label_name. lib/queries/invalidate.ts names this
-      // manager as a required caller; ArchiveConfirm below already calls it.
       invalidateRules(queryClient);
       onClose();
     },
@@ -269,10 +476,12 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
   const trimmed = name.trim();
   const colorChanged =
     props.mode === "edit" && color !== (props.category.color ?? null);
+  const parentChanged =
+    props.mode === "edit" && parentId !== (props.category.parent_id ?? null);
   const changed =
     props.mode === "create"
       ? trimmed.length > 0
-      : trimmed !== props.category.name || colorChanged;
+      : trimmed !== props.category.name || colorChanged || parentChanged;
   const canSubmit = trimmed.length > 0 && changed && !mutation.isPending;
 
   return (
@@ -280,12 +489,16 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
       <DialogContent className="max-w-sm">
         <DialogHeader>
           <DialogTitle>
-            {props.mode === "create" ? "New category" : "Edit category"}
+            {props.mode === "create"
+              ? parentId != null
+                ? "New subcategory"
+                : "New category"
+              : "Edit category"}
           </DialogTitle>
           <DialogDescription className="sr-only">
             {props.mode === "create"
               ? "Add a category for tagging transactions."
-              : "Edit this category's name and color."}
+              : "Edit this category's name, parent, and color."}
           </DialogDescription>
         </DialogHeader>
 
@@ -293,7 +506,9 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
           <TextInput
             value={name}
             onChange={setName}
-            placeholder="e.g. Dining out"
+            placeholder={
+              parentId != null ? "e.g. Groceries" : "e.g. Food & Dining"
+            }
             autoFocus
             maxLength={64}
           />
@@ -307,7 +522,7 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
                   <button
                     key={k}
                     type="button"
-                    onClick={() => setKind(k)}
+                    onClick={() => handleKindChange(k)}
                     className={cn(
                       "rounded-[5px] py-1.5 text-[12px] font-medium transition-colors",
                       kind === k
@@ -328,18 +543,73 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
           </Field>
         </div>
 
-        {/* A curated swatch palette (no freeform picker — overkill for tagging
-            and risks clashing/low-contrast colors). "None" clears to a neutral
-            dot. New categories auto-pick the first unused hue. */}
+        {/* Parent Category Selector / Reparenting */}
         <div className="mt-3">
-          <Field label="Color">
+          <Field label="Parent category (optional)">
+            {isParentWithChildren ? (
+              <div className="rounded-md border border-border/80 bg-muted/40 px-3 py-2 text-[12px] text-muted-foreground">
+                Parent category with active subcategories — cannot be nested
+                under another category.
+              </div>
+            ) : (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-9 w-full justify-between px-2.5 text-[12.5px] font-normal"
+                  >
+                    <span className={cn(!selectedParent && "text-muted-foreground")}>
+                      {selectedParent
+                        ? selectedParent.name
+                        : "None (Top-level parent category)"}
+                    </span>
+                    <IconChevronDown className="size-3 text-muted-foreground" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  className="max-h-60 w-[--radix-dropdown-menu-trigger-width]"
+                >
+                  <DropdownMenuItem onSelect={() => setParentId(null)}>
+                    <span className="text-muted-foreground">
+                      None (Top-level parent category)
+                    </span>
+                  </DropdownMenuItem>
+                  {eligibleParents.map((p) => (
+                    <DropdownMenuItem
+                      key={p.id}
+                      onSelect={() => setParentId(p.id)}
+                    >
+                      {p.name}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </Field>
+        </div>
+
+        {/* Color Palette */}
+        <div className="mt-3">
+          <Field
+            label={
+              parentId != null
+                ? "Color (optional, inherits parent by default)"
+                : "Color"
+            }
+          >
             <div className="flex flex-wrap gap-1.5">
               <button
                 type="button"
                 onClick={() => setColor(null)}
-                aria-label="No color"
+                aria-label="No custom color"
                 aria-pressed={color === null}
-                title="No color"
+                title={
+                  parentId != null
+                    ? "Inherit parent category color"
+                    : "No custom color (neutral dot)"
+                }
                 className={cn(
                   "size-6 rounded-md border border-dashed border-border transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card",
                   color === null &&
@@ -366,14 +636,14 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
         </div>
 
         {mutation.isError ? (
-          <p className="text-[12px] text-neg">
+          <p className="mt-2 text-[12px] text-neg">
             {mutation.error instanceof ApiError
               ? mutation.error.detail
               : "Couldn’t save — try again."}
           </p>
         ) : null}
 
-        <DialogFooter>
+        <DialogFooter className="mt-4">
           <Button
             variant="ghost"
             className="h-8 px-3 text-[12.5px]"
@@ -401,9 +671,11 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
 
 function ArchiveConfirm({
   category,
+  subcategories,
   onClose,
 }: {
   category: CategoryRead;
+  subcategories: CategoryRead[];
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -411,16 +683,13 @@ function ArchiveConfirm({
     mutationFn: () => deleteCategory(category.id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["categories"] });
-      // Archiving hides the category's auto-tag rules (they're kept, not
-      // deleted) and shifts the spend-by-category / tagging-health aggregates on
-      // /dashboard (PRD §F9). invalidateRules refreshes /settings/rules (the
-      // archived category's rules drop out of the list) + any open review
-      // queue's confidence.
       queryClient.invalidateQueries({ queryKey: ["dashboards"] });
       invalidateRules(queryClient);
       onClose();
     },
   });
+
+  const hasSubcategories = subcategories.length > 0;
 
   return (
     <Dialog open onOpenChange={(open) => (open ? null : onClose())}>
@@ -428,9 +697,24 @@ function ArchiveConfirm({
         <DialogHeader>
           <DialogTitle>Archive {category.name}?</DialogTitle>
           <DialogDescription>
-            It’s removed from the category list and its merchant auto-tag rules
-            stop applying while it’s archived. Existing transactions keep this
-            category.
+            {hasSubcategories ? (
+              <>
+                Archiving <span className="font-semibold text-foreground">{category.name}</span> will
+                also archive its <span className="font-semibold text-foreground">{subcategories.length}</span> child{" "}
+                {subcategories.length === 1 ? "subcategory" : "subcategories"} (
+                {subcategories.map((s) => s.name).join(", ")}).
+                <br />
+                <br />
+                Merchant auto-tag rules will stop applying while archived.
+                Existing transactions will keep their historical categories.
+              </>
+            ) : (
+              <>
+                It will be removed from active category lists and its merchant
+                auto-tag rules will stop applying. Existing transactions will keep
+                this category.
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
         {mutation.isError ? (

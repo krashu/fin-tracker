@@ -38,6 +38,7 @@ import {
   type TransactionCreate,
 } from "@/lib/api/client";
 import { Field, PickerButton, TextInput } from "@/components/form/fields";
+import { CategorySelector } from "@/components/categories/category-selector";
 import { rupeesToPaise } from "@/lib/format";
 import { accountLabel } from "@/lib/accounts";
 import { categoryKindForType } from "@/lib/categories";
@@ -259,24 +260,13 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
               />
             </Field>
             <Field label="Category (optional)">
-              <PickerButton
-                label={
-                  selectedCategory ? selectedCategory.name : "Uncategorized"
-                }
-                muted={selectedCategory == null}
-              >
-                <DropdownMenuItem onSelect={() => setCategoryId(null)}>
-                  <span className="text-muted-foreground">Uncategorized</span>
-                </DropdownMenuItem>
-                {visibleCategories.map((c) => (
-                  <DropdownMenuItem
-                    key={c.id}
-                    onSelect={() => setCategoryId(c.id)}
-                  >
-                    {c.name}
-                  </DropdownMenuItem>
-                ))}
-              </PickerButton>
+              <CategorySelector
+                value={categoryId}
+                onChange={setCategoryId}
+                categories={categories}
+                kind={categoryKind}
+                placeholder="Uncategorized"
+              />
             </Field>
           </div>
 
