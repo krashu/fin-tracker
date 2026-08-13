@@ -96,10 +96,19 @@ def test_list_response_shape(
     assert resp.status_code == 200
     rows = resp.json()
     assert len(rows) == 1
-    assert set(rows[0].keys()) == {"id", "name", "kind", "is_seeded", "archived_at", "color"}
+    assert set(rows[0].keys()) == {
+        "id",
+        "name",
+        "kind",
+        "is_seeded",
+        "archived_at",
+        "color",
+        "parent_id",
+    }
     assert "user_id" not in rows[0]
     # Derived-color default: a category created without a color reads back NULL.
     assert rows[0]["color"] is None
+    assert rows[0]["parent_id"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -769,3 +778,160 @@ def test_delete_then_recreate_same_name(
     status_code, body = _post(client, {"name": "Coffee"})
     assert status_code == 201
     assert body["name"] == "Coffee"
+
+
+# ---------------------------------------------------------------------------
+# Two-Level Hierarchy Tests
+# ---------------------------------------------------------------------------
+
+
+def test_create_subcategory_happy(
+    client: TestClient,
+    seeded_user: User,
+) -> None:
+    status_code, parent = _post(
+        client,
+        {"name": "Food & Dining", "kind": "spend", "color": "#d95926"},
+    )
+    assert status_code == 201
+    assert parent["parent_id"] is None
+
+    status_code, child = _post(
+        client,
+        {"name": "Online Food Delivery", "kind": "spend", "parent_id": parent["id"]},
+    )
+    assert status_code == 201
+    assert child["name"] == "Online Food Delivery"
+    assert child["parent_id"] == parent["id"]
+
+
+def test_create_subcategory_parent_not_found_422(
+    client: TestClient,
+    seeded_user: User,
+) -> None:
+    status_code, body = _post(client, {"name": "Groceries", "parent_id": 99999})
+    assert status_code == 422
+    assert body["detail"] == "parent category not found"
+
+
+def test_create_subcategory_foreign_user_parent_422(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    other = User(id=uuid4())
+    session.add(other)
+    session.flush()
+    other_cat = Category(user_id=other.id, name="OtherParent", kind="spend")
+    session.add(other_cat)
+    session.commit()
+
+    status_code, body = _post(client, {"name": "MyChild", "parent_id": other_cat.id})
+    assert status_code == 422
+    assert body["detail"] == "parent category not found"
+
+
+def test_create_subcategory_kind_mismatch_422(
+    client: TestClient,
+    seeded_user: User,
+) -> None:
+    status_code, spend_parent = _post(client, {"name": "Food & Dining", "kind": "spend"})
+    assert status_code == 201
+
+    # Attempt to add income child under spend parent
+    status_code, body = _post(
+        client,
+        {"name": "IncomeChild", "kind": "income", "parent_id": spend_parent["id"]},
+    )
+    assert status_code == 422
+    assert body["detail"] == "category kind must match parent category kind"
+
+
+def test_create_cannot_nest_3_levels_422(
+    client: TestClient,
+    seeded_user: User,
+) -> None:
+    status_code, parent = _post(client, {"name": "Level1", "kind": "spend"})
+    assert status_code == 201
+    status_code, child = _post(
+        client,
+        {"name": "Level2", "kind": "spend", "parent_id": parent["id"]},
+    )
+    assert status_code == 201
+
+    # Attempt to create level 3
+    status_code, body = _post(
+        client,
+        {"name": "Level3", "kind": "spend", "parent_id": child["id"]},
+    )
+    assert status_code == 422
+    assert body["detail"] == "cannot nest category more than 2 levels deep"
+
+
+def test_list_tree_view(
+    client: TestClient,
+    seeded_user: User,
+) -> None:
+    _, food = _post(client, {"name": "Food & Dining", "kind": "spend", "color": "#d95926"})
+    _post(client, {"name": "Groceries", "kind": "spend", "parent_id": food["id"]})
+    _post(client, {"name": "Online Food Delivery", "kind": "spend", "parent_id": food["id"]})
+    _, bills = _post(client, {"name": "Bills & Utilities", "kind": "spend", "color": "#0e97c4"})
+
+    resp = client.get("/api/v1/categories?tree=true")
+    assert resp.status_code == 200
+    tree = resp.json()
+    assert len(tree) == 2  # 2 root parents
+
+    food_node = next(n for n in tree if n["name"] == "Food & Dining")
+    assert len(food_node["subcategories"]) == 2
+    sub_names = {s["name"] for s in food_node["subcategories"]}
+    assert sub_names == {"Groceries", "Online Food Delivery"}
+
+    bills_node = next(n for n in tree if n["name"] == "Bills & Utilities")
+    assert len(bills_node["subcategories"]) == 0
+
+
+def test_patch_reparenting_and_validation(
+    client: TestClient,
+    seeded_user: User,
+) -> None:
+    _, p1 = _post(client, {"name": "Parent1", "kind": "spend"})
+    _, p2 = _post(client, {"name": "Parent2", "kind": "spend"})
+    _, child = _post(client, {"name": "Child", "kind": "spend", "parent_id": p1["id"]})
+
+    # Reparent Child from Parent1 to Parent2
+    resp = client.patch(f"/api/v1/categories/{child['id']}", json={"parent_id": p2["id"]})
+    assert resp.status_code == 200
+    assert resp.json()["parent_id"] == p2["id"]
+
+    # Promote Child to root (parent_id = null)
+    resp = client.patch(f"/api/v1/categories/{child['id']}", json={"parent_id": None})
+    assert resp.status_code == 200
+    assert resp.json()["parent_id"] is None
+
+    # Self-parenting rejected
+    resp = client.patch(f"/api/v1/categories/{p1['id']}", json={"parent_id": p1["id"]})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "category cannot be its own parent"
+
+
+def test_delete_parent_cascades_archive(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    _, parent = _post(client, {"name": "ParentCat", "kind": "spend"})
+    _, child1 = _post(client, {"name": "Child1", "kind": "spend", "parent_id": parent["id"]})
+    _, child2 = _post(client, {"name": "Child2", "kind": "spend", "parent_id": parent["id"]})
+
+    resp = client.delete(f"/api/v1/categories/{parent['id']}")
+    assert resp.status_code == 204
+
+    # Both parent and children are now archived
+    list_resp = client.get("/api/v1/categories")
+    assert list_resp.status_code == 200
+    active_names = {c["name"] for c in list_resp.json()}
+    assert "ParentCat" not in active_names
+    assert "Child1" not in active_names
+    assert "Child2" not in active_names
+

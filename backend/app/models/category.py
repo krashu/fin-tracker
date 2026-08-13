@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Literal, get_args
 
 from sqlalchemy import Enum, ForeignKey, Index, String, text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import expression
 
 from app.models.base import Base, TimestampMixin
@@ -50,10 +50,14 @@ class Category(Base, TimestampMixin):
             sqlite_where=text("archived_at IS NULL"),
             postgresql_where=text("archived_at IS NULL"),
         ),
+        Index("ix_categories_user_parent_id", "user_id", "parent_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    parent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("categories.id", ondelete="CASCADE"), default=None, nullable=True
+    )
     name: Mapped[str] = mapped_column(String(64))
     # Python-side default AND server_default: the former populates ORM inserts
     # that omit kind (test fixtures, seeders), the latter backfills the migration's
@@ -79,3 +83,10 @@ class Category(Base, TimestampMixin):
     # keeps the column portable. No server_default: NULL is the intended sentinel,
     # not a gap to backfill.
     color: Mapped[str | None] = mapped_column(String(16), default=None)
+
+    parent: Mapped[Category | None] = relationship(
+        "Category", remote_side="Category.id", back_populates="subcategories"
+    )
+    subcategories: Mapped[list[Category]] = relationship(
+        "Category", back_populates="parent", cascade="all, delete-orphan"
+    )

@@ -53,7 +53,6 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.schema import CreateIndex
 
 from alembic import command
-from app.core import clock
 from app.core.config import get_settings
 from app.core.db import make_engine
 from app.models import (
@@ -66,12 +65,10 @@ from app.models import (
     Transaction,
     User,
 )
-from app.services.demo_seed import seed_demo_data
 from app.services.provisioning import (
     _DEFAULT_INCOME_CATEGORIES,
     _DEFAULT_SPEND_CATEGORIES,
     _MERCHANT_DICTIONARY,
-    provision_default_categories,
 )
 from app.services.tag_service import pin_tag
 
@@ -1658,24 +1655,9 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
     """
     eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
-
         v1 = get_settings().v1_user_id
+        v1_val = v1.hex if hasattr(v1, "hex") else str(v1)
         other_user_id = uuid.uuid4()
-        session_factory = sessionmaker(bind=eng)
-        with session_factory() as s:
-            seed_demo_data(s, user_id=v1)
-            # A second, pre-existing user who registered before Phase A5 shipped: has
-            # categories (the old provision_default_categories), no merchant dictionary yet.
-            s.add(User(id=other_user_id))
-            s.flush()
-            provision_default_categories(s, other_user_id)
-            s.commit()
-
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")  # must not raise
-
         collisions = {
             "swiggy",
             "zomato",
@@ -1690,7 +1672,65 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
             "bookmyshow",
             "airtel",
         }
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
+            cats = dict(
+                conn.execute(
+                    text("SELECT name, id FROM categories WHERE user_id = :u AND kind = 'spend'"),
+                    {"u": v1_val},
+                ).fetchall()
+            )
+            inserted_canonicals: set[str] = set()
+            for _, canonical, cat_name in _MERCHANT_DICTIONARY:
+                if (
+                    canonical in collisions
+                    and cat_name in cats
+                    and canonical not in inserted_canonicals
+                ):
+                    inserted_canonicals.add(canonical)
+                    conn.execute(
+                        text(
+                            "INSERT INTO merchant_tag_map "
+                            "(user_id, merchant_normalized, category_id, "
+                            "hit_count, created_at, updated_at) "
+                            "VALUES (:u, :m, :c, 5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                        ),
+                        {"u": v1_val, "m": canonical, "c": cats[cat_name]},
+                    )
+            conn.execute(
+                text(
+                    "INSERT INTO users (id, created_at, updated_at) "
+                    "VALUES (:u, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"u": other_user_id.hex},
+            )
+            for name, color in _DEFAULT_SPEND_CATEGORIES:
+                conn.execute(
+                    text(
+                        "INSERT INTO categories "
+                        "(user_id, name, kind, color, is_seeded, created_at, updated_at) "
+                        "VALUES (:u, :name, 'spend', :color, 1, "
+                        "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    ),
+                    {"u": other_user_id.hex, "name": name, "color": color},
+                )
+            for name, color in _DEFAULT_INCOME_CATEGORIES:
+                conn.execute(
+                    text(
+                        "INSERT INTO categories "
+                        "(user_id, name, kind, color, is_seeded, created_at, updated_at) "
+                        "VALUES (:u, :name, 'income', :color, 1, "
+                        "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    ),
+                    {"u": other_user_id.hex, "name": name, "color": color},
+                )
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")  # must not raise
+
         distinct_canonicals = {c for _, c, _ in _MERCHANT_DICTIONARY}
+        session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             v1_maps = {
                 m.merchant_normalized: m.hit_count
@@ -1755,21 +1795,22 @@ def test_0032_downgrade_preserves_pinned_seed_row() -> None:
             # the precondition this test exists for.
             s.refresh(pinned)
             assert (pinned.hit_count, pinned.pinned) == (0, True)
-            survivor = (pinned.merchant_normalized, pinned.category_id)
 
         with eng.begin() as conn:
             command.downgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
 
+        # Pinned row survived; every other zero-hit seed row is gone.
         with session_factory() as s:
             rows = {
-                (m.merchant_normalized, m.category_id)
+                (m.merchant_normalized, m.hit_count, m.pinned)
                 for m in s.scalars(select(MerchantTagMap).where(MerchantTagMap.user_id == v1))
             }
+            survivor = ("netflix", 0, True)
             assert survivor in rows
-            # Every other untouched seed row still goes.
             assert rows == {survivor}
     finally:
         eng.dispose()
+
 
 
 def test_seed_bound_to_archived_category_not_created_via_migration() -> None:
@@ -1778,27 +1819,24 @@ def test_seed_bound_to_archived_category_not_created_via_migration() -> None:
     category must not receive a seed row, without disturbing any other category."""
     eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
     try:
+        v1 = get_settings().v1_user_id
+        v1_val = v1.hex if hasattr(v1, "hex") else str(v1)
         with eng.begin() as conn:
             command.upgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
-
-        v1 = get_settings().v1_user_id
-        session_factory = sessionmaker(bind=eng)
-        with session_factory() as s:
-            utilities = s.scalars(
-                select(Category).where(
-                    Category.user_id == v1,
-                    Category.kind == "spend",
-                    Category.name == "Utilities",
-                )
-            ).one()
-            utilities.archived_at = clock.naive_utcnow()
-            s.commit()
+            conn.execute(
+                text(
+                    "UPDATE categories SET archived_at = CURRENT_TIMESTAMP "
+                    "WHERE user_id = :u AND kind = 'spend' AND name = 'Utilities'"
+                ),
+                {"u": v1_val},
+            )
 
         with eng.begin() as conn:
             command.upgrade(_alembic_cfg(conn), "head")
 
         utilities_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name == "Utilities"}
         other_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name != "Utilities"}
+        session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             v1_maps = {
                 m.merchant_normalized

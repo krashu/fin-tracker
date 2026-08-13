@@ -104,6 +104,15 @@ def run_migrations_online() -> None:
     """
     existing = config.attributes.get("connection")
     if existing is not None:
+        if _is_sqlite():
+            try:
+                raw_conn = existing.connection.dbapi_connection
+                if raw_conn is not None:
+                    cursor = raw_conn.cursor()
+                    cursor.execute("PRAGMA foreign_keys=OFF")
+                    cursor.close()
+            except Exception:
+                pass
         context.configure(
             connection=existing,
             target_metadata=target_metadata,

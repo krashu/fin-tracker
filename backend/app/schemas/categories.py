@@ -59,6 +59,8 @@ class CategoryCreate(BaseModel):
     kind: CategoryKindStr = "spend"
     # Optional hex color; None (default) keeps the derive-from-id behaviour.
     color: str | None = None
+    # Optional parent category ID (must be a top-level category with parent_id IS NULL).
+    parent_id: int | None = None
 
     @field_validator("name", mode="after")
     @classmethod
@@ -80,6 +82,22 @@ class CategoryRead(BaseModel):
     is_seeded: bool
     archived_at: datetime | None
     color: str | None
+    parent_id: int | None = None
+
+
+class CategoryTreeRead(BaseModel):
+    """Hierarchical category schema for nested UI dropdowns and tree views."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    kind: CategoryKindStr
+    is_seeded: bool
+    archived_at: datetime | None
+    color: str | None
+    parent_id: int | None = None
+    subcategories: list[CategoryRead] = Field(default_factory=list)
 
 
 class CategoryUpdate(BaseModel):
@@ -113,6 +131,8 @@ class CategoryUpdate(BaseModel):
     # documented way to clear a picked color and revert to derive-from-id.
     # Omitted (not in model_fields_set) is a no-op via exclude_unset in the route.
     color: str | None = None
+    # Optional parent category ID (can be set to null to promote to root).
+    parent_id: int | None = None
 
     @field_validator("name", mode="after")
     @classmethod

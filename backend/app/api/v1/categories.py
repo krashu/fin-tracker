@@ -40,8 +40,8 @@ from sqlalchemy.exc import IntegrityError
 from app.api.deps import CurrentUserId, SessionDep
 from app.core import clock
 from app.core.db_errors import is_unique_violation
-from app.models import Category
-from app.schemas import CategoryCreate, CategoryRead, CategoryUpdate
+from app.models import Category, CategoryKindStr
+from app.schemas import CategoryCreate, CategoryRead, CategoryTreeRead, CategoryUpdate
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -56,17 +56,46 @@ def _is_name_dup(e: IntegrityError) -> bool:
     )
 
 
-@router.get("", response_model=list[CategoryRead])
+@router.get("", response_model=None)
 def list_categories(
     session: SessionDep,
     user_id: CurrentUserId,
-) -> list[Category]:
-    stmt = (
-        select(Category)
-        .where(Category.user_id == user_id, Category.archived_at.is_(None))
-        .order_by(Category.name.asc())
-    )
-    return list(session.scalars(stmt))
+    kind: CategoryKindStr | None = None,
+    tree: bool = False,
+) -> list[CategoryTreeRead] | list[CategoryRead]:
+    stmt = select(Category).where(Category.user_id == user_id, Category.archived_at.is_(None))
+    if kind is not None:
+        stmt = stmt.where(Category.kind == kind)
+    stmt = stmt.order_by(Category.name.asc())
+    categories = list(session.scalars(stmt))
+
+    if not tree:
+        return [CategoryRead.model_validate(c) for c in categories]
+
+    # Tree view: nest subcategories under parents
+    parents: list[CategoryTreeRead] = []
+    children_by_parent: dict[int, list[CategoryRead]] = {}
+    for c in categories:
+        if c.parent_id is not None:
+            children_by_parent.setdefault(c.parent_id, []).append(CategoryRead.model_validate(c))
+        else:
+            parents.append(
+                CategoryTreeRead(
+                    id=c.id,
+                    name=c.name,
+                    kind=c.kind,
+                    is_seeded=c.is_seeded,
+                    archived_at=c.archived_at,
+                    color=c.color,
+                    parent_id=None,
+                    subcategories=[],
+                )
+            )
+
+    for p in parents:
+        p.subcategories = children_by_parent.get(p.id, [])
+
+    return parents
 
 
 @router.post("", response_model=CategoryRead, status_code=status.HTTP_201_CREATED)
@@ -75,11 +104,36 @@ def create_category(
     session: SessionDep,
     user_id: CurrentUserId,
 ) -> Category:
+    if payload.parent_id is not None:
+        parent = session.scalar(
+            select(Category).where(
+                Category.id == payload.parent_id,
+                Category.user_id == user_id,
+                Category.archived_at.is_(None),
+            )
+        )
+        if parent is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="parent category not found",
+            )
+        if parent.parent_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="cannot nest category more than 2 levels deep",
+            )
+        if parent.kind != payload.kind:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="category kind must match parent category kind",
+            )
+
     category = Category(
         user_id=user_id,
         name=payload.name,
         kind=payload.kind,
         color=payload.color,
+        parent_id=payload.parent_id,
         is_seeded=False,
     )
     session.add(category)
@@ -120,9 +174,55 @@ def update_category(
     if not updates:
         # Empty body — no DB round-trip, no spurious updated_at bump.
         return category
+
+    if "parent_id" in updates and updates["parent_id"] is not None:
+        target_parent_id = updates["parent_id"]
+        if target_parent_id == category_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="category cannot be its own parent",
+            )
+        # Check if category already has active children
+        has_children = session.scalar(
+            select(Category.id)
+            .where(
+                Category.parent_id == category_id,
+                Category.user_id == user_id,
+                Category.archived_at.is_(None),
+            )
+            .limit(1)
+        )
+        if has_children is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="category has subcategories and cannot be assigned a parent",
+            )
+        parent = session.scalar(
+            select(Category).where(
+                Category.id == target_parent_id,
+                Category.user_id == user_id,
+                Category.archived_at.is_(None),
+            )
+        )
+        if parent is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="parent category not found",
+            )
+        if parent.parent_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="cannot nest category more than 2 levels deep",
+            )
+        if parent.kind != category.kind:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="category kind must match parent category kind",
+            )
+
     if "name" in updates and updates["name"] == category.name:
-        # Rename to same name — same short-circuit reasoning.
-        return category
+        del updates["name"]
+
     for field, value in updates.items():
         setattr(category, field, value)
     try:
@@ -157,14 +257,19 @@ def delete_category(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="category not found",
         ) from None
-    # Archive is a pure UPDATE (``archived_at``); ``merchant_tag_map`` rows are
-    # KEPT. F3 auto-tag never resurrects an archived bucket because both
-    # ``prefetch_tag_map`` and ``GET /rules`` filter ``Category.archived_at IS
-    # NULL`` — that filter is the load-bearing guard. Keeping the rows preserves
-    # user-authored ``pinned`` rules across an archive (they would return on a
-    # future un-archive) instead of silently, permanently destroying them.
-    # transactions.category_id is left pointing at the archived row — UI filters
-    # via archived_at, history is preserved.
-    category.archived_at = clock.utcnow()
+    now = clock.utcnow()
+    category.archived_at = now
+
+    # Also archive any active subcategories if a parent is archived
+    subcategories = session.scalars(
+        select(Category).where(
+            Category.parent_id == category_id,
+            Category.user_id == user_id,
+            Category.archived_at.is_(None),
+        )
+    ).all()
+    for sub in subcategories:
+        sub.archived_at = now
+
     session.commit()
     return None

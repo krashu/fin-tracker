@@ -15,7 +15,7 @@ from app.schemas.auth import (
 )
 from app.schemas.backup import BackupImportSummary
 from app.schemas.benchmark import BenchmarkRead, BenchmarkRefreshSummary
-from app.schemas.categories import CategoryCreate, CategoryRead, CategoryUpdate
+from app.schemas.categories import CategoryCreate, CategoryRead, CategoryTreeRead, CategoryUpdate
 from app.schemas.dashboards import (
     NET_WORTH_EXCLUDED_TYPES,
     AccountBalanceRow,
@@ -107,6 +107,7 @@ __all__ = [
     "CategoryRead",
     "CategoryRuleCreate",
     "CategoryRuleRead",
+    "CategoryTreeRead",
     "CategoryUpdate",
     "ChangePasswordRequest",
     "FxRefreshSummary",

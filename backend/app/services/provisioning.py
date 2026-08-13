@@ -32,9 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Category, MerchantAlias, MerchantTagMap
 
-# (name, color) — the active default spend categories. Colors are drawn from the
-# validated CATEGORY_PALETTE (frontend lib/categories.ts) and mirror migration
-# 0018; each spend seed gets a distinct hue, "Other" the neutral grey.
+# (name, color) — the legacy flat default spend categories.
 _DEFAULT_SPEND_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Food", "#d95926"),
     ("Groceries", "#6f9e15"),
@@ -50,13 +48,135 @@ _DEFAULT_SPEND_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Investment", "#008300"),
     ("Other", "#94a3b8"),
 )
-# (name, color) — the active default income categories. Colors mirror 0018;
-# income "Other" reuses the neutral grey.
+# (name, color) — the legacy flat default income categories.
 _DEFAULT_INCOME_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("Salary", "#008300"),
     ("Freelancing", "#2a78d6"),
     ("Cashback", "#c98500"),
     ("Other", "#94a3b8"),
+)
+
+# (parent_name, color, subcategories) — 2-level English taxonomy for Indian personal finance.
+_DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "Food & Dining",
+        "#d95926",
+        (
+            "Food",
+            "Groceries",
+            "Online Food Delivery",
+            "Restaurants & Cafes",
+            "Street Food & Snacks",
+            "Tea & Beverages",
+        ),
+    ),
+    (
+        "Household & Living",
+        "#6c5cd6",
+        (
+            "Rent",
+            "Rent & Maintenance",
+            "Quick Commerce",
+            "Domestic Staff / Household Help",
+            "Home Improvements",
+            "Furniture & Appliances",
+        ),
+    ),
+    (
+        "Bills & Utilities",
+        "#0e97c4",
+        (
+            "Utilities",
+            "Mobile & Wi-Fi Recharge",
+            "Electricity",
+            "LPG / Piped Gas",
+            "DTH / Cable",
+            "Water & Municipal Bills",
+        ),
+    ),
+    (
+        "Commute & Transportation",
+        "#2a78d6",
+        (
+            "Transport",
+            "Travel",
+            "Fuel / Petrol",
+            "Metro & Public Transit",
+            "Auto / Cab / Ride-Hailing",
+            "FASTag & Tolls",
+            "Vehicle Service & Repairs",
+        ),
+    ),
+    (
+        "Shopping & Lifestyle",
+        "#d55181",
+        (
+            "Shopping",
+            "Entertainment",
+            "Health",
+            "Subscriptions",
+            "Clothing & Apparel",
+            "Electronics & Gadgets",
+            "Personal Care & Grooming",
+            "Footwear & Accessories",
+            "OTT & Subscriptions",
+        ),
+    ),
+    (
+        "Family & Social",
+        "#b246c0",
+        (
+            "Gifts & Festival Celebrations",
+            "Family Support / Remittance",
+            "Education & Tuition",
+            "Charity & Donations",
+        ),
+    ),
+    (
+        "Savings & Investments",
+        "#008300",
+        (
+            "Investment",
+            "Mutual Funds / SIP",
+            "Gold",
+            "Stocks & Securities",
+            "Term & Health Insurance",
+            "Fixed Deposits / Savings",
+        ),
+    ),
+    (
+        "Loans & Settlements",
+        "#c23b6b",
+        (
+            "EMI",
+            "Credit Card Bill",
+            "Personal & Home Loan EMI",
+            "Friend & Group Splits",
+        ),
+    ),
+    (
+        "Other",
+        "#94a3b8",
+        (
+            "Other",
+        ),
+    ),
+)
+
+_DEFAULT_INCOME_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "Income",
+        "#008300",
+        (
+            "Salary",
+            "Freelancing",
+            "Freelancing / Consulting",
+            "Cashback",
+            "Investment Returns",
+            "Cashback & Rewards",
+            "Other",
+        ),
+    ),
 )
 
 # (pattern, canonical, category_name) — the seed merchant dictionary (research §13.6).
