@@ -1216,6 +1216,112 @@ export function listSpendByCategory(params: {
   );
 }
 
+export type HierarchicalSubcategorySpend = {
+  category_id: number | null;
+  category_name: string;
+  color: CategoryColor | null;
+  total_paise: number;
+  spend_paise: number;
+  percentage: number;
+  is_direct: boolean;
+};
+
+export type HierarchicalParentSpend = {
+  parent_id: number | null;
+  parent_name: string;
+  color: CategoryColor | null;
+  total_paise: number;
+  spend_paise: number;
+  direct_paise: number;
+  percentage: number;
+  subcategories: HierarchicalSubcategorySpend[];
+};
+
+export type SubcategoryMover = {
+  category_id: number | null;
+  category_name: string;
+  parent_id: number | null;
+  parent_name: string | null;
+  current_paise: number;
+  previous_paise: number;
+  delta_paise: number;
+  growth_rate: number | null;
+};
+
+export type HierarchicalSpendResponse = {
+  period: string;
+  total_spend_paise: number;
+  parents: HierarchicalParentSpend[];
+  top_movers: SubcategoryMover[];
+  label_id: number | null;
+};
+
+export function getHierarchicalSpend(params: {
+  month?: string;
+  year?: string;
+  label_id?: number;
+}): Promise<HierarchicalSpendResponse> {
+  const qs = new URLSearchParams();
+  if (params.month) qs.set("month", params.month);
+  if (params.year) qs.set("year", params.year);
+  if (params.label_id != null) qs.set("label_id", String(params.label_id));
+  return request<HierarchicalSpendResponse>(
+    `/dashboards/hierarchical-spend?${qs}`,
+  );
+}
+
+export type HierarchicalTrendSubcategoryTotal = {
+  category_id: number | null;
+  category_name: string;
+  total_paise: number;
+};
+
+export type HierarchicalTrendParentTotal = {
+  parent_id: number | null;
+  parent_name: string;
+  total_paise: number;
+  subcategories: HierarchicalTrendSubcategoryTotal[];
+};
+
+export type HierarchicalTrendBucket = {
+  period: string;
+  totals: HierarchicalTrendParentTotal[];
+};
+
+export type HierarchicalParentRef = {
+  parent_id: number | null;
+  parent_name: string;
+  color: CategoryColor | null;
+  subcategories: SpendCategoryRef[];
+};
+
+export type HierarchicalTrendResponse = {
+  bucket: "week" | "month";
+  start: string;
+  end: string;
+  parents: HierarchicalParentRef[];
+  buckets: HierarchicalTrendBucket[];
+  label_id: number | null;
+};
+
+export function getHierarchicalTrend(params: {
+  bucket: "week" | "month";
+  start: string;
+  end: string;
+  label_id?: number;
+}): Promise<HierarchicalTrendResponse> {
+  const qs = new URLSearchParams({
+    bucket: params.bucket,
+    start: params.start,
+    end: params.end,
+  });
+  if (params.label_id != null) qs.set("label_id", String(params.label_id));
+  return request<HierarchicalTrendResponse>(
+    `/dashboards/hierarchical-trend?${qs}`,
+  );
+}
+
+
 /** One row of the spend-by-tag breakdown (PRD §F3a; tag-analysis arc Phase B).
  * `total_paise` is signed (spend negative, refund positive — nets within a tag,
  * like SpendByCategoryRow). Both ids are null for the untagged bucket (txns with

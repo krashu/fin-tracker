@@ -34,6 +34,14 @@ from app.schemas import (
     AvailableYearsResponse,
     CashflowByPeriodBucket,
     CashflowByPeriodResponse,
+    HierarchicalParentRef,
+    HierarchicalParentSpend,
+    HierarchicalSpendResponse,
+    HierarchicalSubcategorySpend,
+    HierarchicalTrendBucket,
+    HierarchicalTrendParentTotal,
+    HierarchicalTrendResponse,
+    HierarchicalTrendSubcategoryTotal,
     OverviewResponse,
     PeriodTotalsResponse,
     SpendByCategoryByPeriodBucket,
@@ -49,6 +57,7 @@ from app.schemas import (
     SpendByTagRow,
     SpendCategoryPeriodTotal,
     SpendCategoryRef,
+    SubcategoryMover,
     TaggingStatsResponse,
     TagRef,
     TopMerchantRow,
@@ -1216,3 +1225,364 @@ def tagging_stats(
         pre_tagged=pre_tagged,
         coverage_rate=(pre_tagged / imported_total) if imported_total else None,
     )
+
+
+@router.get("/hierarchical-spend", response_model=HierarchicalSpendResponse)
+def hierarchical_spend(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    month: Annotated[str | None, Query()] = None,
+    year: Annotated[str | None, Query()] = None,
+    label_id: Annotated[int | None, Query(gt=0)] = None,
+) -> HierarchicalSpendResponse:
+    """Two-level hierarchical spend breakdown and top subcategory movers."""
+    window = _period_window(month, year)
+    first, last = window.first, window.last
+
+    # Determine previous period window (prior month or prior year)
+    if window.mon is not None:
+        y, m = window.year, window.mon
+        prev_m = 12 if m == 1 else m - 1
+        prev_y = y - 1 if m == 1 else y
+        prev_window = _period_window(f"{prev_y:04d}-{prev_m:02d}", None)
+    else:
+        prev_window = _period_window(None, str(window.year - 1))
+
+    # Fetch all user categories in one query for fast O(1) lookup
+    all_cats = {
+        c.id: c
+        for c in session.execute(
+            select(Category).where(Category.user_id == user_id)
+        ).scalars().all()
+    }
+
+    # Query current period signed sums by category_id
+    stmt = (
+        select(
+            Transaction.category_id,
+            func.sum(Transaction.amount_paise).label("total_paise"),
+        )
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.transaction_type == "spend",
+            Transaction.date >= first,
+            Transaction.date <= last,
+        )
+        .group_by(Transaction.category_id)
+    )
+    stmt = confirmed_only(stmt)
+    if label_id is not None:
+        stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
+
+    current_totals: dict[int | None, int] = {
+        cat_id: int(tot) for cat_id, tot in session.execute(stmt).all()
+    }
+
+    # Query previous period signed sums by category_id for movers
+    prev_stmt = (
+        select(
+            Transaction.category_id,
+            func.sum(Transaction.amount_paise).label("total_paise"),
+        )
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.transaction_type == "spend",
+            Transaction.date >= prev_window.first,
+            Transaction.date <= prev_window.last,
+        )
+        .group_by(Transaction.category_id)
+    )
+    prev_stmt = confirmed_only(prev_stmt)
+    if label_id is not None:
+        prev_stmt = prev_stmt.where(Transaction.labels.any(Label.id == label_id))
+
+    prev_totals: dict[int | None, int] = {
+        cat_id: int(tot) for cat_id, tot in session.execute(prev_stmt).all()
+    }
+
+    # Total spend magnitude (sum of negative amounts negated, clamped to >= 0)
+    total_spend_paise = sum(-tot for tot in current_totals.values() if tot < 0)
+
+    # In-memory grouping by parent category
+    parent_map: dict[int | None, list[tuple[int | None, int]]] = defaultdict(list)
+    direct_spend_map: dict[int | None, int] = defaultdict(int)
+
+    for cat_id, tot in current_totals.items():
+        if cat_id is None:
+            parent_map[None].append((None, tot))
+            direct_spend_map[None] += tot
+            continue
+
+        cat = all_cats.get(cat_id)
+        if not cat:
+            # Orphan / unknown: treat as its own parent
+            parent_map[cat_id].append((cat_id, tot))
+            direct_spend_map[cat_id] += tot
+            continue
+
+        if cat.parent_id is not None:
+            parent_map[cat.parent_id].append((cat_id, tot))
+        else:
+            parent_map[cat.id].append((cat.id, tot))
+            direct_spend_map[cat.id] += tot
+
+    parents_list: list[HierarchicalParentSpend] = []
+
+    for p_id, items in parent_map.items():
+        parent_obj = all_cats.get(p_id) if p_id is not None else None
+        parent_name = (
+            parent_obj.name
+            if parent_obj
+            else ("Uncategorized" if p_id is None else f"Category {p_id}")
+        )
+        parent_color = parent_obj.color if parent_obj else None
+
+        parent_total_paise = sum(tot for _, tot in items)
+        parent_spend_paise = max(0, -parent_total_paise) if parent_total_paise < 0 else 0
+        direct_total = direct_spend_map.get(p_id, 0)
+        direct_paise = max(0, -direct_total) if direct_total < 0 else 0
+
+        parent_percentage = (
+            round((parent_spend_paise / total_spend_paise) * 100.0, 2)
+            if total_spend_paise > 0
+            else 0.0
+        )
+
+        subcats: list[HierarchicalSubcategorySpend] = []
+        for cat_id, tot in items:
+            c_obj = all_cats.get(cat_id) if cat_id is not None else None
+            is_direct = (cat_id == p_id) or (cat_id is None and p_id is None)
+
+            if is_direct and cat_id is not None:
+                c_name = f"{parent_name} (Direct)"
+            elif c_obj:
+                c_name = c_obj.name
+            else:
+                c_name = "Uncategorized" if cat_id is None else f"Category {cat_id}"
+
+            c_color = c_obj.color if (c_obj and c_obj.color) else parent_color
+            sub_spend_paise = max(0, -tot) if tot < 0 else 0
+            sub_pct = (
+                round((sub_spend_paise / parent_spend_paise) * 100.0, 2)
+                if parent_spend_paise > 0
+                else 0.0
+            )
+
+            subcats.append(
+                HierarchicalSubcategorySpend(
+                    category_id=cat_id,
+                    category_name=c_name,
+                    color=c_color,
+                    total_paise=tot,
+                    spend_paise=sub_spend_paise,
+                    percentage=sub_pct,
+                    is_direct=is_direct,
+                )
+            )
+
+        # Sort subcategories: most-negative first
+        subcats.sort(key=lambda s: s.total_paise)
+
+        parents_list.append(
+            HierarchicalParentSpend(
+                parent_id=p_id,
+                parent_name=parent_name,
+                color=parent_color,
+                total_paise=parent_total_paise,
+                spend_paise=parent_spend_paise,
+                direct_paise=direct_paise,
+                percentage=parent_percentage,
+                subcategories=subcats,
+            )
+        )
+
+    # Sort parents: categorized first by most-negative total, uncategorized pinned last
+    parents_list.sort(
+        key=lambda p: (
+            p.parent_id is None,
+            p.total_paise,
+            p.parent_id or 0,
+        )
+    )
+
+    # Calculate Top Movers (fastest growing & contracting subcategories)
+    all_seen_cats = set(current_totals.keys()) | set(prev_totals.keys())
+    movers: list[SubcategoryMover] = []
+
+    for cat_id in all_seen_cats:
+        c_obj = all_cats.get(cat_id) if cat_id is not None else None
+        p_obj = (
+            all_cats.get(c_obj.parent_id) if (c_obj and c_obj.parent_id is not None) else None
+        )
+
+        c_name = (
+            c_obj.name
+            if c_obj
+            else ("Uncategorized" if cat_id is None else f"Category {cat_id}")
+        )
+        p_id = c_obj.parent_id if c_obj else None
+        p_name = p_obj.name if p_obj else (c_name if p_id is None else None)
+
+        curr_raw = current_totals.get(cat_id, 0)
+        prev_raw = prev_totals.get(cat_id, 0)
+        curr_spend = max(0, -curr_raw)
+        prev_spend = max(0, -prev_raw)
+        delta = curr_spend - prev_spend
+
+        if curr_spend == 0 and prev_spend == 0:
+            continue
+
+        if prev_spend <= 0:
+            growth_rate = 100.0 if curr_spend > 0 else None
+        else:
+            growth_rate = round(((curr_spend - prev_spend) / prev_spend) * 100.0, 1)
+
+        movers.append(
+            SubcategoryMover(
+                category_id=cat_id,
+                category_name=c_name,
+                parent_id=p_id,
+                parent_name=p_name,
+                current_paise=curr_spend,
+                previous_paise=prev_spend,
+                delta_paise=delta,
+                growth_rate=growth_rate,
+            )
+        )
+
+    # Sort movers by absolute delta magnitude descending, cap at top 8
+    movers.sort(key=lambda m: abs(m.delta_paise), reverse=True)
+    top_movers = movers[:8]
+
+    return HierarchicalSpendResponse(
+        period=window.key,
+        total_spend_paise=total_spend_paise,
+        parents=parents_list,
+        top_movers=top_movers,
+        label_id=label_id,
+    )
+
+
+@router.get("/hierarchical-trend", response_model=HierarchicalTrendResponse)
+def hierarchical_trend(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    bucket: Annotated[Literal["week", "month"], Query()],
+    start: Annotated[date, Query()],
+    end: Annotated[date, Query()],
+    label_id: Annotated[int | None, Query(gt=0)] = None,
+) -> HierarchicalTrendResponse:
+    """Stacked hierarchical parent and subcategory spend series over [start, end]."""
+    _require_ordered(start, end)
+
+    # All user categories
+    all_cats = {
+        c.id: c
+        for c in session.execute(
+            select(Category).where(Category.user_id == user_id)
+        ).scalars().all()
+    }
+
+    # Query all confirmed spend transactions in window
+    stmt = (
+        select(
+            Transaction.date,
+            Transaction.category_id,
+            Transaction.amount_paise,
+        )
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.transaction_type == "spend",
+            Transaction.date >= start,
+            Transaction.date <= end,
+        )
+    )
+    stmt = confirmed_only(stmt)
+    if label_id is not None:
+        stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
+
+    rows = session.execute(stmt).all()
+
+    # Bucket rows into (period_label, parent_id, category_id) -> signed sum
+    period_parent_sub_totals: dict[tuple[str, int | None, int | None], int] = defaultdict(int)
+    active_parents_set: set[int | None] = set()
+    active_subcats_by_parent: dict[int | None, set[int | None]] = defaultdict(set)
+
+    for txn_date, cat_id, amount_paise in rows:
+        p_label = _bucket_of(txn_date, bucket).period
+        cat = all_cats.get(cat_id) if cat_id is not None else None
+        p_id = cat.parent_id if (cat and cat.parent_id is not None) else cat_id
+
+        period_parent_sub_totals[(p_label, p_id, cat_id)] += int(amount_paise)
+        active_parents_set.add(p_id)
+        active_subcats_by_parent[p_id].add(cat_id)
+
+    # Build parent metadata refs
+    parents_ref: list[HierarchicalParentRef] = []
+    for p_id in sorted(active_parents_set, key=lambda x: (x is None, x or 0)):
+        p_obj = all_cats.get(p_id) if p_id is not None else None
+        p_name = (
+            p_obj.name
+            if p_obj
+            else ("Uncategorized" if p_id is None else f"Category {p_id}")
+        )
+        p_color = p_obj.color if p_obj else None
+
+        sub_refs: list[SpendCategoryRef] = []
+        for c_id in sorted(active_subcats_by_parent[p_id], key=lambda x: (x is None, x or 0)):
+            c_obj = all_cats.get(c_id) if c_id is not None else None
+            if c_id == p_id and c_id is not None:
+                c_name = f"{p_name} (Direct)"
+            elif c_obj:
+                c_name = c_obj.name
+            else:
+                c_name = "Uncategorized" if c_id is None else f"Category {c_id}"
+            sub_refs.append(SpendCategoryRef(category_id=c_id, category_name=c_name))
+
+        parents_ref.append(
+            HierarchicalParentRef(
+                parent_id=p_id,
+                parent_name=p_name,
+                color=p_color,
+                subcategories=sub_refs,
+            )
+        )
+
+    # Build dense zero-filled buckets for all periods
+    buckets: list[HierarchicalTrendBucket] = []
+    for period in _iter_periods(start, end, bucket):
+        parent_totals: list[HierarchicalTrendParentTotal] = []
+        for pref in parents_ref:
+            p_id = pref.parent_id
+            sub_totals: list[HierarchicalTrendSubcategoryTotal] = []
+            p_sum = 0
+            for sref in pref.subcategories:
+                c_id = sref.category_id
+                tot = period_parent_sub_totals.get((period, p_id, c_id), 0)
+                p_sum += tot
+                sub_totals.append(
+                    HierarchicalTrendSubcategoryTotal(
+                        category_id=c_id,
+                        category_name=sref.category_name or "Category",
+                        total_paise=tot,
+                    )
+                )
+            parent_totals.append(
+                HierarchicalTrendParentTotal(
+                    parent_id=p_id,
+                    parent_name=pref.parent_name,
+                    total_paise=p_sum,
+                    subcategories=sub_totals,
+                )
+            )
+        buckets.append(HierarchicalTrendBucket(period=period, totals=parent_totals))
+
+    return HierarchicalTrendResponse(
+        bucket=bucket,
+        start=start,
+        end=end,
+        parents=parents_ref,
+        buckets=buckets,
+        label_id=label_id,
+    )
+

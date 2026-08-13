@@ -81,7 +81,36 @@ export function nextCategoryColor(
   );
 }
 
+/** Generate a distinct tint/shade of a parent color for subcategory visualization. */
+export function deriveSubcategoryColor(
+  parentColor: string | null | undefined,
+  index: number,
+  total: number,
+): string {
+  if (!parentColor || !parentColor.startsWith("#")) {
+    return "var(--muted-foreground)";
+  }
+  if (total <= 1) return parentColor;
+
+  const hex = parentColor.replace("#", "");
+  const num = parseInt(
+    hex.length === 3 ? hex.split("").map((x) => x + x).join("") : hex,
+    16,
+  );
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+
+  const factor = total > 1 ? 0.4 + (0.6 * (total - 1 - index)) / (total - 1) : 0.85;
+  const mixR = Math.round(r * factor + 240 * (1 - factor) * 0.2);
+  const mixG = Math.round(g * factor + 240 * (1 - factor) * 0.2);
+  const mixB = Math.round(b * factor + 240 * (1 - factor) * 0.2);
+
+  return `rgb(${mixR}, ${mixG}, ${mixB})`;
+}
+
 export type CategoryTreeNode = CategoryRead & {
+
   subcategories: CategoryRead[];
 };
 
