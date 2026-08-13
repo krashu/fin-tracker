@@ -52,7 +52,11 @@ import {
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel } from "@/lib/charts";
 import { periodRange } from "@/lib/period";
-import { categoryColorVar, resolveCategoryColor } from "@/lib/categories";
+import {
+  categoryColorVar,
+  categoryDisplayName,
+  resolveCategoryColor,
+} from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
 
@@ -113,28 +117,62 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
       : null,
   );
 
-  // One row per month for the selected category. `value` is the signed magnitude
-  // (`-total_paise`): spend positive, net-credit month negative (dips below y=0).
+  const activeCatObj = allCategories.find((c) => c.id === activeCat?.category_id);
+  const activeDisplayName = useMemo(() => {
+    if (!activeCat) return "Uncategorized";
+    if (activeCat.category_id == null) return "Uncategorized";
+    return categoryDisplayName(activeCatObj, allCategories);
+  }, [activeCat, activeCatObj, allCategories]);
+
+  // Set of category IDs to aggregate for the active selection. If a parent category
+  // is selected, this includes the parent ID and all its child subcategory IDs.
+  const activeTargetCategoryIds = useMemo(() => {
+    if (!activeCat || activeCat.category_id == null) return null;
+    const catId = activeCat.category_id;
+    const children = allCategories.filter((c) => c.parent_id === catId);
+    if (children.length === 0) return new Set([catId]);
+    return new Set([catId, ...children.map((c) => c.id)]);
+  }, [activeCat, allCategories]);
+
+  // One row per month for the selected category (with parent rollup support).
+  // `value` is the signed magnitude (`-total_paise`): spend positive, net-credit
+  // month negative (dips below y=0).
   const data = useMemo(() => {
     const buckets = query.data?.buckets ?? [];
     return buckets.map((b) => {
-      const cell = b.totals.find((t) => keyFor(t.category_id) === activeKey);
+      if (activeTargetCategoryIds == null) {
+        // Uncategorized
+        const cell = b.totals.find((t) => t.category_id == null);
+        return {
+          label: periodLabel(b.period, "month"),
+          value: cell ? -cell.total_paise : 0,
+        };
+      }
+
+      // Sum all matching cells (parent + subcategories if parent selected)
+      let totalPaise = 0;
+      for (const t of b.totals) {
+        if (t.category_id != null && activeTargetCategoryIds.has(t.category_id)) {
+          totalPaise += t.total_paise;
+        }
+      }
+
       return {
         label: periodLabel(b.period, "month"),
-        value: cell ? -cell.total_paise : 0,
+        value: -totalPaise,
       };
     });
-  }, [query.data, activeKey]);
+  }, [query.data, activeTargetCategoryIds]);
 
   const chartConfig = useMemo(
     () =>
       ({
         value: {
-          label: activeCat?.category_name ?? "Uncategorized",
+          label: activeDisplayName,
           color: activeColor,
         },
       }) satisfies ChartConfig,
-    [activeCat?.category_name, activeColor],
+    [activeDisplayName, activeColor],
   );
 
   return (
@@ -158,27 +196,36 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
                       : null
                   }
                 />
-                {activeCat?.category_name ?? "Uncategorized"}
+                <span className="truncate max-w-[160px]">{activeDisplayName}</span>
                 <IconChevronDown className="size-3 opacity-70" />
               </Pill>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="max-h-72 w-48">
-              {cats.map((c) => (
-                <DropdownMenuItem
-                  key={keyFor(c.category_id)}
-                  onSelect={() => setSelectedKey(keyFor(c.category_id))}
-                >
-                  <CategoryDot
-                    categoryId={c.category_id}
-                    color={
-                      c.category_id != null
-                        ? (colorById.get(c.category_id) ?? null)
-                        : null
-                    }
-                  />
-                  {c.category_name ?? "Uncategorized"}
-                </DropdownMenuItem>
-              ))}
+            <DropdownMenuContent align="end" className="max-h-72 w-56">
+              {cats.map((c) => {
+                const cObj = allCategories.find((cat) => cat.id === c.category_id);
+                const displayName =
+                  c.category_id == null
+                    ? "Uncategorized"
+                    : categoryDisplayName(cObj, allCategories);
+
+                return (
+                  <DropdownMenuItem
+                    key={keyFor(c.category_id)}
+                    onSelect={() => setSelectedKey(keyFor(c.category_id))}
+                    className="flex items-center gap-2"
+                  >
+                    <CategoryDot
+                      categoryId={c.category_id}
+                      color={
+                        c.category_id != null
+                          ? (colorById.get(c.category_id) ?? null)
+                          : null
+                      }
+                    />
+                    <span className="truncate">{displayName}</span>
+                  </DropdownMenuItem>
+                );
+              })}
             </DropdownMenuContent>
           </DropdownMenu>
         ) : null}

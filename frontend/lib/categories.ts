@@ -2,6 +2,7 @@ import type {
   CategoryColor,
   CategoryKind,
   CategoryRead,
+  SpendByCategoryRow,
   TransactionType,
 } from "@/lib/api/client";
 
@@ -193,4 +194,159 @@ export function getReparentingOptions(
       c.id !== currentCategory.id,
   );
 }
+
+export type SubcategorySpendItem = {
+  categoryId: number | null;
+  categoryName: string;
+  totalPaise: number;
+  isDirect?: boolean;
+};
+
+export type ParentSpendRollup = {
+  parentId: number | null;
+  parentName: string | null;
+  totalPaise: number;
+  directPaise: number;
+  subcategories: SubcategorySpendItem[];
+};
+
+/**
+ * Roll up a flat list of `SpendByCategoryRow` into parent categories based on
+ * the 2-level taxonomy. If a row belongs to a subcategory, its total is added to
+ * the parent's total and recorded in the parent's `subcategories` list.
+ * Any spend assigned directly to the parent category is tracked as directPaise.
+ * Uncategorized spend is preserved with `parentId: null`.
+ */
+export function rollUpSpendByCategory(
+  rows: readonly SpendByCategoryRow[],
+  allCategories: readonly CategoryRead[],
+): ParentSpendRollup[] {
+  const catMap = ensureCategoryMap(allCategories);
+  const rollupMap = new Map<number | null, ParentSpendRollup>();
+
+  for (const row of rows) {
+    if (row.category_id == null) {
+      // Uncategorized
+      const existing = rollupMap.get(null) ?? {
+        parentId: null,
+        parentName: null,
+        totalPaise: 0,
+        directPaise: 0,
+        subcategories: [],
+      };
+      existing.totalPaise += row.total_paise;
+      existing.directPaise += row.total_paise;
+      rollupMap.set(null, existing);
+      continue;
+    }
+
+    const cat = catMap.get(row.category_id);
+    if (!cat) {
+      // Category not found in lookup: treat as its own parent
+      const existing = rollupMap.get(row.category_id) ?? {
+        parentId: row.category_id,
+        parentName: row.category_name,
+        totalPaise: 0,
+        directPaise: 0,
+        subcategories: [],
+      };
+      existing.totalPaise += row.total_paise;
+      existing.directPaise += row.total_paise;
+      rollupMap.set(row.category_id, existing);
+      continue;
+    }
+
+    if (cat.parent_id != null) {
+      // Subcategory: roll up to parent
+      const parent = catMap.get(cat.parent_id);
+      const pId = cat.parent_id;
+      const pName = parent ? parent.name : (row.category_name ?? "Parent");
+      const existing = rollupMap.get(pId) ?? {
+        parentId: pId,
+        parentName: pName,
+        totalPaise: 0,
+        directPaise: 0,
+        subcategories: [],
+      };
+      existing.totalPaise += row.total_paise;
+      existing.subcategories.push({
+        categoryId: cat.id,
+        categoryName: cat.name,
+        totalPaise: row.total_paise,
+      });
+      rollupMap.set(pId, existing);
+    } else {
+      // Direct spend on parent category
+      const pId = cat.id;
+      const pName = cat.name;
+      const existing = rollupMap.get(pId) ?? {
+        parentId: pId,
+        parentName: pName,
+        totalPaise: 0,
+        directPaise: 0,
+        subcategories: [],
+      };
+      existing.totalPaise += row.total_paise;
+      existing.directPaise += row.total_paise;
+      rollupMap.set(pId, existing);
+    }
+  }
+
+  // Sort subcategories inside each parent most-negative first
+  for (const rollup of rollupMap.values()) {
+    rollup.subcategories.sort((a, b) => a.totalPaise - b.totalPaise);
+  }
+
+  // Sort rollups: categorized first, most-negative total first, uncategorized last
+  const list = Array.from(rollupMap.values());
+  return list.sort((a, b) => {
+    if (a.parentId === null) return 1;
+    if (b.parentId === null) return -1;
+    return a.totalPaise - b.totalPaise;
+  });
+}
+
+/**
+ * Get subcategory breakdown items for a specific parent category, including
+ * a direct spend entry if there was spend directly on the parent.
+ */
+export function getParentSubcategorySpend(
+  rows: readonly SpendByCategoryRow[],
+  parentId: number,
+  allCategories: readonly CategoryRead[],
+): SubcategorySpendItem[] {
+  const catMap = ensureCategoryMap(allCategories);
+  const parent = catMap.get(parentId);
+  const items: SubcategorySpendItem[] = [];
+  let directPaise = 0;
+
+  for (const row of rows) {
+    if (row.category_id == null) continue;
+    if (row.category_id === parentId) {
+      directPaise += row.total_paise;
+      continue;
+    }
+    const cat = catMap.get(row.category_id);
+    if (cat && cat.parent_id === parentId) {
+      items.push({
+        categoryId: cat.id,
+        categoryName: cat.name,
+        totalPaise: row.total_paise,
+      });
+    }
+  }
+
+  // If there's direct spend on the parent, include a direct item
+  if (directPaise !== 0) {
+    items.push({
+      categoryId: parentId,
+      categoryName: `${parent?.name ?? "General"} (Direct)`,
+      totalPaise: directPaise,
+      isDirect: true,
+    });
+  }
+
+  return items.sort((a, b) => a.totalPaise - b.totalPaise);
+}
+
 

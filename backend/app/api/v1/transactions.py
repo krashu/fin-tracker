@@ -54,14 +54,21 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import CurrentUserId, SessionDep
 from app.core import clock
 from app.core.db_errors import is_unique_violation
-from app.models import Account, CategoryKindStr, Label, Transaction, TransactionTypeStr
+from app.models import (
+    Account,
+    Category,
+    CategoryKindStr,
+    Label,
+    Transaction,
+    TransactionTypeStr,
+)
 from app.schemas import (
     TransactionCreate,
     TransactionRead,
@@ -153,11 +160,14 @@ def list_transactions(
             else Transaction.amount_paise < 0
         )
     if category_id is not None:
-        # Drilldown filter for the F8 spend-by-category surface. No
-        # ?uncategorized=true sentinel in v1 — defer until a real consumer
-        # asks for the null-only drilldown (FastAPI int|None Query parsing
-        # is fiddly enough that adding it speculatively is CLAUDE.md §2).
-        stmt = stmt.where(Transaction.category_id == category_id)
+        # Drilldown filter for the F8 spend-by-category surface.
+        # Matches the category itself OR any child subcategories where parent_id == category_id.
+        # Tenant isolation: Category.user_id == user_id ensures cross-user queries yield empty.
+        cat_subquery = select(Category.id).where(
+            Category.user_id == user_id,
+            or_(Category.id == category_id, Category.parent_id == category_id),
+        )
+        stmt = stmt.where(Transaction.category_id.in_(cat_subquery))
     if label_id is not None:
         # F3a label filter. `.any()` → EXISTS subquery (one link per (txn, label)),
         # so there is no join-row duplication and offset/limit pagination stays

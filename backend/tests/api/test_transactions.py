@@ -241,6 +241,87 @@ def test_list_filter_by_category(
     assert rows[0]["category_id"] == food.id
 
 
+def test_list_filter_by_parent_category_includes_subcategories(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """?category_id=<parent_id> returns txns assigned to parent AND all its child subcategories."""
+    parent = _seed_category(session, axis_account.user_id, name="Food & Dining")
+    groceries = Category(
+        user_id=axis_account.user_id,
+        name="Groceries",
+        kind="spend",
+        parent_id=parent.id,
+        is_seeded=False,
+    )
+    restaurants = Category(
+        user_id=axis_account.user_id,
+        name="Restaurants",
+        kind="spend",
+        parent_id=parent.id,
+        is_seeded=False,
+    )
+    other = _seed_category(session, axis_account.user_id, name="Transport")
+    session.add_all([groceries, restaurants])
+    session.commit()
+    session.refresh(groceries)
+    session.refresh(restaurants)
+
+    session.add_all(
+        [
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 10),
+                amount_paise=-1000,
+                fingerprint="fp-parent-direct",
+                category_id=parent.id,
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 11),
+                amount_paise=-2000,
+                fingerprint="fp-groceries",
+                category_id=groceries.id,
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 12),
+                amount_paise=-3000,
+                fingerprint="fp-restaurants",
+                category_id=restaurants.id,
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 13),
+                amount_paise=-4000,
+                fingerprint="fp-other",
+                category_id=other.id,
+            ),
+        ]
+    )
+    session.commit()
+
+    # Query parent -> gets direct parent + groceries + restaurants (3 txns)
+    resp = client.get(f"/api/v1/transactions?category_id={parent.id}")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 3
+    cat_ids = {r["category_id"] for r in rows}
+    assert cat_ids == {parent.id, groceries.id, restaurants.id}
+
+    # Query subcategory directly -> gets only that subcategory (1 txn)
+    resp_sub = client.get(f"/api/v1/transactions?category_id={groceries.id}")
+    assert resp_sub.status_code == 200
+    rows_sub = resp_sub.json()
+    assert len(rows_sub) == 1
+    assert rows_sub[0]["category_id"] == groceries.id
+
+
 def test_list_filter_by_label(
     client: TestClient,
     axis_account: Account,
