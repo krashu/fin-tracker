@@ -153,10 +153,15 @@ def boom_route() -> Iterator[str]:
 def test_status_to_level_5xx_error(boom_route: str) -> None:
     # raise_server_exceptions=False so TestClient returns the framework
     # 500 instead of bubbling the RuntimeError up into the test thread.
-    with (
-        TestClient(app, raise_server_exceptions=False) as c,
-        structlog.testing.capture_logs() as logs,
-    ):
+    #
+    # Constructed WITHOUT ``with`` on purpose: the lifespan would run app.main's
+    # V1_USER_ID guard against the real ``SessionLocal`` — this test takes no DB
+    # fixture, so that hits the dev database and fails with "no such table: users"
+    # whenever it isn't migrated. The middleware under test runs regardless of
+    # lifespan, and ``configure_logging()`` is already applied by the autouse
+    # fixture in tests/conftest.py. Same pattern as tests/api/test_health.py.
+    c = TestClient(app, raise_server_exceptions=False)
+    with structlog.testing.capture_logs() as logs:
         resp = c.get(boom_route)
     assert resp.status_code == 500
     failed = [e for e in logs if e.get("event") == "request_failed"]
@@ -192,7 +197,10 @@ def test_request_id_propagates_into_handler_log(logging_route: str) -> None:
     # _capture_with_contextvars keeps ``merge_contextvars`` in the chain so
     # the handler's log inherits ``request_id`` from the middleware's
     # contextvar binding (which is exactly what we're verifying).
-    with TestClient(app) as c, _capture_with_contextvars() as logs:
+    #
+    # No ``with`` on the client — see test_status_to_level_5xx_error above.
+    c = TestClient(app)
+    with _capture_with_contextvars() as logs:
         resp = c.get(logging_route)
     handler = [e for e in logs if e.get("event") == "handler_event"]
     completed = [e for e in logs if e.get("event") == "request_completed"]

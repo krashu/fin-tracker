@@ -44,6 +44,7 @@ import {
   type TransactionRead,
 } from "@/lib/api/client";
 import { formatDate, formatINR } from "@/lib/format";
+import { resolveSiblingDisplayColor } from "@/lib/categories";
 import { periodParams, type Period } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
@@ -108,15 +109,20 @@ export function Overview() {
   // as the expenses board (else the same category would show two colors).
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
   });
 
   const data = overviewQuery.data;
   const accountsById = new Map<number, string>(
     (data?.accounts ?? []).map((a) => [a.account_id, a.name]),
   );
+  // Resolved (not raw) color — an inheriting subcategory has `color: null`
+  // and `CategoryDot`/`categoryColorVar` can't inherit on their own, so a raw
+  // lookup rendered its dot grey (8.7, the last such caller after Phase 5's
+  // audit of the other 9).
+  const allCategories = categoriesQuery.data ?? [];
   const categoryColorById = new Map<number, CategoryColor | null>(
-    (categoriesQuery.data ?? []).map((c) => [c.id, c.color]),
+    allCategories.map((c) => [c.id, resolveSiblingDisplayColor(c, allCategories)]),
   );
   const holdings = holdingsQuery.data?.holdings ?? [];
   // "Unpriced" = no NAV at all. Kept separate from the FX case below, which DOES

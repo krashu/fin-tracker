@@ -94,7 +94,7 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
   });
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
   });
   // Never offer an account the backend will reject (investment can't hold
   // transactions; the list endpoint already omits archived).
@@ -114,10 +114,10 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
 
   const type = directionToType(direction);
   const selectedAccount = accounts.find((a) => a.id === accountId) ?? null;
-  // Lookup stays over the full list; only the picker options are kind-filtered.
+  // Lookup stays over the full list; the picker options are kind-filtered inside
+  // `CategorySelector`, from the `kind` prop below.
   const selectedCategory = categories.find((c) => c.id === categoryId) ?? null;
   const categoryKind = categoryKindForType(type);
-  const visibleCategories = categories.filter((c) => c.kind === categoryKind);
   // Single source for both the guard and the request body.
   const magnitude = rupeesToPaise(amount);
 

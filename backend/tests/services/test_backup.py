@@ -37,6 +37,8 @@ from app.parsers.backup_csv import (
     CATEGORIES_CSV,
     METADATA_JSON,
     TRANSACTIONS_CSV,
+    ParsedBackup,
+    ParsedBackupCategory,
     _parse_dt,
     parse_backup_zip,
 )
@@ -779,11 +781,14 @@ def test_restore_of_a_legacy_refund_typed_row_stores_it_as_spend(
     assert txn.amount_paise == 50000  # unchanged — the alias never re-signs.
 
 
-def test_backup_restore_hierarchical_categories_roundtrip(
-    session: Session, user_id: UUID
-) -> None:
+def test_backup_restore_hierarchical_categories_roundtrip(session: Session, user_id: UUID) -> None:
     """Two-level category hierarchy preserves parent-child relationships
     through export and import.
+
+    Explicitly the export_service.py parent pull-in case (:130-142, pinned directly at
+    ``test_export_pulls_in_a_parent_category_with_no_direct_transactions`` below): the only
+    transaction here is tagged to ``sub_cat``, and ``parent_cat`` carries none of its own —
+    so this also proves the pulled-in parent survives end to end, not just onto the wire.
     """
     axis = Account(
         user_id=user_id,
@@ -839,14 +844,10 @@ def test_backup_restore_hierarchical_categories_roundtrip(
         assert not result.warnings
 
         restored_parent = target_session.scalar(
-            select(Category).where(
-                Category.user_id == target_uid, Category.name == "Food & Dining"
-            )
+            select(Category).where(Category.user_id == target_uid, Category.name == "Food & Dining")
         )
         restored_sub = target_session.scalar(
-            select(Category).where(
-                Category.user_id == target_uid, Category.name == "Groceries"
-            )
+            select(Category).where(Category.user_id == target_uid, Category.name == "Groceries")
         )
         assert restored_parent is not None
         assert restored_sub is not None
@@ -858,3 +859,101 @@ def test_backup_restore_hierarchical_categories_roundtrip(
         )
         assert restored_txn is not None
         assert restored_txn.category_id == restored_sub.id
+
+
+def test_export_pulls_in_a_parent_category_with_no_direct_transactions(
+    session: Session, user_id: UUID
+) -> None:
+    """4.3: pin ``export_service.py``'s parent pull-in (:130-142) directly at the wire,
+    independent of the full restore round trip above. Only the CHILD is referenced by any
+    transaction; the parent has none of its own and must still land in ``categories.csv``
+    with a resolvable ``parent_name``, or the child would restore as an orphaned root.
+    """
+    axis = Account(user_id=user_id, name="Axis Bank", type="bank", opening_balance_paise=0)
+    parent = Category(user_id=user_id, name="Food & Dining", kind="spend", color="#4f46e5")
+    session.add_all([axis, parent])
+    session.flush()
+    child = Category(user_id=user_id, name="Groceries", kind="spend", parent_id=parent.id)
+    session.add(child)
+    session.flush()
+    _add_txn(
+        session,
+        user_id=user_id,
+        account_id=axis.id,
+        day=10,
+        amount=-1000,
+        txn_type="spend",
+        merchant_norm="blinkit",
+        category_id=child.id,  # only the child is referenced — parent has no direct txn
+    )
+    session.commit()
+
+    zip_bytes = build_backup_zip(session, user_id=user_id)
+    parsed_categories = parse_backup_zip(zip_bytes).categories
+
+    assert {c.name for c in parsed_categories} == {"Food & Dining", "Groceries"}
+    by_name = {c.name: c for c in parsed_categories}
+    assert by_name["Food & Dining"].parent_name is None
+    assert by_name["Groceries"].parent_name == "Food & Dining"
+
+
+def test_backup_with_a_3_level_category_chain_flattens_the_grandchild_with_a_warning(
+    session: Session, user_id: UUID
+) -> None:
+    """4.2: ADR-0012 caps depth at 2. A backup row whose ``parent_name`` names a row that
+    is ITSELF a subcategory — a hand-edited CSV's declared threat model, or an ordering
+    accident in a partial backup — must not be linked three deep. It flattens to a root,
+    and says so in ``warnings``, rather than silently deepening the tree.
+
+    Built via a hand-constructed ``ParsedBackup`` (bypassing the CSV/zip round trip):
+    ``build_backup_zip`` itself only ever pulls in ONE hop (test above), so there is no
+    way to *produce* a 3-level chain through the real export path — this drives the
+    importer directly, the way a hand-edited backup would reach it.
+    """
+    parsed = ParsedBackup(
+        accounts=[],
+        categories=[
+            ParsedBackupCategory(
+                line_no=2, name="Food & Dining", kind="spend", color=None, archived_at=None
+            ),
+            ParsedBackupCategory(
+                line_no=3,
+                name="Groceries",
+                kind="spend",
+                color=None,
+                archived_at=None,
+                parent_name="Food & Dining",
+            ),
+            ParsedBackupCategory(
+                line_no=4,
+                name="Organic Groceries",
+                kind="spend",
+                color=None,
+                archived_at=None,
+                parent_name="Groceries",  # Groceries is itself a subcategory
+            ),
+        ],
+        transactions=[],
+        warnings=[],
+    )
+
+    result = persist_backup(session, user_id=user_id, parsed=parsed, source_file_hash="hash")
+    session.commit()
+
+    assert result.categories_new == 3
+    # Exact string: the warning has to name BOTH the flattened row and the parent it was
+    # refused, or a user reading it can't tell which row moved. The previous substring
+    # triple ("Organic Groceries" not in w and "Groceries" in w and "subcategory" in w)
+    # was a way to prove the message named the PARENT and not the child — but "Groceries"
+    # is a substring of "Organic Groceries", so it pinned the child's absence as contract
+    # and would have passed on an otherwise garbled message.
+    assert result.warnings == [
+        "categories.csv row 4: category 'Organic Groceries' — parent category 'Groceries' "
+        "is itself a subcategory, restored as a root category (depth is capped at 2)"
+    ]
+
+    by_name = {
+        c.name: c for c in session.scalars(select(Category).where(Category.user_id == user_id))
+    }
+    assert by_name["Groceries"].parent_id == by_name["Food & Dining"].id  # untouched, 2 levels
+    assert by_name["Organic Groceries"].parent_id is None  # flattened, NOT nested 3 deep

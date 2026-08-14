@@ -38,8 +38,9 @@ import { cn } from "@/lib/utils";
 
 import { NAV_GROUPS } from "./nav-config";
 
-// Cap the entity groups so a long list never buries the nav section (and the
-// empty-query view stays scannable). Nav is uncapped — it's a small fixed set.
+// Cap the entity groups in the RESTING (empty-query) view so a long list never
+// buries the nav section. Search results are deliberately uncapped — see `scope`
+// below. Nav is uncapped either way; it's a small fixed set.
 const ENTITY_CAP = 6;
 
 type PaletteItem =
@@ -75,7 +76,7 @@ export function CommandPalette({
   });
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
     enabled: open,
   });
 
@@ -131,8 +132,15 @@ export function CommandPalette({
   const groups = useMemo<PaletteGroup[]>(() => {
     const match = (label: string) => label.toLowerCase().includes(q);
     const scope = (items: PaletteItem[], cap?: number) => {
-      const filtered = q ? items.filter((i) => match(i.label)) : items;
-      return cap != null ? filtered.slice(0, cap) : filtered;
+      if (!q) return cap != null ? items.slice(0, cap) : items;
+      // Capping a SEARCH is different from capping the resting list. The cap
+      // exists so the empty-query view stays scannable and nav isn't buried;
+      // applied to filtered results it silently dropped matches the user had
+      // typed an exact name for — with two levels of categories there are now
+      // 65 flat entries, so a parent with 6+ descendants could never surface
+      // its own row no matter how completely you typed it. Once there IS a
+      // query the list is already narrowed by intent, so leave it whole.
+      return items.filter((i) => match(i.label));
     };
     return [
       { heading: "Go to", items: scope(navItems) },

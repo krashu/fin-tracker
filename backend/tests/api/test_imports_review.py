@@ -151,6 +151,8 @@ def test_candidates_returns_only_pending_rows_of_this_batch(
         "transaction_type",
         "merchant_raw",
         "category_id",
+        "category_name",
+        "category_parent_name",
         "transfer_pair_id",
         "labels",
         "prior_matches",

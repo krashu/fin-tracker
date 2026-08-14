@@ -1,5 +1,7 @@
 # Fin Tracker
 
+**Author:** Ashutosh
+
 Personal finance tracker for Indian banks + global investments — import statements, auto-tag transactions, track an INR+USD portfolio with proper XIRR, all locally.
 
 ![License](https://img.shields.io/badge/license-MIT-green)

@@ -38,7 +38,11 @@ import {
 import { accountLabel } from "@/lib/accounts";
 import { formatINR, formatDate } from "@/lib/format";
 import { thisMonthAnchor, monthKey, monthRange, yearRange } from "@/lib/dates";
-import { resolveCategoryColor } from "@/lib/categories";
+import {
+  categoryLabel,
+  isArchivedCategoryId,
+  resolveCategoryColor,
+} from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
 import { LabelChip } from "@/components/labels/label-chip";
@@ -69,7 +73,12 @@ export function ExpensesBoard() {
 
   // Filters (type view, account/category by id, month navigator) + bulk selection.
   // `monthAnchor` is always a real first-of-month (drives the stepper); `allDates`
-  // is the escape hatch that drops the month range. Default: the current month.
+  // is the escape hatch that drops the month range (still bounded to `year`),
+  // and `allYears` is the wider one that drops the year bound too — both date
+  // bounds omitted, so every date matches. `allYears` wins whenever both are
+  // true; toggling it off returns to whatever `allDates`/`monthAnchor` already
+  // held, so it never needs its own memory of "the year to go back to".
+  // Default: the current month.
   // account/category seed from the URL (deep-link on a fresh mount); the effects
   // below keep them in sync when the palette re-navigates on the same route.
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("spending");
@@ -80,6 +89,7 @@ export function ExpensesBoard() {
   const [labelId, setLabelId] = useState<number | undefined>(undefined);
   const [monthAnchor, setMonthAnchor] = useState(thisMonthAnchor);
   const [allDates, setAllDates] = useState(false);
+  const [allYears, setAllYears] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   // Derived, not its own state: onYearChange keeps monthAnchor's year in sync
   // (below), so a separate `year` state was purely redundant — and updating it
@@ -109,8 +119,15 @@ export function ExpensesBoard() {
   // Cap forward stepping at the current month — no future spend to browse.
   const atCurrentMonth = monthKey(monthAnchor) === monthKey(thisMonthAnchor());
   // Stable string for the query key (never a raw Date — TanStack identity-hashes
-  // objects) and the human-readable "scope" of what's loaded.
-  const monthScope = allDates ? `year-${year}` : monthKey(monthAnchor);
+  // objects) and the human-readable "scope" of what's loaded. "all-years" can't
+  // collide with the `year-${year}` shape (that's always a 4-digit number) or
+  // with `monthKey`'s "YYYY-MM" — a distinct scope is what keeps this query
+  // from silently serving a cached single-year page under the new state.
+  const monthScope = allYears
+    ? "all-years"
+    : allDates
+      ? `year-${year}`
+      : monthKey(monthAnchor);
 
   // "Active" = any filter off its default view (Spending · all accounts · all
   // categories · current month · current year). Drives the Clear pill's visibility.
@@ -121,6 +138,7 @@ export function ExpensesBoard() {
     categoryId != null ||
     labelId != null ||
     allDates ||
+    allYears ||
     year !== currentYear ||
     !atCurrentMonth;
 
@@ -139,6 +157,7 @@ export function ExpensesBoard() {
     setLabelId(undefined);
     setMonthAnchor(thisMonthAnchor());
     setAllDates(false);
+    setAllYears(false);
     resetView();
   }
 
@@ -162,7 +181,7 @@ export function ExpensesBoard() {
         account_id: accountId,
         category_id: categoryId,
         label_id: labelId,
-        ...(allDates ? yearRange(year) : monthRange(monthAnchor)),
+        ...(allYears ? {} : allDates ? yearRange(year) : monthRange(monthAnchor)),
       }),
     getNextPageParam: (lastPage, pages) =>
       lastPage.length === PAGE_SIZE ? pages.length * PAGE_SIZE : undefined,
@@ -173,7 +192,7 @@ export function ExpensesBoard() {
   });
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
   });
   const labelsQuery = useQuery({
     queryKey: ["labels"],
@@ -226,7 +245,12 @@ export function ExpensesBoard() {
 
   return (
     <>
-      <SummaryStrip year={year} monthAnchor={monthAnchor} allDates={allDates} />
+      <SummaryStrip
+        year={year}
+        monthAnchor={monthAnchor}
+        allDates={allDates}
+        allYears={allYears}
+      />
 
       <FilterRow
         accounts={accountsQuery.data ?? []}
@@ -240,6 +264,7 @@ export function ExpensesBoard() {
         availableYears={availableYears}
         monthAnchor={monthAnchor}
         allDates={allDates}
+        allYears={allYears}
         atCurrentMonth={atCurrentMonth}
         hasActiveFilters={hasActiveFilters}
         onClearFilters={clearFilters}
@@ -272,26 +297,43 @@ export function ExpensesBoard() {
           // Keep the monthAnchor's month index but move it to the new year —
           // `year` (derived above) follows automatically on the next render.
           // If the current month is in the future for the selected year,
-          // clamp to December.
+          // clamp to December. Picking a year is also the way back from
+          // "All years" to a single one.
           const curMonth = monthAnchor.getMonth();
           const now = new Date();
           const maxMonth = y === now.getFullYear() ? now.getMonth() : 11;
           const newMonth = Math.min(curMonth, maxMonth);
           setMonthAnchor(new Date(y, newMonth, 1));
           setAllDates(false);
+          setAllYears(false);
           resetView();
         }}
         onStepMonth={(delta) => {
-          // Stepping picks a concrete month → leave All-dates mode. A pure
-          // updater — crossing a year boundary just changes what `monthAnchor`
-          // holds, and the derived `year` above reflects that on the next
-          // render with no separate setState needed.
+          // Stepping picks a concrete month → leave All-dates/All-years mode.
+          // A pure updater — crossing a year boundary just changes what
+          // `monthAnchor` holds, and the derived `year` above reflects that on
+          // the next render with no separate setState needed.
           setMonthAnchor((a) => new Date(a.getFullYear(), a.getMonth() + delta, 1));
           setAllDates(false);
+          setAllYears(false);
           resetView();
         }}
         onToggleAllDates={() => {
-          setAllDates((v) => !v);
+          // Clicking "All months" while "All years" is active always lands on
+          // "all months of the current year" — a plain toggle here would
+          // instead flip whatever `allDates` had silently become while it was
+          // masked by `allYears`, which is not the obvious outcome of the
+          // click the user actually made.
+          if (allYears) {
+            setAllYears(false);
+            setAllDates(true);
+          } else {
+            setAllDates((v) => !v);
+          }
+          resetView();
+        }}
+        onToggleAllYears={() => {
+          setAllYears((v) => !v);
           resetView();
         }}
       />
@@ -360,11 +402,29 @@ export function ExpensesBoard() {
                     t.category_id != null
                       ? categoriesById.get(t.category_id)
                       : undefined;
-                  const parentCategory =
-                    category?.parent_id != null
-                      ? categoriesById.get(category.parent_id)
-                      : undefined;
-                  const categoryName = category?.name ?? "Uncategorized";
+                  // "Parent → Sub" — the same convention as every other
+                  // category surface (spend-by-category's flat view, the rules
+                  // list). This used to render inverted (the leaf name bold on
+                  // its own line, the parent name muted beneath) — the only
+                  // surface that did (8.3).
+                  //
+                  // On a lookup miss the row's category is archived, and the
+                  // wire's `category_name`/`category_parent_name` name it. Before
+                  // that, the miss fell through to "Uncategorized" — flatly
+                  // contradicting the archive dialog's promise that "existing
+                  // transactions will keep their historical categories", and
+                  // reading as though the assignment had been lost. The FK is
+                  // intact throughout (`test_soft_delete_keeps_transactions`).
+                  const categoryArchived = isArchivedCategoryId(
+                    t.category_id,
+                    categoriesById,
+                  );
+                  const categoryName = categoryLabel(
+                    t.category_id,
+                    categoriesById,
+                    t.category_name,
+                    t.category_parent_name,
+                  );
                   const merchant = t.merchant_raw?.trim() || "—";
                   return (
                     <TxnRow
@@ -374,8 +434,9 @@ export function ExpensesBoard() {
                       merchant={merchant}
                       labels={t.labels}
                       categoryId={t.category_id}
-                      categoryName={categoryName}
-                      parentCategoryName={parentCategory?.name ?? null}
+                      categoryName={
+                        categoryArchived ? `${categoryName} (archived)` : categoryName
+                      }
                       categoryColor={resolveCategoryColor(category, categoriesById)}
                       accountName={account?.name ?? "—"}
                       accountLast4={account?.last4 ?? null}
@@ -450,7 +511,6 @@ function TxnRow({
   labels,
   categoryId,
   categoryName,
-  parentCategoryName,
   categoryColor,
   accountName,
   accountLast4,
@@ -465,7 +525,6 @@ function TxnRow({
   labels: LabelRead[];
   categoryId: number | null;
   categoryName: string;
-  parentCategoryName?: string | null;
   categoryColor: CategoryColor | null;
   accountName: string;
   accountLast4: string | null;
@@ -552,22 +611,12 @@ function TxnRow({
       <Td borderClass={border}>
         <div className="flex min-w-0 items-center gap-2">
           <CategoryDot categoryId={categoryId} color={categoryColor} />
-          <div className="flex min-w-0 flex-col">
-            <span
-              className="truncate text-[12.5px] font-medium text-foreground/90"
-              style={{ letterSpacing: "-0.003em" }}
-            >
-              {categoryName}
-            </span>
-            {parentCategoryName ? (
-              <span
-                className="truncate text-[10.5px] text-muted-foreground/70"
-                style={{ letterSpacing: "-0.002em" }}
-              >
-                {parentCategoryName}
-              </span>
-            ) : null}
-          </div>
+          <span
+            className="min-w-0 truncate text-[12.5px] font-medium text-foreground/90"
+            style={{ letterSpacing: "-0.003em" }}
+          >
+            {categoryName}
+          </span>
         </div>
       </Td>
 

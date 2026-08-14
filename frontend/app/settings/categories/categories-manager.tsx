@@ -47,7 +47,7 @@ import {
   buildCategoryTree,
   getReparentingOptions,
   nextCategoryColor,
-  resolveCategoryColor,
+  resolveSiblingDisplayColor,
   type CategoryTreeNode,
 } from "@/lib/categories";
 import { invalidateRules } from "@/lib/queries/invalidate";
@@ -326,7 +326,12 @@ function ParentCategoryCard({
       {parent.subcategories.length > 0 ? (
         <div className="bg-muted/15 pb-1">
           {parent.subcategories.map((sub) => {
-            const subColor = resolveCategoryColor(sub, allCategories);
+            // Siblings rendered side by side — the shade-aware resolver, not
+            // the plain family hue, so an inheriting sibling's swatch reads
+            // as distinct from its siblings' (and from the parent's own dot
+            // elsewhere), rather than all rendering the identical parent
+            // colour (locked decision #5 / 5.6 / 8.6).
+            const subColor = resolveSiblingDisplayColor(sub, allCategories);
             return (
               <div
                 key={sub.id}
@@ -419,11 +424,10 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
       : nextCategoryColor(props.existingColors),
   );
 
-  // Eligible parent options
+  // Eligible parent options — kind + archived-exclusion now live inside the
+  // helper itself (8.4), so no caller-side re-filter is needed here.
   const eligibleParents = useMemo(() => {
-    return getReparentingOptions(category ?? null, allCategories).filter(
-      (c) => c.kind === kind,
-    );
+    return getReparentingOptions(category ?? null, allCategories, kind);
   }, [category, allCategories, kind]);
 
   const selectedParent = useMemo(

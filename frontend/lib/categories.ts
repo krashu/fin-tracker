@@ -81,36 +81,7 @@ export function nextCategoryColor(
   );
 }
 
-/** Generate a distinct tint/shade of a parent color for subcategory visualization. */
-export function deriveSubcategoryColor(
-  parentColor: string | null | undefined,
-  index: number,
-  total: number,
-): string {
-  if (!parentColor || !parentColor.startsWith("#")) {
-    return "var(--muted-foreground)";
-  }
-  if (total <= 1) return parentColor;
-
-  const hex = parentColor.replace("#", "");
-  const num = parseInt(
-    hex.length === 3 ? hex.split("").map((x) => x + x).join("") : hex,
-    16,
-  );
-  const r = (num >> 16) & 255;
-  const g = (num >> 8) & 255;
-  const b = num & 255;
-
-  const factor = total > 1 ? 0.4 + (0.6 * (total - 1 - index)) / (total - 1) : 0.85;
-  const mixR = Math.round(r * factor + 240 * (1 - factor) * 0.2);
-  const mixG = Math.round(g * factor + 240 * (1 - factor) * 0.2);
-  const mixB = Math.round(b * factor + 240 * (1 - factor) * 0.2);
-
-  return `rgb(${mixR}, ${mixG}, ${mixB})`;
-}
-
 export type CategoryTreeNode = CategoryRead & {
-
   subcategories: CategoryRead[];
 };
 
@@ -142,13 +113,24 @@ export function buildCategoryTree(
     }
   }
 
-  // Handle any orphan subcategories whose parent_id does not exist in categories
+  // Promote any subcategory whose parent is absent from this (possibly
+  // pre-filtered — category-selector.tsx, categories-manager.tsx,
+  // review-queue.tsx all call this on a filtered list) input, OR present but
+  // itself not a root. The latter is a defence-in-depth case: the backend caps
+  // depth at 2, so a "grandchild" can't exist in honest full data, but a
+  // filtered list can make a genuine child look like a third level if its
+  // actual parent got filtered out while something else took that id's slot
+  // in a stale render. Either way the node must not silently disappear
+  // (ADR-0012: both tree builders must agree a dropped row is never correct).
   for (const c of categories) {
-    if (c.parent_id !== null && !byId.has(c.parent_id)) {
-      roots.push({
-        ...c,
-        subcategories: [],
-      });
+    if (c.parent_id !== null) {
+      const parent = byId.get(c.parent_id);
+      if (!parent || parent.parent_id !== null) {
+        roots.push({
+          ...c,
+          subcategories: [],
+        });
+      }
     }
   }
 
@@ -179,6 +161,167 @@ export function resolveCategoryColor(
   return null;
 }
 
+function hexToRgb(hex: string): [number, number, number] {
+  const n = parseInt(hex.replace("#", ""), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function rgbToHex(r: number, g: number, b: number): CategoryColor {
+  const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+  return `#${[r, g, b].map((v) => clamp(v).toString(16).padStart(2, "0")).join("")}`;
+}
+
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d === 0) return [0, 0, l];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  let h: number;
+  if (max === rn) h = ((gn - bn) / d) % 6;
+  else if (max === gn) h = (bn - rn) / d + 2;
+  else h = (rn - gn) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return [h, s, l];
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (h < 60) [r, g, b] = [c, x, 0];
+  else if (h < 120) [r, g, b] = [x, c, 0];
+  else if (h < 180) [r, g, b] = [0, c, x];
+  else if (h < 240) [r, g, b] = [0, x, c];
+  else if (h < 300) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+
+/** Fixed HSL-lightness deltas, cycled by sibling index. Symmetric around 0 so
+ * early siblings don't all skew lighter (or darker) in the same direction;
+ * six entries cover the seeded taxonomy's largest sibling groups without a
+ * repeat, and the cycle repeats past that rather than growing unboundedly. */
+const SHADE_LIGHTNESS_DELTA = [0, -0.16, 0.14, -0.28, 0.24, -0.08] as const;
+
+/**
+ * A distinct shade of `parentHue` for the sibling at `siblingIndex` — locked
+ * decision #5 (color inherits one hop; siblings are separated by a derived
+ * shade of the parent hue, never an unrelated colour). Takes the *resolved*
+ * hue (`resolveCategoryColor`'s output, never a raw `category.color`, which
+ * can't inherit and renders grey for a `NULL` child — see `CategoryDot`) and
+ * varies HSL lightness by a fixed per-index delta, clamped well clear of
+ * white/black so the result still reads as the same family. Purely a display
+ * derivation: never stored, never round-tripped through the API.
+ *
+ * `resolveCategoryColor` itself is untouched by this — it keeps returning the
+ * plain family hue for a lone dot (e.g. the board row, one transaction at a
+ * time). Apply this shade only where two siblings render side by side: a flat
+ * list, a drilldown, a dropdown.
+ */
+export function siblingShade(
+  parentHue: CategoryColor,
+  siblingIndex: number,
+): CategoryColor {
+  const [r, g, b] = hexToRgb(parentHue);
+  const [h, s, l] = rgbToHsl(r, g, b);
+  const delta =
+    SHADE_LIGHTNESS_DELTA[
+      ((siblingIndex % SHADE_LIGHTNESS_DELTA.length) +
+        SHADE_LIGHTNESS_DELTA.length) %
+        SHADE_LIGHTNESS_DELTA.length
+    ];
+  const shadedL = Math.min(0.82, Math.max(0.18, l + delta));
+  const [nr, ng, nb] = hslToRgb(h, s, shadedL);
+  return rgbToHex(nr, ng, nb);
+}
+
+/**
+ * Resolve the *display* color for a category shown alongside its siblings —
+ * `resolveCategoryColor`'s hue, shaded by `siblingShade` when the category is
+ * an inheriting child (no color of its own, per locked decision #5's `NULL`
+ * seed). A root, or a child carrying its own explicit color, renders as-is —
+ * only the inherited case needs separating from its siblings. The sibling
+ * index is derived from `allCategories` sorted by id, not from the order rows
+ * happen to appear in a particular query result, so a category's shade stays
+ * the same across periods and views.
+ */
+export function resolveSiblingDisplayColor(
+  category: CategoryRead | null | undefined,
+  allCategories: readonly CategoryRead[],
+): CategoryColor | null {
+  if (!category) return null;
+  const resolved = resolveCategoryColor(category, ensureCategoryMap(allCategories));
+  if (!resolved) return null;
+  if (category.color || category.parent_id == null) return resolved;
+  const siblings = allCategories
+    .filter((c) => c.parent_id === category.parent_id)
+    .sort((a, b) => a.id - b.id);
+  const index = siblings.findIndex((c) => c.id === category.id);
+  return siblingShade(resolved, index < 0 ? 0 : index);
+}
+
+/** Display label for a category **id**, tolerating an ARCHIVED category.
+ *
+ * `GET /categories` returns active rows only (`categories.py`, no
+ * `include_archived` exists), so a historical row pointing at an archived
+ * category misses `lookup`. Passing that miss to `categoryDisplayName` answers
+ * "Uncategorized" — a *different fact*, and a lie about the user's data: the
+ * archive dialog promises "existing transactions will keep their historical
+ * categories", and the FK genuinely survives (`test_soft_delete_keeps_transactions`).
+ *
+ * So resolve by id, not by an already-missed object:
+ * - no id at all            → genuinely "Uncategorized"
+ * - id present, row active   → the full "Parent → Child" breadcrumb
+ * - id present, row archived → `storedName` if the caller has it on the wire,
+ *   else "Archived category"
+ *
+ * Callers with a denormalized name on the wire: `TransactionRead`
+ * (`category_name` + `category_parent_name`, so an archived row keeps its
+ * breadcrumb), `SpendByCategoryRow.category_name` and
+ * `SpendCategoryRef.category_name` (own name only — those aggregates carry no
+ * parent, so an archived row there renders unqualified). All are joined on
+ * id + `user_id`, deliberately never `archived_at`.
+ *
+ * Mirrors the accounts precedent — `accounts-manager.tsx`'s
+ * `Archived account (#id)` — whose comment states the same principle: absent
+ * from the active list is not the same as unset.
+ */
+export function categoryLabel(
+  categoryId: number | null | undefined,
+  lookup: Map<number, CategoryRead> | readonly CategoryRead[],
+  storedName?: string | null,
+  storedParentName?: string | null,
+): string {
+  if (categoryId == null) return "Uncategorized";
+  const map = ensureCategoryMap(lookup);
+  const category = map.get(categoryId);
+  // Active rows resolve through the live list, never the stored copy, so a
+  // rename shows up without refetching every transaction that references it.
+  if (category) return categoryDisplayName(category, map);
+  if (!storedName) return "Archived category";
+  return storedParentName ? `${storedParentName} → ${storedName}` : storedName;
+}
+
+/** True when an id points at a category absent from the active list — i.e.
+ * archived. Separate from {@link categoryLabel} so a caller can decorate the
+ * label (an "(archived)" marker) without re-resolving it. */
+export function isArchivedCategoryId(
+  categoryId: number | null | undefined,
+  lookup: Map<number, CategoryRead> | readonly CategoryRead[],
+): boolean {
+  if (categoryId == null) return false;
+  return !ensureCategoryMap(lookup).has(categoryId);
+}
+
 /** Format a category name as "Parent → Subcategory" or "Parent". */
 export function categoryDisplayName(
   category: CategoryRead | null | undefined,
@@ -193,25 +336,33 @@ export function categoryDisplayName(
   return category.name;
 }
 
-/** Get eligible parent categories for reparenting a given category.
- * Rules:
- * 1. Must be same kind (spend vs income).
- * 2. Must be a root category (parent_id === null) — max 2 levels.
+/** Get eligible parent categories for reparenting a given category (or, when
+ * `currentCategory` is `null`, for a category being newly created). Rules:
+ * 1. Must match `kind` (spend vs income) — the caller's requested kind, not
+ *    necessarily `currentCategory.kind`: create-mode has no category yet, and
+ *    edit-mode's kind is immutable but still driven by the same form state.
+ * 2. Must be an active (non-archived) root category (`parent_id === null`) —
+ *    max 2 levels. `allCategories` today only ever holds active rows (`GET
+ *    /categories` filters `archived_at IS NULL` server-side — see
+ *    `test_list_omits_archived`), so this check is currently a no-op; it's
+ *    kept because this is an exported, general-purpose helper and its own
+ *    contract shouldn't quietly depend on every future caller sourcing data
+ *    the same way (8.4).
  * 3. Cannot be the category itself.
- * 4. If current category already has subcategories, it cannot be assigned a parent (cannot nest). */
+ * 4. If current category already has subcategories, it cannot be assigned a
+ *    parent (cannot nest).
+ * Both the kind and archived filters used to be left to the caller
+ * (`categories-manager.tsx` re-filtered by kind after calling this); pushed
+ * in here so there's one place that knows the eligibility rule. */
 export function getReparentingOptions(
   currentCategory: CategoryRead | null,
   allCategories: readonly CategoryRead[],
+  kind: CategoryKind,
 ): CategoryRead[] {
-  if (!currentCategory) {
-    // For creating a new category
-    return allCategories.filter((c) => c.parent_id === null);
-  }
-
   // Check if current category already has active children
-  const hasChildren = allCategories.some(
-    (c) => c.parent_id === currentCategory.id,
-  );
+  const hasChildren =
+    currentCategory != null &&
+    allCategories.some((c) => c.parent_id === currentCategory.id);
   if (hasChildren) {
     return [];
   }
@@ -219,8 +370,9 @@ export function getReparentingOptions(
   return allCategories.filter(
     (c) =>
       c.parent_id === null &&
-      c.kind === currentCategory.kind &&
-      c.id !== currentCategory.id,
+      c.kind === kind &&
+      c.archived_at == null &&
+      c.id !== currentCategory?.id,
   );
 }
 
@@ -321,6 +473,22 @@ export function rollUpSpendByCategory(
     }
   }
 
+  // A parent's own direct spend needs a row in `subcategories` too — not just
+  // in `directPaise` — so the count that gates the drilldown button and the
+  // "{n} subcat(s)" badge (spend-by-category.tsx) matches what the drilldown
+  // itself renders (`getParentSubcategorySpend` already synthesizes this same
+  // "(Direct)" row). Uncategorized (`parentId: null`) has no such concept.
+  for (const rollup of rollupMap.values()) {
+    if (rollup.parentId != null && rollup.directPaise !== 0) {
+      rollup.subcategories.push({
+        categoryId: rollup.parentId,
+        categoryName: `${rollup.parentName ?? "General"} (Direct)`,
+        totalPaise: rollup.directPaise,
+        isDirect: true,
+      });
+    }
+  }
+
   // Sort subcategories inside each parent most-negative first
   for (const rollup of rollupMap.values()) {
     rollup.subcategories.sort((a, b) => a.totalPaise - b.totalPaise);
@@ -377,5 +545,3 @@ export function getParentSubcategorySpend(
 
   return items.sort((a, b) => a.totalPaise - b.totalPaise);
 }
-
-

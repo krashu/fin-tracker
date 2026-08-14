@@ -17,9 +17,17 @@ from collections.abc import Iterable
 from uuid import UUID
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.models import Category, CategoryKindStr, TransactionTypeStr
+
+# The per-kind fallback bucket seeded by migrations 0003/0012 (PRD §F5). Resolved
+# by NAME because that is already how :func:`default_category_id` finds it, and
+# ``demo_seed._categories_by_kind`` hard-requires one active per kind — it raises
+# without one. Named here so the three places that depend on the same fact (the
+# import fallback, the demo-seed precondition, and the archive-cascade exemption
+# in ``app.api.v1.categories``) cannot drift apart.
+FALLBACK_CATEGORY_NAME = "Other"
 
 
 def kind_for_type(transaction_type: TransactionTypeStr) -> CategoryKindStr:
@@ -57,6 +65,42 @@ def validate_category_ids(
     if kind is not None:
         stmt = stmt.where(Category.kind == kind)
     return set(session.scalars(stmt))
+
+
+def resolve_category_labels(
+    session: Session, *, category_ids: Iterable[int], user_id: UUID
+) -> dict[int, tuple[str, str | None]]:
+    """Map each owned ``category_id`` to ``(name, parent_name)`` for **display**.
+
+    Deliberately does **not** filter ``archived_at`` — the opposite of
+    :func:`validate_category_ids`, and the difference is the point. Archiving is
+    soft (:doc:`/docs/adr/0012-category-hierarchy`): a transaction keeps its
+    ``category_id`` when its category is archived, and ``DELETE /categories``
+    promises exactly that ("existing transactions will keep their historical
+    categories"). But ``GET /categories`` returns active rows only, so the
+    frontend cannot name an archived category and rendered it as
+    "Uncategorized" — telling the user an assignment was lost that was not.
+
+    Same shape as the join behind ``GET /dashboards/spend-by-category``, which
+    already surfaces an archived category's stored name and is pinned by
+    ``test_archived_category_surfaces_with_stored_name``. Validation still runs
+    through ``validate_category_ids``; naming a row is not permission to assign
+    it, so the two must stay separate.
+
+    ``user_id`` is still restated (ADR-0003 rule 1) — an unowned id is simply
+    absent from the result, never named. One batched query; empty input → empty
+    dict with no query issued.
+    """
+    ids = set(category_ids)
+    if not ids:
+        return {}
+    parent = aliased(Category)
+    rows = session.execute(
+        select(Category.id, Category.name, parent.name)
+        .outerjoin(parent, Category.parent_id == parent.id)
+        .where(Category.id.in_(ids), Category.user_id == user_id)
+    ).all()
+    return {cid: (name, parent_name) for cid, name, parent_name in rows}
 
 
 def default_category_id(

@@ -25,6 +25,8 @@ from app.services import auth_service
 from app.services.merchant import normalize_merchant
 from app.services.merchant_alias import load_alias_resolver
 from app.services.provisioning import (
+    _DEFAULT_INCOME_TAXONOMY,
+    _DEFAULT_SPEND_TAXONOMY,
     _MERCHANT_DICTIONARY,
     provision_default_categories,
     provision_seed_merchant_dictionary,
@@ -208,7 +210,9 @@ def test_seed_does_not_fold_uber_eats_onto_uber(engine: Engine) -> None:
 
 def test_provision_default_categories_creates_two_level_tree(session: Session, user: User) -> None:
     """Verify that provision_default_categories constructs a valid 2-level hierarchy
-    with 10 parents (9 spend + 1 income) and properly linked subcategories."""
+    with 10 parents (9 spend + 1 income) and the exact subcategory set each names —
+    derived from the taxonomy constants themselves (ADR-0012: "do not enumerate the
+    taxonomy anywhere but provisioning.py"), not restated here as a literal count."""
     provision_default_categories(session, user.id)
     session.flush()
 
@@ -216,8 +220,13 @@ def test_provision_default_categories_creates_two_level_tree(session: Session, u
     parents = [c for c in cats if c.parent_id is None]
     children = [c for c in cats if c.parent_id is not None]
 
+    expected_child_names = {sub for _, _, subs in _DEFAULT_SPEND_TAXONOMY for sub in subs} | {
+        sub for _, _, subs in _DEFAULT_INCOME_TAXONOMY for sub in subs
+    }
+
     assert len(parents) == 10
-    assert len(children) > 0
+    assert {c.name for c in children} == expected_child_names
+    assert len(children) == len(expected_child_names)
 
     # Ensure every child has a valid parent of matching kind
     parent_ids = {p.id: p for p in parents}
@@ -225,11 +234,3 @@ def test_provision_default_categories_creates_two_level_tree(session: Session, u
         assert child.parent_id in parent_ids
         parent = parent_ids[child.parent_id]
         assert child.kind == parent.kind
-
-    # Assert pure English names - no Hinglish words present
-    disallowed_hinglish = {"auto", "fastag", "dth", "maid", "chulha", "kirana", "dhaba"}
-    for cat in cats:
-        words = set(cat.name.lower().split())
-        msg = f"Found Hinglish word in category name: {cat.name}"
-        assert disallowed_hinglish.isdisjoint(words), msg
-

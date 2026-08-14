@@ -52,6 +52,11 @@ dev = [
     # the warning fires inside starlette.testclient, not at any call site here. Test-only;
     # production httpx usage (NAV snapshot fetches, above) is untouched.
     "httpx2>=2.10.0,<3",
+    # Parallel test execution (`-n auto` in addopts below). Bought for wall clock, not
+    # isolation: every DB test already builds its own `:memory:` engine and the auth
+    # rate-limiter resets per test, so there was nothing to make parallel-safe. Pulls
+    # `execnet` (worker IPC). `-n0` disables it for debugging — see AGENTS.md §Commands.
+    "pytest-xdist>=3.8.0,<4",
 ]
 
 [tool.uv]
@@ -100,9 +105,15 @@ python-version = "3.13"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--cov --cov-report=term-missing"
+# `--durations` is the regression radar, not decoration: a 104ms argon2 call in one
+# fixture silently grew into 82s of this suite because nothing ever printed the slowest
+# tests. Deliberately NOT `-n auto` here — xdist costs ~17s of worker startup on 14
+# cores, which is a loss on the single-file runs pre-commit and debugging do. Parallelism
+# lives in the Makefile's full-suite targets instead.
+addopts = "--cov --cov-report=term-missing --durations=15"
 markers = [
     "real_pdf: requires _local/*.pdf fixtures and AXIS_TEST_PWD env var; skipped when absent",
+    "slow: single test costing >10s; deselected by `make test-fast`, always run by the gate",
 ]
 
 [tool.coverage.run]

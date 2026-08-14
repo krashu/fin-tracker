@@ -11,48 +11,52 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import Engine, create_engine, select, text
+from sqlalchemy import Engine, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import clock, demo
 from app.core.config import Settings
 from app.core.security import verify_password
-from app.models import Base, RefreshSession, User
+from app.models import RefreshSession, User
 from app.services import auth_service
 
 _PW = "correct horse battery"
 
+# These tests open their own `Session(engine)` blocks rather than taking the shared
+# `session` fixture — several of them need two concurrent sessions on one database, or
+# have to read a write back across a session boundary. They still take the shared
+# `engine` fixture (tests/services/conftest.py) so the connection is disposed on
+# teardown and FK enforcement matches the live database: the module used to build its
+# own bare `create_engine("sqlite://")`, which leaked a sqlite3 connection per test
+# (the suite's `ResourceWarning: unclosed database`, attributed by GC timing to
+# unrelated tests further down the run) and silently ran without `make_engine`'s
+# `PRAGMA foreign_keys=ON`.
 
-def _engine() -> Engine:
-    eng = create_engine("sqlite://")  # SingletonThreadPool → one shared connection
-    Base.metadata.create_all(eng)
-    return eng
 
-
-def test_register_duplicate_email_race(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_register_duplicate_email_race(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     """The concurrent-duplicate race (pre-check passes, a competing register commits
     during the argon2 hash window) must surface the flush() IntegrityError as
     EmailAlreadyExistsError → 409, not a raw IntegrityError → 500. Guards that
     flush()/provision/commit all sit inside the try."""
-    eng = _engine()
     orig_hash = auth_service.hash_password
 
     def racing_hash(pw: str) -> str:
         # Request A commits the same email during B's hashing window, then we
         # restore so only this first call races.
-        with Session(eng) as a:
+        with Session(engine) as a:
             a.add(User(email="race@example.com", password_hash="competing"))
             a.commit()
         monkeypatch.setattr(auth_service, "hash_password", orig_hash)
         return orig_hash(pw)
 
     monkeypatch.setattr(auth_service, "hash_password", racing_hash)
-    with Session(eng) as b, pytest.raises(auth_service.EmailAlreadyExistsError):
+    with Session(engine) as b, pytest.raises(auth_service.EmailAlreadyExistsError):
         auth_service.register_user(b, email="race@example.com", password=_PW)
 
 
 def test_register_non_email_integrity_error_is_not_mislabeled(
+    engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A constraint failure unrelated to the email index — e.g. Phase A5's seed-dictionary
@@ -61,7 +65,6 @@ def test_register_non_email_integrity_error_is_not_mislabeled(
     ``except IntegrityError`` handler (trap 4): the comment it replaced asserted email was the
     only reachable IntegrityError in that block, which adding the seed-dictionary inserts made
     false."""
-    eng = _engine()
 
     def _boom(_session: Session, _user_id: object) -> None:
         raise IntegrityError(
@@ -73,11 +76,13 @@ def test_register_non_email_integrity_error_is_not_mislabeled(
         )
 
     monkeypatch.setattr(auth_service, "provision_seed_merchant_dictionary", _boom)
-    with Session(eng) as s, pytest.raises(IntegrityError):
+    with Session(engine) as s, pytest.raises(IntegrityError):
         auth_service.register_user(s, email="nonemail@example.com", password=_PW)
 
 
-def test_authenticate_rejects_demo_login_when_secure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_authenticate_rejects_demo_login_when_secure(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """On a hardened (cookie_secure) deploy the public demo credentials must not
     authenticate, while a normal user still can.
 
@@ -87,8 +92,7 @@ def test_authenticate_rejects_demo_login_when_secure(monkeypatch: pytest.MonkeyP
     ``cookie_secure`` outright (ADR-0003 §Demo account gate, amended 2026-08-02) — a
     sole-signal gate defaulting on would have re-opened exactly this login.
     """
-    eng = _engine()
-    with Session(eng) as s:
+    with Session(engine) as s:
         auth_service.register_user(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD)
         auth_service.register_user(s, email="real@example.com", password=_PW)
 
@@ -102,7 +106,7 @@ def test_authenticate_rejects_demo_login_when_secure(monkeypatch: pytest.MonkeyP
         assert hardened.demo_login_permitted is False
         monkeypatch.setattr(auth_service, "get_settings", lambda s=hardened: s)
 
-        with Session(eng) as s:
+        with Session(engine) as s:
             assert (
                 auth_service.authenticate(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD)
                 is None
@@ -112,6 +116,7 @@ def test_authenticate_rejects_demo_login_when_secure(monkeypatch: pytest.MonkeyP
 
 
 def test_authenticate_rejects_demo_login_by_default_on_plain_http(
+    engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The shipped default refuses the demo credentials on PLAIN HTTP — the case the
@@ -120,8 +125,7 @@ def test_authenticate_rejects_demo_login_by_default_on_plain_http(
 
     Opting in re-enables it, so the flag is a gate and not a wall.
     """
-    eng = _engine()
-    with Session(eng) as s:
+    with Session(engine) as s:
         auth_service.register_user(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD)
         auth_service.register_user(s, email="real@example.com", password=_PW)
 
@@ -137,7 +141,7 @@ def test_authenticate_rejects_demo_login_by_default_on_plain_http(
     assert default.demo_login_enabled is False, "must exercise the shipped default, not an override"
     assert default.cookie_secure is False, "this test must exercise the plain-http case"
     monkeypatch.setattr(auth_service, "get_settings", lambda: default)
-    with Session(eng) as s:
+    with Session(engine) as s:
         assert (
             auth_service.authenticate(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD) is None
         )
@@ -146,14 +150,14 @@ def test_authenticate_rejects_demo_login_by_default_on_plain_http(
 
     opted_in = Settings(demo_login_enabled=True, cors_allowed_origins="http://localhost:3000")
     monkeypatch.setattr(auth_service, "get_settings", lambda: opted_in)
-    with Session(eng) as s:
+    with Session(engine) as s:
         assert (
             auth_service.authenticate(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD)
             is not None
         )
 
 
-def test_rotate_rejects_past_absolute_cap() -> None:
+def test_rotate_rejects_past_absolute_cap(engine: Engine) -> None:
     """A refresh family can't be rotated past the absolute lifetime cap even while
     live/unexpired, and hitting the cap revokes the whole family (OWASP absolute
     timeout, server-enforced against the family origin).
@@ -167,14 +171,13 @@ def test_rotate_rejects_past_absolute_cap() -> None:
     Only ``created_at`` moves; ``expires_at`` stays in the future, so the token is live on
     the sliding TTL and the absolute cap is the sole thing rejecting it.
     """
-    eng = _engine()
-    with Session(eng) as s:
+    with Session(engine) as s:
         user = auth_service.register_user(s, email="cap@example.com", password=_PW)
         raw = auth_service.start_session(s, user.id)
 
     ttl = auth_service.get_settings().session_absolute_ttl_hours
     origin = clock.naive_utcnow() - timedelta(hours=ttl + 1)
-    with Session(eng) as s:
+    with Session(engine) as s:
         # Bound as the string SQLAlchemy's SQLite DATETIME writes ("YYYY-MM-DD HH:MM:SS.ffffff")
         # rather than a datetime object, which raw SQL would push through sqlite3's
         # adapter — deprecated since 3.12 and not the app's storage path anyway.
@@ -184,21 +187,20 @@ def test_rotate_rejects_past_absolute_cap() -> None:
         )
         s.commit()
 
-    with Session(eng) as s:
+    with Session(engine) as s:
         assert auth_service.rotate_session(s, raw) is None
         # The whole family is revoked, not just the presented row.
         assert s.scalars(select(RefreshSession.revoked_at)).all() != []
         assert all(r is not None for r in s.scalars(select(RefreshSession.revoked_at)).all())
 
 
-def test_rotate_succeeds_within_absolute_cap() -> None:
+def test_rotate_succeeds_within_absolute_cap(engine: Engine) -> None:
     """Control: inside the window a live token still rotates normally."""
-    eng = _engine()
-    with Session(eng) as s:
+    with Session(engine) as s:
         user = auth_service.register_user(s, email="within@example.com", password=_PW)
         user_id = user.id  # capture before the session closes (attrs expire on commit)
         raw = auth_service.start_session(s, user_id)
-    with Session(eng) as s:
+    with Session(engine) as s:
         rotated = auth_service.rotate_session(s, raw)
         assert rotated is not None
         assert rotated.user_id == user_id

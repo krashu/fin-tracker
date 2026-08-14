@@ -264,6 +264,10 @@ def delete_account(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="account not found",
         ) from None
-    account.archived_at = clock.utcnow()
+    # naive_utcnow, not utcnow — an aware value assignment-casts through the
+    # server's TimeZone on Postgres v2 and comes back shifted (ADR-0001 rule
+    # 5). Pre-existing sibling of the same bug fixed in categories.py
+    # delete_category (Phase 1 of docs/adr/0012-category-hierarchy.md).
+    account.archived_at = clock.naive_utcnow()
     session.commit()
     return None

@@ -33,6 +33,17 @@ export type TransactionRead = {
   transaction_type: TransactionType;
   merchant_raw: string | null;
   category_id: number | null;
+  /** The category's STORED name, resolved server-side without the `archived_at`
+   * filter — so a row whose category was archived still arrives named. Needed
+   * because `GET /categories` serves active rows only, which left the board
+   * rendering an archived category as "Uncategorized" (a different fact, and a
+   * lie about the user's data). `category_parent_name` supplies the
+   * "Parent → Child" breadcrumb; it is null for a root category, and both are
+   * null when `category_id` is null. Read via `categoryLabel` in
+   * `lib/categories.ts`, never directly — active rows must keep resolving
+   * through the live list so a rename shows up without a refetch of this row. */
+  category_name: string | null;
+  category_parent_name: string | null;
   /** Non-null = this row is one leg of a transfer pair (ADR-0002). Renders the
    * F4a "Linked CC bill payment" banner, and freezes the row's identity fields
    * and type until `unlinkTransaction` breaks the pair (ADR-0007 rule 7). */
@@ -151,6 +162,12 @@ export type CategoryRead = {
   parent_id: number | null;
 };
 
+/** Shape of a `GET /categories?tree=true` row — see `listCategoryTree`. Kept
+ * distinct from `lib/categories.ts`'s `CategoryTreeNode` (built client-side by
+ * `buildCategoryTree` from a flat list): this one is what the *backend*
+ * returns when asked to nest server-side. Structurally identical today; that
+ * is a coincidence of a 2-level taxonomy, not a contract — don't collapse
+ * them into a shared import. */
 export type CategoryTreeRead = CategoryRead & {
   subcategories: CategoryRead[];
 };
@@ -448,21 +465,36 @@ export function listAccounts(): Promise<AccountRead[]> {
   return request<AccountRead[]>("/accounts");
 }
 
+// Every call site today passes no params, so the shared `["categories"]`
+// TanStack key (used at all 11 call sites) is safe — a future caller that
+// passes `kind` (or calls `listCategoryTree`) must fold the params into its
+// own query key (e.g. `["categories", params]`) or it will collide with the
+// unfiltered cache entry.
 export function listCategories(params?: {
   kind?: CategoryKind;
-  tree?: boolean;
-} | unknown): Promise<CategoryRead[]> {
+}): Promise<CategoryRead[]> {
   const qs = new URLSearchParams();
-  if (params && typeof params === "object") {
-    if ("kind" in params && typeof params.kind === "string") {
-      qs.set("kind", params.kind);
-    }
-    if ("tree" in params && params.tree) {
-      qs.set("tree", "true");
-    }
+  if (params?.kind) {
+    qs.set("kind", params.kind);
   }
   const s = qs.toString();
   return request<CategoryRead[]>(`/categories${s ? `?${s}` : ""}`);
+}
+
+/** Same endpoint, `tree=true`: each root comes back with its subcategories
+ * nested, a shape `CategoryRead[]` can't express — split out rather than
+ * overloaded so the return type is never a lie (AGENTS.md §The tsc blind
+ * spot). No caller passes `tree` yet; this exists so the next one that does
+ * gets a real type instead of reaching for `as`. */
+export function listCategoryTree(params?: {
+  kind?: CategoryKind;
+}): Promise<CategoryTreeRead[]> {
+  const qs = new URLSearchParams();
+  if (params?.kind) {
+    qs.set("kind", params.kind);
+  }
+  qs.set("tree", "true");
+  return request<CategoryTreeRead[]>(`/categories?${qs.toString()}`);
 }
 
 // --- Account mutations (PRD §F6) ----------------------------------------------
@@ -596,8 +628,12 @@ export type CategoryRuleRead = {
   id: number; // merchant_tag_map.id — the delete / pin handle
   category_id: number;
   category_name: string;
-  parent_id?: number | null;
-  parent_name?: string | null;
+  // The backend always sends both (rules.py's outerjoin projects `NULL`, not
+  // an absent key, for a root category) — required-but-nullable, not
+  // optional, so a future drop of either field is a tsc error at every call
+  // site instead of a silent `undefined` (AGENTS.md §The tsc blind spot).
+  parent_id: number | null;
+  parent_name: string | null;
   hit_count: number;
   last_used: string;
   // This row's category is the AGGREGATE winner for its canonical merchant
@@ -1215,112 +1251,6 @@ export function listSpendByCategory(params: {
     `/dashboards/spend-by-category?${qs}`,
   );
 }
-
-export type HierarchicalSubcategorySpend = {
-  category_id: number | null;
-  category_name: string;
-  color: CategoryColor | null;
-  total_paise: number;
-  spend_paise: number;
-  percentage: number;
-  is_direct: boolean;
-};
-
-export type HierarchicalParentSpend = {
-  parent_id: number | null;
-  parent_name: string;
-  color: CategoryColor | null;
-  total_paise: number;
-  spend_paise: number;
-  direct_paise: number;
-  percentage: number;
-  subcategories: HierarchicalSubcategorySpend[];
-};
-
-export type SubcategoryMover = {
-  category_id: number | null;
-  category_name: string;
-  parent_id: number | null;
-  parent_name: string | null;
-  current_paise: number;
-  previous_paise: number;
-  delta_paise: number;
-  growth_rate: number | null;
-};
-
-export type HierarchicalSpendResponse = {
-  period: string;
-  total_spend_paise: number;
-  parents: HierarchicalParentSpend[];
-  top_movers: SubcategoryMover[];
-  label_id: number | null;
-};
-
-export function getHierarchicalSpend(params: {
-  month?: string;
-  year?: string;
-  label_id?: number;
-}): Promise<HierarchicalSpendResponse> {
-  const qs = new URLSearchParams();
-  if (params.month) qs.set("month", params.month);
-  if (params.year) qs.set("year", params.year);
-  if (params.label_id != null) qs.set("label_id", String(params.label_id));
-  return request<HierarchicalSpendResponse>(
-    `/dashboards/hierarchical-spend?${qs}`,
-  );
-}
-
-export type HierarchicalTrendSubcategoryTotal = {
-  category_id: number | null;
-  category_name: string;
-  total_paise: number;
-};
-
-export type HierarchicalTrendParentTotal = {
-  parent_id: number | null;
-  parent_name: string;
-  total_paise: number;
-  subcategories: HierarchicalTrendSubcategoryTotal[];
-};
-
-export type HierarchicalTrendBucket = {
-  period: string;
-  totals: HierarchicalTrendParentTotal[];
-};
-
-export type HierarchicalParentRef = {
-  parent_id: number | null;
-  parent_name: string;
-  color: CategoryColor | null;
-  subcategories: SpendCategoryRef[];
-};
-
-export type HierarchicalTrendResponse = {
-  bucket: "week" | "month";
-  start: string;
-  end: string;
-  parents: HierarchicalParentRef[];
-  buckets: HierarchicalTrendBucket[];
-  label_id: number | null;
-};
-
-export function getHierarchicalTrend(params: {
-  bucket: "week" | "month";
-  start: string;
-  end: string;
-  label_id?: number;
-}): Promise<HierarchicalTrendResponse> {
-  const qs = new URLSearchParams({
-    bucket: params.bucket,
-    start: params.start,
-    end: params.end,
-  });
-  if (params.label_id != null) qs.set("label_id", String(params.label_id));
-  return request<HierarchicalTrendResponse>(
-    `/dashboards/hierarchical-trend?${qs}`,
-  );
-}
-
 
 /** One row of the spend-by-tag breakdown (PRD §F3a; tag-analysis arc Phase B).
  * `total_paise` is signed (spend negative, refund positive — nets within a tag,

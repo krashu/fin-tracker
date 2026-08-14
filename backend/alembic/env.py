@@ -7,7 +7,14 @@ share one source of truth for the database URL (the same object backing
 
 In-process callers (e.g. ``tests/test_migration_parity.py``) pass an
 existing connection via ``cfg.attributes["connection"]``; CLI callers
-go through ``engine_from_config``.
+go through ``engine_from_config``. This module does **not** touch
+``PRAGMA foreign_keys`` for the existing-connection path — that connection's
+FK state is whatever the caller's own engine set at DBAPI connect time.
+``PRAGMA foreign_keys`` is a no-op once a connection has an open transaction
+(SQLite requires no pending BEGIN/SAVEPOINT to change it), so it can only be
+set reliably from a ``connect`` event, never mid-run — a caller that needs
+FK OFF for its migration range must build an engine whose connect listener
+says so, not rely on this module to toggle it for them.
 
 For SQLite, ``render_as_batch=True`` is set so ALTER TABLE migrations work
 via copy-and-move. Those batch rebuilds DROP and recreate the target table;
@@ -17,8 +24,16 @@ when the target is referenced by another table (``categories`` ←
 trips the child FK the moment the DB holds real data. So CLI migrations run
 with ``PRAGMA foreign_keys=OFF`` — batch preserves row ids, so references stay
 valid across the rebuild — and the running app re-enables FK at connect time
-via ``app/core/db.py``. Empty in-memory test DBs never hit the violation,
-which is why this only bites a populated dev / prod database.
+via ``app/core/db.py``. This used to bite only a populated dev/prod database,
+on the assumption that a fresh in-memory test DB starts empty — that
+assumption broke the moment migration 0032 started seeding real
+``merchant_tag_map`` rows against the default categories for every user,
+because 0033's own ``add_column`` of a ``ForeignKey``'d ``parent_id`` (self-
+referential or not — Alembic's ``requires_recreate_in_batch`` forces a
+recreate for *any* FK'd column addition) now always finds a referencing row
+in play. ``tests/test_migration_parity.py`` builds its migration-running
+engines with FK OFF at connect time for exactly this reason; see
+``_migration_engine`` there.
 
 Alembic >=1.19's new ``checkconstraint_byname`` autogenerate plugin does not
 round-trip cleanly against SQLite: every ``Enum(..., native_enum=False,
@@ -104,15 +119,6 @@ def run_migrations_online() -> None:
     """
     existing = config.attributes.get("connection")
     if existing is not None:
-        if _is_sqlite():
-            try:
-                raw_conn = existing.connection.dbapi_connection
-                if raw_conn is not None:
-                    cursor = raw_conn.cursor()
-                    cursor.execute("PRAGMA foreign_keys=OFF")
-                    cursor.close()
-            except Exception:
-                pass
         context.configure(
             connection=existing,
             target_metadata=target_metadata,

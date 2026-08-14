@@ -48,14 +48,15 @@ import {
   listCategories,
   listSpendByCategoryByPeriod,
   type CategoryColor,
+  type CategoryRead,
 } from "@/lib/api/client";
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel } from "@/lib/charts";
 import { periodRange } from "@/lib/period";
 import {
   categoryColorVar,
-  categoryDisplayName,
-  resolveCategoryColor,
+  categoryLabel,
+  resolveSiblingDisplayColor,
 } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
@@ -92,13 +93,24 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
   // misses and bars fall back to the muted default (a one-tick flip, acceptable).
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
   });
   const allCategories = categoriesQuery.data ?? [];
+  // Built once and reused everywhere below — `resolveSiblingDisplayColor` used
+  // to be handed the raw `allCategories` array inside this same `.map`,
+  // rebuilding a fresh Map on every iteration (5.5). The dropdown lists
+  // parents and children as flat sibling entries (5.8), so color resolution
+  // goes through the shade-aware helper, not plain `resolveCategoryColor`
+  // (locked decision #5 / 5.6) — otherwise every inheriting child of the same
+  // parent renders one indistinguishable dot, here and in the trigger.
+  const categoriesById = useMemo(
+    () => new Map<number, CategoryRead>(allCategories.map((c) => [c.id, c])),
+    [allCategories],
+  );
   const colorById = useMemo(
     () =>
       new Map<number, CategoryColor | null>(
-        allCategories.map((c) => [c.id, resolveCategoryColor(c, allCategories)]),
+        allCategories.map((c) => [c.id, resolveSiblingDisplayColor(c, allCategories)]),
       ),
     [allCategories],
   );
@@ -109,7 +121,6 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
   // before the first render with data.
   const activeCat =
     cats.find((c) => keyFor(c.category_id) === selectedKey) ?? cats[0] ?? null;
-  const activeKey = activeCat ? keyFor(activeCat.category_id) : null;
   const activeColor = categoryColorVar(
     activeCat?.category_id ?? null,
     activeCat?.category_id != null
@@ -117,12 +128,13 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
       : null,
   );
 
-  const activeCatObj = allCategories.find((c) => c.id === activeCat?.category_id);
   const activeDisplayName = useMemo(() => {
     if (!activeCat) return "Uncategorized";
-    if (activeCat.category_id == null) return "Uncategorized";
-    return categoryDisplayName(activeCatObj, allCategories);
-  }, [activeCat, activeCatObj, allCategories]);
+    // `activeCat.category_name` is the stored name: `SpendCategoryRef` is joined
+    // on id + user_id, never `archived_at`, so an archived category still arrives
+    // named and must not collapse to "Uncategorized".
+    return categoryLabel(activeCat.category_id, categoriesById, activeCat.category_name);
+  }, [activeCat, categoriesById]);
 
   // Set of category IDs to aggregate for the active selection. If a parent category
   // is selected, this includes the parent ID and all its child subcategory IDs.
@@ -202,17 +214,31 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="max-h-72 w-56">
               {cats.map((c) => {
-                const cObj = allCategories.find((cat) => cat.id === c.category_id);
-                const displayName =
-                  c.category_id == null
-                    ? "Uncategorized"
-                    : categoryDisplayName(cObj, allCategories);
+                const cObj =
+                  c.category_id != null ? categoriesById.get(c.category_id) : undefined;
+                const displayName = categoryLabel(
+                  c.category_id,
+                  categoriesById,
+                  c.category_name,
+                );
+                // Selecting a parent rolls its children's spend in too
+                // (`activeTargetCategoryIds` above); selecting a child does
+                // not. The list stays flat (it keeps the response's "biggest
+                // spender first" order), so a child entry is indented and
+                // given the smaller dot the codebase already uses elsewhere
+                // for a subordinate row (filter-row.tsx, selection-bar.tsx)
+                // — the "Parent → Sub" label alone didn't make the narrower
+                // scope visible (5.8).
+                const isChild = cObj?.parent_id != null;
 
                 return (
                   <DropdownMenuItem
                     key={keyFor(c.category_id)}
                     onSelect={() => setSelectedKey(keyFor(c.category_id))}
-                    className="flex items-center gap-2"
+                    className={cn(
+                      "flex items-center gap-2",
+                      isChild && "ml-3 border-l border-border/60 pl-3",
+                    )}
                   >
                     <CategoryDot
                       categoryId={c.category_id}
@@ -221,6 +247,7 @@ export function CategoryTrendBar({ labelId, year }: { labelId?: number; year: nu
                           ? (colorById.get(c.category_id) ?? null)
                           : null
                       }
+                      className={isChild ? "size-1.5" : undefined}
                     />
                     <span className="truncate">{displayName}</span>
                   </DropdownMenuItem>

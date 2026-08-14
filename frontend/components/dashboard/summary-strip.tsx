@@ -2,9 +2,11 @@
 
 /**
  * /expenses summary strip — shows yearly and monthly spend + income totals,
- * driven by the board's filter state (year, month, allDates). When a month is
- * selected, both yearly and monthly rows are shown; when "All dates" (= full
- * year) is active, only the yearly row is shown.
+ * driven by the board's filter state (year, month, allDates, allYears). When a
+ * month is selected, both yearly and monthly rows are shown; when "All dates"
+ * (= full year) is active, only the yearly row is shown; when "All years" is
+ * active, the yearly/monthly rows are replaced by one span covering every
+ * year `useAvailableYears` reports — no period at all.
  *
  * Values are unsigned magnitudes (always positive on screen). `expense_paise`
  * from `period-totals` is signed (≤ 0 typically); we negate it for display.
@@ -12,7 +14,7 @@
  *
  * The 14-week trailing sparkline is always anchored to "today" — it does NOT
  * follow the filter state. It answers "what's my recent spending velocity?"
- * regardless of what year/month the table is showing.
+ * regardless of what year/month/all-years the table is showing.
  */
 import { useQuery } from "@tanstack/react-query";
 
@@ -22,17 +24,20 @@ import { formatINR, formatMonthYear } from "@/lib/format";
 import { periodRange } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
+import { useAvailableYears } from "@/components/dashboard/use-available-years";
 
 export type SummaryStripProps = {
   year?: number;
   monthAnchor?: Date;
   allDates?: boolean;
+  allYears?: boolean;
 };
 
 export function SummaryStrip({
   year = new Date().getFullYear(),
   monthAnchor = new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   allDates = false,
+  allYears = false,
 }: SummaryStripProps = {}) {
   const now = new Date();
   const weekly = trailingWeeksWindow(now, 13);
@@ -44,10 +49,10 @@ export function SummaryStrip({
   const yearTotalsQ = useQuery({
     queryKey: ["dashboards", "period-totals", { start: yearStart, end: yearEnd }],
     queryFn: () => listPeriodTotals({ start: yearStart, end: yearEnd }),
-    // Mirrors monthTotalsQ's `enabled: !allDates` below — only one of the two
-    // totals is ever rendered (see `totalsQ` further down), so the other was
-    // fetching for nothing.
-    enabled: allDates,
+    // Mirrors monthTotalsQ's/allTotalsQ's `enabled` below — only one of the
+    // three totals queries is ever rendered (see `totalsQ` further down), so
+    // the other two would fetch for nothing.
+    enabled: allDates && !allYears,
   });
 
   const yearSpend = -(yearTotalsQ.data?.expense_paise ?? 0);
@@ -64,11 +69,30 @@ export function SummaryStrip({
       { start: monthStart, end: monthEnd },
     ],
     queryFn: () => listPeriodTotals({ start: monthStart, end: monthEnd }),
-    enabled: !allDates,
+    enabled: !allDates && !allYears,
   });
 
   const monthSpend = -(monthTotalsQ.data?.expense_paise ?? 0);
   const monthIncome = monthTotalsQ.data?.income_paise ?? 0;
+
+  // ── All-years totals (every year the data spans — no period at all) ───
+  // Reuses the same shared `["dashboards", "available-years"]` query every
+  // other `<PeriodPicker>` caller fetches, so this costs nothing extra when
+  // the board's own year dropdown has already loaded it.
+  const { years: availableYears } = useAvailableYears();
+  const allYearsRange = {
+    start: periodRange({ year: Math.min(...availableYears) }).start,
+    end: periodRange({ year: Math.max(...availableYears) }).end,
+  };
+
+  const allTotalsQ = useQuery({
+    queryKey: ["dashboards", "period-totals", allYearsRange],
+    queryFn: () => listPeriodTotals(allYearsRange),
+    enabled: allYears,
+  });
+
+  const allSpend = -(allTotalsQ.data?.expense_paise ?? 0);
+  const allIncome = allTotalsQ.data?.income_paise ?? 0;
 
   // ── 14-week sparkline (always trailing from today) ────────────────────
   const weeklyQuery = useQuery({
@@ -80,13 +104,15 @@ export function SummaryStrip({
     Math.max(0, -b.total_paise),
   );
 
-  // Choose which totals to display based on allDates:
-  // - allDates true ("All months"): show yearly totals
-  // - allDates false (specific month): show monthly totals only
-  const showLabel = allDates ? String(year) : monthLabel;
-  const totalsQ = allDates ? yearTotalsQ : monthTotalsQ;
-  const spend = allDates ? yearSpend : monthSpend;
-  const income = allDates ? yearIncome : monthIncome;
+  // Choose which totals to display based on allYears / allDates:
+  // - allYears true ("All years"): show the all-time span, whichever of the
+  //   other two flags is also set — it always wins.
+  // - allYears false, allDates true ("All months"): show yearly totals
+  // - both false (specific month): show monthly totals only
+  const showLabel = allYears ? "All years" : allDates ? String(year) : monthLabel;
+  const totalsQ = allYears ? allTotalsQ : allDates ? yearTotalsQ : monthTotalsQ;
+  const spend = allYears ? allSpend : allDates ? yearSpend : monthSpend;
+  const income = allYears ? allIncome : allDates ? yearIncome : monthIncome;
 
   return (
     <section className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-border pt-4 pb-5">

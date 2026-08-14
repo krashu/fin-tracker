@@ -143,6 +143,8 @@ def test_create_then_import_then_review_then_commit_then_list(
         "transaction_type",
         "merchant_raw",
         "category_id",
+        "category_name",
+        "category_parent_name",
         "transfer_pair_id",
         "labels",
     }

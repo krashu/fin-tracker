@@ -14,9 +14,10 @@ fires via the session-scoped autouse fixture in :mod:`tests.conftest`.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import timedelta
 from decimal import Decimal
+from functools import cache
 
 import pytest
 from fastapi.testclient import TestClient
@@ -30,7 +31,7 @@ from app.core.db import get_db, make_engine
 from app.core.demo import DEMO_EMAIL, DEMO_PASSWORD
 from app.core.security import ACCESS_COOKIE_NAME, create_access_token, hash_password
 from app.main import app
-from app.models import Account, Base, Category, Instrument, User
+from app.models import Account, Category, Instrument, User
 from app.services.nav_snapshot_service import as_valuation_stamp
 
 # Any allowed CORS origin — set as a default header on test clients so the
@@ -48,16 +49,20 @@ def _reset_rate_limiter() -> Iterator[None]:
 
 
 @pytest.fixture
-def engine() -> Iterator[Engine]:
+def engine(clone_schema: Callable[[Engine], None]) -> Iterator[Engine]:
     # StaticPool: single connection shared across threads. Required because
     # FastAPI runs sync endpoints in a thread pool, and the default
     # SingletonThreadPool would give each thread its own :memory: database.
     eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
-    Base.metadata.create_all(eng)
+    # Page-copied from the session template rather than built with create_all —
+    # see ``clone_schema`` in tests/conftest.py. Still a private database.
+    clone_schema(eng)
     try:
         yield eng
     finally:
-        Base.metadata.drop_all(eng)
+        # No drop_all: with StaticPool the single pooled connection *is* the
+        # ``:memory:`` database, so dispose() destroys the schema and the rows
+        # together. Dropping 16 tables first cost ~5.6ms per test for nothing.
         eng.dispose()
 
 
@@ -82,6 +87,20 @@ def session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
+@cache
+def _demo_password_hash() -> str:
+    """The demo user's argon2id hash, computed once per session.
+
+    argon2id costs ~105ms a call at production parameters, and effectively every test
+    in this directory reaches ``seeded_user`` through ``client`` — hashing per test was
+    ~82s of a full-suite run, a third of it. A salt only has to be unique per *user*,
+    not per *test*, so one hash reused across the session is indistinguishable to every
+    consumer: ``verify_password`` reads the parameters back out of the hash string, so
+    the login paths still exercise a real verify.
+    """
+    return hash_password(DEMO_PASSWORD)
+
+
 @pytest.fixture
 def seeded_user(session: Session) -> User:
     """Seed the primary User row (id == v1_user_id) resolved by ``CurrentUserId``.
@@ -99,7 +118,7 @@ def seeded_user(session: Session) -> User:
     user = User(
         id=get_settings().v1_user_id,
         email=DEMO_EMAIL,
-        password_hash=hash_password(DEMO_PASSWORD),
+        password_hash=_demo_password_hash(),
     )
     session.add(user)
     session.commit()

@@ -18,6 +18,7 @@ from app.core.config import Settings, get_settings
 from app.core.demo import DEMO_EMAIL, DEMO_PASSWORD
 from app.core.security import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME
 from app.models import User
+from app.services.provisioning import _DEFAULT_INCOME_TAXONOMY, _DEFAULT_SPEND_TAXONOMY
 
 _EMAIL = "alice@example.com"
 _PW = "correct horse battery"
@@ -63,19 +64,32 @@ def test_register_creates_user_and_sets_cookies(unauth_client: TestClient) -> No
     assert REFRESH_COOKIE_NAME in unauth_client.cookies
 
 
-# The active seeded shape a migrated demo user has after 0003→0012 (the
-# vestigial flat Income/Transfer spend seeds are archived, so excluded). A fresh
-# registrant must get exactly this set — pins provisioning.py against drift from
-# the migration-seeded demo user (parity guard).
+# A fresh registrant must get exactly the taxonomy provisioning.py defines — the name-level
+# drift guard is derived from _DEFAULT_SPEND_TAXONOMY / _DEFAULT_INCOME_TAXONOMY rather than
+# restated here (ADR-0012: "do not enumerate the taxonomy anywhere but provisioning.py").
+# Pins the registration path end to end (auth_service.register_user ->
+# provision_default_categories -> the /categories response) against silently dropping a row,
+# a name, or the color-inheritance invariant (decision #5) along the way.
 def test_register_provisions_default_categories(unauth_client: TestClient) -> None:
     _register(unauth_client)
     cats = unauth_client.get("/api/v1/categories").json()
     parents = [c for c in cats if c["parent_id"] is None]
     children = [c for c in cats if c["parent_id"] is not None]
+
+    expected_parent_names = {name for name, _, _ in _DEFAULT_SPEND_TAXONOMY} | {
+        name for name, _, _ in _DEFAULT_INCOME_TAXONOMY
+    }
+    expected_child_names = {sub for _, _, subs in _DEFAULT_SPEND_TAXONOMY for sub in subs} | {
+        sub for _, _, subs in _DEFAULT_INCOME_TAXONOMY for sub in subs
+    }
+
+    assert {c["name"] for c in parents} == expected_parent_names
+    assert {c["name"] for c in children} == expected_child_names
     assert len(parents) == 10  # 9 spend parents + 1 income parent
-    assert len(children) > 0
+    assert len(children) == len(expected_child_names)
     assert all(c["is_seeded"] for c in cats)  # app defaults, not user-created
     assert all(c["color"] for c in parents)  # parent colors provisioned, none null
+    assert all(c["color"] is None for c in children)  # seeded children inherit (decision #5)
 
 
 def test_register_duplicate_email_409(unauth_client: TestClient) -> None:

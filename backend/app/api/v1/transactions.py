@@ -49,6 +49,7 @@ or self-inflate its ``/candidates`` confidence.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date as date_t
 from typing import Annotated, Literal
 from uuid import UUID
@@ -77,7 +78,11 @@ from app.schemas import (
     TransferRead,
 )
 from app.schemas.transactions import sign_error
-from app.services.category_service import kind_for_type, validate_category_ids
+from app.services.category_service import (
+    kind_for_type,
+    resolve_category_labels,
+    validate_category_ids,
+)
 from app.services.fingerprint import transaction_fingerprint
 from app.services.merchant import normalize_merchant
 from app.services.merchant_labels import learn_merchant_memory
@@ -96,12 +101,44 @@ _IDENTITY_FIELDS = frozenset({"date", "amount_paise", "merchant_raw", "account_i
 _PAIR_LOCKED_FIELDS = _IDENTITY_FIELDS | {"transaction_type"}
 
 
-# `response_model=` is deliberate (not just `-> list[TransactionRead]`):
-# the wire schema is narrower than the ORM model — fingerprint,
-# confirmed_at, etc. are intentionally hidden (see schemas/transactions.py). The
-# return type stays `list[Transaction]` so internal callers/tests can
-# work with ORM objects; FastAPI projects through TransactionRead at the
-# boundary. Don't "simplify" this without widening the wire payload.
+def _to_read(
+    session: Session, txns: Sequence[Transaction], *, user_id: UUID
+) -> list[TransactionRead]:
+    """Project ORM rows onto the wire schema, naming each row's category.
+
+    The names cannot be read off the ORM object: ``Transaction`` has no
+    ``category`` relationship — ``labels`` is documented as its only one, and
+    ADR-0012 keeps ORM cascades off ``categories`` after a ``delete-orphan``
+    there turned a reparent into silent row deletion. So they arrive from one
+    batched query that deliberately ignores ``archived_at``
+    (:func:`app.services.category_service.resolve_category_labels`), which is
+    what lets a transaction on an archived category still render its real name
+    instead of "Uncategorized".
+    """
+    names = resolve_category_labels(
+        session,
+        category_ids=[t.category_id for t in txns if t.category_id is not None],
+        user_id=user_id,
+    )
+    reads: list[TransactionRead] = []
+    for t in txns:
+        read = TransactionRead.model_validate(t)
+        if t.category_id is not None:
+            # A miss means the id is not owned by this user, so it is left unnamed
+            # rather than reaching for a name across the tenant boundary.
+            read.category_name, read.category_parent_name = names.get(t.category_id, (None, None))
+        reads.append(read)
+    return reads
+
+
+# `response_model=` is deliberate: the wire schema is narrower than the ORM model
+# — fingerprint, confirmed_at, etc. are intentionally hidden (see
+# schemas/transactions.py). These routes now return `TransactionRead` rather than
+# the ORM object because the payload carries two fields the ORM instance cannot
+# supply (`category_name` / `category_parent_name`, resolved per-request against
+# archived rows too) — the widening the previous note here required before
+# changing this. Nothing calls these functions directly; the suite drives them
+# over HTTP.
 @router.get("", response_model=list[TransactionRead])
 def list_transactions(
     session: SessionDep,
@@ -115,7 +152,7 @@ def list_transactions(
     date_to: Annotated[date_t | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> list[Transaction]:
+) -> list[TransactionRead]:
     if date_from is not None and date_to is not None and date_from > date_to:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -185,7 +222,7 @@ def list_transactions(
         .limit(limit)
         .offset(offset)
     )
-    return list(session.scalars(stmt))
+    return _to_read(session, list(session.scalars(stmt)), user_id=user_id)
 
 
 def _assert_category_id_or_422(
@@ -277,7 +314,7 @@ def create_transaction(
     payload: TransactionCreate,
     session: SessionDep,
     user_id: CurrentUserId,
-) -> Transaction:
+) -> TransactionRead:
     # Account pre-flight: ownership + non-archived + non-investment + INR.
     _assert_account_or_422(session, account_id=payload.account_id, user_id=user_id)
 
@@ -360,7 +397,7 @@ def create_transaction(
             ) from e
         raise
     session.refresh(txn)
-    return txn
+    return _to_read(session, [txn], user_id=user_id)[0]
 
 
 @router.post("/transfer", response_model=TransferRead, status_code=status.HTTP_201_CREATED)
@@ -510,7 +547,7 @@ def update_transaction(
     payload: TransactionUpdate,
     session: SessionDep,
     user_id: CurrentUserId,
-) -> Transaction:
+) -> TransactionRead:
     """Partial update. Every user-visible column is editable (ADR-0007).
 
     Two cost classes, one endpoint. ``transaction_type`` / ``category_id`` /
@@ -564,7 +601,7 @@ def update_transaction(
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         # Empty body — no DB round-trip, no spurious updated_at bump.
-        return txn
+        return _to_read(session, [txn], user_id=user_id)[0]
 
     # Labels are a relationship (replace-set), not a column — pull them out before
     # the column setattr loop below (setattr(txn, "labels", [<str>]) on the
@@ -718,7 +755,7 @@ def update_transaction(
 
     session.commit()
     session.refresh(txn)
-    return txn
+    return _to_read(session, [txn], user_id=user_id)[0]
 
 
 @router.delete("/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)

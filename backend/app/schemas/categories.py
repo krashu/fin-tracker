@@ -121,7 +121,13 @@ class CategoryUpdate(BaseModel):
     already tagged under the old scope (a spend row left pointing at an
     income category, breaking the spend/income invariant and the
     dashboard signed-sums). ``extra="forbid"`` already 422s an attempt to
-    PATCH ``kind``; rename stays the only mutation.
+    PATCH ``kind``.
+
+    ``parent_id`` IS mutable — a reparent (present, non-null value) or a
+    promotion to root (explicit ``null``), both validated in
+    ``app/api/v1/categories.py`` against the depth-2 cap and the
+    kind-match rule (:doc:`/docs/adr/0012-category-hierarchy`). Rename is
+    not the only mutation this schema allows.
     """
 
     model_config = ConfigDict(extra="forbid")

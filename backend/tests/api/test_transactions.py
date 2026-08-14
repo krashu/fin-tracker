@@ -366,12 +366,19 @@ def test_list_filter_by_category_no_matches_returns_empty(
     seeded_categories: list[Category],
     session: Session,
 ) -> None:
-    """Unknown / cross-user / archived category_id returns []; no 404.
+    """An unknown ``category_id`` returns []; no 404.
 
     Mirrors the ?account_id= filter: a filter with no matches yields an
-    empty result rather than 404. Keeps the drilldown URL stable across
-    "category just archived" or "user typo" races without making the
-    frontend handle two distinct empty states.
+    empty result rather than 404. Keeps the drilldown URL stable across a
+    "user typo" race without making the frontend handle two distinct empty
+    states. The cross-user case is its own test, immediately below.
+
+    An **archived** category is deliberately NOT an empty case: the filter
+    subquery in ``transactions.py`` predicates on ``user_id`` and the
+    parent/self id only, never ``archived_at``. Archiving is soft
+    (ADR-0012) — the rows keep their ``category_id``, so a drilldown into a
+    just-archived category still shows its history, and an archived child's
+    spend still rolls up under its parent. Don't "fix" that into a filter.
     """
     session.add(
         _make_txn(
@@ -388,6 +395,73 @@ def test_list_filter_by_category_no_matches_returns_empty(
     # Defensively above any seeded id rather than a bare constant.
     unknown_id = max(c.id for c in seeded_categories) + 10_000
     resp = client.get(f"/api/v1/transactions?category_id={unknown_id}")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_filter_by_category_cross_user_parent_returns_empty_not_other_users_rows(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """4.4 / ADR-0003: filtering by ANOTHER user's PARENT category id must yield [], never
+    that user's transactions — and never a 403, which would be an existence oracle.
+
+    This is the ``Category.parent_id == category_id`` half of the rollup subquery added for
+    the two-level hierarchy (ADR-0012); ``transactions.py`` carries a comment claiming
+    ``Category.user_id == user_id`` keeps it tenant-isolated, but nothing asserted it before
+    this test. Seeds a parent + child under a second user, each holding a transaction, then
+    queries as the seeded ``client`` user by the foreign parent's id.
+    """
+    other_user = User(id=uuid4())
+    session.add(other_user)
+    session.flush()
+    other_account = Account(
+        user_id=other_user.id,
+        name="Foreign CC",
+        type="credit_card",
+        issuer="axis",
+        last4="9996",
+    )
+    session.add(other_account)
+    session.flush()
+    other_parent = Category(
+        user_id=other_user.id, name="Foreign Parent", kind="spend", is_seeded=False
+    )
+    session.add(other_parent)
+    session.flush()
+    other_child = Category(
+        user_id=other_user.id,
+        name="Foreign Child",
+        kind="spend",
+        parent_id=other_parent.id,
+        is_seeded=False,
+    )
+    session.add(other_child)
+    session.flush()
+    session.add_all(
+        [
+            _make_txn(
+                user_id=other_user.id,
+                account_id=other_account.id,
+                txn_date=date(2026, 5, 10),
+                amount_paise=-1000,
+                fingerprint="fp-foreign-parent-direct",
+                category_id=other_parent.id,
+            ),
+            _make_txn(
+                user_id=other_user.id,
+                account_id=other_account.id,
+                txn_date=date(2026, 5, 11),
+                amount_paise=-2000,
+                fingerprint="fp-foreign-child",
+                category_id=other_child.id,
+            ),
+        ]
+    )
+    session.commit()
+
+    resp = client.get(f"/api/v1/transactions?category_id={other_parent.id}")
     assert resp.status_code == 200
     assert resp.json() == []
 
@@ -502,6 +576,11 @@ def test_list_flat_shape_omits_internal_fields(
         "transaction_type",
         "merchant_raw",
         "category_id",
+        # Denormalised display names for `category_id`, resolved without the
+        # `archived_at` filter so an archived category still renders its real name
+        # instead of "Uncategorized" (see `_to_read` / `resolve_category_labels`).
+        "category_name",
+        "category_parent_name",
         "transfer_pair_id",
         "labels",
     }
@@ -1392,6 +1471,11 @@ def test_post_spend_happy_path(
         "transaction_type",
         "merchant_raw",
         "category_id",
+        # Denormalised display names for `category_id`, resolved without the
+        # `archived_at` filter so an archived category still renders its real name
+        # instead of "Uncategorized" (see `_to_read` / `resolve_category_labels`).
+        "category_name",
+        "category_parent_name",
         "transfer_pair_id",
         "labels",
     }
@@ -2299,6 +2383,11 @@ def test_transfer_happy_path(
         "transaction_type",
         "merchant_raw",
         "category_id",
+        # Denormalised display names for `category_id`, resolved without the
+        # `archived_at` filter so an archived category still renders its real name
+        # instead of "Uncategorized" (see `_to_read` / `resolve_category_labels`).
+        "category_name",
+        "category_parent_name",
         "transfer_pair_id",
         "labels",
     }

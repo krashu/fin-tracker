@@ -20,8 +20,8 @@ the underlying commands are authoritative.
 
 | Task | Command |
 |---|---|
-| Backend tests | `cd backend && uv run pytest` |
-| Backend tests, fast loop | `cd backend && uv run pytest --no-cov` |
+| Backend tests | `cd backend && uv run pytest -n auto` |
+| Backend tests, fast loop | `cd backend && uv run pytest --no-cov -m "not real_pdf and not slow" -n auto` |
 | Backend lint | `cd backend && uv run ruff check .` |
 | Backend typecheck | `cd backend && uv run python -m ty check app` |
 | Frontend lint | `cd frontend && pnpm lint` |
@@ -32,9 +32,24 @@ the underlying commands are authoritative.
 The human runs those in their own terminal; a backgrounded server will serve stale code and
 mislead you. Verify backend behaviour with pytest, not by curling a live instance.
 
+The fast loop is not the definition of done: it drops coverage instrumentation (~25% of the wall
+clock), the real-PDF tests, and `slow`-marked tests. **Touching a migration means running the full
+suite** — the deselected `test_migrations_stairway` is the only thing proving every `downgrade()` in
+the chain reversible, and it is also where 0033's batch rebuild of `categories` gets exercised under
+real FK enforcement.
+
+`-n auto` (pytest-xdist) is on both suite commands but deliberately **not** in `addopts`: worker
+startup costs ~17s, which pays for itself across 1400 tests and never on one file. So run a single
+test or file **without** it, and use `-n0` when you need `--pdb`, which xdist does not support.
+Nothing needed making parallel-safe — every DB test builds its own `:memory:` engine — and coverage
+combines across workers to the same total. `addopts` does carry `--durations=15`: it is the regression
+radar that would have caught the 104ms fixture call this suite once hid.
+
 `pre-commit` is the real merge gate — 12 hooks, including **both** type-checkers (`ty check app`,
 `tsc --noEmit`), ruff, ruff-format, eslint, and a fixture-redaction test. A type error blocks the
-commit rather than surfacing in CI. Install steps: `docs/LOCAL_SETUP.md`.
+commit rather than surfacing in CI. It does **not** run the suite (only the redaction test), so the
+75% coverage floor is enforced solely by a bare `uv run pytest` / `make test`.
+Install steps: `docs/LOCAL_SETUP.md`.
 
 Behind a TLS-inspecting corporate proxy the investment price feeds fail with
 `CERTIFICATE_VERIFY_FAILED`; the git-ignored CA-bundle hook is documented in
@@ -65,6 +80,7 @@ Behind a TLS-inspecting corporate proxy the investment price feeds fail with
 | [0009](docs/adr/0009-refund-as-signed-spend.md) | A refund is a `spend` row with positive `amount_paise`, not its own `transaction_type` — `transaction_type` is `spend \| income \| transfer` |
 | [0010](docs/adr/0010-parsed-statement-return.md) | `StatementParser.parse()` returns `ParsedStatement` (rows + a `StatementSummary` of optional opening/closing balance + period), not a bare row list |
 | [0011](docs/adr/0011-merchant-alias-layer.md) | Merchant alias layer — token-boundary canonicalisation downstream of frozen `normalize_merchant`; per-user seed dictionary at `hit_count = 0` |
+| [0012](docs/adr/0012-category-hierarchy.md) | Categories are **two levels, capped** — one-hop rollup, one-hop colour inheritance, one-level *soft* archive cascade. No ORM `delete-orphan` on `subcategories` |
 
 ## Working rules
 

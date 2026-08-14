@@ -91,7 +91,11 @@ from app.schemas import (
     TransactionRead,
 )
 from app.schemas.transactions import ConfidenceStr
-from app.services.category_service import default_category_id
+from app.services.category_service import (
+    FALLBACK_CATEGORY_NAME,
+    default_category_id,
+    resolve_category_labels,
+)
 from app.services.import_service import (
     AccountNotFoundError,
     NonInrAccountError,
@@ -404,15 +408,32 @@ def list_candidates(
     resolver = load_alias_resolver(session, user_id=user_id)
     strength = prefetch_tag_strength(session, user_id=user_id, resolver=resolver)
 
+    txns = list(session.scalars(stmt))
+    # `TransactionCandidate` extends `TransactionRead`, so it inherits
+    # `category_name`/`category_parent_name` — populate them here too rather than
+    # letting the queue ship them as permanent nulls. A suggested category is
+    # normally active, but a batch left in the queue while its category is archived
+    # would otherwise render "Uncategorized" over a real suggestion.
+    category_names = resolve_category_labels(
+        session,
+        category_ids=[t.category_id for t in txns if t.category_id is not None],
+        user_id=user_id,
+    )
+
     candidates = []
-    for txn in session.scalars(stmt):
+    for txn in txns:
         canonical = resolver.canonical(txn.merchant_normalized)
         prior_matches, confidence, pinned = _candidate_strength(
             strength, canonical=canonical, category_id=txn.category_id
         )
+        read = TransactionRead.model_validate(txn)
+        if txn.category_id is not None:
+            read.category_name, read.category_parent_name = category_names.get(
+                txn.category_id, (None, None)
+            )
         candidates.append(
             TransactionCandidate(
-                **TransactionRead.model_validate(txn).model_dump(),
+                **read.model_dump(),
                 prior_matches=prior_matches,
                 confidence=confidence,
                 pinned=pinned,
@@ -531,7 +552,7 @@ def commit_import_batch(
     # spend row with a positive amount, so it lands in the same bucket. Looked up
     # once; None only if the user archived or renamed it away (then those rows
     # fall back to the 422 guard).
-    spend_other_id = default_category_id(session, user_id=user_id, name="Other")
+    spend_other_id = default_category_id(session, user_id=user_id, name=FALLBACK_CATEGORY_NAME)
     # Same idea for a cashback-named income row (see the docstring above) —
     # income kind, and None here is NOT guarded: it just means those rows
     # commit uncategorized, same as any other income row.

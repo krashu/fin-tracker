@@ -38,13 +38,16 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3
 import uuid
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import inspect, select, text
+from alembic.script import ScriptDirectory
+from sqlalchemy import Engine, create_engine, event, inspect, select, text
 from sqlalchemy.dialects import postgresql as postgresql_dialect
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.exc import IntegrityError
@@ -66,8 +69,6 @@ from app.models import (
     User,
 )
 from app.services.provisioning import (
-    _DEFAULT_INCOME_CATEGORIES,
-    _DEFAULT_SPEND_CATEGORIES,
     _MERCHANT_DICTIONARY,
     provision_default_categories,
 )
@@ -81,6 +82,158 @@ def _alembic_cfg(connection: object) -> Config:
     cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
     cfg.attributes["connection"] = connection
     return cfg
+
+
+def _migration_engine(
+    url: str = "sqlite:///:memory:", *, poolclass: type[object] | None = StaticPool
+) -> Engine:
+    """A throwaway SQLite engine for driving ``command.upgrade`` / ``downgrade``
+    through this file's injected-connection path, with SQLite FK enforcement OFF
+    from DBAPI connect time — the opposite of ``make_engine``.
+
+    Migration 0032 seeds real ``merchant_tag_map`` rows against the default
+    categories for every user, so by 0033 — whose ``add_column`` of a
+    ``ForeignKey``'d ``parent_id`` Alembic can only apply on SQLite via a full
+    DROP-and-recreate of ``categories`` (any FK'd column addition forces
+    ``requires_recreate_in_batch`` to return True, self-referential or not) — a
+    freshly-created in-memory test DB now always has a live row referencing
+    ``categories`` before that recreate runs. Under real FK enforcement the
+    implicit row-delete inside ``DROP TABLE`` trips it (see ``env.py``'s module
+    docstring). ``PRAGMA foreign_keys`` can only be set reliably at connect time
+    (it no-ops once a transaction is open — see the same docstring), so toggling
+    it mid-run is not an option; building the engine FK-off from the start is.
+
+    None of this file's assertions exercise runtime FK/CASCADE enforcement — they
+    read schema shape, DDL text, and row survival — so this is safe for every
+    test that only needs to get *through* the migration chain. A test that needs
+    genuine FK enforcement (e.g. proving a downgrade leaves no dangling FK) must
+    use its own file-backed engine pair instead, matching
+    ``test_cli_upgrade_with_referencing_data_succeeds``.
+
+    ``url``/``poolclass`` are overridable so ``test_migrations_stairway`` can point
+    this at a real temp file (``poolclass=None``) instead of ``:memory:`` — a
+    stairway walk opens many independent connections in sequence and a file
+    survives that the same way a populated dev DB would, which is the case this
+    helper exists to guard.
+    """
+    kwargs: dict[str, object] = {"connect_args": {"check_same_thread": False}}
+    if poolclass is not None:
+        kwargs["poolclass"] = poolclass
+    engine = create_engine(url, **kwargs)
+
+    @event.listens_for(engine, "connect")
+    def _disable_fk(dbapi_connection, _record) -> None:  # noqa: ANN001 — alembic/SA event sig
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.close()
+
+    return engine
+
+
+def _sqlite_conn(raw: object) -> sqlite3.Connection:
+    """The real ``sqlite3.Connection`` behind a pool checkout.
+
+    SQLAlchemy types ``driver_connection`` as ``Any | None`` since it is
+    dialect-dependent; every engine in this file is SQLite.
+    """
+    conn = getattr(raw, "driver_connection", None)
+    assert isinstance(conn, sqlite3.Connection)
+    return conn
+
+
+@cache
+def _head_template_engine() -> Engine:
+    """One in-memory DB migrated to head, built once per process as a copy source.
+
+    ``command.upgrade(..., "head")`` costs ~1.2s — 35 revisions of DDL plus data steps —
+    and most tests below were each paying it to reach a byte-identical state. Cached, so
+    the chain runs once; ``_head_engine`` then page-copies it in ~1ms.
+
+    Held open for the life of the process on purpose: with ``StaticPool`` this engine's
+    single DBAPI connection *is* the template database, so disposing it would destroy
+    what every later clone reads from. Process exit reclaims it.
+
+    Not used by the tests that upgrade to an *intermediate* revision first — the
+    pre-migration shape is their subject — nor by ``test_migration_matches_models``,
+    which is deliberately left running a real chain from scratch so that something
+    independent of this template still proves a from-base upgrade matches the ORM.
+    """
+    eng = _migration_engine()
+    with eng.begin() as conn:
+        command.upgrade(_alembic_cfg(conn), "head")
+    return eng
+
+
+def _head_engine() -> Engine:
+    """A private in-memory engine already at head. Caller disposes, as with
+    ``_migration_engine``.
+
+    The copy carries ``alembic_version`` at head along with the schema and seed rows,
+    so ``command.downgrade`` runs against it exactly as it would against a DB this test
+    had migrated itself. (``tests/conftest.py::clone_schema`` does the same trick for
+    the ORM-built schema used by the api/services suites.)
+    """
+    eng = _migration_engine()
+    target = eng.raw_connection()
+    _sqlite_conn(_head_template_engine().raw_connection()).backup(_sqlite_conn(target))
+    target.close()  # returns to the pool; StaticPool keeps it open
+    return eng
+
+
+@pytest.fixture()
+def alembic_config() -> Config:
+    """A bare ``Config`` (``script_location`` only) for ``test_migrations_stairway``.
+
+    Modeled on ``common.alembic.testing.make_alembic_config``, a shared Alembic
+    test helper used elsewhere at this org, which builds its ``Config`` straight
+    from a session-scoped Postgres-testcontainer URL and hands the whole
+    ``command.upgrade``/``downgrade`` sequence that single ``Config``. This
+    project's ``env.py`` instead resolves its URL from ``get_settings()`` and
+    branches on whether an existing connection was injected (see its module
+    docstring) — there is no single ``Config`` that can drive the walk below, so
+    this fixture supplies only the ``ScriptDirectory``-facing half (revision
+    walking) and the test itself opens one connection per step, matching every
+    other test in this file. Function-scoped rather than session-scoped: unlike a
+    Postgres testcontainer, a throwaway SQLite file has no startup cost worth
+    amortizing.
+    """
+    cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    return cfg
+
+
+@pytest.mark.slow
+def test_migrations_stairway(alembic_config: Config, tmp_path: Path) -> None:
+    """Walk every migration base -> head: upgrade to it, downgrade to its parent,
+    upgrade to it again. Proves every ``downgrade()`` in the chain actually runs
+    and is reversible, one revision at a time — modeled on
+    ``common.alembic.testing.run_stairway_test``.
+
+    Structural only, on an empty DB: it cannot see a downgrade orphan a
+    transaction (the targeted ``test_0034_downgrade_*`` test below pins that with
+    real data) — but it does repeatedly hammer 0033's batch table-rebuild of
+    ``categories`` after 0032 has, by this point in the walk, already made it a
+    referenced table, on an engine with real FK enforcement (off only at connect
+    time — see ``_migration_engine``) rather than a swallowed mid-run toggle. That
+    is exactly the path the removed ``env.py`` ``PRAGMA foreign_keys=OFF`` hunk
+    used to paper over. A real temp file, never ``:memory:``: each step below
+    opens its own connection, and only a file — not an in-process ``:memory:`` DB
+    without a shared pool — survives that the way a populated dev DB would.
+    """
+    revisions = list(ScriptDirectory.from_config(alembic_config).walk_revisions("base", "heads"))
+    revisions.reverse()  # base -> head
+
+    engine = _migration_engine(f"sqlite:///{(tmp_path / 'stairway.db').as_posix()}", poolclass=None)
+    try:
+        for rev in revisions:
+            with engine.begin() as conn:
+                command.upgrade(_alembic_cfg(conn), rev.revision)
+            with engine.begin() as conn:
+                command.downgrade(_alembic_cfg(conn), str(rev.down_revision or "base"))
+            with engine.begin() as conn:
+                command.upgrade(_alembic_cfg(conn), rev.revision)
+    finally:
+        engine.dispose()
 
 
 def _snapshot(engine: object) -> dict[str, dict]:
@@ -141,7 +294,7 @@ def _check_constraints(engine: object) -> dict[str, list[tuple[str | None, str]]
 
 
 def test_migration_matches_models() -> None:
-    eng_migrate = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng_migrate = _migration_engine()
     eng_orm = make_engine("sqlite:///:memory:", poolclass=StaticPool)
     try:
         with eng_migrate.begin() as conn:
@@ -180,11 +333,8 @@ def test_migration_matches_models() -> None:
 
 
 def test_v1_user_seeded() -> None:
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             users = list(s.scalars(select(User)))
@@ -227,11 +377,8 @@ _ARCHIVED_FLAT_SEEDS = frozenset({"Income", "Transfer"})
 
 def test_default_categories_seeded() -> None:
     """After ``alembic upgrade head`` the v1 user has the 2-level category taxonomy seeded."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             cats = list(
@@ -243,11 +390,30 @@ def test_default_categories_seeded() -> None:
 
             # 9 spend parents (Food & Dining, Household & Living, Bills & Utilities,
             # Commute & Transportation, Shopping & Lifestyle, Family & Social,
-            # Savings & Investments, Loans & Settlements, Other) + 1 income parent = 10
+            # Savings & Investments, Loans & Settlements, Other) + 1 income parent = 10,
+            # holding 55 children total (49 spend + 6 income) — see provisioning.py's
+            # _DEFAULT_SPEND_TAXONOMY / _DEFAULT_INCOME_TAXONOMY, the taxonomy's one source
+            # of truth (ADR-0012).
             assert len(parents) == 10
-            assert len(children) > 0
+            assert len(children) == 55
             assert all(c.is_seeded is True for c in cats)
             assert all(c.created_at is not None for c in cats)
+
+            # A per-parent child-NAME set, not just a count — a same-count swap between two
+            # siblings (e.g. a typo trading "Coffee & Tea" for something else) would still
+            # pass len(children) == 55.
+            food_parent = next(
+                c for c in parents if c.kind == "spend" and c.name == "Food & Dining"
+            )
+            food_children = {c.name for c in children if c.parent_id == food_parent.id}
+            assert food_children == {
+                "Food",
+                "Groceries",
+                "Online Food Delivery",
+                "Restaurants & Cafes",
+                "Quick Bites & Snacks",
+                "Coffee & Tea",
+            }
 
             # Vestigial flat seeds: still spend-kind, now archived.
             archived = [c for c in cats if c.archived_at is not None]
@@ -260,11 +426,8 @@ def test_default_categories_seeded() -> None:
 def test_provisioning_matches_migration_seed() -> None:
     """The migration-seeded demo user's ACTIVE categories must equal what
     ``provision_default_categories`` gives a fresh registrant."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             migrated_cats = list(
@@ -286,34 +449,43 @@ def test_provisioning_matches_migration_seed() -> None:
                 )
             )
 
-            migrated_set = {(c.name, c.kind, c.parent_id is not None) for c in migrated_cats}
-            fresh_set = {(c.name, c.kind, c.parent_id is not None) for c in fresh_cats}
+            migrated_set = {
+                (c.name, c.kind, c.parent_id is not None, c.color) for c in migrated_cats
+            }
+            fresh_set = {(c.name, c.kind, c.parent_id is not None, c.color) for c in fresh_cats}
             assert migrated_set == fresh_set
     finally:
         eng.dispose()
 
 
 def test_seed_categories_have_default_color() -> None:
-    """Every root parent category carries a default hex color."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    """Every root parent category carries a default hex color, and every seeded child is
+    ``NULL`` (decision #5, ADR-0012 / PRD §F5: a subcategory inherits its parent's hue;
+    a seeded subcategory carrying its own hex is drift)."""
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
-            cats = list(
+            active = list(
                 s.scalars(
                     select(Category).where(
                         Category.user_id == get_settings().v1_user_id,
                         Category.archived_at.is_(None),
-                        Category.parent_id.is_(None),
                     )
                 )
             )
-            uncolored = [c.name for c in cats if c.color is None]
+            parents = [c for c in active if c.parent_id is None]
+            children = [c for c in active if c.parent_id is not None]
+
+            uncolored = [c.name for c in parents if c.color is None]
             assert not uncolored, f"seeded categories missing a default color: {uncolored}"
-            assert all(re.fullmatch(r"#[0-9a-f]{6}", c.color or "") for c in cats)
+            assert all(re.fullmatch(r"#[0-9a-f]{6}", c.color or "") for c in parents)
+
+            colored_children = [c.name for c in children if c.color is not None]
+            assert not colored_children, (
+                f"seeded subcategories must be color=NULL to inherit the parent's hue, "
+                f"but these carry their own: {colored_children}"
+            )
     finally:
         eng.dispose()
 
@@ -328,11 +500,8 @@ def test_benchmarks_seeded() -> None:
     """After ``alembic upgrade head`` the 7-row benchmark catalog exists (global
     reference data, no user_id), with valid numeric scheme codes — a typo'd code
     in the migration fails here, not in prod."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             benchmarks = list(s.scalars(select(Benchmark)))
@@ -355,10 +524,9 @@ def test_0014_downgrade_drops_benchmark_tables() -> None:
     Locks 0014's ``downgrade()`` (drop benchmark_nav before benchmarks — reverse FK
     order). ``test_migration_matches_models`` runs upgrade-side only and cannot catch
     downgrade drift (house precedent: 0003/0005/0008 each ship a downgrade test)."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0013_add_instrument_identifiers")
 
         insp = inspect(eng)
@@ -374,10 +542,9 @@ def test_0015_downgrade_drops_fx_rates() -> None:
     Locks 0015's ``downgrade()`` (single ``drop_table``). ``test_migration_matches_models``
     runs upgrade-side only and cannot catch downgrade drift (house precedent: 0003/0005/0008/
     0014 each ship a downgrade test)."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0014_add_benchmarks")
 
         assert not inspect(eng).has_table("fx_rates")
@@ -393,10 +560,9 @@ def test_0016_downgrade_narrows_instrument_index() -> None:
     2-col recreate doesn't trip — the migration docstring flags that a downgrade with
     dual-currency symbols present is irreversible (forward-only widening). House precedent:
     0005/0008/0014/0015 each ship a downgrade test."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0015_add_fx_rates")
 
         insp = inspect(eng)
@@ -433,10 +599,9 @@ def test_instruments_partial_index_where_clause_preserved() -> None:
     rendered_pg = str(CreateIndex(idx).compile(dialect=postgresql_dialect.dialect()))
     assert "archived_at IS NULL" in rendered_pg, f"model-side postgres WHERE missing: {rendered_pg}"
 
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             row = conn.execute(
                 text(
                     "SELECT sql FROM sqlite_master WHERE type='index' "
@@ -479,10 +644,9 @@ def test_partial_index_where_clause_preserved() -> None:
         f"model-side postgres WHERE missing: {rendered_pg}"
     )
 
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             row = conn.execute(
                 text(
                     "SELECT sql FROM sqlite_master "
@@ -510,10 +674,9 @@ def test_0005_downgrade_removes_constraints() -> None:
     constraints behind. ``test_migration_matches_models`` runs on the
     upgrade side only — it cannot catch downgrade drift.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0004_add_transaction_confirmed_at")
 
         insp = inspect(eng)
@@ -546,11 +709,8 @@ def test_0005_downgrade_removes_constraints() -> None:
 
 def test_default_categories_downgrade_removes_seeded_only() -> None:
     """0003 downgrade deletes seeded rows (incl. archived) and keeps user-made (incl. archived)."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         # Seed three more rows to lock down the archived-row edges:
         #   - UserMade (active, is_seeded=False)        → survives
         #   - ArchivedUserMade (archived, is_seeded=False) → survives
@@ -828,10 +988,9 @@ def test_0008_downgrade_removes_kind_and_income_seeds() -> None:
     restore the 2-column active-name unique index. ``test_migration_matches_models``
     runs on the upgrade side only and cannot catch downgrade drift.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0007_add_investment_tables")
 
         insp = inspect(eng)
@@ -894,7 +1053,7 @@ def test_0026_downgrade_restores_switch_pair_id() -> None:
     a column that no longer exists. House precedent: each migration ships a
     downgrade test.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
 
         def _state() -> tuple[set[str], tuple[str, ...], str]:
@@ -914,8 +1073,6 @@ def test_0026_downgrade_restores_switch_pair_id() -> None:
                 ).scalar()
             return cols, fk, ddl or ""
 
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
         cols, fk, ddl = _state()
         assert "pair_id" in cols and "switch_pair_id" not in cols
         assert fk == ("pair_id", "user_id")
@@ -945,7 +1102,7 @@ def test_0025_recomputes_existing_fingerprints() -> None:
     assert the stored value is now the ``\\x1f``-joined hash. Also asserts the
     ``occurrence`` server_default covers a raw INSERT that never names it.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _migration_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
@@ -983,11 +1140,10 @@ def test_0025_downgrade_restores_the_old_key_and_is_reversible() -> None:
     unique constraint to 3 columns, and restores the separatorless fingerprints;
     re-upgrading returns to the ``\\x1f`` form. House precedent: each migration
     ships a downgrade test; ``test_migration_matches_models`` runs upgrade-only."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             conn.execute(text("INSERT INTO users (id) VALUES (:u)").bindparams(u=uid_hex))
             conn.execute(
                 text(
@@ -1036,10 +1192,8 @@ def test_0025_batch_rebuild_preserves_the_partial_index_predicate() -> None:
     WHERE clause. ``test_migration_matches_models`` does NOT compare partial
     predicates (see ``Transaction.__table_args__``), so assert it here rather than
     inherit that silence — mirrors ``test_partial_index_where_clause_preserved``."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
         with eng.connect() as conn:
             sql = conn.execute(
                 text(
@@ -1117,7 +1271,7 @@ def test_0027_recomputes_investment_fingerprints() -> None:
     (reading it through the ``Units`` TypeDecorator would unscale it and change every
     hash), and that the ``occurrence`` server_default covers a raw INSERT that never
     names it."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _migration_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
@@ -1149,7 +1303,7 @@ def test_0027_recompute_leaves_manual_null_fingerprints_alone() -> None:
     """A manual row carries ``fingerprint = NULL``, and NULLs-are-distinct is what keeps
     the unique index inert for manual entry. Hashing one would silently enrol it in
     dedup, so the recompute's ``IS NOT NULL`` filter is load-bearing."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _migration_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
@@ -1185,11 +1339,10 @@ def test_0027_downgrade_restores_the_old_key_and_is_reversible() -> None:
     index to 3 columns, and restores the separatorless fingerprints; re-upgrading returns
     to the ``\\x1f`` form. House precedent: each migration ships a downgrade test;
     ``test_migration_matches_models`` runs upgrade-only."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             inst_id, _ = _seed_investment_row(conn, uid_hex=uid_hex, fingerprint="whatever")
 
         assert _investment_uq_columns(eng) == [
@@ -1229,11 +1382,10 @@ def test_0027_downgrade_refuses_to_merge_two_real_duplicates() -> None:
     recompute to the SAME old fingerprint, and the re-narrowed 3-column index must
     REFUSE them — losing one would silently destroy a real transaction. The recompute
     runs before the narrowing precisely so this fails at CREATE UNIQUE INDEX."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             inst_id, _ = _seed_investment_row(conn, uid_hex=uid_hex, fingerprint="dupe")
             # The second of two genuinely-distinct identical transactions.
             conn.execute(
@@ -1258,10 +1410,9 @@ def test_0022_downgrade_readds_note_and_is_reversible() -> None:
     the label tables in place); re-upgrading drops it again — the drop is
     schema-reversible (data loss is by design). House precedent: each migration
     ships a downgrade test; ``test_migration_matches_models`` runs upgrade-only."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0021_add_transaction_labels")
 
         insp = inspect(eng)
@@ -1281,10 +1432,9 @@ def test_0023_downgrade_drops_merchant_label_map() -> None:
     """``alembic downgrade 0022`` from head drops ``merchant_label_map``; re-upgrading
     re-creates it — the table is schema-reversible. House precedent: each migration
     ships a downgrade test; ``test_migration_matches_models`` runs upgrade-only."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0022_drop_transaction_note")
 
         assert not inspect(eng).has_table("merchant_label_map")
@@ -1301,10 +1451,9 @@ def test_0021_downgrade_drops_label_tables() -> None:
     """``alembic downgrade 0020`` from head drops both label tables (reverse FK
     order: transaction_labels before labels). ``note`` is back at 0020 because
     0022's downgrade re-added it before 0021's ran."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
             command.downgrade(_alembic_cfg(conn), "0020_widen_merchant_normalized")
 
         insp = inspect(eng)
@@ -1329,11 +1478,8 @@ def test_transaction_labels_timestamps_have_server_default() -> None:
     twice over — but only this test says *why* it must not be dropped.
     FK ON (make_engine default) → seed real parent rows.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         uid_hex = get_settings().v1_user_id.hex  # 0001 seeds this user
         with eng.begin() as conn:
             conn.execute(
@@ -1389,7 +1535,7 @@ def test_0028_backfills_origin_fingerprint_for_import_rows_only() -> None:
     Harmless while ``origin_fingerprint == fingerprint``, which is why the migration
     docstring records it instead of inventing a column to distinguish them.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _migration_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
@@ -1456,7 +1602,7 @@ def test_0029_recomputes_refund_rows_to_positive_spend() -> None:
     narrowed CHECK actually rejects ``refund`` post-upgrade, so a future
     contributor can't silently widen the vocabulary back without this failing.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _migration_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
@@ -1508,7 +1654,7 @@ def test_0029_partial_index_predicate_survives_up_and_down() -> None:
     checking the downgrade side too, since 0029's downgrade rebuilds the same
     table and could lose the predicate the same way the upgrade could.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
 
         def _predicate_sql() -> str | None:
@@ -1520,8 +1666,6 @@ def test_0029_partial_index_predicate_survives_up_and_down() -> None:
                     )
                 ).scalar()
 
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
         sql = _predicate_sql()
         assert sql is not None
         assert "confirmed_at IS NOT NULL" in sql
@@ -1549,7 +1693,7 @@ def test_0029_downgrade_restores_refund_type_and_is_reversible() -> None:
     (no such row is reachable pre-0029, since ``spend > 0`` 422ed before this
     migration) — the up→down→up round trip is what this test actually proves.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _migration_engine()
     try:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
@@ -1610,11 +1754,8 @@ def test_merchant_dictionary_matches_migration_seed() -> None:
     implies, keeping migration 0032's frozen literal and ``provisioning.py``'s tuple mutually
     guarding (Phase A5 trap 6) instead of registrants silently diverging from the demo user.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
             v1 = get_settings().v1_user_id
@@ -1648,6 +1789,35 @@ def test_merchant_dictionary_matches_migration_seed() -> None:
         eng.dispose()
 
 
+# (name, color) — the pre-hierarchy flat default categories (0003/0008/0012/0018), used ONLY
+# to hand-build "other_user" below as a pre-0033 registrant. These used to live in
+# provisioning.py as ``_DEFAULT_SPEND_CATEGORIES`` / ``_DEFAULT_INCOME_CATEGORIES``, but that
+# module's live shape has been the 2-level taxonomy since ADR-0012 — this test is now their
+# only reader, so they moved here rather than surviving as dead exports (AGENTS.md §Surgical
+# changes: full-text search found zero callers under app/).
+_LEGACY_FLAT_SPEND_CATEGORIES: tuple[tuple[str, str], ...] = (
+    ("Food", "#d95926"),
+    ("Groceries", "#6f9e15"),
+    ("Transport", "#2a78d6"),
+    ("Rent", "#6c5cd6"),
+    ("Utilities", "#0e97c4"),
+    ("Shopping", "#d55181"),
+    ("Entertainment", "#b246c0"),
+    ("Health", "#e34948"),
+    ("Travel", "#0e9488"),
+    ("Subscriptions", "#1baf7a"),
+    ("EMI", "#c23b6b"),
+    ("Investment", "#008300"),
+    ("Other", "#94a3b8"),
+)
+_LEGACY_FLAT_INCOME_CATEGORIES: tuple[tuple[str, str], ...] = (
+    ("Salary", "#008300"),
+    ("Freelancing", "#2a78d6"),
+    ("Cashback", "#c98500"),
+    ("Other", "#94a3b8"),
+)
+
+
 def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
     """The realistic Phase A5 trap-1 scenario: an existing deployment already ran
     ``app.services.demo_seed.seed_demo_data`` (12 of this dictionary's canonicals collide with
@@ -1656,7 +1826,7 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
     must seed a second, unrelated pre-existing user identically — "idempotent" (safe against
     pre-existing colliding data) + "user-scoped" in one test.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _migration_engine()
     try:
         v1 = get_settings().v1_user_id
         v1_val = v1.hex if hasattr(v1, "hex") else str(v1)
@@ -1719,7 +1889,7 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
                 ),
                 {"u": other_user_id.hex},
             )
-            for name, color in _DEFAULT_SPEND_CATEGORIES:
+            for name, color in _LEGACY_FLAT_SPEND_CATEGORIES:
                 conn.execute(
                     text(
                         "INSERT INTO categories "
@@ -1729,7 +1899,7 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
                     ),
                     {"u": other_user_id.hex, "name": name, "color": color},
                 )
-            for name, color in _DEFAULT_INCOME_CATEGORIES:
+            for name, color in _LEGACY_FLAT_INCOME_CATEGORIES:
                 conn.execute(
                     text(
                         "INSERT INTO categories "
@@ -1783,11 +1953,8 @@ def test_0032_downgrade_preserves_pinned_seed_row() -> None:
     discarded. Sibling to
     ``test_default_categories_downgrade_removes_seeded_only``.
     """
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    eng = _head_engine()
     try:
-        with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
-
         v1 = get_settings().v1_user_id
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
@@ -1826,45 +1993,222 @@ def test_0032_downgrade_preserves_pinned_seed_row() -> None:
         eng.dispose()
 
 
-
 def test_seed_bound_to_archived_category_not_created_via_migration() -> None:
-    """Phase A5 trap 3 at the migration level: ``uq_categories_active_user_name`` is a
-    *partial* index, so an archived category can share a name with an active one. An archived
-    category must not receive a seed row, without disturbing any other category."""
-    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    """Phase A5 trap 3, retargeted for the hierarchy: ``uq_categories_active_user_name`` is a
+    *partial* index, so an archived category can share a name with an active one. 0035
+    re-points a legacy seed row from a flat category onto its fine-grained subcategory — an
+    archived subcategory must not receive that re-point (it would bind a seed row to an
+    archived category), without disturbing any other merchant's re-point.
+
+    Archives "Mobile & Broadband" / "Cable & Satellite TV" — the actual subcategories 0035's
+    dictionary names for airtel/bsnl/tata play/etc — between 0034 (which creates them,
+    unarchived) and head, where 0035 runs the re-point. The ORIGINAL version of this test
+    archived "Utilities" *before* 0034 even ran: that only re-proved 0032's pre-existing
+    archived-category skip (unrelated to the hierarchy) and never exercised 0035 at all, since
+    "Mobile & Broadband" / "Cable & Satellite TV" don't exist — let alone bind anything — until
+    0034 creates the very row this test now archives.
+    """
+    eng = _migration_engine()
     try:
         v1 = get_settings().v1_user_id
         v1_val = v1.hex if hasattr(v1, "hex") else str(v1)
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "0031_add_merchant_alias")
+            command.upgrade(_alembic_cfg(conn), "0034_seed_category_taxonomy")
             conn.execute(
                 text(
                     "UPDATE categories SET archived_at = CURRENT_TIMESTAMP "
-                    "WHERE user_id = :u AND kind = 'spend' AND name = 'Utilities'"
+                    "WHERE user_id = :u AND kind = 'spend' "
+                    "AND name IN ('Mobile & Broadband', 'Cable & Satellite TV')"
                 ),
                 {"u": v1_val},
             )
+            utilities_id = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u "
+                    "AND kind = 'spend' AND name = 'Utilities'"
+                ),
+                {"u": v1_val},
+            ).scalar()
 
         with eng.begin() as conn:
-            command.upgrade(_alembic_cfg(conn), "head")
+            command.upgrade(_alembic_cfg(conn), "head")  # must not raise, must not dangle
 
-        utilities_canonicals = {
-            c
-            for _, c, name in _MERCHANT_DICTIONARY
+        archived_target_canonicals = {
+            canonical
+            for _, canonical, name in _MERCHANT_DICTIONARY
             if name in ("Mobile & Broadband", "Cable & Satellite TV")
         }
-        other_canonicals = {
-            c
-            for _, c, name in _MERCHANT_DICTIONARY
+        other_targets = {
+            canonical: name
+            for _, canonical, name in _MERCHANT_DICTIONARY
             if name not in ("Mobile & Broadband", "Cable & Satellite TV")
         }
         session_factory = sessionmaker(bind=eng)
         with session_factory() as s:
+            cat_id_by_name = {
+                c.name: c.id
+                for c in s.scalars(
+                    select(Category).where(
+                        Category.user_id == v1,
+                        Category.kind == "spend",
+                        Category.archived_at.is_(None),
+                    )
+                )
+            }
             v1_maps = {
-                m.merchant_normalized
+                m.merchant_normalized: m.category_id
                 for m in s.scalars(select(MerchantTagMap).where(MerchantTagMap.user_id == v1))
             }
-            assert not (v1_maps & utilities_canonicals)
-            assert v1_maps == other_canonicals
+            # Archived target: 0035 skipped the re-point, so the seed row stayed on the
+            # legacy flat category it already pointed at — never on the archived subcategory,
+            # never dangling.
+            for canonical in archived_target_canonicals:
+                assert v1_maps[canonical] == utilities_id, (
+                    f"{canonical} should stay bound to legacy 'Utilities' while its target "
+                    f"subcategory is archived, got category_id={v1_maps[canonical]}"
+                )
+            # Every other merchant still re-pointed to its real subcategory — the archived
+            # pair didn't disturb 0035's loop for anyone else.
+            for canonical, target_name in other_targets.items():
+                assert v1_maps[canonical] == cat_id_by_name[target_name]
+    finally:
+        eng.dispose()
+
+
+def test_0034_downgrade_preserves_referenced_and_user_authored_categories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``alembic downgrade 0033`` (0035's downgrade, a merchant_tag_map-only no-op
+    here, then 0034's) must not destroy data — under REAL FK enforcement.
+
+    The stairway test above is structural only and walks an empty DB, so it
+    cannot see a downgrade orphan a transaction; this test seeds real referencing
+    rows. Regression coverage for the two verified defects in the *original*
+    ``downgrade()``: (2.2) an unscoped ``UPDATE categories SET parent_id = NULL``
+    with no WHERE would have flattened a user-authored hierarchy the migration
+    never created; (2.3) two unconditional DELETEs of seeded categories by name,
+    with no check for referencing rows, would leave ``transactions`` /
+    ``merchant_tag_map`` pointing at a row that no longer exists (or, under FK
+    enforcement, simply raise).
+
+    Drives the upgrade half through the CLI path against a real temp file — FK
+    OFF there is deliberate (0033's now-populated-table recreate, see env.py) —
+    then reopens a fresh ``make_engine`` connection (FK ON at connect, the
+    opposite of this file's throwaway ``_migration_engine``) for seeding, the
+    downgrade under test, and every assertion, so a regression here surfaces as
+    a genuine ``IntegrityError`` or a caught dangling FK, not a silently-passing
+    test.
+    """
+    import app.core.config as config_mod
+
+    uid_hex = uuid.UUID("00000000-0000-0000-0000-000000000001").hex  # 0001 seeds this user
+    db_url = f"sqlite:///{(tmp_path / 'cat_downgrade.db').as_posix()}"
+    monkeypatch.setattr(
+        config_mod, "get_settings", lambda: config_mod.Settings(database_url=db_url)
+    )
+
+    def _cli_cfg() -> Config:
+        cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
+        cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+        return cfg
+
+    command.upgrade(_cli_cfg(), "head")
+
+    eng = make_engine(db_url)  # FK ON at connect — the real enforcement this test needs.
+    try:
+        with eng.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type) "
+                    "VALUES (:u, 'Axis CC', 'credit_card')"
+                ).bindparams(u=uid_hex)
+            )
+            acct_id = conn.execute(text("SELECT id FROM accounts")).scalar()
+
+            sub_id = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u AND kind = 'spend' "
+                    "AND name = 'Coffee & Tea' AND archived_at IS NULL"
+                ).bindparams(u=uid_hex)
+            ).scalar()
+            income_parent_id = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u AND kind = 'income' "
+                    "AND name = 'Income' AND archived_at IS NULL"
+                ).bindparams(u=uid_hex)
+            ).scalar()
+            assert sub_id is not None and income_parent_id is not None
+
+            # One transaction tagged to a seeded SUBCATEGORY, one to the seeded
+            # "Income" PARENT directly.
+            conn.execute(
+                text(
+                    "INSERT INTO transactions "
+                    "(user_id, account_id, date, amount_paise, transaction_type, "
+                    " merchant_normalized, fingerprint, source, category_id) "
+                    "VALUES (:u, :a, '2025-01-10', -500, 'spend', 'starbucks', 'fp-sub', "
+                    " 'manual', :c)"
+                ).bindparams(u=uid_hex, a=acct_id, c=sub_id)
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO transactions "
+                    "(user_id, account_id, date, amount_paise, transaction_type, "
+                    " merchant_normalized, fingerprint, source, category_id) "
+                    "VALUES (:u, :a, '2025-01-15', 50000, 'income', 'employer', 'fp-inc', "
+                    " 'manual', :c)"
+                ).bindparams(u=uid_hex, a=acct_id, c=income_parent_id)
+            )
+
+            # A hand-created parent/child pair 0034 never touched and has no
+            # business reparenting or deleting.
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded) "
+                    "VALUES (:u, 'My Parent', 'spend', 0)"
+                ).bindparams(u=uid_hex)
+            )
+            user_parent_id = conn.execute(
+                text("SELECT id FROM categories WHERE name = 'My Parent'")
+            ).scalar()
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, parent_id) "
+                    "VALUES (:u, 'My Child', 'spend', 0, :p)"
+                ).bindparams(u=uid_hex, p=user_parent_id)
+            )
+            user_child_id = conn.execute(
+                text("SELECT id FROM categories WHERE name = 'My Child'")
+            ).scalar()
+
+        # The downgrade under test — real FK enforcement throughout (no CLI-path
+        # FK-off: this connection's listener turned it ON at connect).
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), "0033_add_category_parent_id")
+
+        with eng.connect() as conn:
+            # (b) no FK dangles — asked of SQLite directly rather than inferred.
+            violations = conn.execute(text("PRAGMA foreign_key_check")).all()
+            assert violations == [], f"dangling FK(s) after downgrade: {violations}"
+
+            # (a) both transactions still resolve a category (archived is fine —
+            # deleted, i.e. the id no longer existing, is not).
+            sub_resolves, income_resolves = conn.execute(
+                text(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM categories WHERE id = "
+                    " (SELECT category_id FROM transactions WHERE fingerprint = 'fp-sub')), "
+                    "(SELECT COUNT(*) FROM categories WHERE id = "
+                    " (SELECT category_id FROM transactions WHERE fingerprint = 'fp-inc'))"
+                )
+            ).one()
+            assert sub_resolves == 1
+            assert income_resolves == 1
+
+            # (c) the user-authored parent_id survived 2.2's scoping.
+            child_parent_id = conn.execute(
+                text("SELECT parent_id FROM categories WHERE id = :c").bindparams(c=user_child_id)
+            ).scalar()
+            assert child_parent_id == user_parent_id
     finally:
         eng.dispose()

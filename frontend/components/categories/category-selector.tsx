@@ -170,7 +170,9 @@ export function CategorySelector({
               className="max-h-72 overflow-y-auto"
               onWheelCapture={(e) => e.stopPropagation()}
             >
-              <CommandEmpty>No matching categories.</CommandEmpty>
+              {filteredTree.length === 0 ? (
+                <CommandEmpty>No matching categories.</CommandEmpty>
+              ) : null}
 
               {optional && !q ? (
                 <>

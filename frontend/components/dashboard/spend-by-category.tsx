@@ -26,13 +26,14 @@ import {
   listCategories,
   listSpendByCategory,
   type CategoryColor,
+  type CategoryRead,
 } from "@/lib/api/client";
 import { formatINR, formatMonthYear, formatPercent } from "@/lib/format";
 import {
   categoryColorVar,
-  categoryDisplayName,
+  categoryLabel,
   getParentSubcategorySpend,
-  resolveCategoryColor,
+  resolveSiblingDisplayColor,
   rollUpSpendByCategory,
 } from "@/lib/categories";
 import { cn } from "@/lib/utils";
@@ -84,21 +85,33 @@ export function SpendByCategory({
   // The aggregate carries only id/name/total — join the shared ["categories"] cache.
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
   });
   const allCategories = categoriesQuery.data ?? [];
+  // Every dot/bar in this card renders siblings next to each other (the
+  // parent list, the drilldown, the flat "All Detailed" view, the net-credit
+  // footer), so color resolution goes through the shade-aware helper, not
+  // plain `resolveCategoryColor` (locked decision #5 / 5.6). Built once here
+  // rather than per-element — `resolveCategoryColor` used to be handed the
+  // raw `allCategories` array inside this same `.map`, rebuilding a fresh
+  // Map on every iteration.
   const colorById = useMemo(
     () =>
       new Map<number, CategoryColor | null>(
-        allCategories.map((c) => [c.id, resolveCategoryColor(c, allCategories)]),
+        allCategories.map((c) => [c.id, resolveSiblingDisplayColor(c, allCategories)]),
       ),
     [allCategories],
   );
   const colorFor = (id: number | null): CategoryColor | null =>
     id != null ? (colorById.get(id) ?? null) : null;
+  const categoriesById = useMemo(
+    () => new Map<number, CategoryRead>(allCategories.map((c) => [c.id, c])),
+    [allCategories],
+  );
 
-  // Split by sign. Spend rows drive the bars + percentage base; net-credit rows
-  // (positive total) are listed apart; exact-zero rows are dropped (no signal).
+  // Split by sign. Spend rows drive the flat-view bars + its percentage base;
+  // net-credit rows (positive total) are listed apart; exact-zero rows are
+  // dropped (no signal).
   const spendRows = useMemo(() => rows.filter((r) => r.total_paise < 0), [rows]);
   const creditRows = useMemo(() => rows.filter((r) => r.total_paise > 0), [rows]);
   const totalSpend = useMemo(
@@ -140,6 +153,21 @@ export function SpendByCategory({
     () => parentRollups.filter((r) => r.totalPaise > 0),
     [parentRollups],
   );
+  // What the net-credit footer actually renders — computed once so the
+  // footer's visibility gate and its render body can never disagree (5.7).
+  const creditDisplayRows = viewMode === "parent" ? creditRollups : creditRows;
+  // Percentage base for the Parent view's bars: the sum of the SAME rolled-up,
+  // refund-netted magnitudes the bars render — not the flat, spend-only
+  // `totalSpend` above. That flat sum double-counts a parent's direct spend
+  // against its children's separate rows and drops any category that nets
+  // credit entirely, so dividing a netted rollup magnitude by it never summed
+  // to 100% once any category had a refund (5.3). `totalSpend` stays as the
+  // base for the Flat "All Detailed" view and the headline total, where
+  // numerator and denominator are already on the same flat, spend-only basis.
+  const totalSpendRollup = useMemo(
+    () => spendRollups.reduce((sum, r) => sum - r.totalPaise, 0),
+    [spendRollups],
+  );
 
   // Selected parent category details when drilled down
   const selectedRollup = useMemo(
@@ -150,10 +178,16 @@ export function SpendByCategory({
     [selectedParentId, parentRollups],
   );
 
+  // Fed the FULL `rows` (spend and credit), not the spend-only `spendRows` —
+  // `selectedRollup.totalPaise` (the drilldown's percentage base) is also
+  // computed from the full rows via `rollUpSpendByCategory`, so numerator and
+  // denominator must share that same netted basis or a net-credit sibling
+  // that's excluded from the numerators but still netted into the
+  // denominator skews every share (5.3 — the 166.7%-and-overflowing-bar case).
   const subcategorySpendItems = useMemo(() => {
     if (selectedParentId == null) return [];
-    return getParentSubcategorySpend(spendRows, selectedParentId, allCategories);
-  }, [selectedParentId, spendRows, allCategories]);
+    return getParentSubcategorySpend(rows, selectedParentId, allCategories);
+  }, [selectedParentId, rows, allCategories]);
 
   const displayPeriodLabel = month
     ? formatMonthYear(new Date(Number(month.split("-")[0]), Number(month.split("-")[1]) - 1, 1))
@@ -228,12 +262,25 @@ export function SpendByCategory({
             {query.isSuccess ? (
               selectedParentId != null && selectedRollup ? (
                 <>
-                  <Sensitive>{formatINR(-selectedRollup.totalPaise)}</Sensitive> in category
+                  {/* A parent can flip net-positive between the click and this
+                      render (e.g. stepping the month while drilled in) — clamp
+                      so a net-credit parent never renders a negative rupee
+                      figure (5.3). */}
+                  <Sensitive>
+                    {formatINR(Math.max(0, -selectedRollup.totalPaise))}
+                  </Sensitive>{" "}
+                  in category
                 </>
               ) : (
-                <>
+                // Gross, spend-only — the SAME basis as the flat "All
+                // Detailed" view, deliberately NOT netted against the Parent
+                // view's rolled-up bars below (which net refunds into their
+                // category per 5.3). Labelled via title rather than netted:
+                // a refund shouldn't make it look like less money left the
+                // account (8.8).
+                <span title="Gross spend across all categories — a category's own bar below nets any refund against it, so the two totals can differ.">
                   <Sensitive>{formatINR(totalSpend)}</Sensitive> spent
-                </>
+                </span>
               )
             ) : (
               " "
@@ -261,7 +308,7 @@ export function SpendByCategory({
               </span>
               {selectedParentId != null ? (
                 <Link
-                  href={`/expenses?category_id=${selectedParentId}`}
+                  href={`/expenses?category=${selectedParentId}`}
                   className="text-[11.5px] text-primary hover:underline"
                 >
                   View all transactions →
@@ -273,8 +320,15 @@ export function SpendByCategory({
               {subcategorySpendItems.map((subcat) => {
                 const mag = -subcat.totalPaise;
                 const parentTotalMag = selectedRollup ? -selectedRollup.totalPaise : 0;
+                // Numerator and denominator are both netted (subcategorySpendItems
+                // is fed the full `rows`, same as `selectedRollup`), so shares sum
+                // to 100% — but a single sibling can still legitimately exceed
+                // 100% of the parent's net when another sibling nets credit and
+                // offsets it. The percentage TEXT can say that; the bar WIDTH
+                // must not overflow its track, so it alone is clamped (5.3).
                 const shareOfParentPct =
                   parentTotalMag > 0 ? (mag * 100) / parentTotalMag : 0;
+                const barWidthPct = Math.max(0, Math.min(100, shareOfParentPct));
 
                 return (
                   <li key={subcat.categoryId ?? "direct"}>
@@ -282,7 +336,7 @@ export function SpendByCategory({
                       <Link
                         href={
                           subcat.categoryId != null
-                            ? `/expenses?category_id=${subcat.categoryId}`
+                            ? `/expenses?category=${subcat.categoryId}`
                             : `/expenses`
                         }
                         className={cn(
@@ -319,7 +373,7 @@ export function SpendByCategory({
                       <div
                         className="h-full rounded-full"
                         style={{
-                          width: hidden ? "0%" : `${shareOfParentPct}%`,
+                          width: hidden ? "0%" : `${barWidthPct}%`,
                           backgroundColor: categoryColorVar(
                             subcat.categoryId,
                             colorFor(subcat.categoryId),
@@ -337,7 +391,13 @@ export function SpendByCategory({
           <ul className="flex flex-col gap-2.5">
             {spendRollups.map((r) => {
               const mag = -r.totalPaise;
-              const sharePct = totalSpend > 0 ? (mag * 100) / totalSpend : 0;
+              // Base is `totalSpendRollup` (sum of these same rolled-up
+              // magnitudes) — not the flat `totalSpend` — so shares sum to
+              // 100% (5.3). No individual share can exceed 100% here: every
+              // term is a non-negative magnitude summing to the total, unlike
+              // the drilldown below where one sibling can outweigh a parent's
+              // net.
+              const sharePct = totalSpendRollup > 0 ? (mag * 100) / totalSpendRollup : 0;
               const hasSubcategories = r.parentId != null && r.subcategories.length > 0;
 
               return (
@@ -363,9 +423,15 @@ export function SpendByCategory({
                           <span className="truncate">
                             {r.parentName ?? "Uncategorized"}
                           </span>
+                          {/* "rows", not "subcats": `subcategories` deliberately
+                              includes the parent's own "(Direct)" spend as a row
+                              (see `rollUpSpendByCategory`) so this count matches
+                              what the drilldown actually renders. That invariant
+                              is load-bearing — do NOT make the count exclude the
+                              direct row to justify the old label. */}
                           <span className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.2 text-[10.5px] font-normal text-muted-foreground bg-muted group-hover:bg-primary/10 group-hover:text-primary">
                             {r.subcategories.length}{" "}
-                            {r.subcategories.length === 1 ? "subcat" : "subcats"}
+                            {r.subcategories.length === 1 ? "row" : "rows"}
                             <IconChevronRight className="size-2.5 opacity-70" />
                           </span>
                         </button>
@@ -373,7 +439,7 @@ export function SpendByCategory({
                         <Link
                           href={
                             r.parentId != null
-                              ? `/expenses?category_id=${r.parentId}`
+                              ? `/expenses?category=${r.parentId}`
                               : "/expenses"
                           }
                           className={cn(
@@ -415,7 +481,7 @@ export function SpendByCategory({
                     <div
                       className="h-full rounded-full"
                       style={{
-                        width: hidden ? "0%" : `${sharePct}%`,
+                        width: hidden ? "0%" : `${Math.max(0, Math.min(100, sharePct))}%`,
                         backgroundColor: categoryColorVar(
                           r.parentId,
                           colorFor(r.parentId),
@@ -433,8 +499,12 @@ export function SpendByCategory({
             {spendRows.map((r) => {
               const mag = -r.total_paise;
               const sharePct = totalSpend > 0 ? (mag * 100) / totalSpend : 0;
-              const catObj = allCategories.find((c) => c.id === r.category_id);
-              const displayName = categoryDisplayName(catObj, allCategories);
+              // `r.category_name` is the row's STORED name — the aggregate join
+              // predicates on id + user_id only, never `archived_at`, so an
+              // archived category still arrives named. Passing it through
+              // `categoryLabel` keeps the breadcrumb for active rows and stops an
+              // archived one from rendering as "Uncategorized".
+              const displayName = categoryLabel(r.category_id, categoriesById, r.category_name);
 
               return (
                 <li key={r.category_id ?? "uncategorized"}>
@@ -442,7 +512,7 @@ export function SpendByCategory({
                     <Link
                       href={
                         r.category_id != null
-                          ? `/expenses?category_id=${r.category_id}`
+                          ? `/expenses?category=${r.category_id}`
                           : "/expenses"
                       }
                       className={cn(
@@ -456,9 +526,7 @@ export function SpendByCategory({
                         categoryId={r.category_id}
                         color={colorFor(r.category_id)}
                       />
-                      <span className="truncate">
-                        {r.category_id == null ? "Uncategorized" : displayName}
-                      </span>
+                      <span className="truncate">{displayName}</span>
                     </Link>
                     <span
                       className="flex shrink-0 items-baseline gap-1.5 text-[12px] tabular-nums text-muted-foreground"
@@ -503,10 +571,16 @@ export function SpendByCategory({
           </p>
         ) : null}
 
-        {creditRows.length > 0 && selectedParentId == null ? (
+        {/* Gate on the SAME array being rendered — `creditRows` (flat) and
+            `creditRollups` (rolled up) can differ in length once several
+            net-credit siblings merge into one parent bucket, or merge with a
+            parent's direct spend into a bucket that's no longer net-positive
+            at all. Gating on `creditRows.length` while rendering
+            `creditRollups` could show the header with an empty list (5.7). */}
+        {creditDisplayRows.length > 0 && selectedParentId == null ? (
           <p className="mt-3 border-t border-border/60 pt-2.5 text-[11.5px] text-muted-foreground">
             Net credit this month:{" "}
-            {(viewMode === "parent" ? creditRollups : creditRows).map((r, i) => {
+            {creditDisplayRows.map((r, i) => {
               const catId = "parentId" in r ? r.parentId : r.category_id;
               const catName = "parentName" in r ? r.parentName : r.category_name;
               const total = "totalPaise" in r ? r.totalPaise : r.total_paise;
@@ -586,4 +660,3 @@ function Empty({
     </p>
   );
 }
-

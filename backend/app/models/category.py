@@ -1,4 +1,10 @@
-"""Category model — flat list, no hierarchy in v1 (per PRD §F5).
+"""Category model — a two-level hierarchy (per PRD §F5, ADR-0012).
+
+``parent_id`` is a nullable self-FK capped at depth 2: a row with
+``parent_id IS NULL`` is a parent, a row pointing at one is a subcategory,
+and a subcategory can never itself be a parent. The cap is enforced in
+``app/api/v1/categories.py``, not here — this model carries no parent
+validation.
 
 ``is_seeded`` flags the defaults the app inserts on first run; user-
 created categories carry ``False``. Soft-delete via ``archived_at`` so the
@@ -87,6 +93,15 @@ class Category(Base, TimestampMixin):
     parent: Mapped[Category | None] = relationship(
         "Category", remote_side="Category.id", back_populates="subcategories"
     )
+    # NOT cascade="all, delete-orphan" — de-associating a child (PATCH parent_id
+    # to a new parent, or to null to promote it to root) is a legitimate,
+    # user-facing write, not a delete. delete-orphan would turn that PATCH into
+    # a row DELETE and take transactions.category_id (a plain FK, no ON DELETE)
+    # down with it (ADR-0012). The default cascade ("save-update, merge") is what
+    # this relationship wants. passive_deletes=True defers to the DB's
+    # ondelete="CASCADE" (migration 0033) instead of the ORM emitting its own
+    # child UPDATE/DELETE — there is currently no code path that hard-deletes a
+    # category (soft-delete only), so this is defence-in-depth, not a live path.
     subcategories: Mapped[list[Category]] = relationship(
-        "Category", back_populates="parent", cascade="all, delete-orphan"
+        "Category", back_populates="parent", passive_deletes=True
     )

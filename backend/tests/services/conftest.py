@@ -22,7 +22,7 @@ round-trip itself is the contract — notably ``DateTime``, which SQLite returns
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 from sqlalchemy import Engine
@@ -31,17 +31,21 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.config import get_settings
 from app.core.db import make_engine
-from app.models import Base, User
+from app.models import User
 
 
 @pytest.fixture
-def engine() -> Iterator[Engine]:
+def engine(clone_schema: Callable[[Engine], None]) -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
-    Base.metadata.create_all(eng)
+    # Page-copied from the session template rather than built with create_all —
+    # see ``clone_schema`` in tests/conftest.py. Still a private database.
+    clone_schema(eng)
     try:
         yield eng
     finally:
-        Base.metadata.drop_all(eng)
+        # No drop_all: with StaticPool the single pooled connection *is* the
+        # ``:memory:`` database, so dispose() destroys the schema and the rows
+        # together. Dropping 16 tables first cost ~5.6ms per test for nothing.
         eng.dispose()
 
 

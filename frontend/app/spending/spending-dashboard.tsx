@@ -26,14 +26,11 @@ import { useQuery } from "@tanstack/react-query";
 
 import { CashflowBar } from "@/components/dashboard/cashflow-bar";
 import { CategoryTrendBar } from "@/components/dashboard/category-trend-bar";
-import { HierarchicalDonutChart } from "@/components/dashboard/hierarchical-donut-chart";
-import { HierarchicalTrendBar } from "@/components/dashboard/hierarchical-trend-bar";
 import { PeriodPicker } from "@/components/dashboard/period-picker";
 import { SpendByCategory } from "@/components/dashboard/spend-by-category";
 import { SpendByPeriodBar } from "@/components/dashboard/spend-by-period-bar";
 import { SpendByTag } from "@/components/dashboard/spend-by-tag";
 import { SpendByTagHeatmap } from "@/components/dashboard/spend-by-tag-heatmap";
-import { SubcategoryMovers } from "@/components/dashboard/subcategory-movers";
 import { TaggingHealthCard } from "@/components/dashboard/tagging-health-card";
 import { TopMerchants } from "@/components/dashboard/top-merchants";
 import { useAvailableYears } from "@/components/dashboard/use-available-years";
@@ -48,7 +45,6 @@ import { IconChevronDown } from "@/components/icons";
 import { listLabels } from "@/lib/api/client";
 import { labelDisplay } from "@/lib/labels";
 import { periodKey, type Period } from "@/lib/period";
-
 
 export function SpendingDashboard() {
   const yearsQuery = useAvailableYears();
@@ -109,18 +105,14 @@ export function SpendingDashboard() {
         ) : null}
       </div>
 
-      <HierarchicalDonutChart labelId={labelId} year={selectedYear} month={monthParam} />
-      <SubcategoryMovers labelId={labelId} year={selectedYear} month={monthParam} />
       <SpendByCategory labelId={labelId} year={selectedYear} month={monthParam} />
       {labels.length > 0 ? <SpendByTag year={selectedYear} month={monthParam} /> : null}
       <TopMerchants labelId={labelId} year={selectedYear} month={monthParam} />
       <CashflowBar tagActive={labelId != null} year={selectedYear} />
       <SpendByPeriodBar labelId={labelId} year={selectedYear} />
-      <HierarchicalTrendBar labelId={labelId} year={selectedYear} />
       <CategoryTrendBar labelId={labelId} year={selectedYear} />
       {labels.length > 0 ? <SpendByTagHeatmap year={selectedYear} /> : null}
       <TaggingHealthCard />
     </div>
   );
 }
-

@@ -22,9 +22,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from sqlalchemy import Engine
 
 FIXTURES_ROOT = Path(__file__).parent / "fixtures"
 LOCAL_ROOT = FIXTURES_ROOT / "_local"
@@ -90,6 +97,59 @@ def _configure_structlog_for_tests() -> None:
     from app.core.log_config import configure_logging
 
     configure_logging()
+
+
+@pytest.fixture(scope="session")
+def clone_schema() -> Iterator[Callable[[Engine], None]]:
+    """Yields ``clone_schema(engine)``, which stamps ``Base.metadata``'s schema onto a
+    fresh in-memory SQLite engine by copying it rather than rebuilding it.
+
+    ``create_all`` compiles and executes 16 ``CREATE TABLE``s plus their indexes —
+    15.5ms, which every DB test in ``tests/api`` and ``tests/services`` was paying to
+    reach a byte-identical result. SQLite's own backup API copies the *finished* pages
+    of an already-built database in 0.5ms instead.
+
+    This does **not** make the database shared. Each test still gets its own private
+    ``:memory:`` engine that merely starts out built, so isolation is exactly what it
+    was; the template is only ever read from. Requires ``StaticPool`` on both ends —
+    that is what makes one DBAPI connection *be* the database, and therefore what makes
+    ``driver_connection`` the thing ``backup()`` can copy between. ``tests/models`` is
+    deliberately not a caller: it has no ``StaticPool``.
+
+    Imports are function-local on purpose, matching ``_configure_structlog_for_tests``:
+    ``app.core.db`` builds its module-level engine from ``get_settings()`` at import
+    time, so importing it before ``_load_dotenv()`` above has run would resolve settings
+    against the wrong environment.
+    """
+    from sqlalchemy.pool import StaticPool
+
+    from app.core.db import make_engine
+    from app.models import Base
+
+    def _sqlite_conn(raw: object) -> sqlite3.Connection:
+        # SQLAlchemy types ``driver_connection`` as ``Any | None`` (it is
+        # dialect-dependent); every engine here is SQLite, so narrow it once.
+        conn = getattr(raw, "driver_connection", None)
+        assert isinstance(conn, sqlite3.Connection)
+        return conn
+
+    eng = make_engine("sqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    # Hold the checkout for the whole session: with StaticPool this single DBAPI
+    # connection *is* the template database, so letting it close would destroy it.
+    raw = eng.raw_connection()
+    source = _sqlite_conn(raw)
+
+    def _clone(target: Engine) -> None:
+        target_raw = target.raw_connection()
+        source.backup(_sqlite_conn(target_raw))
+        target_raw.close()  # returns to the pool; StaticPool keeps it open
+
+    try:
+        yield _clone
+    finally:
+        raw.close()
+        eng.dispose()
 
 
 def _glob_local(prefix: str) -> list[Path]:

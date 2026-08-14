@@ -19,7 +19,7 @@
  *  - propagation is invalidate-on-mutation (no SSE): a category PATCH refreshes
  *    this batch; a commit refreshes the board.
  */
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -277,7 +277,7 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   });
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
   });
   // Prime the label catalog on mount so the per-row tag type-ahead has
   // suggestions immediately (its own query is `enabled: open`, which would fetch
@@ -1544,9 +1544,9 @@ function ReviewRow({
                 <CommandSeparator />
                 <CommandGroup heading="Spend (refund)">
                   {buildCategoryTree(spendCategories).map((parent) => (
-                    <div key={parent.id} className="py-0.5">
+                    <Fragment key={parent.id}>
                       <CommandItem
-                        value={`spend-${parent.name}`}
+                        value={`${parent.name}-${parent.id}`}
                         onSelect={() => selectCredit("spend", parent.id)}
                         className="flex items-center gap-2 font-medium"
                       >
@@ -1559,7 +1559,7 @@ function ReviewRow({
                       {parent.subcategories.map((sub) => (
                         <CommandItem
                           key={sub.id}
-                          value={`spend-${parent.name}-${sub.name}`}
+                          value={`${sub.name}-${sub.id}`}
                           onSelect={() => selectCredit("spend", sub.id)}
                           className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
                         >
@@ -1571,15 +1571,15 @@ function ReviewRow({
                           <span className="truncate">{sub.name}</span>
                         </CommandItem>
                       ))}
-                    </div>
+                    </Fragment>
                   ))}
                 </CommandGroup>
                 <CommandSeparator />
                 <CommandGroup heading="Income">
                   {buildCategoryTree(incomeCategories).map((parent) => (
-                    <div key={parent.id} className="py-0.5">
+                    <Fragment key={parent.id}>
                       <CommandItem
-                        value={`income-${parent.name}`}
+                        value={`${parent.name}-${parent.id}`}
                         onSelect={() => selectCredit("income", parent.id)}
                         className="flex items-center gap-2 font-medium"
                       >
@@ -1592,7 +1592,7 @@ function ReviewRow({
                       {parent.subcategories.map((sub) => (
                         <CommandItem
                           key={sub.id}
-                          value={`income-${parent.name}-${sub.name}`}
+                          value={`${sub.name}-${sub.id}`}
                           onSelect={() => selectCredit("income", sub.id)}
                           className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
                         >
@@ -1604,7 +1604,7 @@ function ReviewRow({
                           <span className="truncate">{sub.name}</span>
                         </CommandItem>
                       ))}
-                    </div>
+                    </Fragment>
                   ))}
                 </CommandGroup>
               </CommandList>
@@ -1643,7 +1643,7 @@ function ReviewRow({
                 {buildCategoryTree(visibleCategories).map((parent) => (
                   <CommandGroup key={parent.id} className="p-0.5">
                     <CommandItem
-                      value={`cat-${parent.name}`}
+                      value={`${parent.name}-${parent.id}`}
                       onSelect={() => selectCategory(parent.id)}
                       className="flex items-center gap-2 font-medium"
                     >
@@ -1656,7 +1656,7 @@ function ReviewRow({
                     {parent.subcategories.map((sub) => (
                       <CommandItem
                         key={sub.id}
-                        value={`sub-${parent.name}-${sub.name}`}
+                        value={`${sub.name}-${sub.id}`}
                         onSelect={() => selectCategory(sub.id)}
                         className="ml-3 flex items-center gap-2 border-l border-border/60 pl-3 text-[12px]"
                       >

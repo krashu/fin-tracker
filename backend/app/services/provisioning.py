@@ -5,13 +5,17 @@ Categories are per-user reference data (unlike the global ``benchmark`` /
 default category set the seeded demo user has — otherwise their board has no
 categories to tag against.
 
-This is the **runtime source of truth** for that default set: the *active*
-current shape after migrations 0003 → 0012, i.e. the 13 active spend
-categories (the vestigial flat "Income" / "Transfer" seeds are excluded — they
-exist on the demo user only as archived migration cruft) plus the 4 income
-categories, each with its 0012 default color. Migrations stay frozen snapshots
-and never import this module; only :mod:`app.services.auth_service` (register)
-calls it.
+This is the **runtime source of truth** for that default set, and since
+[ADR-0012](../../../docs/adr/0012-category-hierarchy.md) that set is a *two-level
+taxonomy*, not a flat list: ``_DEFAULT_SPEND_TAXONOMY`` (9 parents) and
+``_DEFAULT_INCOME_TAXONOMY`` (1 parent, "Income"), each parent carrying its hex
+and **every subcategory carrying ``color=None``** so it inherits the parent's hue
+(PRD §F5). Migration ``0034_seed_category_taxonomy`` brings an existing user to
+the same shape by reparenting the old flat defaults, and
+``tests/test_migration_parity.py::test_provisioning_matches_migration_seed``
+polices the two staying in agreement — including colour, which no other test
+pins. Migrations stay frozen snapshots and never import this module; only
+:mod:`app.services.auth_service` (register) calls it.
 
 Also the runtime source of truth for the seed *merchant* dictionary (merchant-
 alias arc, Phase A5 — research §13.6): ~96 seed ``(pattern, canonical,
@@ -31,30 +35,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Category, MerchantAlias, MerchantTagMap
-
-# (name, color) — the legacy flat default spend categories.
-_DEFAULT_SPEND_CATEGORIES: tuple[tuple[str, str], ...] = (
-    ("Food", "#d95926"),
-    ("Groceries", "#6f9e15"),
-    ("Transport", "#2a78d6"),
-    ("Rent", "#6c5cd6"),
-    ("Utilities", "#0e97c4"),
-    ("Shopping", "#d55181"),
-    ("Entertainment", "#b246c0"),
-    ("Health", "#e34948"),
-    ("Travel", "#0e9488"),
-    ("Subscriptions", "#1baf7a"),
-    ("EMI", "#c23b6b"),
-    ("Investment", "#008300"),
-    ("Other", "#94a3b8"),
-)
-# (name, color) — the legacy flat default income categories.
-_DEFAULT_INCOME_CATEGORIES: tuple[tuple[str, str], ...] = (
-    ("Salary", "#008300"),
-    ("Freelancing", "#2a78d6"),
-    ("Cashback", "#c98500"),
-    ("Other", "#94a3b8"),
-)
 
 # (parent_name, color, subcategories) — 2-level pure English taxonomy for Indian personal finance.
 _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -180,13 +160,14 @@ _DEFAULT_INCOME_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # (pattern, canonical, category_name) — the seed merchant dictionary (research §13.6).
 # Every string is written ALREADY in normalize_merchant()-normalized form (lowercase,
 # single-spaced) — test_seed_dictionary_entries_are_pre_normalized enforces that invariant
-# so a typo can't silently produce a dead pattern. category_name must be one of
-# _DEFAULT_SPEND_CATEGORIES' names or the entry inserts nothing (see
-# provision_seed_merchant_dictionary). Two rows deliberately fold a spelling variant onto a
-# shared canonical (BigBasket, Hotstar's Disney+ rename) — the fan-in this arc exists to
-# prove. Every entry, including the ~94 where pattern == canonical, gets its own
-# merchant_alias row — that identity row is what lets AliasResolver.canonical() match an
-# unseen variant like "upi/swiggy/9876@ybl" down to "swiggy"; decision 8's identity fallback
+# so a typo can't silently produce a dead pattern. category_name must name one of this
+# user's active spend categories (a _DEFAULT_SPEND_TAXONOMY parent or subcategory) or the
+# entry inserts nothing (see provision_seed_merchant_dictionary). Two rows deliberately
+# fold a spelling variant onto a shared canonical (BigBasket, Hotstar's Disney+ rename) —
+# the fan-in this arc exists to prove. Every entry, including the ~94 where pattern ==
+# canonical, gets its own merchant_alias row — that identity row is what lets
+# AliasResolver.canonical() match an unseen variant like "upi/swiggy/9876@ybl" down to
+# "swiggy"; decision 8's identity fallback
 # only covers a string that already equals a canonical outright, not one that merely
 # contains it as a token. See provision_seed_merchant_dictionary.
 _MERCHANT_DICTIONARY: tuple[tuple[str, str, str], ...] = (

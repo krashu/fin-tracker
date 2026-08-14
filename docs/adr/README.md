@@ -63,3 +63,4 @@ Do *not* write an ADR for:
 | [0009](0009-refund-as-signed-spend.md) | A refund is a signed spend, not a `transaction_type` | Accepted | 2026-08-12 |
 | [0010](0010-parsed-statement-return.md) | `parse()` returns `ParsedStatement`, not `list[RawTransaction]` | Accepted | 2026-08-12 |
 | [0011](0011-merchant-alias-layer.md) | Merchant alias / canonicalisation layer + seeded Indian merchant dictionary | Accepted | 2026-08-12 |
+| [0012](0012-category-hierarchy.md) | Two-level category hierarchy — depth cap, one-hop rollup, soft-delete contract | Accepted | 2026-08-14 |

@@ -41,6 +41,7 @@ from app.core import clock
 from app.core.demo_data import INSTRUMENTS, build_demo_dataset
 from app.core.log_config import get_logger
 from app.models import Account, Category, Instrument, InvestmentTransaction, Transaction
+from app.services.category_service import FALLBACK_CATEGORY_NAME
 from app.services.fingerprint import transaction_fingerprint
 from app.services.merchant import normalize_merchant
 from app.services.merchant_labels import learn_merchant_memory
@@ -98,7 +99,8 @@ def _categories_by_kind(
     ).all()
     spend = {c.name.lower(): c.id for c in cats if c.kind == "spend"}
     income = {c.name.lower(): c.id for c in cats if c.kind == "income"}
-    if "other" not in spend or "other" not in income:
+    fallback = FALLBACK_CATEGORY_NAME.lower()
+    if fallback not in spend or fallback not in income:
         raise RuntimeError(
             "demo seed: default 'Other' category missing — expected migrations "
             "0003/0012 to seed it for the demo user before seeding runs."

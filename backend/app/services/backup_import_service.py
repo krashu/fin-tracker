@@ -46,6 +46,7 @@ from app.core.log_config import get_logger
 from app.models import Account, Category, ImportBatch, Transaction
 from app.parsers.backup_csv import (
     ACCOUNTS_CSV,
+    CATEGORIES_CSV,
     TRANSACTIONS_CSV,
     ParsedBackup,
     ParsedBackupAccount,
@@ -119,7 +120,7 @@ def persist_backup(
     accounts_new, accounts_matched, accounts_by_name, account_warnings = _upsert_accounts(
         session, user_id=user_id, rows=parsed.accounts
     )
-    categories_new, categories_matched, categories_by_key = _upsert_categories(
+    categories_new, categories_matched, categories_by_key, category_warnings = _upsert_categories(
         session, user_id=user_id, rows=parsed.categories
     )
     imported, skipped, relinked, txn_warnings = _persist_transactions(
@@ -131,7 +132,7 @@ def persist_backup(
         categories_by_key=categories_by_key,
     )
 
-    warnings = [*parsed.warnings, *account_warnings, *txn_warnings]
+    warnings = [*parsed.warnings, *account_warnings, *category_warnings, *txn_warnings]
     batch.imported_count = imported
     batch.skipped_count = skipped
     # Informational only (no hash short-circuit reads it): "failed" carries the documented
@@ -206,8 +207,8 @@ def _upsert_accounts(
         if existing is not None:
             if existing.type != row.type or existing.currency != row.currency:
                 warnings.append(
-                    f"{ACCOUNTS_CSV} row {row.line_no}: account exists with a different "
-                    "type/currency — not rebinding"
+                    f"{ACCOUNTS_CSV} row {row.line_no}: account {row.name!r} exists with a "
+                    "different type/currency — not rebinding"
                 )
                 continue
             resolved[row.name] = existing  # reuse as-is; never overwrite locked fields
@@ -232,12 +233,15 @@ def _upsert_accounts(
 
 def _upsert_categories(
     session: Session, *, user_id: UUID, rows: list[ParsedBackupCategory]
-) -> tuple[int, int, dict[tuple[str, str], Category]]:
+) -> tuple[int, int, dict[tuple[str, str], Category], list[str]]:
     """Resolve each backup ``(name, kind)`` to a ``Category``, creating missing ones.
 
     Restored categories carry ``is_seeded=False`` (user data, not app seeds). Subcategories
-    link to their parent category via ``parent_id`` when ``parent_name`` is present.
-    Returns ``(created, matched, {(name, kind): Category})``.
+    link to their parent category via ``parent_id`` when ``parent_name`` is present — but a
+    ``parent_name`` that cannot be resolved to a ROOT category flattens the row to a root
+    instead (ADR-0012 caps depth at 2), and that flattening is reported in the returned
+    warnings rather than silently counted as a success. Mirrors ``_upsert_accounts``' shape.
+    Returns ``(created, matched, {(name, kind): Category}, warnings)``.
     """
     existing_active: dict[tuple[str, str], Category] = {
         (c.name, c.kind): c
@@ -246,6 +250,7 @@ def _upsert_categories(
         )
     }
     resolved: dict[tuple[str, str], Category] = {}
+    warnings: list[str] = []
     created = 0
     matched = 0
 
@@ -290,6 +295,22 @@ def _upsert_categories(
             if row.parent_name
             else None
         )
+        if parent is not None and parent.parent_id is not None:
+            # The named parent is itself a subcategory. Linking under it would build a
+            # third level, which ADR-0012 caps out — the router enforces this on every
+            # other write path, and the importer must hold the same line rather than
+            # trusting a (possibly hand-edited) backup CSV. Flatten instead of nesting.
+            warnings.append(
+                f"{CATEGORIES_CSV} row {row.line_no}: category {row.name!r} — parent category "
+                f"{row.parent_name!r} is itself a subcategory, restored as a root category "
+                "(depth is capped at 2)"
+            )
+            parent = None
+        elif row.parent_name and parent is None:
+            warnings.append(
+                f"{CATEGORIES_CSV} row {row.line_no}: category {row.name!r} — parent category "
+                f"{row.parent_name!r} not found, restored as a root category"
+            )
         parent_id = parent.id if parent is not None else None
         category = Category(
             user_id=user_id,
@@ -304,7 +325,7 @@ def _upsert_categories(
         created += 1
 
     session.flush()  # assign ids for the transaction FK
-    return created, matched, resolved
+    return created, matched, resolved, warnings
 
 
 def _persist_transactions(

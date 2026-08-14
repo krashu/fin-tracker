@@ -80,6 +80,15 @@ export function RulesManager() {
   const rulesQuery = useQuery({ queryKey: ["rules"], queryFn: listRules });
   const rules = rulesQuery.data ?? [];
 
+  // Lifted out of CategoryRuleLine (was one useQuery + useMemo per rule row —
+  // deduped by TanStack but still N mounted subscriptions and N Map rebuilds).
+  const categoriesQuery = useQuery({ queryKey: ["categories"], queryFn: () => listCategories() });
+  const categories = categoriesQuery.data ?? [];
+  const categoryMap = useMemo(
+    () => new Map(categories.map((c) => [c.id, c])),
+    [categories],
+  );
+
   const [dialog, setDialog] = useState<RuleDialog>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [showSeeded, setShowSeeded] = useState(false);
@@ -136,6 +145,7 @@ export function RulesManager() {
                 <RuleGroup
                   key={rule.merchant_normalized}
                   rule={rule}
+                  categoryMap={categoryMap}
                   onForget={setDialog}
                 />
               ))
@@ -165,6 +175,7 @@ export function RulesManager() {
                       <RuleGroup
                         key={rule.merchant_normalized}
                         rule={rule}
+                        categoryMap={categoryMap}
                         onForget={setDialog}
                       />
                     ))
@@ -189,9 +200,11 @@ export function RulesManager() {
  * groups and the seed-dictionary groups from the same markup. */
 function RuleGroup({
   rule,
+  categoryMap,
   onForget,
 }: {
   rule: MerchantRuleRead;
+  categoryMap: Map<number, CategoryRead>;
   onForget: (dialog: RuleDialog) => void;
 }) {
   return (
@@ -219,6 +232,7 @@ function RuleGroup({
               key={`c-${cat.id}`}
               merchant={rule.merchant_normalized}
               rule={cat}
+              categoryMap={categoryMap}
               onForget={() =>
                 onForget({
                   kind: "category",
@@ -372,11 +386,13 @@ function ChangeCategoryDialog({
   onClose,
   merchant,
   currentCategoryId,
+  ruleId,
 }: {
   open: boolean;
   onClose: () => void;
   merchant: string;
   currentCategoryId: number;
+  ruleId: number;
 }) {
   const [selectedId, setSelectedId] = useState<number | null>(currentCategoryId);
   const [err, setErr] = useState<string | null>(null);
@@ -384,9 +400,16 @@ function ChangeCategoryDialog({
 
   const mutation = useMutation({
     mutationFn: async (categoryId: number) => {
+      // Pin the new category, then forget the row we're replacing — otherwise
+      // pin_tag's upsert only un-pins the old map row (it never deletes it),
+      // so the merchant would show both the new and the stale rule until the
+      // user separately "Forget rule"s the one they thought they'd replaced.
       await createCategoryRule({ merchant, category_id: categoryId });
+      await deleteCategoryRule(ruleId);
     },
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["categories"] });
+      qc.invalidateQueries({ queryKey: ["dashboards"] });
       invalidateRules(qc);
       onClose();
     },
@@ -444,17 +467,16 @@ function ChangeCategoryDialog({
 function CategoryRuleLine({
   merchant,
   rule,
+  categoryMap,
   onForget,
 }: {
   merchant: string;
   rule: CategoryRuleRead;
+  categoryMap: Map<number, CategoryRead>;
   onForget: () => void;
 }) {
   const qc = useQueryClient();
   const [changeOpen, setChangeOpen] = useState(false);
-  const categoriesQuery = useQuery({ queryKey: ["categories"], queryFn: listCategories });
-  const categories = categoriesQuery.data ?? [];
-  const categoryMap = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
   const cat = categoryMap.get(rule.category_id);
   const color = resolveCategoryColor(cat, categoryMap);
 
@@ -515,6 +537,7 @@ function CategoryRuleLine({
           onClose={() => setChangeOpen(false)}
           merchant={merchant}
           currentCategoryId={rule.category_id}
+          ruleId={rule.id}
         />
       ) : null}
     </>

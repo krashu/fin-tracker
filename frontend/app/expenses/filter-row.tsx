@@ -5,11 +5,17 @@
  * Presentational: the board (expenses-board.tsx) owns the values + change
  * handlers; this just renders the controls and emits selections.
  *
- * The date control is a month stepper (◀ June 2026 ▶), defaulting to the
- * current month, with an "All dates" escape hatch. Stepping picks that calendar
- * month (and turns All-dates off); the board turns the anchor into a
- * `{date_from,date_to}` range via `monthRange`. The stepper is dimmed while
- * All-dates is active but stays clickable — it's the way back to a single month.
+ * The date control has three states, each wider than the last: a month
+ * stepper (◀ June 2026 ▶), defaulting to the current month (the board turns
+ * the anchor into a `{date_from,date_to}` range via `monthRange`); "All
+ * months" widens that to every month of the selected year (`yearRange`);
+ * "All years" widens it again to every date in the data — both bounds
+ * omitted, so the year selector no longer applies either. Picking a year, or
+ * stepping the month, always drops back to a single bounded month/year — the
+ * way back from either escape hatch. The year selector and the month stepper
+ * are dimmed while "All years" is active, and the stepper is also dimmed
+ * while "All months" is active — all stay clickable, since they're the way
+ * back.
  */
 import {
   DropdownMenu,
@@ -24,7 +30,7 @@ import { formatMonth } from "@/lib/format";
 import { labelDisplay } from "@/lib/labels";
 import {
   buildCategoryTree,
-  categoryDisplayName,
+  categoryLabel,
   resolveCategoryColor,
 } from "@/lib/categories";
 import { CategoryDot } from "@/components/category-dot";
@@ -78,6 +84,7 @@ export type FilterRowProps = {
   availableYears: number[];
   monthAnchor: Date;
   allDates: boolean;
+  allYears: boolean;
   atCurrentMonth: boolean;
   hasActiveFilters: boolean;
   onClearFilters: () => void;
@@ -88,6 +95,7 @@ export type FilterRowProps = {
   onYearChange: (year: number) => void;
   onStepMonth: (delta: number) => void;
   onToggleAllDates: () => void;
+  onToggleAllYears: () => void;
 };
 
 export function FilterRow({
@@ -102,6 +110,7 @@ export function FilterRow({
   availableYears,
   monthAnchor,
   allDates,
+  allYears,
   atCurrentMonth,
   hasActiveFilters,
   onClearFilters,
@@ -112,13 +121,14 @@ export function FilterRow({
   onYearChange,
   onStepMonth,
   onToggleAllDates,
+  onToggleAllYears,
 }: FilterRowProps) {
   const account = accounts.find((a) => a.id === accountId);
-  // Lookup over the full list (active pill label); options are kind-filtered to
-  // match the type view (spending and transfers → spend categories, income →
-  // income). Transfers keep the spend picker deliberately: a transfer may carry
-  // a spend category (ADR-0007 rule 7), so hiding it would strand those rows.
-  const category = categories.find((c) => c.id === categoryId);
+  // The active pill label resolves over the full list via `categoryLabel` below;
+  // options are kind-filtered to match the type view (spending and transfers →
+  // spend categories, income → income). Transfers keep the spend picker
+  // deliberately: a transfer may carry a spend category (ADR-0007 rule 7), so
+  // hiding it would strand those rows.
   const categoryKind = typeFilter === "income" ? "income" : "spend";
   const visibleCategories = categories.filter((c) => c.kind === categoryKind);
   const label = labels.find((l) => l.id === labelId);
@@ -169,9 +179,16 @@ export function FilterRow({
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Pill active={categoryId != null}>
-            {category
-              ? categoryDisplayName(category, categories)
-              : "All categories"}
+            {/* Three states, not two. An ARCHIVED id is absent from `categories`
+                (the list is active-only), and the old `category ? … : "All
+                categories"` collapsed that onto the no-filter branch — so a
+                drilldown into a just-archived category rendered an *active* pill
+                reading "All categories" while the board was genuinely filtered.
+                No stored name is available here (the chip resolves a bare id,
+                with no transaction in hand), hence the generic fallback. */}
+            {categoryId == null
+              ? "All categories"
+              : categoryLabel(categoryId, categories)}
             <IconChevronDown className="size-3 opacity-70" />
           </Pill>
         </DropdownMenuTrigger>
@@ -235,13 +252,17 @@ export function FilterRow({
       ) : null}
 
       {/* Year selector. Year-only — the month navigator below is its own,
-          separate control (a stepper, not this dropdown). */}
-      <PeriodPicker
-        period={{ year }}
-        availableYears={availableYears}
-        onChange={(p) => onYearChange(p.year)}
-        allowMonth={false}
-      />
+          separate control (a stepper, not this dropdown). Dimmed but still
+          clickable while "All years" is active — picking a year is the way
+          back to a single one. */}
+      <div className={cn(allYears && "opacity-50")}>
+        <PeriodPicker
+          period={{ year }}
+          availableYears={availableYears}
+          onChange={(p) => onYearChange(p.year)}
+          allowMonth={false}
+        />
+      </div>
 
       {/* Month navigator — pill-height (h-7) so the row keeps its height and the
           table's sticky `stickyTop` offset stays valid. Dimmed but clickable
@@ -249,7 +270,7 @@ export function FilterRow({
       <div
         className={cn(
           "inline-flex h-7 items-center gap-0.5 rounded-md border border-border bg-card px-0.5",
-          allDates && "opacity-50",
+          (allDates || allYears) && "opacity-50",
         )}
       >
         <button
@@ -276,6 +297,10 @@ export function FilterRow({
 
       <Pill active={allDates} onClick={onToggleAllDates}>
         All months
+      </Pill>
+
+      <Pill active={allYears} onClick={onToggleAllYears}>
+        All years
       </Pill>
 
       {/* Appears only when a filter is off its default — resets everything in one

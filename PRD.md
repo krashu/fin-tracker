@@ -434,17 +434,46 @@ would produce wrong totals.
   create and immutable thereafter (there is no PATCH for `kind`). Spend categories serve
   `spend` transactions of either sign — a refund included
   ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)); income categories serve
-  `income`. Each row also carries a user-pickable `color` (`#rrggbb`, nullable →
-  derived from the id).
-- Registration provisions 17 defaults (`services/provisioning.py` is the live path):
-  - **spend (13)**: Food, Groceries, Transport, Rent, Utilities, Shopping,
-    Entertainment, Health, Travel, Subscriptions, EMI, Investment, Other.
-  - **income (4)**: Salary, Freelancing, Cashback, Other.
-- Note "Income" and "Transfer" are **not** category names — those moved to the `kind`
-  and `transaction_type` dimensions respectively. And "Other" exists **twice**, once per
-  `kind`: `kind` participates in the active-name unique index, so a name-only lookup for
+  `income`. Each row also carries a user-pickable `color` (`#rrggbb`, nullable — see the
+  inheritance rule below; `categoryColorVar` falls back to `--muted-foreground`, it does
+  **not** derive a hue from the id).
+- **Two levels, and no more** ([ADR-0012](docs/adr/0012-category-hierarchy.md)). A
+  category carries a nullable self-FK `parent_id`. `parent_id IS NULL` is a *parent*; a
+  row pointing at one is a *subcategory*. A subcategory can never itself be a parent —
+  a create or PATCH that would nest three deep is a 422 — and its `kind` must equal its
+  parent's. Depth is enforced in `api/v1/categories.py`, not in the schema layer.
+- **Both levels are taggable.** A transaction may point at a parent or at a subcategory;
+  there is no leaf-only rule, so the F3/F4a "Other" default and every pre-hierarchy row
+  stay valid untouched. Aggregates roll a parent up **exactly one hop** at the query
+  boundary: `GET /transactions?category_id=<parent>` matches the parent *and* its
+  children, and the F8 by-category surface groups on the parent with a subcategory
+  drilldown. There is no recursive walk anywhere.
+- Registration provisions a 2-level default taxonomy. `services/provisioning.py`
+  `_DEFAULT_SPEND_TAXONOMY` / `_DEFAULT_INCOME_TAXONOMY` are the live path **and the only
+  place the subcategory names are written down** — read them rather than copying the list
+  into prose here or into a test.
+  - **spend — 9 parents**: Food & Dining, Household & Living, Bills & Utilities,
+    Commute & Transportation, Shopping & Lifestyle, Family & Social,
+    Savings & Investments, Loans & Settlements, Other.
+  - **income — 1 parent**: Income, holding Salary / Freelancing / Cashback /
+    Investment Returns / Rental Income / Other.
+  - An existing user is brought to the same shape by migration 0034, which **reparents**
+    the old flat defaults under the new parents. It renames nothing and deletes nothing,
+    so a transaction tagged "Groceries" keeps its category and merely gains an ancestor.
+- **`color` inherits one hop.** A subcategory with `color IS NULL` renders in its
+  parent's hue, so a family reads as one colour; siblings are separated by a derived
+  shade, never by an unrelated hue. Every seeded subcategory is `NULL` — a seeded
+  subcategory carrying its own hex is drift, and `tests/test_migration_parity.py` is what
+  pins that.
+- Note "Transfer" is **not** a category name — that moved to the `transaction_type`
+  dimension. **"Income" now is one**: it is the single income parent. And "Other" still
+  exists **twice**, once per `kind` — as a spend *parent* and as a subcategory under
+  Income. `kind` participates in the active-name unique index, so a name-only lookup for
   the F3/F4a Other-default is ambiguous and must also filter `kind`.
-- User can add / rename / soft-delete. Flat list, no hierarchy in v1.
+- User can add / rename / **reparent** / soft-delete. **Archiving cascades one level** —
+  archiving a parent archives its active subcategories in the same request. There is
+  still no hard delete: `transactions.category_id` is a plain FK, and the `archived_at`
+  contract is the only thing keeping it from breaking.
 
 ### F6. Accounts
 
@@ -595,7 +624,10 @@ actually needed.
    /dashboards/period-totals`, but it is not built; earlier drafts of this
    document asserted it in three places.
 2. **Monthly spend by category** — stacked bar or pie, current month default with
-   month-picker. Drilldown to transaction list per category.
+   month-picker. **Grouped by parent category** (§F5), with two drilldowns: click a
+   parent to see its subcategory split, click either level to reach the transaction list
+   filtered to that category. A parent's filter includes its children, so the drilldown
+   total and the resulting transaction list agree.
 3. **Weekly / monthly spend bar** — toggle between weekly and monthly aggregation for
    the last N periods.
 4. **Net worth** — cash / bank balances + investment current values. **Two account
@@ -682,7 +714,10 @@ same underlying APIs — splitting is purely scope discipline, not extra work.
   Foreign keys are exported as both the internal id and a human-readable label (e.g.
   `account_id` + `account_name`) so the CSV is usable in Excel without lookups.
   `transactions.csv` carries a `labels` column (the row's F3a tags as `;`-joined names)
-  in place of the former free-text note.
+  in place of the former free-text note. `categories.csv` carries `parent_name` — the
+  §F5 hierarchy travels as a **label, not an id**, so the link survives a restore into a
+  database where ids differ. A parent whose child has transactions is pulled into the
+  export even if the parent itself has none, otherwise the child would restore orphaned.
 - Out of scope v1: `merchant_tag_map.csv`, `instruments.csv`,
   `investment_transactions.csv`, `fx_rates.csv`. A full-table backup is a scoped feature
   with its own verification step, not a widening of this one.
@@ -746,7 +781,9 @@ sessions (id, user_id, family_id, token_hash, expires_at, revoked_at)
   -- revokes by family_id, and created_at is the 12h absolute-cap origin
 accounts (id, user_id, name, type, issuer, last4, opening_balance_paise, currency,
           parent_account_id, archived_at)
-categories (id, user_id, name, kind, is_seeded, archived_at, color)
+categories (id, user_id, name, kind, is_seeded, archived_at, color, parent_id)
+  -- parent_id: nullable self-FK, NULL = a parent row. Depth is capped at 2 (ADR-0012),
+  -- enforced in the router. color NULL on a subcategory means "inherit the parent's".
 transactions (
   id, user_id, account_id, date, amount_paise, transaction_type, merchant_raw,
   merchant_normalized, category_id, auto_category_id, fingerprint, occurrence,
@@ -1362,6 +1399,39 @@ End-to-end test once built:
       resolves to its own canonical while the parent brand does not move. The two brands must
       then learn independently: confirming a category on one must not change the other's
       suggestion.
+16. **Two-level categories** ([ADR-0012](docs/adr/0012-category-hierarchy.md)): register a
+    fresh user → `GET /categories?tree=true` returns 10 parents, every seeded subcategory
+    hangs off one of them with `color = null`, and no row is three deep. Create a
+    subcategory under a parent of the *other* `kind` → 422; under a subcategory → 422;
+    under another user's parent → 422 (not 404 — the parent is a body FK, ADR-0003 rule 3).
+    - **Reparent is not a delete.** PATCH a subcategory to `parent_id: null` → it becomes a
+      root and **its transactions still resolve**. This is the path an ORM
+      `delete-orphan` cascade silently turns into a row deletion, so assert the
+      transaction count, not just the category's `parent_id`.
+    - **Archive cascades one level, and only forward.** Archive a parent → it and its
+      active children carry the same `archived_at`, transactions keep resolving their
+      (now archived) category, and the tree view omits the whole family. Archive a child →
+      the parent is untouched. Stored `archived_at` is **naive UTC** (ADR-0001 rule 5) on
+      every row the cascade writes, parent and children alike.
+    - **Migration parity, both directions.** `alembic upgrade head` on a database seeded
+      with the pre-0033 flat defaults produces the *same* `(name, kind, parent_id IS NOT
+      NULL, color)` set as `provision_default_categories` does for a fresh registrant —
+      a migrated user and a new user must not render the same taxonomy in different
+      colours. Then tag a transaction to a seeded subcategory and `alembic downgrade 0033`
+      → the downgrade must not orphan or delete that transaction's category, and must not
+      clear `parent_id` on a hierarchy the *user* authored.
+    - **Rollup arithmetic.** With a parent holding direct spend *and* two children, one of
+      which has a refund: the F8 parent bar, the subcategory drilldown (including the
+      parent's own direct spend as its own row), and the transaction list reached by
+      clicking through all agree on the same total, and the drilldown's shares **sum to
+      100%**. A single share may legitimately exceed 100% when a refunding sibling offsets
+      it — that is the honest number and it is displayed, but the rendered *bar* is clamped
+      to `[0, 100]` so it never overflows its track. What must never appear is a negative
+      rupee headline when a parent nets positive.
+    - **Backup round-trip.** Export with a parent/child pair → restore into a fresh
+      database → the child's `parent_id` points at the restored parent. Hand-edit the zip
+      so a child's `parent_name` names a category that isn't in the file → the restore
+      still succeeds, but the flattened row is reported in `warnings`, never silently.
 
 ## Open assumptions to confirm later
 

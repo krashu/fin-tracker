@@ -31,7 +31,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import {
   Popover,
   PopoverContent,
@@ -44,7 +43,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { Field, PickerButton } from "@/components/form/fields";
+import { Field } from "@/components/form/fields";
 import { CategorySelector } from "@/components/categories/category-selector";
 import { LabelChip } from "@/components/labels/label-chip";
 import { IconCheck, IconChevronDown, IconPlus } from "@/components/icons";
@@ -170,15 +169,12 @@ export function NewRuleDialog({
 
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
-    queryFn: listCategories,
+    queryFn: () => listCategories(),
     enabled: open,
   });
   const spendCategories = (categoriesQuery.data ?? []).filter(
     (c) => c.kind === "spend" && c.archived_at === null,
   );
-  const selectedCategory =
-    spendCategories.find((c) => c.id === categoryId) ?? null;
-
   const merchantTrimmed = merchant.trim();
   const canSubmit =
     merchantTrimmed.length > 0 && (categoryId != null || labels.length > 0);

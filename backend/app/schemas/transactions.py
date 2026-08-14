@@ -82,6 +82,17 @@ class TransactionRead(BaseModel):
     transaction_type: TransactionTypeStr
     merchant_raw: str | None
     category_id: int | None
+    # Denormalised display names for `category_id`, resolved WITHOUT the
+    # `archived_at` filter (`category_service.resolve_category_labels`). Archiving is
+    # soft (ADR-0012) so this row keeps its `category_id`, but `GET /categories`
+    # serves active rows only — leaving the frontend unable to name an archived
+    # category, which it rendered as "Uncategorized". That contradicted the archive
+    # dialog's own promise and read as "your category assignment was lost".
+    # `parent_name` carries the "Parent → Child" breadcrumb for a subcategory; both
+    # are None when `category_id` is None, and `category_parent_name` is None for a
+    # root category. Same contract as `SpendByCategoryRow.category_name`.
+    category_name: str | None = None
+    category_parent_name: str | None = None
     # ADR-0002 pairing, surfaced for the F4a "Linked CC bill payment" banner and its
     # break-link control (PRD §F4a-1) — the consumer the module docstring above
     # anticipated. Non-null also means the row's identity columns and type are frozen
