@@ -60,4 +60,3 @@ jobs:
             backend/htmlcov/
             backend/coverage.xml
           retention-days: 7
-

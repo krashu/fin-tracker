@@ -51,4 +51,3 @@ jobs:
       - name: Run PII Redaction Fixture Guard
         working-directory: backend
         run: uv run pytest tests/test_fixture_redaction.py -q --no-cov
-

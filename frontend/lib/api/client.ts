@@ -1886,4 +1886,3 @@ export function getHierarchicalTrend(params: {
     `/dashboards/hierarchical-trend?${qs.toString()}`,
   );
 }
-
