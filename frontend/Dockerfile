@@ -46,7 +46,7 @@
 # on ANY network. Additionally, any *.crt dropped into ./certs/ (gitignored) is added
 # to the store, so the build also works behind a corporate TLS-inspection proxy
 # (e.g. Zscaler) whose root CA isn't publicly trusted. Empty certs/ = plain build.
-FROM node:24.18.1-trixie-slim AS base
+FROM node:26.7.0-trixie-slim AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
 RUN corepack enable
 COPY certs/ /tmp/corp-certs/
