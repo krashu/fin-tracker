@@ -8,12 +8,13 @@
 import { useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
 
 import { useAuth } from "@/components/auth/auth-provider";
 import { AuthShell } from "@/components/auth/auth-shell";
 import { Field, TextInput } from "@/components/form/fields";
 import { Button } from "@/components/ui/button";
-import { ApiError } from "@/lib/api/client";
+import { ApiError, getAuthConfig } from "@/lib/api/client";
 
 // Stable target for the credential fields' aria-describedby. Deliberately NOT
 // paired with aria-invalid: the backend returns a detail string, not a field, so
@@ -24,7 +25,15 @@ const ERROR_ID = "register-error";
 
 export default function RegisterPage() {
   const router = useRouter();
-  const { status, register } = useAuth();
+  const { status, register, loginDemo } = useAuth();
+  const authConfig = useQuery({
+    queryKey: ["auth", "config"],
+    queryFn: getAuthConfig,
+    staleTime: Infinity,
+  }).data;
+  const registrationEnabled = authConfig?.registration_enabled ?? true;
+  const demoEnabled = authConfig?.demo_login_enabled ?? false;
+
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
@@ -65,6 +74,64 @@ export default function RegisterPage() {
       );
       setSubmitting(false);
     }
+  }
+
+  async function handleDemo() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      await loginDemo();
+      router.replace("/dashboard");
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.detail
+          : "Something went wrong — try again.",
+      );
+      setSubmitting(false);
+    }
+  }
+
+  if (!registrationEnabled) {
+    return (
+      <AuthShell
+        title="Registration Disabled"
+        subtitle="This showcase instance is configured in demo-only mode."
+        footer={
+          <Link href="/login" className="text-foreground hover:underline">
+            Go to sign in
+          </Link>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-[13px] text-muted-foreground">
+            New user accounts cannot be created on this deployment. You can explore all features using the pre-seeded demo account.
+          </p>
+
+          {demoEnabled ? (
+            <Button
+              type="button"
+              size="lg"
+              className="w-full"
+              disabled={submitting}
+              onClick={handleDemo}
+            >
+              {submitting ? "Opening demo…" : "Explore Demo Account"}
+            </Button>
+          ) : (
+            <Button asChild size="lg" className="w-full">
+              <Link href="/login">Return to Sign in</Link>
+            </Button>
+          )}
+
+          {error ? (
+            <p id={ERROR_ID} role="alert" className="text-[12px] text-neg">
+              {error}
+            </p>
+          ) : null}
+        </div>
+      </AuthShell>
+    );
   }
 
   return (

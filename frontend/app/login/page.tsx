@@ -69,15 +69,17 @@ function resolveDestination(): string {
 export default function LoginPage() {
   const router = useRouter();
   const { status, login, loginDemo } = useAuth();
-  // Public, pre-auth config: hide "Try the demo" unless the backend permits it (the
-  // operator set DEMO_LOGIN_ENABLED, on plain http). Hide-until-confirmed, which is also
-  // the correct default now that the gate is opt-in — the button appears only after the
-  // fetch confirms it, so no deploy ever flashes a button that would 401.
-  const demoEnabled = useQuery({
+  // Public, pre-auth config: reads backend's demo and registration policies.
+  const authConfig = useQuery({
     queryKey: ["auth", "config"],
     queryFn: getAuthConfig,
     staleTime: Infinity,
-  }).data?.demo_login_enabled;
+  }).data;
+  const demoEnabled = authConfig?.demo_login_enabled;
+  const registrationEnabled = authConfig?.registration_enabled ?? true;
+  const isDemoOnly = Boolean(demoEnabled && !registrationEnabled);
+
+  const [showPasswordForm, setShowPasswordForm] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -128,15 +130,21 @@ export default function LoginPage() {
 
   return (
     <AuthShell
-      title="Sign in"
-      subtitle="Welcome back to your finance tracker."
+      title={isDemoOnly ? "Explore the Demo" : "Sign in"}
+      subtitle={
+        isDemoOnly
+          ? "Experience fin·tracker with preloaded accounts, spending, and investments."
+          : "Welcome back to your finance tracker."
+      }
       footer={
-        <>
-          No account?{" "}
-          <Link href="/register" className="text-foreground hover:underline">
-            Create one
-          </Link>
-        </>
+        registrationEnabled ? (
+          <>
+            No account?{" "}
+            <Link href="/register" className="text-foreground hover:underline">
+              Create one
+            </Link>
+          </>
+        ) : null
       }
     >
       {idleSignedOut ? (
@@ -145,66 +153,134 @@ export default function LoginPage() {
         </p>
       ) : null}
 
-      <form onSubmit={handleSubmit} className="flex flex-col gap-3">
-        <Field label="Email">
-          <TextInput
-            type="email"
-            value={email}
-            onChange={setEmail}
-            autoComplete="email"
-            placeholder="you@example.com"
-            aria-describedby={error ? ERROR_ID : undefined}
-            required
-          />
-        </Field>
-        <Field label="Password">
-          <TextInput
-            type="password"
-            value={password}
-            onChange={setPassword}
-            autoComplete="current-password"
-            placeholder="••••••••"
-            aria-describedby={error ? ERROR_ID : undefined}
-            required
-          />
-        </Field>
-
-        {error ? (
-          <p id={ERROR_ID} role="alert" className="text-[12px] text-neg">
-            {error}
-          </p>
-        ) : null}
-
-        <Button
-          type="submit"
-          size="lg"
-          className="mt-1 w-full"
-          disabled={submitting || email === "" || password === ""}
-        >
-          {submitting ? "Signing in…" : "Sign in"}
-        </Button>
-      </form>
-
-      {demoEnabled ? (
-        <>
-          <div className="my-4 flex items-center gap-3 text-[11px] uppercase tracking-wider text-muted-foreground">
-            <span className="h-px flex-1 bg-border" />
-            or
-            <span className="h-px flex-1 bg-border" />
-          </div>
-
+      {isDemoOnly ? (
+        <div className="flex flex-col gap-4">
           <Button
             type="button"
-            variant="outline"
             size="lg"
             className="w-full"
             disabled={submitting}
             onClick={() => run(loginDemo)}
           >
-            Try the demo
+            {submitting ? "Opening demo…" : "Try the demo"}
           </Button>
+
+          {error ? (
+            <p id={ERROR_ID} role="alert" className="text-[12px] text-neg">
+              {error}
+            </p>
+          ) : null}
+
+          <div className="pt-2">
+            {!showPasswordForm ? (
+              <button
+                type="button"
+                className="w-full text-center text-[12px] text-muted-foreground hover:text-foreground"
+                onClick={() => setShowPasswordForm(true)}
+              >
+                Sign in with credentials
+              </button>
+            ) : (
+              <form onSubmit={handleSubmit} className="flex flex-col gap-3 pt-2 border-t border-border">
+                <Field label="Email">
+                  <TextInput
+                    type="email"
+                    value={email}
+                    onChange={setEmail}
+                    autoComplete="email"
+                    placeholder="you@example.com"
+                    aria-describedby={error ? ERROR_ID : undefined}
+                    required
+                  />
+                </Field>
+                <Field label="Password">
+                  <TextInput
+                    type="password"
+                    value={password}
+                    onChange={setPassword}
+                    autoComplete="current-password"
+                    placeholder="••••••••"
+                    aria-describedby={error ? ERROR_ID : undefined}
+                    required
+                  />
+                </Field>
+                <Button
+                  type="submit"
+                  size="sm"
+                  variant="secondary"
+                  className="mt-1 w-full"
+                  disabled={submitting || email === "" || password === ""}
+                >
+                  {submitting ? "Signing in…" : "Sign in"}
+                </Button>
+              </form>
+            )}
+          </div>
+        </div>
+      ) : (
+        <>
+          <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+            <Field label="Email">
+              <TextInput
+                type="email"
+                value={email}
+                onChange={setEmail}
+                autoComplete="email"
+                placeholder="you@example.com"
+                aria-describedby={error ? ERROR_ID : undefined}
+                required
+              />
+            </Field>
+            <Field label="Password">
+              <TextInput
+                type="password"
+                value={password}
+                onChange={setPassword}
+                autoComplete="current-password"
+                placeholder="••••••••"
+                aria-describedby={error ? ERROR_ID : undefined}
+                required
+              />
+            </Field>
+
+            {error ? (
+              <p id={ERROR_ID} role="alert" className="text-[12px] text-neg">
+                {error}
+              </p>
+            ) : null}
+
+            <Button
+              type="submit"
+              size="lg"
+              className="mt-1 w-full"
+              disabled={submitting || email === "" || password === ""}
+            >
+              {submitting ? "Signing in…" : "Sign in"}
+            </Button>
+          </form>
+
+          {demoEnabled ? (
+            <>
+              <div className="my-4 flex items-center gap-3 text-[11px] uppercase tracking-wider text-muted-foreground">
+                <span className="h-px flex-1 bg-border" />
+                or
+                <span className="h-px flex-1 bg-border" />
+              </div>
+
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                className="w-full"
+                disabled={submitting}
+                onClick={() => run(loginDemo)}
+              >
+                Try the demo
+              </Button>
+            </>
+          ) : null}
         </>
-      ) : null}
+      )}
     </AuthShell>
   );
 }

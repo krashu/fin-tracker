@@ -151,6 +151,23 @@ class Settings(BaseSettings):
             "Necessary but not sufficient: see :attr:`demo_login_permitted`."
         ),
     )
+    allow_demo_login_over_https: bool = Field(
+        default=False,
+        validation_alias="ALLOW_DEMO_LOGIN_OVER_HTTPS",
+        description=(
+            "Allow the demo login even when COOKIE_SECURE=true. Intended specifically for "
+            "dedicated public demo showcases (such as on FastAPI Cloud). OFF by default to "
+            "prevent accidental public credential access on real hosted deployments."
+        ),
+    )
+    registration_enabled: bool = Field(
+        default=True,
+        validation_alias="REGISTRATION_ENABLED",
+        description=(
+            "Enable open user registration (POST /auth/register). Enabled by default. "
+            "Set false on demo-only deployments or private instances where signup should be closed."
+        ),
+    )
     cookie_samesite: str = Field(
         default="lax",
         validation_alias="COOKIE_SAMESITE",
@@ -301,22 +318,18 @@ class Settings(BaseSettings):
 
     @property
     def demo_login_permitted(self) -> bool:
-        """May the demo credentials authenticate? Explicitly opted in AND plain http.
+        """May the demo credentials authenticate?
 
-        The single expression read by BOTH the login path
-        (:func:`app.services.auth_service.authenticate`) and the public
-        ``GET /auth/config``, so the "Try the demo" button and the login 401 can never
-        disagree — the invariant ADR-0003 Alternative 3 was defending.
+        True if explicitly opted in (`demo_login_enabled`), AND either:
+        - The transport is plain http (`not cookie_secure`), OR
+        - The operator explicitly permitted demo login over HTTPS
+          (`allow_demo_login_over_https`, e.g. for a dedicated cloud demo deployment).
 
-        Two necessary conditions, because neither works alone. ``cookie_secure`` alone
-        was the shipped gate and it is structurally unsettable on the documented LAN
-        self-host topology (``deploy/Caddyfile`` serves ``:80`` plain http and browsers
-        drop ``Secure`` cookies over http, so enabling it breaks login outright) — which
-        left a source-published password permanently open on every LAN-reachable stack.
-        ``demo_login_enabled`` alone would let a hardened https deploy re-open it, which
-        the shipped gate correctly refused. ANDing them is strictly the safer of the two.
+        Read by both `auth_service.authenticate` and `GET /auth/config`.
         """
-        return self.demo_login_enabled and not self.cookie_secure
+        if not self.demo_login_enabled:
+            return False
+        return not self.cookie_secure or self.allow_demo_login_over_https
 
     @model_validator(mode="after")
     def _validate_cookie_policy(self) -> Settings:

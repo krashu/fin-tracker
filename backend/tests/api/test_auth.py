@@ -469,28 +469,55 @@ def test_auth_config_demo_disabled_by_default(
     monkeypatch.setattr("app.api.v1.auth.get_settings", _demo_disabled)
     r = unauth_client.get("/api/v1/auth/config")
     assert r.status_code == 200
-    assert r.json() == {"demo_login_enabled": False}
+    assert r.json()["demo_login_enabled"] is False
+    assert r.json()["registration_enabled"] is True
 
 
 def test_auth_config_demo_enabled_when_opted_in(
     unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("app.api.v1.auth.get_settings", _demo_enabled)
-    assert unauth_client.get("/api/v1/auth/config").json() == {"demo_login_enabled": True}
+    body = unauth_client.get("/api/v1/auth/config").json()
+    assert body["demo_login_enabled"] is True
+    assert body["registration_enabled"] is True
+
+
+def test_auth_config_registration_disabled(
+    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    no_reg = Settings(
+        registration_enabled=False,
+        demo_login_enabled=True,
+        cors_allowed_origins="http://localhost:3000",
+    )
+    monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: no_reg)
+    body = unauth_client.get("/api/v1/auth/config").json()
+    assert body["registration_enabled"] is False
+    assert body["demo_login_enabled"] is True
+
+
+def test_register_refused_when_registration_disabled(
+    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    no_reg = Settings(
+        registration_enabled=False,
+        cors_allowed_origins="http://localhost:3000",
+    )
+    monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: no_reg)
+    r = unauth_client.post("/api/v1/auth/register", json={"email": _EMAIL, "password": _PW})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "registration is disabled"
 
 
 @pytest.mark.parametrize("demo_flag", [False, True])
 def test_auth_config_demo_disabled_when_cookie_secure(
     unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch, demo_flag: bool
 ) -> None:
-    """On a hardened deploy the login page must hide 'Try the demo' — /auth/config reads
-    the same ``demo_login_permitted`` expression authenticate() gates the demo on, and
-    that expression ANDs cookie_secure, so an operator's explicit opt-in does NOT open it
-    here either. Patch the symbol in the route's module (get_settings is imported into
-    several namespaces); a purpose-built Settings avoids mutating the cached singleton."""
+    """On a hardened deploy without explicit override, the login page must hide 'Try the demo'."""
     hardened = Settings(
         cookie_secure=True,
         demo_login_enabled=demo_flag,
+        allow_demo_login_over_https=False,
         jwt_secret="a-real-random-secret",
         cors_allowed_origins="http://localhost:3000",
     )
@@ -498,3 +525,51 @@ def test_auth_config_demo_disabled_when_cookie_secure(
     r = unauth_client.get("/api/v1/auth/config")
     assert r.status_code == 200
     assert r.json()["demo_login_enabled"] is False
+
+
+def test_demo_login_allowed_over_https_when_explicitly_permitted(
+    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dedicated cloud demo showcase can allow demo login over HTTPS."""
+    demo_cloud = Settings(
+        cookie_secure=True,
+        demo_login_enabled=True,
+        allow_demo_login_over_https=True,
+        jwt_secret="a-real-random-secret",
+        cors_allowed_origins="http://localhost:3000",
+    )
+    monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: demo_cloud)
+    monkeypatch.setattr("app.services.auth_service.get_settings", lambda: demo_cloud)
+
+    r = unauth_client.get("/api/v1/auth/config")
+    assert r.status_code == 200
+    assert r.json()["demo_login_enabled"] is True
+
+    # And authenticate actually succeeds with the demo credentials
+    r_login = unauth_client.post(
+        "/api/v1/auth/login", json={"email": DEMO_EMAIL, "password": DEMO_PASSWORD}
+    )
+    assert r_login.status_code == 200
+
+
+def test_demo_login_refused_when_demo_login_disabled_even_if_https_override_set() -> None:
+    """If DEMO_LOGIN_ENABLED is False, demo_login_permitted must stay False regardless of
+    allow_demo_login_over_https."""
+    s = Settings(
+        demo_login_enabled=False,
+        allow_demo_login_over_https=True,
+        cookie_secure=True,
+        jwt_secret="a-real-random-secret",
+        cors_allowed_origins="http://localhost:3000",
+    )
+    assert s.demo_login_permitted is False
+
+
+def test_validate_cookie_policy_requires_secure_for_samesite_none() -> None:
+    """COOKIE_SAMESITE=none must raise ValidationError if COOKIE_SECURE is False."""
+    with pytest.raises(Exception, match="COOKIE_SAMESITE=none requires COOKIE_SECURE=true"):
+        Settings(
+            cookie_samesite="none",
+            cookie_secure=False,
+            cors_allowed_origins="http://localhost:3000",
+        )

@@ -51,11 +51,11 @@ class ChangePasswordRequest(BaseModel):
 
 class AuthConfig(BaseModel):
     """Public, pre-auth client config (the login page reads it). Exposes only the
-    resolved product policy — whether the demo login would actually succeed — never the
-    ``DEMO_LOGIN_ENABLED`` / ``COOKIE_SECURE`` inputs it's computed from
-    (``Settings.demo_login_permitted``)."""
+    resolved product policy — whether the demo login would actually succeed and whether
+    open user registration is enabled."""
 
     demo_login_enabled: bool
+    registration_enabled: bool = True
 
 
 class UserRead(BaseModel):

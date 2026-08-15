@@ -1,0 +1,15 @@
+# FastAPI Cloud ignore rules (https://fastapicloud.com/docs/builds-and-deployments/fastapicloudignore)
+# Respects .gitignore by default; excludes test files, coverage, and caches from cloud bundle upload.
+
+tests/
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage
+.ruff_cache/
+.env*
+!app/
+!alembic/
+!alembic.ini
+!pyproject.toml
+!uv.lock

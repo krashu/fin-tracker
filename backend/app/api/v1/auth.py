@@ -83,6 +83,11 @@ def register(
     response: Response,
     _: None = Depends(RateLimit(bucket="register")),
 ) -> User:
+    if not get_settings().registration_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="registration is disabled",
+        )
     try:
         user = auth_service.register_user(
             session,
@@ -202,7 +207,10 @@ def me(user: CurrentUser) -> User:
 def config() -> AuthConfig:
     # Deliberately reads the SAME expression authenticate() gates the demo login on
     # (Settings.demo_login_permitted) — one source of truth so the "Try the demo" button
-    # and the login 401 can never disagree. DEMO_LOGIN_ENABLED is one of its two inputs,
-    # not a second gate; see ADR-0003 §Demo account gate for why cookie_secure alone
-    # could not close the LAN topology.
-    return AuthConfig(demo_login_enabled=get_settings().demo_login_permitted)
+    # and the login 401 can never disagree. Exposes registration_enabled as well so the
+    # UI can adapt to private/demo deployments.
+    settings = get_settings()
+    return AuthConfig(
+        demo_login_enabled=settings.demo_login_permitted,
+        registration_enabled=settings.registration_enabled,
+    )

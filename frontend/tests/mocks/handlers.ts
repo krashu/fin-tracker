@@ -175,6 +175,7 @@ export const mockTransactions: TransactionRead[] = [
 
 export const mockAuthConfig: AuthConfig = {
   demo_login_enabled: true,
+  registration_enabled: true,
 };
 
 export const mockNavRefreshSummary: NavRefreshSummary = {

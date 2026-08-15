@@ -411,11 +411,14 @@ export function changePassword(
 }
 
 /** Public, pre-auth client config. `demo_login_enabled` mirrors the backend's resolved
- * demo-login gate — off unless the operator set `DEMO_LOGIN_ENABLED` on a plain-http
- * deploy — so the login page can hide the "Try the demo" button when it wouldn't work.
+ * demo-login gate — so the login page can hide/show the "Try the demo" button.
+ * `registration_enabled` reflects whether open user registration is allowed.
  * `noRefresh`: this is read before any session exists, so a 401 must never trigger a
  * refresh attempt. */
-export type AuthConfig = { demo_login_enabled: boolean };
+export type AuthConfig = {
+  demo_login_enabled: boolean;
+  registration_enabled: boolean;
+};
 
 export function getAuthConfig(): Promise<AuthConfig> {
   return request<AuthConfig>("/auth/config", undefined, { noRefresh: true });
