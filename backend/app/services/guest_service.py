@@ -89,9 +89,7 @@ def delete_guest_sandbox(session: Session, user_id: UUID) -> None:
     """
     # Phase 1: Break cyclic / self-referential foreign keys
     session.execute(
-        update(Transaction)
-        .where(Transaction.user_id == user_id)
-        .values(transfer_pair_id=None)
+        update(Transaction).where(Transaction.user_id == user_id).values(transfer_pair_id=None)
     )
     session.execute(
         update(InvestmentTransaction)
@@ -99,9 +97,7 @@ def delete_guest_sandbox(session: Session, user_id: UUID) -> None:
         .values(pair_id=None)
     )
     session.execute(
-        update(Account)
-        .where(Account.user_id == user_id)
-        .values(parent_account_id=None)
+        update(Account).where(Account.user_id == user_id).values(parent_account_id=None)
     )
 
     # Phase 2: Delete join / secondary mapping tables (leaves)

@@ -126,7 +126,6 @@ def _cleanup_guests_on_startup() -> None:
             logger.exception("startup_guest_cleanup_failed")
 
 
-
 def _maybe_seed_demo(settings: Settings) -> None:
     """Sync the demo dataset into place when SEED_DEMO_ON_STARTUP is enabled.
 
