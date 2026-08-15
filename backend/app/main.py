@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -181,3 +182,17 @@ app.add_middleware(
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_exception_handler(Exception, _cors_aware_500_handler)
 app.include_router(api_router, prefix=API_V1_PREFIX)
+
+# Mount static frontend for full-stack deployment (e.g. FastAPI Cloud) if dist exists.
+_frontend_dist_setting = get_settings().frontend_dist_dir
+_frontend_path: Path | None = None
+if _frontend_dist_setting:
+    _p = Path(_frontend_dist_setting)
+    _frontend_path = _p if _p.is_absolute() else (Path(__file__).resolve().parent.parent / _p)
+else:
+    _default_dist = Path(__file__).resolve().parent.parent / "frontend_dist"
+    if _default_dist.is_dir() and any(_default_dist.iterdir()):
+        _frontend_path = _default_dist
+
+if _frontend_path and _frontend_path.is_dir() and hasattr(app, "frontend"):
+    app.frontend("/", directory=str(_frontend_path), check_dir=False)

@@ -36,8 +36,15 @@ export default async function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const cookieStore = await cookies();
-  const isDark = cookieStore.get("theme")?.value === "dark";
+  let isDark = false;
+  if (process.env.NEXT_OUTPUT_MODE === "standalone") {
+    try {
+      const cookieStore = await cookies();
+      isDark = cookieStore.get("theme")?.value === "dark";
+    } catch {
+      isDark = false;
+    }
+  }
 
   return (
     <html

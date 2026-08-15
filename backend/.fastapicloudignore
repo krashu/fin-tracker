@@ -13,3 +13,5 @@ __pycache__/
 !alembic.ini
 !pyproject.toml
 !uv.lock
+!frontend_dist/
+

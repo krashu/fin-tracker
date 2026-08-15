@@ -168,6 +168,15 @@ class Settings(BaseSettings):
             "Set false on demo-only deployments or private instances where signup should be closed."
         ),
     )
+    frontend_dist_dir: str | None = Field(
+        default=None,
+        validation_alias="FRONTEND_DIST_DIR",
+        description=(
+            "Directory containing static frontend build files to serve via FastAPI app.frontend(). "
+            "If unset, FastAPI checks if 'frontend_dist' exists and is non-empty. "
+            "Allows full-stack unified deployment while leaving local dev server untouched."
+        ),
+    )
     cookie_samesite: str = Field(
         default="lax",
         validation_alias="COOKIE_SAMESITE",

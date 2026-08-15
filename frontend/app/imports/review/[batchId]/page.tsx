@@ -10,6 +10,10 @@ import { notFound } from "next/navigation";
 
 import { ReviewQueue } from "./review-queue";
 
+export function generateStaticParams(): { batchId: string }[] {
+  return [{ batchId: "1" }];
+}
+
 export default async function ReviewPage({
   params,
 }: {

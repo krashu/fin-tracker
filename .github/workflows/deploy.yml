@@ -1,10 +1,11 @@
-name: Deploy Backend (FastAPI Cloud)
+name: Deploy Full-Stack (FastAPI Cloud)
 
 on:
   push:
     branches: [main]
     paths:
       - "backend/**"
+      - "frontend/**"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
@@ -17,11 +18,8 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy to FastAPI Cloud
+    name: Build Frontend & Deploy to FastAPI Cloud
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
 
     steps:
       - name: Checkout repository
@@ -29,21 +27,51 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static frontend for unified deployment
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_BASE_URL: "/api/v1"
+        run: pnpm build
+
+      - name: Stage frontend assets into backend/frontend_dist
+        run: |
+          mkdir -p backend/frontend_dist
+          cp -r frontend/out/* backend/frontend_dist/
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: "3.13"
 
-      - name: Install dependencies (locked)
+      - name: Install backend dependencies (locked)
+        working-directory: backend
         run: uv sync --locked
 
-      - name: Pre-deploy quality gate
+      - name: Pre-deploy backend quality gate
+        working-directory: backend
         run: |
           uv run ruff check .
           uv run python -m ty check app --output-format github
 
       - name: Deploy to FastAPI Cloud
+        working-directory: backend
         env:
           FASTAPI_CLOUD_TOKEN: ${{ secrets.FASTAPI_CLOUD_TOKEN }}
           FASTAPI_CLOUD_APP_ID: ${{ secrets.FASTAPI_CLOUD_APP_ID }}

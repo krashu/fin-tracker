@@ -51,6 +51,8 @@ htmlcov/
 node_modules/
 .next/
 out/
+backend/frontend_dist/
+frontend_dist/
 *.tsbuildinfo
 next-env.d.ts
 coverage/

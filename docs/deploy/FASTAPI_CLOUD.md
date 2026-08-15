@@ -1,18 +1,19 @@
-# Deploying Demo-Only Instance to FastAPI Cloud
+# Deploying Demo-Only Full-Stack Instance to FastAPI Cloud
 
-This guide provides instructions for deploying the **fin-tracker backend** to **FastAPI Cloud** in a **demo-only showcase mode** using SQLite.
+This guide provides instructions for deploying the **fin-tracker full-stack application (FastAPI backend + Next.js static frontend)** to **FastAPI Cloud** in a **demo-only showcase mode** using SQLite.
 
 ---
 
 ## 1. Overview
 
 In this configuration:
-- **FastAPI Cloud** hosts the FastAPI backend application with automatic HTTPS, autoscaling, and metrics.
+- **FastAPI Cloud** hosts the unified full-stack application (serving both `/api/v1` and the React frontend on the same domain via `app.frontend()`).
 - **SQLite** is used as the database engine.
 - **Demo Dataset** is automatically seeded on startup with a rolling 90-day window ending at today (`SEED_DEMO_ON_STARTUP=true`).
 - **User Registration is Disabled** (`REGISTRATION_ENABLED=false`), preventing public account creation.
 - **Demo Login over HTTPS is Allowed** (`DEMO_LOGIN_ENABLED=true` + `ALLOW_DEMO_LOGIN_OVER_HTTPS=true`).
-- **Frontend** displays a streamlined 1-click **"Try the demo"** experience and removes public registration forms.
+- **Frontend** provides an instant 1-click **"Try the demo"** exploration experience.
+- **Zero CORS / Cookie Friction**: Because the UI and API reside on the same origin, auth cookies work natively without cross-origin configuration.
 
 ---
 
@@ -76,27 +77,42 @@ fastapi cloud env set --secret JWT_SECRET "<generate-random-64-char-string>"
 
 ---
 
-## 4. Deploying the Backend
+## 4. Building & Deploying the Full-Stack Application
 
-Because `backend/pyproject.toml` is configured with `[tool.fastapi]` entrypoint (`app.main:app`) and `backend/.fastapicloudignore` is in place, simply deploy with:
+### 1. Build the Static Frontend
+Compile the Next.js frontend with relative API path routing:
+
+```bash
+# In frontend/
+cd frontend
+NEXT_PUBLIC_API_BASE_URL="/api/v1" pnpm build
+```
+
+### 2. Stage Static Assets into Backend
+Copy the generated `frontend/out/` directory into `backend/frontend_dist/`:
+
+```bash
+# From project root
+mkdir -p backend/frontend_dist
+cp -r frontend/out/* backend/frontend_dist/
+```
+
+### 3. Deploy to FastAPI Cloud
+Navigate to the `backend/` directory and run:
 
 ```bash
 cd backend
 fastapi deploy
 ```
 
-FastAPI Cloud will package your files, build the container, provision HTTPS (`https://<project-name>.fastapicloud.dev`), and launch the application.
+FastAPI Cloud will package your backend and static frontend bundle, build the container, provision HTTPS (`https://<project-name>.fastapicloud.dev`), and launch the application.
 
 ---
 
-## 5. Connecting the Frontend
+## 5. Deployment Options
 
-1. Deploy the `frontend/` to **Vercel**, **Cloudflare Pages**, or **Netlify**.
-2. Set the environment variable on the frontend platform:
-   ```env
-   NEXT_PUBLIC_API_URL=https://<project-name>.fastapicloud.dev/api/v1
-   ```
-3. Update `CORS_ALLOWED_ORIGINS` in your FastAPI Cloud dashboard to match the production frontend URL.
+- **Unified Hosting (Recommended)**: Both frontend and API are served from `https://<project-name>.fastapicloud.dev` via FastAPI's `app.frontend()`.
+- **Decoupled Hosting (Optional)**: If you prefer hosting the frontend on **Vercel** or **Cloudflare Pages**, set `NEXT_PUBLIC_API_BASE_URL=https://<project-name>.fastapicloud.dev/api/v1` on your hosting provider and set `CORS_ALLOWED_ORIGINS` on FastAPI Cloud.
 
 ---
 
