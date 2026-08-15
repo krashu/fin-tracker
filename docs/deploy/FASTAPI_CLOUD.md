@@ -189,5 +189,3 @@ When the frontend and backend are served together on the same origin (e.g. `http
 ### 3. Local Development vs. Production Deployment
 - **Local Dev**: Run backend on `:8000` (`uv run uvicorn ...`) and frontend on `:3000` (`pnpm dev`). Because `backend/frontend_dist/` is git-ignored, FastAPI serves purely the API and leaves Next.js hot reload untouched.
 - **FastAPI Cloud**: Single container hosts both the API and the pre-built React frontend at `https://fin-tracker-demo.fastapicloud.dev`.
-
-
