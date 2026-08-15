@@ -36,7 +36,7 @@ COPY . .
 RUN uv sync --frozen --no-dev
 
 # ---- run: lean runtime — no uv binary, no download cache -----------------------
-FROM python:3.13-slim-bookworm AS run
+FROM python:3.14-slim-bookworm AS run
 
 ENV PYTHONUNBUFFERED=1
 
