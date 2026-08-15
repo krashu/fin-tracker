@@ -19,10 +19,8 @@ import { AppShell } from "@/components/shell/app-shell";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "./auth-provider";
 
-// Two hardcoded entries, not Next route groups: with exactly two public routes,
-// a plain list is simpler than restructuring the whole app/ tree. Grow into route
-// groups only if a third public route (e.g. password reset) ever lands.
-const PUBLIC_ROUTES = ["/login", "/register"];
+// Public routes: / (landing router), /login, /register
+const PUBLIC_ROUTES = ["/", "/login", "/register"];
 
 function FullscreenSpinner() {
   return (
@@ -62,7 +60,12 @@ export function RouteGuard({
   const pathname = usePathname();
   const router = useRouter();
   const { status, refetch } = useAuth();
-  const isPublic = PUBLIC_ROUTES.includes(pathname);
+  const normalizedPath =
+    pathname.endsWith("/") && pathname !== "/" ? pathname.slice(0, -1) : pathname;
+  const isPublic =
+    normalizedPath === "/" ||
+    normalizedPath === "/login" ||
+    normalizedPath === "/register";
 
   useEffect(() => {
     if (!isPublic && status === "unauthenticated") {
@@ -75,7 +78,7 @@ export function RouteGuard({
       // purely to serve a value this effect reads once, at redirect time. Effects
       // run only on the client, where `window.location` is always available.
       const next = `${pathname}${window.location.search}`;
-      router.replace(`/login?next=${encodeURIComponent(next)}`);
+      router.replace(`/login/?next=${encodeURIComponent(next)}`);
     }
   }, [isPublic, pathname, status, router]);
 

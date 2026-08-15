@@ -1,5 +1,20 @@
-import { redirect } from "next/navigation";
+"use client";
+
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/components/auth/auth-provider";
 
 export default function RootPage() {
-  redirect("/dashboard");
+  const router = useRouter();
+  const { status } = useAuth();
+
+  useEffect(() => {
+    if (status === "authenticated") {
+      router.replace("/dashboard/");
+    } else if (status === "unauthenticated") {
+      router.replace("/login/");
+    }
+  }, [status, router]);
+
+  return null;
 }

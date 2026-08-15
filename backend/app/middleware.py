@@ -173,7 +173,13 @@ class OriginCSRFMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if request.method not in _CSRF_SAFE_METHODS:
             origin = request.headers.get("origin")
-            if origin is None or origin not in get_settings().cors_origins:
+            if origin is None:
+                return JSONResponse({"detail": "origin not allowed"}, status_code=403)
+            # Allow configured CORS origins or same-origin requests (e.g. unified full-stack SPA)
+            host = request.headers.get("host")
+            proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+            same_origin = f"{proto}://{host}" if host else None
+            if origin not in get_settings().cors_origins and origin != same_origin:
                 return JSONResponse({"detail": "origin not allowed"}, status_code=403)
         return await call_next(request)
 

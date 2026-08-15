@@ -25,7 +25,7 @@ import { ApiError, getAuthConfig } from "@/lib/api/client";
 // the app doesn't know.
 const ERROR_ID = "login-error";
 
-const DEFAULT_DESTINATION = "/dashboard";
+const DEFAULT_DESTINATION = "/dashboard/";
 
 /**
  * Resolve the post-login destination from `?next`, which RouteGuard attaches when
@@ -55,9 +55,11 @@ function resolveDestination(): string {
     // Off-origin: absolute, protocol-relative, or a non-http scheme (whose origin
     // parses as opaque and so can never match). This is the open-redirect case.
     if (url.origin !== window.location.origin) return DEFAULT_DESTINATION;
-    // The public routes would bounce straight back here. Mirrors the list at
-    // route-guard.tsx:25 — keep the two in step if a third public route lands.
-    if (url.pathname === "/login" || url.pathname === "/register") {
+    const destPath =
+      url.pathname.endsWith("/") && url.pathname !== "/"
+        ? url.pathname.slice(0, -1)
+        : url.pathname;
+    if (destPath === "/login" || destPath === "/register") {
       return DEFAULT_DESTINATION;
     }
     return `${url.pathname}${url.search}`;
