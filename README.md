@@ -1,8 +1,6 @@
 # Fin Tracker
 
-**Author:** Ashutosh
-
-Personal finance tracker for Indian banks + global investments — import statements, auto-tag transactions, manage hierarchical categories, track an INR+USD portfolio with proper XIRR, and analyze spending trends, all locally and self-hosted.
+A privacy-first, self-hosted personal finance tracker for Indian banks and global investments — import statements, auto-tag transactions, manage hierarchical categories, track an INR+USD portfolio with proper XIRR, and analyze spending trends locally.
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
@@ -209,10 +207,22 @@ Environment variables live in `.env` at the project root (copy from [.env.exampl
 
 ---
 
+## Contributing
+
+Contributions, issues, and feature requests are welcome! Feel free to open an issue or submit a pull request.
+
+Before submitting a pull request, ensure all test suites and linting checks pass:
+
+```bash
+# Backend validation
+cd backend && uv run pytest -n auto && uv run ruff check . && uv run python -m ty check app
+
+# Frontend validation
+cd frontend && pnpm test && pnpm typecheck && pnpm lint
+```
+
+---
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## Author
-
-Built by Ashutosh Upadhyay. Personal project.
+Distributed under the MIT License. See [LICENSE](LICENSE) for more details.
