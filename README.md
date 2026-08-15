@@ -2,283 +2,212 @@
 
 **Author:** Ashutosh
 
-Personal finance tracker for Indian banks + global investments — import statements, auto-tag transactions, track an INR+USD portfolio with proper XIRR, all locally.
+Personal finance tracker for Indian banks + global investments — import statements, auto-tag transactions, manage hierarchical categories, track an INR+USD portfolio with proper XIRR, and analyze spending trends, all locally and self-hosted.
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![Node](https://img.shields.io/badge/node-24-brightgreen)
+![Next.js](https://img.shields.io/badge/Next.js-16_App_Router-black)
+![Tailwind](https://img.shields.io/badge/Tailwind_CSS-4.0-38bdf8)
+![Tests](https://img.shields.io/badge/tests-pytest_%7C_vitest-success)
 
-> Self-hosted and privacy-first — your statements and portfolio data never leave your machine.
-
-## Why this exists
-
-Existing trackers (Mint, Lunchmoney, YNAB, Kuvera) each fall short on at least one axis: poor support for Indian bank statement formats, no investment-side depth, or SaaS hosting your full financial data. This is a self-hosted alternative that imports CC + bank PDFs from ICICI / Axis, tracks investments via a canonical transaction-CSV import (any broker / AMC export), handles US stocks held via INDmoney in USD with FX-adjusted rollups, and computes XIRR / allocation properly. Built primarily as a personal tool — also a portfolio project.
+> Self-hosted and privacy-first — your statements, transactions, and portfolio data never leave your machine.
 
 ## Screenshots
 
 > _Coming soon._
 
-## Features
+## Key Features
 
-- 📥 Import credit-card & bank statements (CSV + password-protected PDF) — ICICI / Axis
-- 🤖 Auto-tag transactions by learning your past merchant→category mappings
-- ✍️ Manual transactions (cash, transfers, imports the parser missed)
-- 📊 Investments via canonical transaction-CSV import — MFs & equities from any broker/AMC export
-- 🌍 US stocks/ETFs via INDmoney transaction export, with per-transaction FX stamping
-- 💱 INR home currency with USD investment rollup
-- 📈 Live portfolio tiles + monthly spend dashboards
-- 🏆 Portfolio vs benchmark — "am I beating the market?" against an index fund, in XIRR alpha
-- 🧾 Capital-gains statement (FIFO STCG/LTCG split, debt-slab flag, ₹1.25L exemption) + dividend-income summary — to reconcile against your AMC report & AIS at filing
-- 🗂️ One-click CSV export to Google Drive
-
-**Coming soon:** recurring-transaction detection, OCR for scanned bills, budgets, multi-user households, capital-loss set-off + carry-forward, tax-loss harvesting.
+- 📥 **Statement Import & Staging**: Credit card & bank statement import (CSV + password-protected PDFs for ICICI / Axis) with structured `ParsedStatement` returns, balance reconciliation, and an interactive review queue (`/imports/review/[batchId]`).
+- 🏷️ **Hierarchical 2-Level Categorization**: Full two-level category tree (ADR-0012) with one-hop rollup, color inheritance, soft archive cascades, and a command-palette (`cmdk`) integrated category selector.
+- 🤖 **Smart Auto-Tagging & Merchant Aliases**: Automatically learns merchant→category mappings and canonical merchant aliases across recurring transactions.
+- ✍️ **Expenses Board & Manual Entry**: Fast transaction management with date-aware formatting, multi-selection batch edits, custom transaction labels, and instant privacy balance masking (`Sensitive` over-the-shoulder masking).
+- 📊 **Spending Analytics & Visualizations**:
+  - Spend-by-category overview and monthly breakdown.
+  - Interactive hierarchical donut charts (`HierarchicalDonutChart`) and trend bars (`HierarchicalTrendBar`, `CategoryTrendBar`).
+  - Subcategory mover analysis (`SubcategoryMovers`) highlighting top spending shifts.
+  - Summary metrics strip with income/spend/savings tracking.
+- 📈 **Investments & Portfolio Tracking**:
+  - Canonical transaction-CSV import for MFs & equities from any broker/AMC export.
+  - US stocks/ETFs via INDmoney transaction export with per-transaction FX stamping.
+  - INR home currency with USD investment rollup.
+  - Scalar XIRR alpha against Indian benchmark index funds.
+- 🧾 **Tax & Capital Gains Reporting**: Capital-gains statement (FIFO STCG/LTCG split, debt-slab flag, ₹1.25L exemption) + dividend-income summary.
+- 💾 **Backup, Restore & Migration**: Comprehensive JSON/CSV export and import service with transaction deduplication and schema migration compatibility.
+- 🔒 **Multi-User Tenant Isolation**: Secure cookie JWT authentication with rotating refresh tokens and strict per-row tenant isolation (`user_id`).
 
 Full scope in [PRD.md](PRD.md).
 
 ## Architecture
 
 ```
-                           ┌──────────────────────────────────────┐
-                           │   Browser (React + TanStack Query)   │
-                           └──────────────────┬───────────────────┘
-                                              │ HTTP / JSON
-                                              ▼
-┌────────────────┐   ┌──────────────────────────────────────────┐
-│   PDF / CSV    │──▶│  FastAPI  ─ parsers ─ services ─ models  │
-│   statements   │   │       │                                  │
-└────────────────┘   │       └──▶  SQLAlchemy ──▶  SQLite        │
-                     │                                          │
-                     │       └──▶  Google Drive (CSV backup)     │
-                     └──────────────────────────────────────────┘
+                           ┌────────────────────────────────────────────────────────┐
+                           │   Browser (Next.js 16 App Router + TanStack Query v5)  │
+                           └───────────────────────────┬────────────────────────────┘
+                                                       │ HTTP / JSON (Cookie JWT)
+                                                       ▼
+┌───────────────────────────┐   ┌───────────────────────────────────────────────────┐
+│   PDF / CSV statements    │──▶│      FastAPI Backend (Python 3.13)                │
+│ (ICICI, Axis, Broker CSV) │   │  • Parsers (pdfplumber + pikepdf)                 │
+└───────────────────────────┘   │  • Services (dedup, auto-tagging, XIRR, backup)   │
+                                │  • SQLAlchemy 2.0 (naive UTC clock, tenant-bound) │
+                                └─────────────────────────┬─────────────────────────┘
+                                                          │
+                                                          ▼
+                                ┌───────────────────────────────────────────────────┐
+                                │             SQLite Database / Postgres            │
+                                └───────────────────────────────────────────────────┘
 ```
 
-Server-rendered? No — Next.js is the React frontend, FastAPI is the JSON API. The four consumed Pydantic schemas are hand-mirrored as TypeScript types in `frontend/lib/api/client.ts`. Live tiles use TanStack Query polling today; a push-based SSE channel is planned.
+The frontend uses Next.js 16 App Router with React 19 and TanStack Query v5 for client state management. Pydantic schemas are hand-mirrored as TypeScript types in `frontend/lib/api/client.ts`. Live tiles use TanStack Query invalidation contracts (`lib/queries/invalidate.ts`) to keep views synchronized.
 
 ## Tech stack
 
-| Layer        | Choice                                                      |
-| ------------ | ----------------------------------------------------------- |
-| Backend      | Python 3.13 + FastAPI + SQLAlchemy 2 + Alembic              |
-| DB           | SQLite, with Postgres support planned                       |
-| PDF parsing  | pdfplumber + pikepdf (per-issuer strategy pattern)          |
-| XIRR         | `pyxirr`                                                     |
-| Frontend     | Next.js 16 LTS + React 19 + TypeScript 7 + Tailwind CSS 4   |
-| UI kit       | shadcn/ui (Radix primitives) + Recharts via shadcn `Chart`  |
-| Data layer   | TanStack Query v5                                           |
-| Tooling      | uv (Python) / pnpm (Node) / pre-commit / ruff / ty / eslint |
+| Layer              | Choice                                                                        |
+| ------------------ | ----------------------------------------------------------------------------- |
+| **Backend**        | Python 3.13 + FastAPI + SQLAlchemy 2.0 + Alembic                              |
+| **Database**       | SQLite (with Postgres portability via ADR-0001)                               |
+| **PDF Parsing**    | `pdfplumber` + `pikepdf` (per-issuer strategy pattern)                        |
+| **Financial Math** | `pyxirr`                                                                      |
+| **Frontend**       | Next.js 16 App Router + React 19 + TypeScript + Tailwind CSS 4                |
+| **UI Components**  | shadcn/ui (Radix primitives) + Lucide Icons + Recharts                        |
+| **State & Cache**  | TanStack Query v5 (manual invalidation architecture)                          |
+| **Testing**        | `pytest` + `pytest-xdist` (backend, 75% coverage gate), `vitest` (frontend)    |
+| **Tooling & CI**   | `uv` (Python), `pnpm` (Node), `ruff`, Astral `ty`, `eslint`, GitHub Actions   |
 
 Full rationale in [PRD.md § Tech stack](PRD.md#tech-stack).
 
 ## Deploy with Docker
 
-Run the whole app on your own computer with Docker — your financial data never leaves your
-machine. You don't need Python, Node, or any of the developer tools below; Docker builds
-everything for you.
+Run the whole app on your own computer with Docker — your financial data never leaves your machine.
 
 ### 1. Install Docker
 
-- **Windows / macOS** — install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-  and start it (wait until the whale icon says it's running).
-- **Linux** — install [Docker Engine](https://docs.docker.com/engine/install/) + the Compose
-  plugin (v2.24 or newer).
+- **Windows / macOS** — install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and start it.
+- **Linux** — install [Docker Engine](https://docs.docker.com/engine/install/) + Compose plugin (v2.24+).
 
-Confirm it works: `docker --version`.
-
-### 2. Get the code
+### 2. Clone and Start
 
 ```bash
 git clone <repository-url>
 cd fin-tracker
-```
-
-No git? On the project's page use **Code → Download ZIP**, unzip it, and open a terminal in that
-folder.
-
-### 3. Start it
-
-```bash
 docker compose -f docker-compose.yml up -d --build
 ```
 
-The first run takes a few minutes while Docker builds the images. `-d` runs it in the
-background, so you can close the terminal afterwards. *(If you have `make`, `make up` is a
-shortcut — it just runs in the foreground.)*
+### 3. Open the App
 
-### 4. Open it
+Open **http://localhost:3000** in your browser and register your account.
 
-On **this computer**, open **http://localhost:3000** and **create your account**. (A demo account
-— `demo@fin-tracker.local` / `demofintracker` — also exists, but its password is published in
-this repo, so **its login is refused unless you set `DEMO_LOGIN_ENABLED=true`** in `.env`. Leave
-it off: this stack is reachable from your LAN, and that account is the row your own data would
-hang off on an upgraded install. `make dev` enables it for throwaway dev boxes.)
+### Managing Docker Containers
 
-On the very first run, give it a minute, then confirm both parts are up:
+| Task            | Command                                                                            |
+| --------------- | ---------------------------------------------------------------------------------- |
+| **Stop**        | `docker compose -f docker-compose.yml down`                                        |
+| **Start again** | `docker compose -f docker-compose.yml up -d`                                       |
+| **View logs**   | `docker compose -f docker-compose.yml logs -f`                                     |
+| **Update**      | `git pull && docker compose -f docker-compose.yml up -d --build`                   |
+| **Back up**     | Stop the container and copy the **`data/`** directory.                             |
 
+### Reverse Proxy & LAN Access
+
+To access the app across your local network or phone:
 ```bash
-docker compose -f docker-compose.yml ps
+docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d --build
 ```
+Access via **http://localhost:8080** (or `http://<your-host-ip>:8080`). Ensure your host IP is listed in `CORS_ALLOWED_ORIGINS` in `.env`.
 
-`backend` and `frontend` should both show `running` (backend `healthy`). That's the whole thing
-for personal use on your own machine.
+---
 
-### Managing it
-
-| Task        | Command                                                                    |
-| ----------- | -------------------------------------------------------------------------- |
-| Stop        | `docker compose -f docker-compose.yml down`                                |
-| Start again | `docker compose -f docker-compose.yml up -d`                               |
-| See logs    | `docker compose -f docker-compose.yml logs -f`                             |
-| Update      | Get the latest code (`git pull`, or re-download the ZIP), then re-run **Start it**. |
-| **Back up** | Stop it, then copy the whole **`data/`** folder — that's your entire history. |
-
-### If it doesn't start
-
-- **Nothing loads / "cannot connect":** make sure Docker Desktop is actually running, then
-  re-run **Start it** and watch `docker compose -f docker-compose.yml logs -f`.
-- **"port is already allocated":** another program is using `3000` or `8000` — close it (or stop
-  the other container), then start again.
-
-### Options & notes
-
-- **One address / use it from your phone:** run
-  `docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d --build`
-  (or `make up-proxy`) and open **http://localhost:8080**. To reach it from another device on
-  your Wi-Fi, add **this computer's own address** (e.g. `http://192.168.1.42:8080`, not the
-  phone's) to `CORS_ALLOWED_ORIGINS` — see the notes in
-  [docker-compose.proxy.yml](docker-compose.proxy.yml).
-- **Before exposing it beyond your own computer,** set a secret: copy [.env.example](.env.example)
-  to `.env` and set `JWT_SECRET` to a long random value (e.g. `openssl rand -base64 48`). Safe
-  to skip for local-only use.
-- **Use a different database (advanced):** the default is a local SQLite file under `data/`. To
-  point at your own database (e.g. Postgres), set `DATABASE_URL` in `.env` — it overrides the
-  default. (A Docker SQLite path needs four slashes: `sqlite:////data/fin-tracker.db`.)
-- **Linux hosts only:** the backend runs as a non-root user (uid 10001). Make the data folder
-  writable by it once, before step 3:
-  ```bash
-  mkdir -p data && sudo chown -R 10001:10001 data
-  ```
-  Not needed on Docker Desktop (Windows/macOS).
-
-## Quickstart
+## Local Development Setup
 
 ### Prerequisites
-- **Python 3.13** + **uv** (`pip install uv` or [astral.sh/uv](https://docs.astral.sh/uv/))
-- **Node 24** + **pnpm 11**
-- *(Optional)* **make** — Linux/macOS native; Windows via `choco install make` or `scoop install make`
+- **Python 3.13** + **uv** ([astral.sh/uv](https://docs.astral.sh/uv/))
+- **Node 24** + **pnpm 11** (`npm install -g pnpm@11.21.0`)
+- *(Optional)* **make**
 
-### Option A — with `make` (recommended)
-
-```bash
-make dev   # docker compose up: backend + frontend with hot-reload
-```
-
-### Option B — raw commands
+### 1. Backend Setup
 
 ```bash
-# Backend (one terminal)
 cd backend
 uv sync
-uv run alembic upgrade head   # one-time (and after new migrations): seeds the app's user row
-uv run main.py                # start the API — host/port/reload read from .env (see Configuration)
+uv run alembic upgrade head   # Run database migrations
+uv run uvicorn app.main:app --reload
 ```
+API runs at **http://localhost:8000** (interactive Swagger docs at **http://localhost:8000/docs**).
 
-The `alembic upgrade head` step is not optional on a fresh database: the app's
-startup guard refuses to boot if the configured `V1_USER_ID` has no matching
-row in `users`, and the migrations seed that row. Equivalent: `make migrate`.
+### 2. Frontend Setup
 
 ```bash
-# Frontend (second terminal)
-# First time only: install pnpm globally (no admin required on Windows)
-npm install -g pnpm@11.21.0
-# Windows: ensure %APPDATA%\npm is on PATH (PowerShell, no admin):
-#   setx PATH "%PATH%;%APPDATA%\npm"
-# Reopen the shell after.
-
 cd frontend
 pnpm install
 pnpm dev
 ```
+Frontend runs at **http://localhost:3000**.
 
-Backend on `http://localhost:8000`, frontend on `http://localhost:3000`.
-
-### Configuration
-
-Runtime config lives in a gitignored `.env` at the repo root (copy from [.env.example](.env.example)). Defaults are production-safe, so `.env` is optional for local use. The `API_*` vars are the **backend** server's — the Next.js frontend has its own config. `uv run main.py` reads `API_HOST` / `API_PORT` / `API_RELOAD`; `make backend` forces `--reload` for dev regardless.
-
-| Var            | Default                             | Purpose                                                          |
-| -------------- | ----------------------------------- | ---------------------------------------------------------------- |
-| `API_HOST`     | `127.0.0.1`                         | Backend bind address. Set `0.0.0.0` to expose on the LAN.        |
-| `API_PORT`     | `8000`                              | Backend API port — the frontend calls the API here.              |
-| `API_RELOAD`   | `false`                             | Uvicorn auto-reload. Set `true` for local hot-reload.            |
-| `LOG_FORMAT`   | `console`                           | Set `json` for structured logs in production.                   |
-| `LOG_LEVEL`    | `info`                              | Level for app + bridged uvicorn logs. Not SQLAlchemy: it pins its own logger to WARNING at import. |
-| `DATABASE_URL` | `sqlite:///./data/fin-tracker.db`   | SQLAlchemy URL — Postgres support planned.                       |
-| `V1_USER_ID`   | seeded UUID                         | Must match the Alembic-seeded `users` row.                       |
-
-### VS Code / IDE setup
-
-1. After `uv sync` completes, select the project venv as Python interpreter so type hints and import resolution work:
-   **`Ctrl+Shift+P` → "Python: Select Interpreter" → `backend/.venv/Scripts/python.exe`** (or `backend/.venv/bin/python` on macOS/Linux).
-2. If `fastapi`, `sqlalchemy`, etc. still show as "missing import" after that, reload the window (`Ctrl+Shift+P` → "Developer: Reload Window").
-
-## Development workflow
-
-`pre-commit` runs `ruff` + `ty` + `eslint` + `tsc` on every commit. GitHub Actions runs the same checks plus the test suite on every push to `main` and on PRs.
-
-Running from source (no Docker) and keeping dependencies current — pnpm, frontend, and backend update procedures — are documented in [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
-
-| Command          | What it does                              |
-| ---------------- | ----------------------------------------- |
-| `make dev`       | Full stack via docker compose             |
-| `make test`      | `pytest` (backend) + coverage             |
-| `make lint`      | `ruff check` + `eslint`                   |
-| `make typecheck` | `ty` + `tsc --noEmit`                     |
-
-Activate the git pre-commit hook locally after `uv sync`:
+### 3. Running with Make (Alternative)
 
 ```bash
-cd backend && uv run pre-commit install
+make dev        # Hot-reload full stack via docker compose
+make migrate    # Run alembic migrations
+make backend    # Run backend locally with uvicorn reload
+make frontend   # Run frontend dev server
 ```
 
-## Roadmap
+---
 
-- One issuer, end-to-end: Axis CC PDF → parse → dedupe → tag → review screen.
-- Add ICICI parser.
-- Manual transactions + category management UI.
-- Investment side: manual + transaction-CSV import + XIRR.
-- Multi-currency + INDmoney import.
-- Dashboards: live tiles, monthly-by-category, weekly/monthly bar, net-worth headline.
-- Portfolio vs benchmark: scalar XIRR alpha against an Indian index-fund NAV/price snapshot.
-- CSV export + Google Drive sync.
-- Tax statements & reporting: capital-gains statement (FIFO STCG/LTCG split, debt-slab flag, ₹1.25L exemption) + dividend-income summary.
-- Basic auth, cloud-deployable.
-- OCR for scanned bills, recurring-transaction detection, budgets, multi-user households, capital-loss set-off + carry-forward, tax-loss harvesting, push-based live updates.
+## Testing & Quality Gates
 
-Full sequencing detail in [PRD.md § Build sequencing](PRD.md#build-sequencing--what-to-build-first).
+The project maintains high code quality and strict type safety enforced through local hooks and GitHub Actions CI:
+
+| Task                     | Command                                                              |
+| ------------------------ | -------------------------------------------------------------------- |
+| **Backend Tests**        | `cd backend && uv run pytest -n auto` (enforces 75% coverage floor)   |
+| **Backend Fast Loop**    | `cd backend && uv run pytest --no-cov -m "not real_pdf and not slow"`|
+| **Frontend Tests**       | `cd frontend && pnpm test` (Vitest unit tests)                       |
+| **Backend Lint**         | `cd backend && uv run ruff check .`                                  |
+| **Backend Typecheck**    | `cd backend && uv run python -m ty check app`                        |
+| **Frontend Lint**        | `cd frontend && pnpm lint`                                           |
+| **Frontend Typecheck**   | `cd frontend && pnpm typecheck` (`tsc --noEmit`)                      |
+| **Pre-commit Checks**    | `cd backend && uv run pre-commit run --all-files`                     |
+
+### CI/CD Workflows (`.github/workflows/`)
+
+- **`test-backend.yml`**: Runs pytest suite across python matrix, enforces 75% coverage and migration stairway verification.
+- **`test-frontend.yml`**: Runs `vitest`, `tsc --noEmit`, and ESLint across frontend components and utilities.
+- **`docker-build.yml`**: Validates Docker container builds for both backend and frontend.
+- **`security.yml`**: CodeQL static analysis and dependency vulnerability scans.
+- **`pre-commit.yml`**: Validates pre-commit hook compliance including fixture redaction checks.
+- **Dependabot**: Automated dependency tracking and security patches.
+
+---
+
+## Configuration
+
+Environment variables live in `.env` at the project root (copy from [.env.example](.env.example)):
+
+| Variable         | Default                             | Purpose                                                          |
+| ---------------- | ----------------------------------- | ---------------------------------------------------------------- |
+| `API_HOST`       | `127.0.0.1`                         | Backend bind address (`0.0.0.0` for LAN access).                 |
+| `API_PORT`       | `8000`                              | Backend API port.                                                |
+| `API_RELOAD`     | `false`                             | Enable uvicorn hot reloading in development.                     |
+| `LOG_FORMAT`     | `console`                           | Log output format (`console` or `json` for production).          |
+| `LOG_LEVEL`      | `info`                              | App log level (`debug`, `info`, `warning`, `error`).             |
+| `DATABASE_URL`   | `sqlite:///./data/fin-tracker.db`   | Database connection string (SQLite or Postgres).                 |
+| `JWT_SECRET`     | seeded dev secret                   | Secret key used for signing JWT session tokens.                  |
+| `V1_USER_ID`     | seeded UUID                         | Default user ID matching Alembic seeded user row.                |
+
+---
 
 ## Troubleshooting
 
-Five issues that bit during bootstrap on Windows. Documented here so the next person (or future-you) skips them.
+- **`uv sync` fails with TLS / certificate errors**: Force the public PyPI index: `UV_INDEX= uv sync`.
+- **VS Code shows missing Python imports**: Press `Ctrl+Shift+P` → "Python: Select Interpreter" → choose `backend/.venv/Scripts/python.exe`.
+- **`pnpm: command not found` on Windows**: Ensure `%APPDATA%\npm` is added to your user PATH: `setx PATH "%PATH%;%APPDATA%\npm"`.
+- **`pnpm install` postinstall script errors**: `frontend/pnpm-workspace.yaml` is configured to build `sharp` and `unrs-resolver`. If shims break on Windows, run `corepack pnpm install --force`.
+- **Corporate TLS Proxy / Zscaler**: See [frontend/certs/README.md](frontend/certs/README.md) for the `ca-bundle` automatic merge workflow.
 
-**`uv sync` fails with TLS / certificate errors.**
-Your shell may have a `UV_INDEX` env var (e.g. a corporate artifactory). This project's `[tool.uv]` in `backend/pyproject.toml` already pins to public PyPI, but the env var can override per-invocation. Force the project config: `UV_INDEX= uv sync`.
-
-**VS Code says `fastapi` / `sqlalchemy` / etc. imports are missing.**
-VS Code is using the system Python instead of the project venv. Fix: `Ctrl+Shift+P` → "Python: Select Interpreter" → pick `backend/.venv/Scripts/python.exe` (or `backend/.venv/bin/python` on macOS/Linux).
-
-**`pnpm: command not found` after `npm install -g pnpm`.**
-npm's global prefix on Windows (`%APPDATA%\npm`) isn't on PATH by default in bash / git-bash. Add it from PowerShell (no admin): `setx PATH "%PATH%;%APPDATA%\npm"`, then reopen the shell.
-
-**`pnpm install` errors with `ERR_PNPM_IGNORED_BUILDS`.**
-Already handled in this repo — `frontend/pnpm-workspace.yaml` opts `sharp` and `unrs-resolver` into running their install scripts. Re-run `pnpm install` and the postinstall scripts execute cleanly.
-
-**`pnpm dev` / `pnpm typecheck` / `pnpm lint` fail with `'sh' is not recognized` (or `tsc` / `next` / `eslint` "not recognized").**
-A partial `pnpm install` can skip generating the Windows `.cmd` / `.ps1` shims in `node_modules/.bin/`, leaving only the extension-less bash shims — which PowerShell/cmd can't run. Regenerate them: `corepack pnpm install --force`. To bypass without reinstalling, invoke the tool through Node directly:
-```powershell
-node node_modules/next/dist/bin/next dev          # instead of pnpm dev
-node node_modules/typescript/bin/tsc --noEmit     # instead of pnpm typecheck
-node node_modules/eslint/bin/eslint.js .          # instead of pnpm lint
-```
+---
 
 ## License
 
