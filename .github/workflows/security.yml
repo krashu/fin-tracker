@@ -1,0 +1,43 @@
+name: Security & Redaction Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  security-audit:
+    name: Security & Fixture Redaction
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for unredacted .env files
+        run: |
+          if find . -type f -name ".env*" ! -name ".env.example" | grep -q .; then
+            echo "::error::Found committed .env files. Never commit private .env files!"
+            exit 1
+          fi
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: uv sync --locked
+
+      - name: Run PII Redaction Fixture Guard
+        working-directory: backend
+        run: uv run pytest tests/test_fixture_redaction.py -q --no-cov
+
