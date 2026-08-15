@@ -3,7 +3,16 @@ name: Test Frontend
 on:
   push:
     branches: [main]
+    paths:
+      - "frontend/**"
+      - ".nvmrc"
+      - ".github/workflows/test-frontend.yml"
   pull_request:
+    paths:
+      - "frontend/**"
+      - ".nvmrc"
+      - ".github/workflows/test-frontend.yml"
+
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

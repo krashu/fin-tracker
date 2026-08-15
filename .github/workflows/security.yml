@@ -3,7 +3,18 @@ name: Security & Redaction Check
 on:
   push:
     branches: [main]
+    paths:
+      - "backend/**"
+      - "scripts/**"
+      - ".env*"
+      - ".github/workflows/security.yml"
   pull_request:
+    paths:
+      - "backend/**"
+      - "scripts/**"
+      - ".env*"
+      - ".github/workflows/security.yml"
+
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
