@@ -124,3 +124,34 @@ FastAPI Cloud will package your files, build the container, provision HTTPS (`ht
    - Navigate to the frontend login URL.
    - Confirm the page displays the **"Try the demo"** button as the primary call-to-action without any signup link in the footer.
    - Click **"Try the demo"** to verify instantaneous sign-in to the demo dashboard.
+
+---
+
+## 7. Automated CI/CD (GitHub Actions)
+
+The repository includes a dedicated workflow [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) that automatically runs code quality checks and deploys the backend to FastAPI Cloud whenever changes are pushed to `main`.
+
+### Setting Up GitHub Secrets
+
+1. **Create a Deploy Token**:
+   - Via CLI:
+     ```bash
+     fastapi cloud tokens create --name "GitHub Actions CI" --expires-in-days 365
+     ```
+   - Or via Web Dashboard:
+     Navigate to your app > **Deploy Tokens** > **Create Token**.
+
+2. **Add Secrets to GitHub**:
+   In your GitHub repository, go to **Settings > Secrets and variables > Actions > New repository secret** and add:
+
+   | Secret Name | Description / Value |
+   |---|---|
+   | `FASTAPI_CLOUD_TOKEN` | The deploy token generated in Step 1. |
+   | `FASTAPI_CLOUD_APP_ID` | Your app UUID: `8a2313e9-ac17-4761-add4-20a4b23a0655` |
+
+### How the Workflow Operates
+
+- **Scoped Triggers**: Only runs on pushes to `main` modifying `backend/**` or `.github/workflows/deploy.yml`, or via manual trigger (`workflow_dispatch`).
+- **Atomic Rollout**: Uses `concurrency.cancel-in-progress: false` to ensure in-flight builds and database migrations complete without interruption.
+- **Pre-Deploy Quality Gate**: Runs `ruff check` and `ty check app` before initiating `fastapi deploy` to prevent deploying regressed code.
+

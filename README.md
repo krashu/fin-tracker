@@ -9,11 +9,12 @@ A privacy-first, self-hosted personal finance tracker for Indian banks and globa
 ![Next.js](https://img.shields.io/badge/Next.js-16_App_Router-black)
 ![Tailwind](https://img.shields.io/badge/Tailwind_CSS-4.0-38bdf8)
 ![Tests](https://img.shields.io/badge/tests-pytest_%7C_vitest-success)
+[![Live Demo](https://img.shields.io/badge/demo-fastapicloud-brightgreen)](https://fin-tracker-demo.fastapicloud.dev)
 
 > [!NOTE]
-> **Active Development**: Fin Tracker is under active development. Features, database migrations, and APIs may evolve.
+> **Live Demo**: Explore the pre-seeded interactive showcase at [fin-tracker-demo.fastapicloud.dev](https://fin-tracker-demo.fastapicloud.dev).
 >
-> Self-hosted and privacy-first — your statements, transactions, and portfolio data never leave your machine.
+> **Privacy-First & Self-Hostable**: For personal use, run locally with SQLite/Docker — your statements, transactions, and portfolio data never leave your machine. See the [FastAPI Cloud Deployment Guide](docs/deploy/FASTAPI_CLOUD.md) for self-hosting a public showcase.
 
 ## Screenshots
 
@@ -180,6 +181,7 @@ The project maintains high code quality and strict type safety enforced through 
 - **`docker-build.yml`**: Validates Docker container builds for both backend and frontend.
 - **`security.yml`**: CodeQL static analysis and dependency vulnerability scans.
 - **`pre-commit.yml`**: Validates pre-commit hook compliance including fixture redaction checks.
+- **`deploy.yml`**: Continuous deployment to FastAPI Cloud demo instance on push to `main`.
 - **Dependabot**: Automated dependency tracking and security patches.
 
 ---
