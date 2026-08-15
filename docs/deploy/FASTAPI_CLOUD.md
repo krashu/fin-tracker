@@ -167,7 +167,27 @@ The repository includes a dedicated workflow [`.github/workflows/deploy.yml`](..
 
 ### How the Workflow Operates
 
-- **Scoped Triggers**: Only runs on pushes to `main` modifying `backend/**` or `.github/workflows/deploy.yml`, or via manual trigger (`workflow_dispatch`).
+- **Scoped Triggers**: Runs on pushes to `main` modifying `backend/**`, `frontend/**`, or `.github/workflows/deploy.yml`, or via manual trigger (`workflow_dispatch`).
+- **Automated Frontend Build**: Compiles the Next.js frontend with `NEXT_PUBLIC_API_BASE_URL="/api/v1"` and stages static assets into `backend/frontend_dist/`.
 - **Atomic Rollout**: Uses `concurrency.cancel-in-progress: false` to ensure in-flight builds and database migrations complete without interruption.
 - **Pre-Deploy Quality Gate**: Runs `ruff check` and `ty check app` before initiating `fastapi deploy` to prevent deploying regressed code.
+
+---
+
+## 8. Full-Stack Architecture & Troubleshooting
+
+### 1. Same-Origin CSRF Protection (`OriginCSRFMiddleware`)
+When the frontend and backend are served together on the same origin (e.g. `https://fin-tracker-demo.fastapicloud.dev`):
+- Non-safe HTTP methods (`POST`, `PUT`, `PATCH`, `DELETE`) require an `Origin` header.
+- `OriginCSRFMiddleware` automatically allows requests whose `Origin` header matches the incoming request host/protocol (`same_origin`), as well as any external origins specified in `CORS_ALLOWED_ORIGINS`.
+
+### 2. Trailing Slash Routing (`trailingSlash: true`)
+- Next.js static HTML export emits directory indices (e.g. `login/index.html`, `dashboard/index.html`).
+- FastAPI's `app.frontend()` serves directory indices with trailing slashes (`/login/`, `/dashboard/`).
+- Routes in `route-guard.tsx` and `login/page.tsx` normalize trailing slashes so checks succeed regardless of slash variations.
+
+### 3. Local Development vs. Production Deployment
+- **Local Dev**: Run backend on `:8000` (`uv run uvicorn ...`) and frontend on `:3000` (`pnpm dev`). Because `backend/frontend_dist/` is git-ignored, FastAPI serves purely the API and leaves Next.js hot reload untouched.
+- **FastAPI Cloud**: Single container hosts both the API and the pre-built React frontend at `https://fin-tracker-demo.fastapicloud.dev`.
+
 
