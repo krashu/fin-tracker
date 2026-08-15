@@ -81,6 +81,9 @@ export default function RegisterPage() {
     setSubmitting(true);
     try {
       await loginDemo();
+      try {
+        window.localStorage.setItem("balance-hidden", "0");
+      } catch {}
       router.replace("/dashboard");
     } catch (err) {
       setError(

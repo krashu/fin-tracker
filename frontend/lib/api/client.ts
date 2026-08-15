@@ -347,6 +347,7 @@ export type AuthUser = {
   id: string;
   email: string | null;
   display_name: string | null;
+  is_guest?: boolean;
 };
 
 /** Public demo credentials (backend `app/core/demo.py`) — the demo owns only
@@ -361,6 +362,14 @@ export function login(email: string, password: string): Promise<AuthUser> {
   return request<AuthUser>(
     "/auth/login",
     { method: "POST", body: JSON.stringify({ email, password }) },
+    { noRefresh: true },
+  );
+}
+
+export function demoSession(): Promise<AuthUser> {
+  return request<AuthUser>(
+    "/auth/demo-session",
+    { method: "POST" },
     { noRefresh: true },
   );
 }

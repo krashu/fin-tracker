@@ -25,9 +25,11 @@ raw password never touches the DB.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Index, String, text
+from sqlalchemy import Boolean, DateTime, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.sql import expression
 
 from app.models.base import Base, TimestampMixin
 
@@ -45,9 +47,17 @@ class User(Base, TimestampMixin):
             sqlite_where=text("email IS NOT NULL"),
             postgresql_where=text("email IS NOT NULL"),
         ),
+        Index(
+            "ix_users_guest_expires_at",
+            "guest_expires_at",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     email: Mapped[str | None] = mapped_column(String(255))
     password_hash: Mapped[str | None] = mapped_column(String(255))
     display_name: Mapped[str | None] = mapped_column(String(128))
+    is_guest: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=expression.false()
+    )
+    guest_expires_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)

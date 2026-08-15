@@ -39,7 +39,7 @@ from app.schemas import (
     RegisterRequest,
     UserRead,
 )
-from app.services import auth_service
+from app.services import auth_service, guest_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -156,6 +156,23 @@ def logout(request: Request, session: SessionDep, response: Response) -> None:
     return None
 
 
+@router.post("/demo-session", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def demo_session(
+    session: SessionDep,
+    response: Response,
+    _: None = Depends(RateLimit(bucket="demo-session")),
+) -> User:
+    settings = get_settings()
+    if not settings.demo_login_permitted:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="demo access is disabled on this instance",
+        )
+    user, refresh_token = guest_service.create_guest_sandbox(session)
+    _set_auth_cookies(response, user, refresh_token)
+    return user
+
+
 @router.post("/change-password", response_model=UserRead)
 def change_password(
     payload: ChangePasswordRequest,
@@ -169,7 +186,9 @@ def change_password(
     # demo" until a reseed). Reachable only where the demo login itself is permitted
     # (Settings.demo_login_permitted — opted in, on plain http), since a session on this
     # account can't be obtained anywhere else.
-    if user.email is not None and auth_service.normalize_email(user.email) == DEMO_EMAIL:
+    if user.is_guest or (
+        user.email is not None and auth_service.normalize_email(user.email) == DEMO_EMAIL
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="the demo account password can't be changed",

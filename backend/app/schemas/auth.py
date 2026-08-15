@@ -64,3 +64,4 @@ class UserRead(BaseModel):
     id: UUID
     email: str | None
     display_name: str | None
+    is_guest: bool = False

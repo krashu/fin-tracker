@@ -17,8 +17,9 @@ the V1_USER_ID guard hits the seeded test DB, not production.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -39,8 +40,22 @@ from app.middleware import (
 )
 from app.models import User
 from app.services.demo_seed import seed_demo_data
+from app.services.guest_service import cleanup_expired_guests
 
 logger = get_logger(__name__)
+
+
+async def _guest_cleanup_loop() -> None:
+    """Periodic background task that sweeps expired guest sandboxes every 15 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(900)  # 15 minutes
+            with SessionLocal() as session:
+                cleanup_expired_guests(session)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("periodic_guest_cleanup_error")
 
 
 @asynccontextmanager
@@ -92,7 +107,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "Run `make migrate` to seed it, or align V1_USER_ID with the seeded UUID."
         )
     _maybe_seed_demo(settings)
-    yield
+    _cleanup_guests_on_startup()
+    cleanup_task = asyncio.create_task(_guest_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
+
+
+def _cleanup_guests_on_startup() -> None:
+    """Sweep expired guest accounts left over from previous runs on boot."""
+    with SessionLocal() as session:
+        try:
+            cleanup_expired_guests(session)
+        except Exception:
+            logger.exception("startup_guest_cleanup_failed")
+
 
 
 def _maybe_seed_demo(settings: Settings) -> None:

@@ -7,6 +7,8 @@ on:
       - "backend/**"
       - "frontend/**"
       - ".github/workflows/deploy.yml"
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 concurrency:

@@ -44,9 +44,12 @@ def make_engine(url: str, poolclass: type[Pool] | None = None) -> Engine:
     if url.startswith("sqlite"):
 
         @event.listens_for(engine, "connect")
-        def _enable_sqlite_fk(dbapi_connection: Any, _conn_record: Any) -> None:
+        def _configure_sqlite(dbapi_connection: Any, _conn_record: Any) -> None:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
     return engine

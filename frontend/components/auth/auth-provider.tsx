@@ -34,6 +34,7 @@ import {
 import {
   ApiError,
   DEMO_CREDENTIALS,
+  demoSession as apiDemoSession,
   login as apiLogin,
   logout as apiLogout,
   me,
@@ -133,10 +134,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         await resetSession(qc, user);
       },
       loginDemo: async () => {
-        const user = await apiLogin(
-          DEMO_CREDENTIALS.email,
-          DEMO_CREDENTIALS.password,
-        );
+        let user: AuthUser;
+        try {
+          user = await apiDemoSession();
+        } catch {
+          user = await apiLogin(
+            DEMO_CREDENTIALS.email,
+            DEMO_CREDENTIALS.password,
+          );
+        }
         await resetSession(qc, user);
       },
       register: async (email, password, displayName) => {

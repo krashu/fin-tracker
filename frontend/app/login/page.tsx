@@ -162,7 +162,16 @@ export default function LoginPage() {
             size="lg"
             className="w-full"
             disabled={submitting}
-            onClick={() => run(loginDemo)}
+            onClick={() =>
+              run(async () => {
+                await loginDemo();
+                try {
+                  window.localStorage.setItem("balance-hidden", "0");
+                } catch {
+                  // ignore localStorage errors
+                }
+              })
+            }
           >
             {submitting ? "Opening demo…" : "Try the demo"}
           </Button>
