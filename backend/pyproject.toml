@@ -36,7 +36,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "ruff>=0.15.13,<0.16",
+    "ruff>=0.15.13,<0.17",
     # Type checker (see docs/adr/0005-type-checker-ty.md). Pre-1.0: behaviour can shift
     # between 0.0.x releases, so the ceiling is the next minor per §Maintenance posture
     # and uv.lock pins exact — upgrades are deliberate (`uv lock --upgrade`).
