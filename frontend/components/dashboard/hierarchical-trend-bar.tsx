@@ -69,7 +69,7 @@ export function HierarchicalTrendBar({
   const selectedParentRef = useMemo(
     () =>
       selectedParentId !== "all"
-        ? parents.find((p) => p.parent_id === selectedParentId) ?? null
+        ? parents.find((p: HierarchicalParentRef) => p.parent_id === selectedParentId) ?? null
         : null,
     [selectedParentId, parents],
   );
@@ -78,20 +78,22 @@ export function HierarchicalTrendBar({
   const seriesConfig = useMemo(() => {
     if (selectedParentRef) {
       // Selected specific parent: subcategories are the stacked series
-      return selectedParentRef.subcategories.map((sub, idx) => ({
-        key: `sub_${sub.category_id ?? "uncat"}`,
-        name: sub.category_name ?? "General",
-        color: deriveSubcategoryColor(
-          selectedParentRef.color,
-          idx,
-          selectedParentRef.subcategories.length,
-        ),
-        categoryId: sub.category_id,
-      }));
+      return selectedParentRef.subcategories.map(
+        (sub: { category_id: number | null; category_name: string }, idx: number) => ({
+          key: `sub_${sub.category_id ?? "uncat"}`,
+          name: sub.category_name ?? "General",
+          color: deriveSubcategoryColor(
+            selectedParentRef.color,
+            idx,
+            selectedParentRef.subcategories.length,
+          ),
+          categoryId: sub.category_id,
+        }),
+      );
     }
 
     // All parents view: parent categories are the stacked series
-    return parents.map((p) => ({
+    return parents.map((p: HierarchicalParentRef) => ({
       key: `parent_${p.parent_id ?? "uncat"}`,
       name: p.parent_name,
       color: p.color ?? "var(--muted-foreground)",
@@ -101,7 +103,7 @@ export function HierarchicalTrendBar({
 
   // Build chart row data for Recharts
   const chartData = useMemo(() => {
-    return buckets.map((bucket) => {
+    return buckets.map((bucket: { period: string; totals: { parent_id: number | null; total_paise: number; subcategories: { category_id: number | null; total_paise: number }[] }[] }) => {
       const row: Record<string, string | number> = {
         period: periodLabel(bucket.period, "month"),
       };
@@ -133,6 +135,7 @@ export function HierarchicalTrendBar({
       return row;
     });
   }, [buckets, selectedParentRef, parents]);
+
 
   return (
     <Card>
@@ -168,7 +171,7 @@ export function HierarchicalTrendBar({
               <DropdownMenuItem onSelect={() => setSelectedParentId("all")}>
                 <span className="font-medium">All Parent Categories</span>
               </DropdownMenuItem>
-              {parents.map((p) => (
+              {parents.map((p: HierarchicalParentRef) => (
                 <DropdownMenuItem
                   key={p.parent_id ?? "uncat"}
                   onSelect={() => setSelectedParentId(p.parent_id ?? "all")}
@@ -220,9 +223,9 @@ export function HierarchicalTrendBar({
                   className="text-[11px] fill-muted-foreground"
                 />
                 <Tooltip
-                  formatter={(value: any, name: any) => [
+                  formatter={(value: unknown, name: unknown) => [
                     formatINR(Number(value || 0)),
-                    name,
+                    String(name || ""),
                   ]}
                   contentStyle={{
                     backgroundColor: "var(--background)",
@@ -232,7 +235,7 @@ export function HierarchicalTrendBar({
                   }}
                 />
                 <ReferenceLine y={0} stroke="var(--border)" strokeWidth={1} />
-                {seriesConfig.map((s) => (
+                {seriesConfig.map((s: { key: string; name: string; color: string }) => (
                   <Bar
                     key={s.key}
                     dataKey={s.key}
@@ -250,3 +253,4 @@ export function HierarchicalTrendBar({
     </Card>
   );
 }
+

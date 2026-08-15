@@ -1777,3 +1777,113 @@ export function refreshBenchmarks(): Promise<BenchmarkRefreshSummary> {
     method: "POST",
   });
 }
+
+// --- Hierarchical Dashboards --------------------------------------------------
+
+export type HierarchicalSubcategorySpend = {
+  category_id: number | null;
+  category_name: string;
+  spend_paise: number;
+  total_paise: number;
+  percentage: number;
+  is_direct?: boolean;
+  color?: string | null;
+};
+
+export type HierarchicalParentSpend = {
+  parent_id: number | null;
+  parent_name: string;
+  spend_paise: number;
+  direct_paise: number;
+  total_paise: number;
+  percentage: number;
+  color?: string | null;
+  subcategories: HierarchicalSubcategorySpend[];
+};
+
+export type SubcategoryMover = {
+  category_id: number | null;
+  category_name: string;
+  parent_name?: string | null;
+  current_paise: number;
+  previous_paise: number;
+  delta_paise: number;
+  growth_rate: number | null;
+};
+
+export type HierarchicalSpendResponse = {
+  period: string;
+  total_spend_paise: number;
+  parents: HierarchicalParentSpend[];
+  top_movers: SubcategoryMover[];
+  label_id?: number | null;
+};
+
+export function getHierarchicalSpend(params: {
+  month?: string;
+  year?: string;
+  label_id?: number;
+}): Promise<HierarchicalSpendResponse> {
+  const qs = new URLSearchParams();
+  if (params.month) qs.set("month", params.month);
+  if (params.year) qs.set("year", params.year);
+  if (params.label_id != null) qs.set("label_id", String(params.label_id));
+  return request<HierarchicalSpendResponse>(
+    `/dashboards/hierarchical-spend?${qs.toString()}`,
+  );
+}
+
+export type HierarchicalSubcategoryRef = {
+  category_id: number | null;
+  category_name: string;
+};
+
+export type HierarchicalParentRef = {
+  parent_id: number | null;
+  parent_name: string;
+  color?: string | null;
+  subcategories: HierarchicalSubcategoryRef[];
+};
+
+export type HierarchicalSubcategoryPeriodTotal = {
+  category_id: number | null;
+  total_paise: number;
+};
+
+export type HierarchicalParentPeriodTotal = {
+  parent_id: number | null;
+  total_paise: number;
+  subcategories: HierarchicalSubcategoryPeriodTotal[];
+};
+
+export type HierarchicalTrendBucket = {
+  period: string;
+  totals: HierarchicalParentPeriodTotal[];
+};
+
+export type HierarchicalTrendResponse = {
+  bucket: "week" | "month";
+  start: string;
+  end: string;
+  parents: HierarchicalParentRef[];
+  buckets: HierarchicalTrendBucket[];
+  label_id?: number | null;
+};
+
+export function getHierarchicalTrend(params: {
+  bucket: "week" | "month";
+  start: string;
+  end: string;
+  label_id?: number;
+}): Promise<HierarchicalTrendResponse> {
+  const qs = new URLSearchParams({
+    bucket: params.bucket,
+    start: params.start,
+    end: params.end,
+  });
+  if (params.label_id != null) qs.set("label_id", String(params.label_id));
+  return request<HierarchicalTrendResponse>(
+    `/dashboards/hierarchical-trend?${qs.toString()}`,
+  );
+}
+

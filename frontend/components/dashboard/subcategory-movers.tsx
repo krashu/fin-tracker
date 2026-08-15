@@ -37,11 +37,11 @@ export function SubcategoryMovers({
   const movers = query.data?.top_movers ?? [];
 
   const expanding = useMemo(
-    () => movers.filter((m) => m.delta_paise > 0).slice(0, 4),
+    () => movers.filter((m: SubcategoryMover) => m.delta_paise > 0).slice(0, 4),
     [movers],
   );
   const contracting = useMemo(
-    () => movers.filter((m) => m.delta_paise < 0).slice(0, 4),
+    () => movers.filter((m: SubcategoryMover) => m.delta_paise < 0).slice(0, 4),
     [movers],
   );
 
@@ -75,7 +75,7 @@ export function SubcategoryMovers({
             </p>
           ) : (
             <div className="flex flex-col gap-1.5">
-              {expanding.map((m) => (
+              {expanding.map((m: SubcategoryMover) => (
                 <MoverRow key={m.category_id ?? m.category_name} mover={m} />
               ))}
             </div>
@@ -94,7 +94,7 @@ export function SubcategoryMovers({
             </p>
           ) : (
             <div className="flex flex-col gap-1.5">
-              {contracting.map((m) => (
+              {contracting.map((m: SubcategoryMover) => (
                 <MoverRow key={m.category_id ?? m.category_name} mover={m} />
               ))}
             </div>
@@ -104,6 +104,7 @@ export function SubcategoryMovers({
     </Card>
   );
 }
+
 
 function MoverRow({ mover }: { mover: SubcategoryMover }) {
   const isIncrease = mover.delta_paise > 0;

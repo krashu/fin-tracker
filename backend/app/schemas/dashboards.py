@@ -615,3 +615,99 @@ class OverviewResponse(BaseModel):
     expense_paise: int
     net_paise: int
     accounts: list[AccountBalanceRow]
+
+
+class HierarchicalSubcategorySpend(BaseModel):
+    """One subcategory row in a parent's hierarchical spend breakdown."""
+
+    category_id: int | None
+    category_name: str
+    spend_paise: int
+    total_paise: int
+    percentage: float
+    is_direct: bool = False
+    color: str | None = None
+
+
+class HierarchicalParentSpend(BaseModel):
+    """One parent category in the hierarchical spend breakdown."""
+
+    parent_id: int | None
+    parent_name: str
+    spend_paise: int
+    direct_paise: int
+    total_paise: int
+    percentage: float
+    color: str | None = None
+    subcategories: list[HierarchicalSubcategorySpend]
+
+
+class SubcategoryMover(BaseModel):
+    """One subcategory spend shift between previous and current period."""
+
+    category_id: int | None = None
+    category_name: str
+    parent_name: str | None = None
+    current_paise: int
+    previous_paise: int
+    delta_paise: int
+    growth_rate: float | None = None
+
+
+class HierarchicalSpendResponse(BaseModel):
+    """Envelope for GET /api/v1/dashboards/hierarchical-spend."""
+
+    period: str
+    total_spend_paise: int
+    parents: list[HierarchicalParentSpend]
+    top_movers: list[SubcategoryMover]
+    label_id: int | None = None
+
+
+class HierarchicalSubcategoryRef(BaseModel):
+    """One subcategory in the hierarchical trend echoed parent set."""
+
+    category_id: int | None
+    category_name: str
+
+
+class HierarchicalParentRef(BaseModel):
+    """One parent category in the hierarchical trend echoed set."""
+
+    parent_id: int | None
+    parent_name: str
+    color: str | None = None
+    subcategories: list[HierarchicalSubcategoryRef] = []
+
+
+class HierarchicalSubcategoryPeriodTotal(BaseModel):
+    """One subcategory's signed total in a trend bucket."""
+
+    category_id: int | None
+    total_paise: int
+
+
+class HierarchicalParentPeriodTotal(BaseModel):
+    """One parent category's signed total in a trend bucket."""
+
+    parent_id: int | None = None
+    total_paise: int
+    subcategories: list[HierarchicalSubcategoryPeriodTotal] = []
+
+
+class HierarchicalTrendBucket(BaseModel):
+    """One bucket of the hierarchical trend timeline."""
+
+    period: str
+    totals: list[HierarchicalParentPeriodTotal]
+
+
+class HierarchicalTrendResponse(BaseModel):
+    """Envelope for GET /api/v1/dashboards/hierarchical-trend."""
+
+    bucket: Literal["week", "month"]
+    start: date
+    end: date
+    parents: list[HierarchicalParentRef]
+    buckets: list[HierarchicalTrendBucket]
+    label_id: int | None = None

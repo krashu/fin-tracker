@@ -23,7 +23,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import and_, case, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.api.deps import CurrentUserId, SessionDep
 from app.core import clock
@@ -34,6 +34,15 @@ from app.schemas import (
     AvailableYearsResponse,
     CashflowByPeriodBucket,
     CashflowByPeriodResponse,
+    HierarchicalParentPeriodTotal,
+    HierarchicalParentRef,
+    HierarchicalParentSpend,
+    HierarchicalSpendResponse,
+    HierarchicalSubcategoryPeriodTotal,
+    HierarchicalSubcategoryRef,
+    HierarchicalSubcategorySpend,
+    HierarchicalTrendBucket,
+    HierarchicalTrendResponse,
     OverviewResponse,
     PeriodTotalsResponse,
     SpendByCategoryByPeriodBucket,
@@ -49,6 +58,7 @@ from app.schemas import (
     SpendByTagRow,
     SpendCategoryPeriodTotal,
     SpendCategoryRef,
+    SubcategoryMover,
     TaggingStatsResponse,
     TagRef,
     TopMerchantRow,
@@ -1215,4 +1225,382 @@ def tagging_stats(
         imported_total=imported_total,
         pre_tagged=pre_tagged,
         coverage_rate=(pre_tagged / imported_total) if imported_total else None,
+    )
+
+
+@router.get("/hierarchical-spend", response_model=HierarchicalSpendResponse)
+def hierarchical_spend(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    month: Annotated[str | None, Query()] = None,
+    year: Annotated[str | None, Query()] = None,
+    label_id: Annotated[int | None, Query(gt=0)] = None,
+) -> HierarchicalSpendResponse:
+    """Hierarchical parent/subcategory spend breakdown and top movers."""
+    window = _period_window(month, year)
+    first, last = window.first, window.last
+
+    if window.mon is not None:
+        prev_last = first - timedelta(days=1)
+        prev_first = date(prev_last.year, prev_last.month, 1)
+    else:
+        prev_first = date(window.year - 1, 1, 1)
+        prev_last = date(window.year - 1, 12, 31)
+
+    ParentCategory = aliased(Category)
+
+    stmt = (
+        select(
+            Transaction.date,
+            Transaction.category_id,
+            Category.name.label("category_name"),
+            Category.parent_id,
+            Category.color.label("category_color"),
+            ParentCategory.name.label("parent_name"),
+            ParentCategory.color.label("parent_color"),
+            Transaction.amount_paise,
+        )
+        .outerjoin(
+            Category,
+            and_(
+                Category.id == Transaction.category_id,
+                Category.user_id == user_id,
+            ),
+        )
+        .outerjoin(
+            ParentCategory,
+            and_(
+                ParentCategory.id == Category.parent_id,
+                ParentCategory.user_id == user_id,
+            ),
+        )
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.transaction_type == "spend",
+            Transaction.date >= prev_first,
+            Transaction.date <= last,
+        )
+    )
+    stmt = confirmed_only(stmt)
+    if label_id is not None:
+        stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
+
+    rows = session.execute(stmt).all()
+
+    current_cat_totals: dict[
+        tuple[int | None, str | None, int | None, str | None, str | None, str | None], int
+    ] = defaultdict(int)
+    prev_cat_totals: dict[str, int] = defaultdict(int)
+
+    for row in rows:
+        txn_date = row.date
+        amt = int(row.amount_paise)
+        cat_id = row.category_id
+        cat_name = row.category_name
+        parent_id = row.parent_id
+        parent_name = row.parent_name
+        cat_color = row.category_color
+        parent_color = row.parent_color
+
+        if first <= txn_date <= last:
+            key = (cat_id, cat_name, parent_id, parent_name, cat_color, parent_color)
+            current_cat_totals[key] += amt
+        elif prev_first <= txn_date <= prev_last:
+            name = cat_name or "Uncategorized"
+            prev_cat_totals[name] += amt
+
+    parents_map: dict[int | None, dict] = {}
+    total_spend_paise = 0
+
+    for (
+        cat_id,
+        cat_name,
+        parent_id,
+        parent_name,
+        cat_color,
+        parent_color,
+    ), signed_total in current_cat_totals.items():
+        if cat_id is None:
+            p_id = None
+            p_name = "Uncategorized"
+            p_color = None
+            is_direct = True
+            sub_id = None
+            sub_name = "Uncategorized"
+            sub_color = None
+        elif parent_id is None:
+            p_id = cat_id
+            p_name = cat_name or "Category"
+            p_color = cat_color
+            is_direct = True
+            sub_id = cat_id
+            sub_name = f"{p_name} (Direct)"
+            sub_color = cat_color
+        else:
+            p_id = parent_id
+            p_name = parent_name or "Category"
+            p_color = parent_color
+            is_direct = False
+            sub_id = cat_id
+            sub_name = cat_name or "Subcategory"
+            sub_color = cat_color
+
+        if p_id not in parents_map:
+            parents_map[p_id] = {
+                "parent_id": p_id,
+                "parent_name": p_name,
+                "color": p_color,
+                "total_paise": 0,
+                "direct_paise": 0,
+                "subcategories": {},
+            }
+
+        parents_map[p_id]["total_paise"] += signed_total
+        if is_direct:
+            parents_map[p_id]["direct_paise"] += -signed_total
+
+        sub_key = (sub_id, sub_name, is_direct, sub_color)
+        parents_map[p_id]["subcategories"][sub_key] = (
+            parents_map[p_id]["subcategories"].get(sub_key, 0) + signed_total
+        )
+
+    for p_data in parents_map.values():
+        total_spend_paise += max(0, -p_data["total_paise"])
+
+    parent_list: list[HierarchicalParentSpend] = []
+    for p_id, p_data in parents_map.items():
+        p_total = p_data["total_paise"]
+        p_spend = max(0, -p_total)
+        p_direct = max(0, p_data["direct_paise"])
+        p_pct = (p_spend / total_spend_paise * 100.0) if total_spend_paise > 0 else 0.0
+
+        subcat_list: list[HierarchicalSubcategorySpend] = []
+        for (s_id, s_name, is_dir, s_col), s_total in p_data["subcategories"].items():
+            s_spend = max(0, -s_total)
+            s_pct = (s_spend / p_spend * 100.0) if p_spend > 0 else 0.0
+            subcat_list.append(
+                HierarchicalSubcategorySpend(
+                    category_id=s_id,
+                    category_name=s_name,
+                    spend_paise=s_spend,
+                    total_paise=s_total,
+                    percentage=round(s_pct, 2),
+                    is_direct=is_dir,
+                    color=s_col,
+                )
+            )
+
+        subcat_list.sort(key=lambda s: (s.is_direct, -s.spend_paise, s.category_name))
+
+        parent_list.append(
+            HierarchicalParentSpend(
+                parent_id=p_id,
+                parent_name=p_data["parent_name"],
+                spend_paise=p_spend,
+                direct_paise=p_direct,
+                total_paise=p_total,
+                percentage=round(p_pct, 2),
+                color=p_data["color"],
+                subcategories=subcat_list,
+            )
+        )
+
+    parent_list.sort(key=lambda p: (p.parent_id is None, -p.spend_paise, p.parent_name or ""))
+
+    current_subcat_spend: dict[str, tuple[int | None, str | None, int]] = {}
+    for (
+        cat_id,
+        cat_name,
+        _parent_id,
+        parent_name,
+        _,
+        _,
+    ), signed_total in current_cat_totals.items():
+        name = cat_name or "Uncategorized"
+        spend = max(0, -signed_total)
+        current_subcat_spend[name] = (cat_id, parent_name, spend)
+
+    all_mover_names = set(current_subcat_spend.keys()) | set(prev_cat_totals.keys())
+    movers: list[SubcategoryMover] = []
+
+    for name in all_mover_names:
+        cat_id, p_name, curr_spend = current_subcat_spend.get(name, (None, None, 0))
+        prev_signed = prev_cat_totals.get(name, 0)
+        prev_spend = max(0, -prev_signed)
+        delta = curr_spend - prev_spend
+
+        if prev_spend > 0:
+            growth = round(((curr_spend - prev_spend) / prev_spend) * 100.0, 2)
+        else:
+            growth = None
+
+        if curr_spend > 0 or prev_spend > 0:
+            movers.append(
+                SubcategoryMover(
+                    category_id=cat_id,
+                    category_name=name,
+                    parent_name=p_name,
+                    current_paise=curr_spend,
+                    previous_paise=prev_spend,
+                    delta_paise=delta,
+                    growth_rate=growth,
+                )
+            )
+
+    movers.sort(key=lambda m: (-abs(m.delta_paise), m.category_name))
+
+    return HierarchicalSpendResponse(
+        period=window.key,
+        total_spend_paise=total_spend_paise,
+        parents=parent_list,
+        top_movers=movers,
+        label_id=label_id,
+    )
+
+
+@router.get("/hierarchical-trend", response_model=HierarchicalTrendResponse)
+def hierarchical_trend(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    bucket: Annotated[Literal["week", "month"], Query()],
+    start: Annotated[date, Query()],
+    end: Annotated[date, Query()],
+    label_id: Annotated[int | None, Query(gt=0)] = None,
+) -> HierarchicalTrendResponse:
+    """Stacked hierarchical spend trend over [start, end]."""
+    _require_ordered(start, end)
+
+    ParentCategory = aliased(Category)
+
+    stmt = (
+        select(
+            Transaction.date,
+            Transaction.category_id,
+            Category.name.label("category_name"),
+            Category.parent_id,
+            Category.color.label("category_color"),
+            ParentCategory.name.label("parent_name"),
+            ParentCategory.color.label("parent_color"),
+            Transaction.amount_paise,
+        )
+        .outerjoin(
+            Category,
+            and_(
+                Category.id == Transaction.category_id,
+                Category.user_id == user_id,
+            ),
+        )
+        .outerjoin(
+            ParentCategory,
+            and_(
+                ParentCategory.id == Category.parent_id,
+                ParentCategory.user_id == user_id,
+            ),
+        )
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.transaction_type == "spend",
+            Transaction.date >= start,
+            Transaction.date <= end,
+        )
+    )
+    stmt = confirmed_only(stmt)
+    if label_id is not None:
+        stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
+
+    rows = session.execute(stmt).all()
+
+    parents_meta: dict[int | None, dict] = {}
+    period_parent_totals: dict[tuple[str, int | None], int] = defaultdict(int)
+    period_subcat_totals: dict[tuple[str, int | None, int | None], int] = defaultdict(int)
+
+    for row in rows:
+        txn_date = row.date
+        p_lbl = _bucket_of(txn_date, bucket).period
+        amt = int(row.amount_paise)
+        cat_id = row.category_id
+        cat_name = row.category_name
+        p_id = row.parent_id
+        p_name = row.parent_name
+        p_color = row.parent_color
+
+        if cat_id is None:
+            parent_id_eff = None
+            parent_name_eff = "Uncategorized"
+            parent_color_eff = None
+            sub_id_eff = None
+            sub_name_eff = "Uncategorized"
+        elif p_id is None:
+            parent_id_eff = cat_id
+            parent_name_eff = cat_name or "Category"
+            parent_color_eff = row.category_color
+            sub_id_eff = cat_id
+            sub_name_eff = f"{parent_name_eff} (Direct)"
+        else:
+            parent_id_eff = p_id
+            parent_name_eff = p_name or "Category"
+            parent_color_eff = p_color
+            sub_id_eff = cat_id
+            sub_name_eff = cat_name or "Subcategory"
+
+        if parent_id_eff not in parents_meta:
+            parents_meta[parent_id_eff] = {
+                "parent_name": parent_name_eff,
+                "color": parent_color_eff,
+                "subcategories": {},
+            }
+        parents_meta[parent_id_eff]["subcategories"][sub_id_eff] = sub_name_eff
+
+        period_parent_totals[(p_lbl, parent_id_eff)] += amt
+        period_subcat_totals[(p_lbl, parent_id_eff, sub_id_eff)] += amt
+
+    echoed_parents: list[HierarchicalParentRef] = []
+    for p_id, p_info in parents_meta.items():
+        sub_refs = [
+            HierarchicalSubcategoryRef(category_id=s_id, category_name=s_name)
+            for s_id, s_name in p_info["subcategories"].items()
+        ]
+        echoed_parents.append(
+            HierarchicalParentRef(
+                parent_id=p_id,
+                parent_name=p_info["parent_name"],
+                color=p_info["color"],
+                subcategories=sub_refs,
+            )
+        )
+
+    echoed_parents.sort(key=lambda p: (p.parent_id is None, p.parent_name))
+
+    timeline_buckets: list[HierarchicalTrendBucket] = []
+    for p_lbl in _iter_periods(start, end, bucket):
+        totals: list[HierarchicalParentPeriodTotal] = []
+        for p_ref in echoed_parents:
+            p_id = p_ref.parent_id
+            p_total = period_parent_totals.get((p_lbl, p_id), 0)
+
+            sub_totals: list[HierarchicalSubcategoryPeriodTotal] = []
+            for s_ref in p_ref.subcategories:
+                s_id = s_ref.category_id
+                s_tot = period_subcat_totals.get((p_lbl, p_id, s_id), 0)
+                sub_totals.append(
+                    HierarchicalSubcategoryPeriodTotal(category_id=s_id, total_paise=s_tot)
+                )
+
+            totals.append(
+                HierarchicalParentPeriodTotal(
+                    parent_id=p_id,
+                    total_paise=p_total,
+                    subcategories=sub_totals,
+                )
+            )
+
+        timeline_buckets.append(HierarchicalTrendBucket(period=p_lbl, totals=totals))
+
+    return HierarchicalTrendResponse(
+        bucket=bucket,
+        start=start,
+        end=end,
+        parents=echoed_parents,
+        buckets=timeline_buckets,
+        label_id=label_id,
     )

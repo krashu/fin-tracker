@@ -55,7 +55,7 @@ export function HierarchicalDonutChart({
 
   // Filter parents with actual spend (spend_paise > 0)
   const activeParents = useMemo(
-    () => parents.filter((p) => p.spend_paise > 0),
+    () => parents.filter((p: HierarchicalParentSpend) => p.spend_paise > 0),
     [parents],
   );
 
@@ -63,14 +63,14 @@ export function HierarchicalDonutChart({
   const selectedParent = useMemo(
     () =>
       selectedParentId != null
-        ? activeParents.find((p) => p.parent_id === selectedParentId) ?? null
+        ? activeParents.find((p: HierarchicalParentSpend) => p.parent_id === selectedParentId) ?? null
         : null,
     [selectedParentId, activeParents],
   );
 
   // Inner Ring Data: Parent Categories
   const parentChartData = useMemo(() => {
-    return activeParents.map((p) => ({
+    return activeParents.map((p: HierarchicalParentSpend) => ({
       id: p.parent_id,
       name: p.parent_name,
       value: p.spend_paise,
@@ -84,8 +84,10 @@ export function HierarchicalDonutChart({
   const subcategoryChartData = useMemo(() => {
     if (selectedParent) {
       // Drilled down into one parent: show its subcategories
-      const subs = selectedParent.subcategories.filter((s) => s.spend_paise > 0);
-      return subs.map((s, idx) => ({
+      const subs = selectedParent.subcategories.filter(
+        (s: HierarchicalSubcategorySpend) => s.spend_paise > 0,
+      );
+      return subs.map((s: HierarchicalSubcategorySpend, idx: number) => ({
         id: s.category_id,
         name: s.category_name,
         value: s.spend_paise,
@@ -110,8 +112,10 @@ export function HierarchicalDonutChart({
     }> = [];
 
     for (const p of activeParents) {
-      const activeSubs = p.subcategories.filter((s) => s.spend_paise > 0);
-      activeSubs.forEach((s, idx) => {
+      const activeSubs = p.subcategories.filter(
+        (s: HierarchicalSubcategorySpend) => s.spend_paise > 0,
+      );
+      activeSubs.forEach((s: HierarchicalSubcategorySpend, idx: number) => {
         items.push({
           id: s.category_id,
           name: s.category_name,
@@ -128,6 +132,7 @@ export function HierarchicalDonutChart({
 
     return items;
   }, [activeParents, selectedParent, totalSpendPaise]);
+
 
   // Active Center Display Info
   const centerDisplay = useMemo(() => {
@@ -254,14 +259,14 @@ export function HierarchicalDonutChart({
                       innerRadius={68}
                       outerRadius={98}
                       paddingAngle={2}
-                      onClick={(entry: any) => {
+                      onClick={(entry: { payload?: { id?: number | null }; id?: number | null }) => {
                         const payload = entry?.payload ?? entry;
                         if (payload?.id != null) {
                           setSelectedParentId(payload.id);
                           setHoveredSlice(null);
                         }
                       }}
-                      onMouseEnter={(entry: any) => {
+                      onMouseEnter={(entry: { payload?: { name?: string; value?: number; percentage?: number; color?: string }; name?: string; value?: number; percentage?: number; color?: string }) => {
                         const payload = entry?.payload ?? entry;
                         setHoveredSlice({
                           name: payload?.name ?? "Category",
@@ -273,7 +278,7 @@ export function HierarchicalDonutChart({
                       onMouseLeave={() => setHoveredSlice(null)}
                       cursor="pointer"
                     >
-                      {parentChartData.map((entry, index) => (
+                      {parentChartData.map((entry: { id: number | null; name: string; value: number; percentage: number; color: string; raw: HierarchicalParentSpend }, index: number) => (
                         <Cell
                           key={`parent-cell-${index}`}
                           fill={entry.color}
@@ -295,7 +300,7 @@ export function HierarchicalDonutChart({
                     innerRadius={selectedParent ? 75 : 105}
                     outerRadius={selectedParent ? 130 : 138}
                     paddingAngle={selectedParent ? 3 : 1}
-                    onMouseEnter={(entry: any) => {
+                    onMouseEnter={(entry: { payload?: { name?: string; value?: number; percentage?: number; color?: string; parentName?: string }; name?: string; value?: number; percentage?: number; color?: string; parentName?: string }) => {
                       const payload = entry?.payload ?? entry;
                       setHoveredSlice({
                         name: payload?.name ?? "Subcategory",
@@ -309,7 +314,7 @@ export function HierarchicalDonutChart({
                     onMouseLeave={() => setHoveredSlice(null)}
 
                   >
-                    {subcategoryChartData.map((entry, index) => (
+                    {subcategoryChartData.map((entry: { id: number | null; name: string; value: number; percentage: number; parentName: string; color: string; raw: HierarchicalSubcategorySpend }, index: number) => (
                       <Cell
                         key={`subcat-cell-${index}`}
                         fill={entry.color}
@@ -351,7 +356,7 @@ export function HierarchicalDonutChart({
 
             {selectedParent ? (
               <div className="flex flex-col gap-1.5">
-                {selectedParent.subcategories.map((sub, idx) => (
+                {selectedParent.subcategories.map((sub: HierarchicalSubcategorySpend, idx: number) => (
                   <div
                     key={sub.category_id ?? `sub-${idx}`}
                     className="flex items-center justify-between p-2 rounded-md hover:bg-muted/40 transition-colors text-[13px]"
@@ -385,7 +390,7 @@ export function HierarchicalDonutChart({
               </div>
             ) : (
               <div className="flex flex-col gap-1.5">
-                {activeParents.map((parent) => (
+                {activeParents.map((parent: HierarchicalParentSpend) => (
                   <button
                     key={parent.parent_id ?? "uncat"}
                     onClick={() => {

@@ -245,6 +245,23 @@ export function siblingShade(
 }
 
 /**
+ * Safely derives a shade for a subcategory within a hierarchical chart.
+ * If the parent has no hex color (e.g. Uncategorized or CSS variable),
+ * it safely falls back to a neutral CSS variable.
+ */
+export function deriveSubcategoryColor(
+  parentHue: CategoryColor | string | null | undefined,
+  siblingIndex: number,
+  _totalSiblings?: number,
+): string {
+  if (!parentHue || !parentHue.startsWith("#")) {
+    return "var(--muted-foreground)";
+  }
+  return siblingShade(parentHue as CategoryColor, siblingIndex);
+}
+
+
+/**
  * Resolve the *display* color for a category shown alongside its siblings —
  * `resolveCategoryColor`'s hue, shaded by `siblingShade` when the category is
  * an inheriting child (no color of its own, per locked decision #5's `NULL`
