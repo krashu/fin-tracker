@@ -3,12 +3,16 @@
 A privacy-first, self-hosted personal finance tracker for Indian banks and global investments — import statements, auto-tag transactions, manage hierarchical categories, track an INR+USD portfolio with proper XIRR, and analyze spending trends locally.
 
 ![License](https://img.shields.io/badge/license-MIT-green)
+![Status](https://img.shields.io/badge/status-under_active_development-orange)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![Node](https://img.shields.io/badge/node-24-brightgreen)
 ![Next.js](https://img.shields.io/badge/Next.js-16_App_Router-black)
 ![Tailwind](https://img.shields.io/badge/Tailwind_CSS-4.0-38bdf8)
 ![Tests](https://img.shields.io/badge/tests-pytest_%7C_vitest-success)
 
+> [!NOTE]
+> **Active Development**: Fin Tracker is under active development. Features, database migrations, and APIs may evolve.
+>
 > Self-hosted and privacy-first — your statements, transactions, and portfolio data never leave your machine.
 
 ## Screenshots
