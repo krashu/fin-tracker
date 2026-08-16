@@ -89,3 +89,28 @@ def test_multiple_guest_sessions_are_isolated(
     # Guest 2 must not see Guest 1's custom transaction
     guest2_txns = unauth_client.get("/api/v1/transactions").json()
     assert not any(t.get("merchant_raw") == "Guest 1 Unique Store" for t in guest2_txns)
+
+
+def test_demo_session_returns_503_on_capacity(
+    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _demo_capped() -> Settings:
+        return Settings(
+            demo_login_enabled=True,
+            cors_allowed_origins="http://localhost:3000",
+            MAX_GUEST_ACCOUNTS=1,
+        )
+
+    monkeypatch.setattr("app.api.v1.auth.get_settings", _demo_capped)
+    monkeypatch.setattr("app.core.config.get_settings", _demo_capped)
+    monkeypatch.setattr("app.services.guest_service.get_settings", _demo_capped)
+
+    # 1st succeeds
+    r1 = unauth_client.post("/api/v1/auth/demo-session")
+    assert r1.status_code == 201
+
+    # 2nd reaches cap -> 503
+    unauth_client.cookies.clear()
+    r2 = unauth_client.post("/api/v1/auth/demo-session")
+    assert r2.status_code == 503
+    assert "demo is at capacity" in r2.json()["detail"]

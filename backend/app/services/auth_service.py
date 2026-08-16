@@ -178,6 +178,19 @@ def rotate_session(session: Session, raw_token: str) -> RotatedSession | None:
         session.commit()
         return None
 
+    # Guest sandbox hard expiry — a guest whose sandbox has expired must not refresh,
+    # even if the refresh token is still within its sliding TTL.
+    user = session.get(User, row.user_id)
+    if (
+        user is not None
+        and user.is_guest
+        and user.guest_expires_at is not None
+        and clock.naive_utcnow() >= user.guest_expires_at
+    ):
+        _revoke_family(session, row.family_id)
+        session.commit()
+        return None
+
     # Rotate atomically: revoke via a conditional UPDATE and treat a 0-rowcount
     # as "already rotated" (a concurrent refresh won the race). Without this, two
     # in-flight refreshes of the same live token — an ordinary SPA double-submit

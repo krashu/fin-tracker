@@ -29,6 +29,7 @@ _WINDOW_S = 60
 # key -> hit count in the current window. Bounded churn: keys carry the window
 # index, so stale windows are simply never read again (a few dozen live keys).
 _store: dict[str, int] = {}
+_last_sweep_window: int = 0
 # Sync dependencies run in FastAPI's threadpool, so concurrent requests touch
 # _store from different threads. Guard the evict + read-modify-write critical
 # section: without it the counter can under-count (lost increments) and, under a
@@ -38,7 +39,10 @@ _lock = threading.Lock()
 
 def reset() -> None:
     """Clear all counters. Test hook (autouse fixture) — never called in prod."""
-    _store.clear()
+    global _last_sweep_window
+    with _lock:
+        _store.clear()
+        _last_sweep_window = 0
 
 
 def _client_ip(request: Request, *, trust_proxy: bool) -> str:
@@ -76,12 +80,15 @@ class RateLimit:
         key = f"{self.bucket}:{ip}:{window}"
         suffix = f":{window}"
         with _lock:
+            global _last_sweep_window
             # Evict keys from prior windows so a long-running process doesn't
             # accumulate one dead key per (bucket, ip) per window forever.
             # Sweeping the whole store is only safe because every bucket shares
             # _WINDOW_S — see the constant.
-            for stale in [k for k in _store if not k.endswith(suffix)]:
-                _store.pop(stale, None)
+            if window != _last_sweep_window:
+                for stale in [k for k in _store if not k.endswith(suffix)]:
+                    _store.pop(stale, None)
+                _last_sweep_window = window
             count = _store.get(key, 0) + 1
             _store[key] = count
         if count > settings.auth_rate_limit_per_minute:

@@ -209,3 +209,26 @@ def test_rotate_succeeds_within_absolute_cap(engine: Engine) -> None:
 def test_verify_password_returns_false_on_malformed_hash() -> None:
     """A corrupt/non-argon2 stored hash is a failed verification (False), not a 500."""
     assert verify_password("whatever", "not-a-valid-argon2-hash") is False
+
+
+def test_rotate_session_rejects_expired_guest(engine: Engine) -> None:
+    """A guest whose guest_expires_at is in the past must be rejected by rotate_session."""
+    from uuid import uuid4
+
+    with Session(engine) as s:
+        guest = User(
+            id=uuid4(),
+            email=None,
+            password_hash=None,
+            display_name="Expired Guest",
+            is_guest=True,
+            guest_expires_at=clock.naive_utcnow() - timedelta(minutes=5),
+        )
+        s.add(guest)
+        s.commit()
+        raw = auth_service.start_session(s, guest.id)
+
+    with Session(engine) as s:
+        assert auth_service.rotate_session(s, raw) is None
+        # Family revoked
+        assert all(r is not None for r in s.scalars(select(RefreshSession.revoked_at)).all())

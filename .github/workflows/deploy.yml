@@ -23,6 +23,7 @@ jobs:
   validate-docker:
     name: Docker Compose Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -40,6 +41,7 @@ jobs:
   test-backend:
     name: Test Backend (Python 3.13)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
@@ -72,6 +74,7 @@ jobs:
   test-frontend:
     name: Test Frontend (Next.js & Vitest)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -107,6 +110,7 @@ jobs:
   security-audit:
     name: Security & Fixture Redaction
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -137,6 +141,7 @@ jobs:
     name: Build Frontend & Deploy to FastAPI Cloud
     needs: [validate-docker, test-backend, test-frontend, security-audit]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository

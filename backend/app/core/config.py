@@ -201,6 +201,15 @@ class Settings(BaseSettings):
         validation_alias="AUTH_RATE_LIMIT_PER_MINUTE",
         description="Max register/login/refresh attempts per client IP per 60s window.",
     )
+    max_guest_accounts: int = Field(
+        default=100,
+        gt=0,
+        validation_alias="MAX_GUEST_ACCOUNTS",
+        description=(
+            "Maximum number of active guest accounts. Reject new guest sessions "
+            "with 503 when reached."
+        ),
+    )
     rate_limit_trust_proxy: bool = Field(
         default=False,
         validation_alias="RATE_LIMIT_TRUST_PROXY",

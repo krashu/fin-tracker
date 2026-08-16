@@ -146,6 +146,7 @@ def _maybe_seed_demo(settings: Settings) -> None:
     with SessionLocal() as session:
         try:
             seeded = seed_demo_data(session, user_id=user_id)
+            session.commit()
         except Exception:
             session.rollback()
             logger.exception("demo_seed_failed")

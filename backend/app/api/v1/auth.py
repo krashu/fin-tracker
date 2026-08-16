@@ -168,7 +168,13 @@ def demo_session(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="demo access is disabled on this instance",
         )
-    user, refresh_token = guest_service.create_guest_sandbox(session)
+    try:
+        user, refresh_token = guest_service.create_guest_sandbox(session)
+    except guest_service.GuestCapReachedError as err:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="demo is at capacity, try again later",
+        ) from err
     _set_auth_cookies(response, user, refresh_token)
     return user
 

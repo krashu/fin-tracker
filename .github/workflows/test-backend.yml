@@ -23,6 +23,7 @@ jobs:
   test-backend:
     name: Test Backend (Python 3.13)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend

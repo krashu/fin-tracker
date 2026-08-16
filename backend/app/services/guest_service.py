@@ -9,10 +9,11 @@ from __future__ import annotations
 from datetime import timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.core import clock
+from app.core.config import get_settings
 from app.core.log_config import get_logger
 from app.models import (
     Account,
@@ -41,6 +42,10 @@ logger = get_logger(__name__)
 DEFAULT_GUEST_TTL_HOURS = 2
 
 
+class GuestCapReachedError(Exception):
+    """Raised when active guest accounts reach max_guest_accounts."""
+
+
 def create_guest_sandbox(
     session: Session, ttl_hours: int = DEFAULT_GUEST_TTL_HOURS
 ) -> tuple[User, str]:
@@ -49,6 +54,12 @@ def create_guest_sandbox(
     Omits argon2 password hashing (guests authenticate via direct cookie issuance),
     dropping provisioning latency to < 30ms and preventing CPU exhaustion DOS attacks.
     """
+    active_count = (
+        session.scalar(select(func.count()).select_from(User).where(User.is_guest.is_(True))) or 0
+    )
+    if active_count >= get_settings().max_guest_accounts:
+        raise GuestCapReachedError("Guest account limit reached")
+
     guest_id = uuid4()
     now = clock.naive_utcnow()
     expires_at = now + timedelta(hours=ttl_hours)
@@ -87,6 +98,12 @@ def delete_guest_sandbox(session: Session, user_id: UUID) -> None:
     Respects strict foreign key constraints (SQLite PRAGMA foreign_keys=ON / Postgres)
     by breaking cyclic/self-referential FKs before deleting child tables and root entities.
     """
+    # Guard: verify the target is actually an existing guest BEFORE any destructive operation.
+    user = session.get(User, user_id)
+    if user is None or not user.is_guest:
+        logger.warning("delete_guest_sandbox_skipped_non_guest", user_id=str(user_id))
+        return
+
     # Phase 1: Break cyclic / self-referential foreign keys
     session.execute(
         update(Transaction).where(Transaction.user_id == user_id).values(transfer_pair_id=None)
@@ -133,23 +150,45 @@ def delete_guest_sandbox(session: Session, user_id: UUID) -> None:
 
 
 def cleanup_expired_guests(session: Session, batch_size: int = 25) -> int:
-    """Find and delete expired guest accounts in bounded batches. Returns count cleaned."""
+    """Find and delete expired guest accounts in bounded batches until drained.
+
+    Returns count cleaned.
+    """
     now = clock.naive_utcnow()
-    expired_ids = session.scalars(
-        select(User.id)
-        .where(User.is_guest.is_(True), User.guest_expires_at <= now)
-        .limit(batch_size)
-    ).all()
+    total_cleaned = 0
+    while True:
+        expired_ids = session.scalars(
+            select(User.id)
+            .where(User.is_guest.is_(True), User.guest_expires_at <= now)
+            .limit(batch_size)
+        ).all()
+        if not expired_ids:
+            break
 
-    cleaned = 0
-    for uid in expired_ids:
-        try:
-            delete_guest_sandbox(session, uid)
-            cleaned += 1
-        except Exception:
-            session.rollback()
-            logger.exception("guest_cleanup_failed", user_id=str(uid))
+        batch_cleaned = 0
+        for uid in expired_ids:
+            try:
+                delete_guest_sandbox(session, uid)
+                batch_cleaned += 1
+            except Exception:
+                session.rollback()
+                logger.exception("guest_cleanup_failed", user_id=str(uid))
+                # Push the poisoned row's expiry forward so it doesn't wedge the queue.
+                # It will be retried in a future cycle window.
+                try:
+                    session.execute(
+                        update(User)
+                        .where(User.id == uid)
+                        .values(guest_expires_at=now + timedelta(hours=1))
+                    )
+                    session.commit()
+                except Exception:
+                    session.rollback()
 
-    if cleaned > 0:
-        logger.info("expired_guests_cleaned", count=cleaned)
-    return cleaned
+        total_cleaned += batch_cleaned
+        if batch_cleaned == 0:
+            break  # Every row in this batch failed — break to avoid infinite loop
+
+    if total_cleaned > 0:
+        logger.info("expired_guests_cleaned", count=total_cleaned)
+    return total_cleaned

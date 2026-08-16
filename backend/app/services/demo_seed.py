@@ -280,7 +280,7 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
 
     inst_count, inv_txn_count = _seed_investments(session, user_id=user_id)
 
-    session.commit()
+    session.flush()
     return DemoSeedCounts(
         accounts=2,
         transactions=txn_count,
