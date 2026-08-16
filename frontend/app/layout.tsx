@@ -15,14 +15,12 @@ import "./globals.css";
 const hanken = Hanken_Grotesk({
   subsets: ["latin"],
   display: "swap",
-  weight: ["400", "500", "600"],
   variable: "--font-hanken",
 });
 
 const jbMono = JetBrains_Mono({
   subsets: ["latin"],
   display: "swap",
-  weight: ["400", "500"],
   variable: "--font-jbmono",
 });
 
