@@ -65,7 +65,7 @@ dev = [
 index-url = "https://pypi.org/simple"
 # Trust the OS/native certificate store (corporate TLS proxy CA).
 # Load platform certs over the bundled Mozilla roots.
-native-tls = true
+system-certs = true
 # Dependency cooldown: never resolve to a release younger than 3 days (rolling
 # window). Applies only at resolution time (`uv lock` / `--upgrade`), not at
 # `uv sync --frozen`/`--locked` install — guards against freshly-published
