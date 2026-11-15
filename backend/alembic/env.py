@@ -71,7 +71,9 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 _DB_URL = get_settings().database_url
-config.set_main_option("sqlalchemy.url", _DB_URL)
+# Escape '%' as '%%' for Alembic's ConfigParser interpolation (e.g. SQLite URLs on Windows
+# where drive letters like 'C:' are percent-encoded as '%3A' in SQLAlchemy 2.1+).
+config.set_main_option("sqlalchemy.url", _DB_URL.replace("%", "%%"))
 
 
 def _is_sqlite() -> bool:

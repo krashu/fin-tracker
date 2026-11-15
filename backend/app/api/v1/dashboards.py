@@ -459,7 +459,11 @@ def top_merchants(
     stmt = confirmed_only(stmt)
     result = session.execute(stmt).all()
     rows = [
-        TopMerchantRow(merchant_normalized=mn, merchant_label=label, total_paise=int(total))
+        TopMerchantRow(
+            merchant_normalized=mn,
+            merchant_label=label or mn,
+            total_paise=int(total),
+        )
         for mn, label, total, _ in result
     ]
     total_merchants = int(result[0].total_merchants) if result else 0

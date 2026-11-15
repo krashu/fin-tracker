@@ -1,4 +1,4 @@
-# fin-tracker backend — FastAPI + uv, Python 3.13.
+# fin-tracker backend — FastAPI + uv, Python 3.14.
 #
 # Multi-stage on purpose: uv builds the venv in the `builder` stage, then the lean `run`
 # stage copies ONLY /app (venv + source) onto the plain official Python image. That drops
@@ -7,8 +7,8 @@
 # behind). We run uvicorn straight from the venv interpreter instead of `uv run`, so uv is
 # absent from the shipped image entirely.
 #
-# Safe because the uv builder image (astral-sh/uv:python3.13-bookworm-slim) IS the official
-# python:3.13-slim-bookworm + uv: same interpreter at /usr/local/bin/python3.13, so the
+# Safe because the uv builder image (astral-sh/uv:python3.14-bookworm-slim) IS the official
+# python:3.14-slim-bookworm + uv: same interpreter at /usr/local/bin/python3.14, so the
 # venv's symlinks/shebangs resolve unchanged in the run stage (identical WORKDIR /app).
 #
 # The whole backend/ tree is copied (respecting .dockerignore), which lands the `alembic/`
@@ -16,7 +16,7 @@
 # `alembic upgrade head` in-process on boot, resolving the script location as /app/alembic.
 
 # ---- builder: uv installs the venv, then is discarded --------------------------
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS builder
 
 # UV_COMPILE_BYTECODE: precompile .pyc for faster cold starts.
 # UV_LINK_MODE=copy: silence the hardlink warning when the cache and target sit on
@@ -36,7 +36,7 @@ COPY . .
 RUN uv sync --frozen --no-dev
 
 # ---- run: lean runtime — no uv binary, no download cache -----------------------
-FROM python:3.13-slim-bookworm AS run
+FROM python:3.14-slim-bookworm AS run
 
 ENV PYTHONUNBUFFERED=1
 

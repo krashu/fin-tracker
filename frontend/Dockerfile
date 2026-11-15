@@ -1,31 +1,21 @@
-# fin-tracker frontend — Next.js 16 (App Router), Node 24 (build 24.18.1, run 24.18.0),
-# pnpm via corepack (11.21.0, resolved from package.json's `packageManager`).
+# fin-tracker frontend — Next.js 16 (App Router), Node 26 (build 26.7.0, run 26.x),
+# pnpm (11.21.0, resolved from package.json's `packageManager`).
 #
-# The Node major matches the rest of the repo — .nvmrc (24.18.1),
-# .github/workflows/ci.yml (node-version "24"), PRD §Production-grade essentials
-# and §Maintenance posture, and frontend/package.json's "@types/node": "24.13.3".
+# The Node major matches the rest of the repo — .nvmrc (26.13.0),
+# .github/workflows/ci.yml (node-version-file: .nvmrc), PRD §Production-grade essentials
+# and §Maintenance posture, and frontend/package.json's "@types/node": "26.2.0".
 # That alignment is the point: @types/node is the drift vector, so server-rendered
 # code is typechecked against the same API surface the deployed artefact executes.
-# This image previously built on Node 22 and ran on distroless nodejs22, which meant
-# a Node-24-only runtime API passed CI and then threw inside a run stage that has no
-# shell to diagnose it. Keep all four in step on the next bump: the `base` FROM, the
+# Keep all four in step on the next bump: the `base` FROM, the
 # `run` stage's distroless tag, .nvmrc, and this header.
 #
 # The Debian codename is part of the contract, not incidental. Distroless no longer
-# publishes nodejs*-debian12, so `run` is nodejs24-debian13 (trixie) and `base` is
-# node:24.18.1-trixie-slim so the two still share a libc by construction — see the
+# publishes nodejs*-debian12, so `run` is nodejs26-debian13 (trixie) and `base` is
+# node:26.7.0-trixie-slim so the two still share a libc by construction — see the
 # `run` stage note, which is what that invariant protects.
 #
-# The two stages agree on the major but not the patch: distroless tracks upstream
-# patches on its own cadence and nodejs24-debian13 currently ships 24.18.0 against the
-# base's 24.18.1. Only the major is load-bearing (it is what makes @types/node honest),
-# so this is tolerated — but don't write a patch-exact claim here without re-checking.
-# Verified 2026-08-02 in the built image: run reports v24.18.0, glibc 2.41, and the
-# traced sharp 0.34.5 native addon loads.
-#
 # Corepack is bundled in Node 24 and is NOT bundled from Node 25 on (the TSC voted to
-# stop distributing it). `corepack enable` below breaks on the next LTS — install
-# corepack explicitly or pin pnpm another way when that lands.
+# stop distributing it). pnpm is installed globally via npm in the base stage.
 #
 # Multi-stage so the production runner (`run`) and the dev hot-reload container
 # (`dev`) build from ONE Dockerfile:
@@ -46,9 +36,9 @@
 # on ANY network. Additionally, any *.crt dropped into ./certs/ (gitignored) is added
 # to the store, so the build also works behind a corporate TLS-inspection proxy
 # (e.g. Zscaler) whose root CA isn't publicly trusted. Empty certs/ = plain build.
-FROM node:24.18.1-trixie-slim AS base
+FROM node:26.7.0-trixie-slim AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
-RUN corepack enable
+RUN npm install -g pnpm@11.21.0
 COPY certs/ /tmp/corp-certs/
 RUN set -eux; \
     apt-get update; \
@@ -100,7 +90,7 @@ CMD ["pnpm", "dev"]
 # ENTRYPOINT is already ["/nodejs/bin/node"], so CMD is just the script (NOT ["node", ...]).
 # HOSTNAME=0.0.0.0 is required — Next's standalone server.js binds process.env.HOSTNAME,
 # and without it the published :3000 port isn't reachable from the host.
-FROM gcr.io/distroless/nodejs24-debian13:nonroot AS run
+FROM gcr.io/distroless/nodejs26-debian13:nonroot AS run
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \

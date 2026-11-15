@@ -65,6 +65,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -401,7 +402,7 @@ def _persist_txns(
     # uq_investment_transactions_user_instrument_fingerprint.
     instrument_ids = {inst.id for inst in instruments_by_key.values()}
     existing_counts: dict[tuple[int, str], tuple[int, int]] = {
-        (instrument_id, fingerprint): (count, max_occ)
+        (instrument_id, cast(str, fingerprint)): (count, max_occ)
         for instrument_id, fingerprint, count, max_occ in session.execute(
             select(
                 InvestmentTransaction.instrument_id,

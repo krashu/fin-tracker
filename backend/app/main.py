@@ -18,7 +18,7 @@ the V1_USER_ID guard hits the seeded test DB, not production.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -59,7 +59,7 @@ async def _guest_cleanup_loop() -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     configure_logging()
     settings = get_settings()
     if settings.rate_limit_trust_proxy:

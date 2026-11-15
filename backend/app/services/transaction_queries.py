@@ -9,14 +9,12 @@ trigger.
 
 from __future__ import annotations
 
-from typing import Any
-
 from sqlalchemy import Select
 
 from app.models import Transaction
 
 
-def confirmed_only[S: Select[Any]](stmt: S) -> S:
+def confirmed_only[S: Select](stmt: S) -> S:
     """Restrict a Transaction query to board rows (committed, not pending).
 
     ``confirmed_at IS NULL`` = pending in the per-batch review queue;
@@ -27,7 +25,7 @@ def confirmed_only[S: Select[Any]](stmt: S) -> S:
     return stmt.where(Transaction.confirmed_at.is_not(None))
 
 
-def board_or_pending_on_batch[S: Select[Any]](stmt: S, batch_id: int) -> S:
+def board_or_pending_on_batch[S: Select](stmt: S, batch_id: int) -> S:
     """Restrict to board rows plus this one batch's still-pending rows.
 
     Second concrete consumer of this module (CLAUDE.md §2):
