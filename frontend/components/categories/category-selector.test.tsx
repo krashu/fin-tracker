@@ -11,7 +11,9 @@ const mockCategories: CategoryRead[] = [
     is_seeded: true,
     archived_at: null,
     color: "#ff5500",
+    display_color: "#ff5500",
     parent_id: null,
+    role: null,
   },
   {
     id: 2,
@@ -20,7 +22,9 @@ const mockCategories: CategoryRead[] = [
     is_seeded: true,
     archived_at: null,
     color: null,
+    display_color: "#ff5500",
     parent_id: 1,
+    role: null,
   },
   {
     id: 3,
@@ -29,7 +33,9 @@ const mockCategories: CategoryRead[] = [
     is_seeded: true,
     archived_at: null,
     color: null,
+    display_color: "#ff5500",
     parent_id: 1,
+    role: null,
   },
   {
     id: 4,
@@ -38,7 +44,9 @@ const mockCategories: CategoryRead[] = [
     is_seeded: true,
     archived_at: null,
     color: "#00aa00",
+    display_color: "#00aa00",
     parent_id: null,
+    role: null,
   },
 ];
 

@@ -6,8 +6,10 @@
  * create/rename/archive propagates everywhere on invalidate (PRD §F9).
  *
  * Seeded defaults are renamed/archived like any other (the backend permits it);
- * the "default" tag is display-only. Archiving a parent category also cascades
- * to archive its child subcategories server-side.
+ * the "default" tag is display-only. The exception is each kind's fallback
+ * ("Other", `role === "fallback"`, ADR-0012 rule 8): it offers no archive, no
+ * rename and no parent, because imports find it by name. Archiving a parent
+ * category also cascades to archive its child subcategories server-side.
  */
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -30,10 +32,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { IconArchive, IconChevronDown, IconPlus } from "@/components/icons";
 import { Field, TextInput } from "@/components/form/fields";
+import { CategorySelector } from "@/components/categories/category-selector";
 import {
   ApiError,
   createCategory,
   deleteCategory,
+  getCategoryPalette,
   listCategories,
   patchCategory,
   type CategoryColor,
@@ -43,11 +47,8 @@ import {
 } from "@/lib/api/client";
 import {
   CATEGORY_KIND_LABELS,
-  CATEGORY_PALETTE,
   buildCategoryTree,
   getReparentingOptions,
-  nextCategoryColor,
-  resolveSiblingDisplayColor,
   type CategoryTreeNode,
 } from "@/lib/categories";
 import { invalidateRules } from "@/lib/queries/invalidate";
@@ -145,7 +146,6 @@ export function CategoriesManager() {
           allCategories={categories}
           defaultParentId={dialog.defaultParentId ?? null}
           defaultKind={dialog.defaultKind ?? "spend"}
-          existingColors={categories.map((c) => c.color)}
           onClose={closeDialog}
         />
       ) : dialog?.kind === "edit" ? (
@@ -154,13 +154,13 @@ export function CategoriesManager() {
           mode="edit"
           category={dialog.category}
           allCategories={categories}
-          existingColors={categories.map((c) => c.color)}
           onClose={closeDialog}
         />
       ) : dialog?.kind === "archive" ? (
         <ArchiveConfirm
           category={dialog.category}
           subcategories={dialog.subcategories}
+          allCategories={categories}
           onClose={closeDialog}
         />
       ) : null}
@@ -309,16 +309,18 @@ function ParentCategoryCard({
           >
             Edit
           </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={onArchiveParent}
-            className="h-7 px-2 text-[12px] text-muted-foreground hover:text-neg"
-            aria-label={`Archive ${parent.name}`}
-            title="Archive"
-          >
-            <IconArchive className="size-3.5" />
-          </Button>
+          {parent.role === "fallback" ? null : (
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={onArchiveParent}
+              className="h-7 px-2 text-[12px] text-muted-foreground hover:text-neg"
+              aria-label={`Archive ${parent.name}`}
+              title="Archive"
+            >
+              <IconArchive className="size-3.5" />
+            </Button>
+          )}
         </div>
       </div>
 
@@ -326,12 +328,8 @@ function ParentCategoryCard({
       {parent.subcategories.length > 0 ? (
         <div className="bg-muted/15 pb-1">
           {parent.subcategories.map((sub) => {
-            // Siblings rendered side by side — the shade-aware resolver, not
-            // the plain family hue, so an inheriting sibling's swatch reads
-            // as distinct from its siblings' (and from the parent's own dot
-            // elsewhere), rather than all rendering the identical parent
-            // colour (locked decision #5 / 5.6 / 8.6).
-            const subColor = resolveSiblingDisplayColor(sub, allCategories);
+            // An inheriting subcategory shows its family hue (server-resolved).
+            const subColor = sub.display_color;
             return (
               <div
                 key={sub.id}
@@ -345,12 +343,8 @@ function ParentCategoryCard({
                 ) : (
                   <span
                     className="size-3.5 shrink-0 rounded-[4px] border border-dashed border-border"
-                    style={{ backgroundColor: subColor ?? undefined }}
-                    title={
-                      subColor
-                        ? "Inheriting color from parent"
-                        : "No color (neutral dot)"
-                    }
+                    style={{ backgroundColor: subColor }}
+                    title="Inheriting color from parent"
                   />
                 )}
                 <span className="min-w-0 flex-1 truncate text-[12.5px] font-normal text-foreground/90">
@@ -390,14 +384,12 @@ type CategoryFormDialogProps =
       allCategories: CategoryRead[];
       defaultParentId?: number | null;
       defaultKind?: CategoryKind;
-      existingColors: (CategoryColor | null)[];
       onClose: () => void;
     }
   | {
       mode: "edit";
       category: CategoryRead;
       allCategories: CategoryRead[];
-      existingColors: (CategoryColor | null)[];
       onClose: () => void;
     };
 
@@ -418,11 +410,17 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
     return props.category.parent_id ?? null;
   });
 
-  const [color, setColor] = useState<CategoryColor | null>(() =>
-    props.mode === "edit"
-      ? (props.category.color ?? null)
-      : nextCategoryColor(props.existingColors),
+  // Edit seeds from the stored colour. Create starts at null: a subcategory inherits;
+  // a root is assigned a palette slot by the server.
+  const [pickedColor, setPickedColor] = useState<CategoryColor | null>(
+    props.mode === "edit" ? (props.category.color ?? null) : null,
   );
+  const color = pickedColor;
+  const paletteQuery = useQuery({
+    queryKey: ["category-palette"],
+    queryFn: getCategoryPalette,
+    staleTime: Infinity,
+  });
 
   // Eligible parent options — kind + archived-exclusion now live inside the
   // helper itself (8.4), so no caller-side re-filter is needed here.
@@ -463,7 +461,8 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
       // Send ONLY changed fields
       const body: CategoryUpdate = {};
       if (trimmedName !== props.category.name) body.name = trimmedName;
-      if (color !== (props.category.color ?? null)) body.color = color;
+      if (color !== (props.category.color ?? null) && !(color === null && parentId == null))
+        body.color = color;
       if (parentId !== (props.category.parent_id ?? null)) {
         body.parent_id = parentId;
       }
@@ -477,6 +476,9 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
     },
   });
 
+  // The kind's fallback is found by name at import, so it keeps its name and stays a
+  // root; only its colour is editable (ADR-0012 rule 8).
+  const isFallback = category?.role === "fallback";
   const trimmed = name.trim();
   const colorChanged =
     props.mode === "edit" && color !== (props.category.color ?? null);
@@ -515,7 +517,13 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
             }
             autoFocus
             maxLength={64}
+            disabled={isFallback}
           />
+          {isFallback ? (
+            <p className="mt-1.5 text-[11px] text-muted-foreground">
+              The fallback category can’t be renamed: imports find it by name.
+            </p>
+          ) : null}
         </Field>
 
         <div className="mt-3">
@@ -550,7 +558,11 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
         {/* Parent Category Selector / Reparenting */}
         <div className="mt-3">
           <Field label="Parent category (optional)">
-            {isParentWithChildren ? (
+            {isFallback ? (
+              <div className="rounded-md border border-border/80 bg-muted/40 px-3 py-2 text-[12px] text-muted-foreground">
+                The fallback category is always top-level.
+              </div>
+            ) : isParentWithChildren ? (
               <div className="rounded-md border border-border/80 bg-muted/40 px-3 py-2 text-[12px] text-muted-foreground">
                 Parent category with active subcategories — cannot be nested
                 under another category.
@@ -604,27 +616,31 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
             }
           >
             <div className="flex flex-wrap gap-1.5">
-              <button
-                type="button"
-                onClick={() => setColor(null)}
-                aria-label="No custom color"
-                aria-pressed={color === null}
-                title={
-                  parentId != null
-                    ? "Inherit parent category color"
-                    : "No custom color (neutral dot)"
-                }
-                className={cn(
-                  "size-6 rounded-md border border-dashed border-border transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card",
-                  color === null &&
-                    "ring-2 ring-ring/30 ring-offset-2 ring-offset-card dark:ring-ring/40",
-                )}
-              />
-              {CATEGORY_PALETTE.map((c) => (
+              {parentId != null ? (
+                <button
+                  type="button"
+                  onClick={() => setPickedColor(null)}
+                  aria-label="No custom color"
+                  aria-pressed={color === null}
+                  title="Inherit parent category color"
+                  className={cn(
+                    "size-6 rounded-md border border-dashed border-border transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card",
+                    color === null &&
+                      "ring-2 ring-ring/30 ring-offset-2 ring-offset-card dark:ring-ring/40",
+                  )}
+                />
+              ) : null}
+              {paletteQuery.isPending ? (
+                <p className="text-[11.5px] text-muted-foreground">Loading colors…</p>
+              ) : null}
+              {paletteQuery.isError ? (
+                <p className="text-[11.5px] text-neg">Couldn’t load the color palette.</p>
+              ) : null}
+              {(paletteQuery.data?.colors ?? []).map((c) => (
                 <button
                   key={c}
                   type="button"
-                  onClick={() => setColor(c)}
+                  onClick={() => setPickedColor(c)}
                   aria-label={`Color ${c}`}
                   aria-pressed={color === c}
                   className={cn(
@@ -636,6 +652,11 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
                 />
               ))}
             </div>
+            {props.mode === "create" && parentId == null && color === null ? (
+              <p className="mt-1 text-[11.5px] text-muted-foreground">
+                A palette color is assigned when you save.
+              </p>
+            ) : null}
           </Field>
         </div>
 
@@ -676,18 +697,29 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
 function ArchiveConfirm({
   category,
   subcategories,
+  allCategories,
   onClose,
 }: {
   category: CategoryRead;
   subcategories: CategoryRead[];
+  allCategories: CategoryRead[];
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
+  // Optional: the default "Don't move them" leaves the rows on the archived category.
+  const [reassignTo, setReassignTo] = useState<number | null>(null);
+  // A target can't sit inside the set being archived. The selector drops archived
+  // categories itself; the server's 422 (wrong kind, archived, inside the set) stays
+  // authoritative and renders below.
+  const archivedIds = new Set([category.id, ...subcategories.map((s) => s.id)]);
+  const targets = allCategories.filter((c) => !archivedIds.has(c.id));
   const mutation = useMutation({
-    mutationFn: () => deleteCategory(category.id),
+    mutationFn: () =>
+      deleteCategory(category.id, reassignTo != null ? { reassignTo } : undefined),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["categories"] });
       queryClient.invalidateQueries({ queryKey: ["dashboards"] });
+      if (reassignTo != null) queryClient.invalidateQueries({ queryKey: ["transactions"] });
       invalidateRules(queryClient);
       onClose();
     },
@@ -709,18 +741,32 @@ function ArchiveConfirm({
                 {subcategories.map((s) => s.name).join(", ")}).
                 <br />
                 <br />
-                Merchant auto-tag rules will stop applying while archived.
-                Existing transactions will keep their historical categories.
+                Merchant auto-tag rules will stop applying while archived.{" "}
+                {reassignTo != null
+                  ? "Their transactions will move to the category you pick below."
+                  : "Existing transactions will keep their historical categories."}
               </>
             ) : (
               <>
                 It will be removed from active category lists and its merchant
-                auto-tag rules will stop applying. Existing transactions will keep
-                this category.
+                auto-tag rules will stop applying.{" "}
+                {reassignTo != null
+                  ? "Its transactions will move to the category you pick below."
+                  : "Existing transactions will keep this category."}
               </>
             )}
           </DialogDescription>
         </DialogHeader>
+        <Field label="Move its transactions to">
+          <CategorySelector
+            value={reassignTo}
+            onChange={setReassignTo}
+            categories={targets}
+            kind={category.kind}
+            optional
+            placeholder="Don't move them"
+          />
+        </Field>
         {mutation.isError ? (
           <p className="text-[12px] text-neg">
             {mutation.error instanceof ApiError

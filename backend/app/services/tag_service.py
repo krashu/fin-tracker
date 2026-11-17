@@ -27,10 +27,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import UnaryExpression
 
 from app.core import clock
-from app.core.db_errors import is_unique_violation, savepoint_insert
+from app.core.db_errors import insert_or_increment, is_unique_violation, savepoint_insert
 from app.core.log_config import get_logger
 from app.models import Category, MerchantLabelMap, MerchantTagMap, TransactionTypeStr
-from app.services.merchant_alias import AliasResolver
+from app.services.merchant_alias import AliasResolver, is_unknown_via
 
 logger = get_logger(__name__)
 
@@ -70,12 +70,11 @@ def merchant_map_winner_order(
 
 
 # Transaction types that participate in F3 auto-tagging — both the learning
-# signal (every record_tag call site: import commit + manual POST/PATCH) and the
+# signal (every teach: import commit, manual POST/PATCH, bulk) and the
 # import auto-suggest (import_service). Income and transfer are hand-classified
 # in a separate taxonomy, so a manual income/transfer row with a category must
 # NOT feed the spend merchant→category map (it could only ever resurface as a
-# cross-taxonomy spend suggestion). Manual entry was previously type-agnostic
-# here, unlike import — this set now gates all three call sites alike.
+# cross-taxonomy spend suggestion). This set gates every teach alike.
 #
 # Refunds are still auto-tagged: a refund is a ``spend`` row with a positive
 # amount (ADR-0009), so it is inside this set by construction, and teaching the
@@ -86,13 +85,25 @@ def merchant_map_winner_order(
 AUTO_TAGGABLE_TYPES: frozenset[TransactionTypeStr] = frozenset({"spend"})
 
 
-def should_learn_tag(*, transaction_type: str, merchant_normalized: str) -> bool:
-    """True when a row's type + merchant make it eligible to teach F3.
+def is_seeded(*, hit_count: int, pinned: bool) -> bool:
+    """True for a never-confirmed seed-dictionary row: ``hit_count == 0`` and not pinned.
 
-    The shared eligibility core for every :func:`record_tag` call site — POST /
-    PATCH manual entry (:mod:`app.api.v1.transactions`), import commit
-    (:mod:`app.api.v1.imports`), and the demo seeder
-    (:mod:`app.services.demo_seed`): a non-empty normalized merchant and a
+    One definition for every read site (ADR-0011 rule 11). A pin is user-authored —
+    ``pin_tag`` never bumps ``hit_count``, so a pinned seed row sits at zero — and
+    must not read as a dictionary suggestion. ``dashboards.tagging_stats`` states the
+    same predicate in SQL (``hit_count > 0 OR pinned``).
+    """
+    return hit_count == 0 and not pinned
+
+
+def should_learn_tag(*, transaction_type: str, merchant_normalized: str) -> bool:
+    """True when a row's type + canonical merchant make it eligible to teach F3.
+
+    The shared eligibility core for every teach, reached through
+    :func:`app.services.merchant_labels.learn_merchant_memory` (which passes the
+    *canonical*, so a descriptor an alias folds to nothing never teaches): a
+    non-empty canonical merchant that is not an unknown-via gateway handle
+    (ADR-0011 rule 12) and a
     ``spend`` type (refunds included — they are spend rows carrying a positive
     amount). ``income`` / ``transfer`` are hand-classified and must never feed
     the spend→category map.
@@ -102,7 +113,11 @@ def should_learn_tag(*, transaction_type: str, merchant_normalized: str) -> bool
     plus its own extra guards — PATCH: confirmed + changed; commit:
     not-Other-defaulted.
     """
-    return bool(merchant_normalized) and transaction_type in AUTO_TAGGABLE_TYPES
+    return (
+        bool(merchant_normalized)
+        and transaction_type in AUTO_TAGGABLE_TYPES
+        and not is_unknown_via(merchant_normalized)
+    )
 
 
 @dataclass(slots=True)
@@ -139,8 +154,9 @@ def _aggregate_tag_rows(
 
     With ``EMPTY_RESOLVER`` every group has exactly one member (the map's
     UNIQUE constraint), so this reduces to that row's own fields unchanged —
-    the byte-identity argument in the merchant-alias brief's design section;
-    the empty-resolver tests pin it rather than trust it.
+    identical to the pre-alias pick, except keys that resolve to an unknown-via
+    canonical, which are skipped (ADR-0011 rule 12); the empty-resolver tests pin it
+    rather than trust it.
     """
     stmt = (
         select(
@@ -163,6 +179,8 @@ def _aggregate_tag_rows(
         stmt
     ):
         canonical = resolver.canonical(merchant_normalized)
+        if is_unknown_via(canonical):
+            continue  # a gateway handle names no merchant (ADR-0011 rule 12)
         by_category = groups.setdefault(canonical, {})
         agg = by_category.get(category_id)
         if agg is None:
@@ -199,28 +217,26 @@ def prefetch_tag_map(session: Session, *, user_id: UUID, resolver: AliasResolver
     WHERE the winner pick happens moved (SQL ORDER BY + first-row-seen ->
     Python aggregate + max).
 
-    ``merchant_tag_map.category_id`` is a plain FK — unlike the sibling
-    ``merchant_label_map``, which carries ADR-0002's composite same-user FK,
-    which is why :func:`app.services.merchant_labels.prefetch_label_map` needs
-    no equivalent restated-user_id predicate — so the DB would permit a
-    cross-user row. No write path can create one today, but this is the one
+    ``merchant_tag_map.category_id`` is a composite same-user FK, so the DB
+    refuses a cross-user row (ADR-0003 rule 10). The join still restates
+    ``Category.user_id`` (rule 7, in ``_aggregate_tag_rows``): this is the one
     merchant-memory read whose result is WRITTEN back, onto imported rows as
-    ``auto_category_id``, so a dangling ref degrading to "absent" rather than
-    to another user's bucket is worth the clause (in ``_aggregate_tag_rows``).
+    ``auto_category_id``, so it must not depend on the FK alone.
 
     The archived-category filter is **load-bearing**: ``DELETE /categories/{id}``
     keeps the tag-map rows (archive is a pure ``archived_at`` UPDATE — see
     :mod:`app.api.v1.categories`), so archived categories DO have live tag-map
     rows and this JOIN filter is the sole thing that stops F3 prefilling an
-    archived bucket. It also means a user-authored ``pinned`` rule survives an
-    archive and returns if the category is ever un-archived.
+    archived bucket. A user-authored ``pinned`` rule row survives the archive, but
+    archive is one-way (ADR-0012), so it never prefills again.
 
     ``resolver`` is a REQUIRED keyword argument, not defaulted: a default
     would let a production call site read ``prefetch_tag_map(session,
     user_id=x)``, compile, type-check, pass tests, and silently disable
     aliasing entirely. Pass :data:`app.services.merchant_alias.EMPTY_RESOLVER`
-    explicitly for unaliased behaviour — provably byte-identical to the
-    pre-alias output (see :func:`_aggregate_tag_rows`).
+    explicitly for unaliased behaviour — identical to the pre-alias output, except
+    keys that resolve to an unknown-via canonical, which are skipped (ADR-0011
+    rule 12; see :func:`_aggregate_tag_rows`).
     """
     groups = _aggregate_tag_rows(session, user_id=user_id, resolver=resolver)
     return {
@@ -282,68 +298,31 @@ def record_tag(
     No-op on empty merchant string (manual-entry rows with blank merchants
     shouldn't pollute the map). Caller owns the commit.
 
-    Race handling: SELECT-then-INSERT-or-UPDATE. If two near-simultaneous
-    PATCHes hit the same triple, both SELECT miss; the loser's INSERT trips
-    ``uq_merchant_tag_map_user_merchant_category`` → ``IntegrityError``. The
-    INSERT is wrapped in a ``begin_nested()`` SAVEPOINT so the failure rolls
-    back ONLY the insert — pending caller-side state (e.g. the PATCH route's
-    ``setattr(txn, "category_id", …)``) survives. A naive ``session.rollback()``
-    would discard the parent transaction and silently drop the user's
-    category change. For the Postgres v2 swap see
-    :func:`app.core.db_errors.savepoint_insert` — it is not a single edit, and that
-    docstring is the one place scoping it.
-
-    Asymmetric flush: the INSERT branch flushes to surface the IntegrityError
-    here (otherwise it'd raise at commit time, outside our handler). The
-    UPDATE branch does not — caller's commit flushes the dirty hit_count.
+    One ``INSERT … ON CONFLICT DO UPDATE`` statement (ADR-0004 rule 7), so two
+    concurrent teaches of the same triple both land: there is no SELECT-then-write
+    window to race in and no SAVEPOINT, which also means the caller's pending state
+    (e.g. the PATCH route's ``setattr(txn, "category_id", …)``) is untouched. A
+    non-conflict ``IntegrityError`` (e.g. a foreign ``category_id``) propagates.
     """
     if not merchant_normalized:
         return
 
-    existing = session.scalar(
-        select(MerchantTagMap).where(
-            MerchantTagMap.user_id == user_id,
-            MerchantTagMap.merchant_normalized == merchant_normalized,
-            MerchantTagMap.category_id == category_id,
-        )
-    )
-    if existing is not None:
-        existing.hit_count += 1
-        existing.last_used = clock.naive_utcnow()
-        return
-
-    # savepoint_insert isolates the INSERT in a SAVEPOINT: True → inserted;
-    # False → the (user, merchant, category) uniqueness violation (the
-    # concurrent-insert race), rolled back, parent transaction intact — refetch
-    # the winner and bump. Any other IntegrityError re-raises inside the helper.
-    if not savepoint_insert(
+    now = clock.naive_utcnow()
+    insert_or_increment(
         session,
-        MerchantTagMap(
-            user_id=user_id,
-            merchant_normalized=merchant_normalized,
-            category_id=category_id,
-        ),
-        is_conflict=_is_merchant_tag_conflict,
-    ):
-        winner = session.scalar(
-            select(MerchantTagMap).where(
-                MerchantTagMap.user_id == user_id,
-                MerchantTagMap.merchant_normalized == merchant_normalized,
-                MerchantTagMap.category_id == category_id,
-            )
-        )
-        if winner is None:
-            # The refetch should always find the row the unique constraint just
-            # collided with. If it doesn't, the user's decision is being lost —
-            # surface it (PII: never log merchant_normalized; it can carry names).
-            logger.warning(
-                "record_tag_conflict_no_winner",
-                user_id=str(user_id),
-                category_id=category_id,
-            )
-            return
-        winner.hit_count += 1
-        winner.last_used = clock.naive_utcnow()
+        MerchantTagMap,
+        values={
+            "user_id": user_id,
+            "merchant_normalized": merchant_normalized,
+            "category_id": category_id,
+            "hit_count": 1,
+            "last_used": now,
+        },
+        conflict_cols=["user_id", "merchant_normalized", "category_id"],
+        counter="hit_count",
+        touch={"last_used": now, "updated_at": now},
+        label="merchant_tag_map",
+    )
 
 
 def _unpin_sibling_tags(
@@ -394,6 +373,10 @@ def pin_tag(
     merchant (F3 authoring — ``/settings/rules``). Serves both *create-new* and
     *re-point-to-a-never-seen-category*; re-pointing to an already-learned category
     goes through :func:`set_tag_pinned` (PATCH).
+
+    A pin never bumps ``hit_count``, so a pinned seed row stays at zero yet is
+    user-authored at every read site (:func:`is_seeded` is false for it); un-pinning
+    it reverts it to seeded.
 
     Deliberately unlike :func:`record_tag` (the *learning* path):
 

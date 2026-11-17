@@ -28,7 +28,6 @@ import {
 import {
   buildCategoryTree,
   categoryDisplayName,
-  resolveCategoryColor,
 } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 
@@ -84,7 +83,7 @@ export function CategorySelector({
   );
 
   const selectedCategory = value != null ? categoriesById.get(value) : null;
-  const selectedColor = resolveCategoryColor(selectedCategory, categoriesById);
+  const selectedColor = selectedCategory?.display_color ?? null;
 
   function handleSelect(categoryId: number | null) {
     onChange(categoryId);
@@ -196,10 +195,7 @@ export function CategorySelector({
               ) : null}
 
               {filteredTree.map((parent) => {
-                const parentColor = resolveCategoryColor(
-                  parent,
-                  categoriesById,
-                );
+                const parentColor = parent.display_color;
                 const isParentSelected = value === parent.id;
 
                 return (
@@ -229,10 +225,7 @@ export function CategorySelector({
 
                     {/* Subcategories (indented) */}
                     {parent.subcategories.map((sub) => {
-                      const subColor = resolveCategoryColor(
-                        sub,
-                        categoriesById,
-                      );
+                      const subColor = sub.display_color;
                       const isSubSelected = value === sub.id;
 
                       return (

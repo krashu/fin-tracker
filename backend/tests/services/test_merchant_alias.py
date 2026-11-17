@@ -11,15 +11,19 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy.orm import Session
 
 from app.models import MerchantAlias, User
 from app.services.merchant_alias import (
     EMPTY_RESOLVER,
     AliasResolver,
+    build_resolver,
+    is_unknown_via,
     load_alias_resolver,
     tokenize,
 )
+from app.services.provisioning import PAYMENT_GATEWAYS, PSP_HANDLES, UPI_QR_IDS
 
 # ---------- tokenize --------------------------------------------------------
 
@@ -40,6 +44,25 @@ def test_tokenize_all_punctuation_is_the_zero_token_hazard() -> None:
     """normalize_merchant("***") == "***" (non-blank) but tokenize sees no
     alphanumerics at all -- this is the case load_alias_resolver must guard."""
     assert tokenize("***") == ()
+
+
+def test_tokenize_keeps_unicode_letters() -> None:
+    assert tokenize("café coffee day") == ("café", "coffee", "day")
+    assert tokenize("स्विगी/123") == ("स्विगी", "123")
+    assert tokenize("x_y") == ("x", "y")
+    r = build_resolver([("café", "café coffee day")])
+    assert r.canonical("upi/café/77") == "café coffee day"
+    assert r.canonical("caf coffee") == "caf coffee"
+
+
+def test_alias_matches_across_unicode_spellings_after_normalizing() -> None:
+    from app.services.merchant import normalize_merchant
+
+    precomposed = build_resolver([(normalize_merchant("Caf\u00e9"), "ccd")])
+    assert precomposed.canonical(normalize_merchant("UPI/CAFE\u0301/77")) == "ccd"
+
+    decomposed = build_resolver([(normalize_merchant("Cafe\u0301"), "ccd")])
+    assert decomposed.canonical(normalize_merchant("UPI/CAF\u00c9/77")) == "ccd"
 
 
 # ---------- AliasResolver.canonical -----------------------------------------
@@ -165,3 +188,103 @@ def test_empty_resolver_never_memoizes() -> None:
     call returns its own input."""
     assert EMPTY_RESOLVER.canonical("anything") == "anything"
     assert EMPTY_RESOLVER._memo == {}
+
+
+# ---------- gateway handles (ADR-0011 rules 6 and 12) -----------------------
+
+
+def test_psp_handle_resolves_to_unknown_via() -> None:
+    r = build_resolver([("swiggy", "swiggy"), ("airtel", "airtel")])
+    cases = {
+        "upi/razorpay@hdfcbank/order 42": "unknown via razorpay",
+        "upi/cashfree.123456@yesbank": "unknown via cashfree",
+        "upi/9876543210@ybl/payment": "unknown via phonepe",
+        "upi-9876543210-2@ybl-yesb0000001-123456789012": "unknown via phonepe",
+        "upi/9876543210@hdfcbank": "unknown via hdfcbank",
+        "upi/9876543210@airtel": "unknown via airtel",
+        "upi/paytmqr2810050501011abcd@paytm": "unknown via paytm",
+        "upi/q123456789@ybl": "unknown via phonepe",
+        "upi/bharatpe.9000000000@fbpe": "unknown via bharatpe",
+        "upi/swiggy/9876543210@ybl": "swiggy",  # an alias wins
+    }
+    for merchant, expected in cases.items():
+        assert r.canonical(merchant) == expected, merchant
+    assert build_resolver([]).canonical("upi/9876543210@ybl") == "unknown via phonepe"
+
+
+def test_identifying_vpa_is_not_a_gateway_handle() -> None:
+    """Locks behaviour that was already right: these name someone, so they stay as they are."""
+    r = build_resolver([])
+    for merchant in (
+        "upi/zomatoonline@paytm/x",
+        "upi/razorpay.swiggy@icici",
+        "upi/ramesh.k@okaxis",
+        "upi/john.doe-1@okaxis",
+        "upi/qutub123@ybl",
+        "upi/9876@ybl",
+        "upi/paytmqrx@paytm",
+        "paytm mall order",
+    ):
+        assert r.canonical(merchant) == merchant, merchant
+
+
+def test_alias_never_matches_a_upi_handle() -> None:
+    r = build_resolver([("airtel", "airtel")])
+    assert r.canonical("upi/9876543210@airtel") == "unknown via airtel"
+    assert r.canonical("airtel prepaid recharge") == "airtel"
+    assert r.canonical("upi/airtel.recharge@icici") == "airtel"
+    # A pattern's own handle is ignored too: it matches the payee on any handle.
+    payee = build_resolver([("9876543210@ybl", "ramesh")])
+    assert payee.canonical("upi/9876543210@paytm") == "ramesh"
+
+
+# One literal example per list entry; the next test fails if an entry has none.
+_HANDLE_EXAMPLES = {
+    "ybl": "phonepe",
+    "ibl": "phonepe",
+    "axl": "phonepe",
+    "paytm": "paytm",
+    "ptyes": "paytm",
+    "ptaxis": "paytm",
+    "pthdfc": "paytm",
+    "ptsbi": "paytm",
+    "okaxis": "google pay",
+    "okhdfcbank": "google pay",
+    "okicici": "google pay",
+    "oksbi": "google pay",
+    "apl": "amazon pay",
+    "fbpe": "bharatpe",
+    "upi": "bhim",
+}
+_GATEWAY_EXAMPLES = ("razorpay", "cashfree", "payu", "billdesk", "ccavenue")
+_QR_EXAMPLES = {
+    r"paytmqr[a-z0-9]{6,}": ("upi/paytmqr2810050501011abcd@paytm", "unknown via paytm"),
+    r"q[0-9]{6,}": ("upi/q123456789@ybl", "unknown via phonepe"),
+    r"bharatpe[._]?[0-9]{6,}": ("upi/bharatpe.9000000000@fbpe", "unknown via bharatpe"),
+}
+
+
+@pytest.mark.parametrize(("handle", "psp"), sorted(_HANDLE_EXAMPLES.items()))
+def test_psp_list_entry_resolves_handle(handle: str, psp: str) -> None:
+    assert build_resolver([]).canonical(f"upi/9876543210@{handle}") == f"unknown via {psp}"
+
+
+@pytest.mark.parametrize("gateway", _GATEWAY_EXAMPLES)
+def test_psp_list_entry_resolves_gateway(gateway: str) -> None:
+    assert build_resolver([]).canonical(f"upi/{gateway}@hdfcbank") == f"unknown via {gateway}"
+
+
+@pytest.mark.parametrize(("example", "expected"), sorted(_QR_EXAMPLES.values()))
+def test_psp_list_entry_resolves_qr(example: str, expected: str) -> None:
+    assert build_resolver([]).canonical(example) == expected
+
+
+def test_psp_lists_are_fully_exemplified() -> None:
+    assert dict(PSP_HANDLES) == _HANDLE_EXAMPLES
+    assert set(_GATEWAY_EXAMPLES) == set(PAYMENT_GATEWAYS)
+    assert set(_QR_EXAMPLES) == {pattern for pattern, _ in UPI_QR_IDS}
+
+
+def test_reserved_prefix_is_unknown_via() -> None:
+    assert is_unknown_via("unknown via hdfcbank")
+    assert not is_unknown_via("unknown")

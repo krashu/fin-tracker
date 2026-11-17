@@ -4,6 +4,7 @@ import {
   buildCategoryTree,
   categoryLabel,
   getParentSubcategorySpend,
+  rollUpSpendByCategory,
 } from "@/lib/categories";
 
 function cat(overrides: Partial<CategoryRead> & Pick<CategoryRead, "id" | "name">): CategoryRead {
@@ -12,7 +13,9 @@ function cat(overrides: Partial<CategoryRead> & Pick<CategoryRead, "id" | "name"
     is_seeded: false,
     archived_at: null,
     color: null,
+    display_color: overrides.color ?? "#2a78d6",
     parent_id: null,
+    role: null,
     ...overrides,
   };
 }
@@ -66,11 +69,11 @@ describe("getParentSubcategorySpend", () => {
     const categories = [parent, child];
 
     const rows: SpendByCategoryRow[] = [
-      { category_id: 2, category_name: "Store A", total_paise: -50000 },
-      { category_id: 1, category_name: "Groceries", total_paise: -12000 },
+      { category_id: 2, category_name: "Store A", parent_id: 1, parent_name: "Groceries", display_color: null, parent_display_color: null, total_paise: -50000 },
+      { category_id: 1, category_name: "Groceries", parent_id: null, parent_name: null, display_color: null, parent_display_color: null, total_paise: -12000 },
     ];
 
-    const items = getParentSubcategorySpend(rows, 1, categories);
+    const items = getParentSubcategorySpend(rows, 1);
 
     // One real child + one synthetic direct row = 2, not 1.
     expect(items).toHaveLength(2);
@@ -87,13 +90,42 @@ describe("getParentSubcategorySpend", () => {
     const categories = [parent, child];
 
     const rows: SpendByCategoryRow[] = [
-      { category_id: 2, category_name: "Store A", total_paise: -50000 },
+      { category_id: 2, category_name: "Store A", parent_id: 1, parent_name: "Groceries", display_color: null, parent_display_color: null, total_paise: -50000 },
     ];
 
-    const items = getParentSubcategorySpend(rows, 1, categories);
+    const items = getParentSubcategorySpend(rows, 1);
 
     expect(items).toHaveLength(1);
     expect(items.every((i) => !i.isDirect)).toBe(true);
+  });
+});
+
+describe("rollUpSpendByCategory", () => {
+  // ADR-0012 rule 6: the rollup follows the row's own parent_id, never the active
+  // category list, which omits an archived subcategory.
+  const parent = cat({ id: 1, name: "Food" });
+  const rows: SpendByCategoryRow[] = [
+    { category_id: 2, category_name: "Old cafe", parent_id: 1, parent_name: "Food", display_color: null, parent_display_color: null, total_paise: -3000 },
+    { category_id: 1, category_name: "Food", parent_id: null, parent_name: null, display_color: null, parent_display_color: null, total_paise: -1000 },
+  ];
+
+  it("rolls an archived subcategory up under its parent via the row's parent_id", () => {
+    // Only the parent is in the lookup: the archived child (id 2) is not listed.
+    const [food, ...rest] = rollUpSpendByCategory(rows);
+    expect(rest).toEqual([]);
+    expect(food.parentId).toBe(1);
+    expect(food.parentName).toBe("Food");
+    expect(food.totalPaise).toBe(-4000);
+    expect(food.directPaise).toBe(-1000);
+    expect(food.subcategories.map((s) => s.categoryName)).toEqual([
+      "Old cafe",
+      "Food (Direct)",
+    ]);
+  });
+
+  it("the drilldown lists an archived subcategory", () => {
+    const items = getParentSubcategorySpend(rows, 1);
+    expect(items.map((i) => i.categoryName)).toEqual(["Old cafe", "Food (Direct)"]);
   });
 });
 

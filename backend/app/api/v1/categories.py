@@ -10,6 +10,8 @@ carries no parent validation).
   (:class:`app.schemas.CategoryTreeRead`); a child whose parent is absent
   from the result set (archived, or filtered out by ``kind``) is promoted
   to root rather than dropped.
+* ``GET /api/v1/categories/palette`` — the palette colours in slot order
+  (:class:`app.schemas.CategoryPaletteRead`); the frontend offers exactly these.
 * ``POST /api/v1/categories`` — create user category, optionally under
   ``parent_id``. 409 on duplicate active name (the partial unique index
   ``uq_categories_active_user_name`` carves out archived rows so
@@ -22,17 +24,27 @@ carries no parent validation).
   promotion is a plain PATCH, never a delete (see
   :attr:`app.models.Category.subcategories`). A category with active
   children cannot itself be given a parent. Empty body is a no-op (mirrors
-  ``PATCH /transactions``). 409 on rename collision.
+  ``PATCH /transactions``). 409 on rename collision. Each kind's fallback
+  "Other" can be recoloured but never renamed or given a parent — 422
+  (ADR-0012 rule 8). A root always has a color: omit it on create and the server
+  assigns the least-used palette slot of its kind; null on a root (create, PATCH,
+  promotion) is a 422; a promotion of a colourless subcategory assigns one
+  (ADR-0012 rule 7).
 * ``DELETE /api/v1/categories/{id}`` — soft-delete (sets ``archived_at``).
-  Archiving a parent cascades to its active children in the same request
-  (one hop, forward only — archiving a child never touches the parent).
-  ``merchant_tag_map`` rows are **kept**: F3 auto-tag never resurrects an
-  archived bucket because both ``prefetch_tag_map`` and ``GET /rules``
-  filter ``Category.archived_at IS NULL`` (that filter is the load-bearing
-  guard, not defence-in-depth). Keeping the rows means user-authored
-  ``pinned`` rules survive an archive and would return if the category is
-  ever un-archived. Idempotent: re-DELETE returns 404 because the archived
-  row is filtered out of the loader query.
+  422 on a kind's fallback "Other", which always stays active (ADR-0012
+  rule 8). Archiving a parent cascades to **all** its active children in the
+  same request with one shared stamp (one hop, forward only — archiving a
+  child never touches the parent). ``?reassign_to=<id>`` also moves every
+  **board** row on the archived categories (parent and cascaded children) to a
+  live, same-kind target outside that set, in the same commit, teaching once
+  per canonical merchant (ADR-0012 rule 10 / ADR-0004 rule 4); an invalid
+  target is a 422 before anything is written. Pending (staged) rows are left
+  alone — the import commit defaults them to "Other". Archive is one-way: no endpoint clears
+  ``archived_at``. ``merchant_tag_map`` rows are **kept**: F3 auto-tag never
+  resurrects an archived bucket because both ``prefetch_tag_map`` and
+  ``GET /rules`` filter ``Category.archived_at IS NULL`` (that filter is the
+  load-bearing guard, not defence-in-depth). Idempotent: re-DELETE returns
+  404 because the archived row is filtered out of the loader query.
 
 Cross-dialect 409 detection mirrors :mod:`app.api.v1.accounts`.
 
@@ -50,16 +62,40 @@ invariant is now DB-query enforced, not just UI-enforced.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import select
+from collections.abc import Sequence
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Query, status
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUserId, SessionDep
 from app.core import clock
 from app.core.db_errors import is_unique_violation
-from app.models import Category, CategoryKindStr
-from app.schemas import CategoryCreate, CategoryRead, CategoryTreeRead, CategoryUpdate
-from app.services.category_service import FALLBACK_CATEGORY_NAME
+from app.models import Category, CategoryKindStr, Transaction
+from app.schemas import (
+    CategoryCreate,
+    CategoryPaletteRead,
+    CategoryRead,
+    CategoryTreeRead,
+    CategoryUpdate,
+)
+from app.services.bulk_categorise import bulk_categorise
+from app.services.category_colors import (
+    CATEGORY_PALETTE,
+    active_root_colors,
+    category_colors,
+    next_root_color,
+)
+from app.services.category_service import (
+    category_roles,
+    is_fallback_category,
+    validate_category_ids,
+)
+from app.services.merchant_alias import load_alias_resolver
+from app.services.transaction_queries import confirmed_only
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -72,6 +108,29 @@ def _is_name_dup(e: IntegrityError) -> bool:
         index_name="uq_categories_active_user_name",
         columns=["categories.user_id", "categories.name"],
     )
+
+
+def _reads(session: Session, categories: Sequence[Category], user_id: UUID) -> list[CategoryRead]:
+    """Build the read schema for ``categories`` with each one's ``role`` and ``display_color``.
+
+    Both are required on ``CategoryRead``, so this is the only way a response gets built.
+    """
+    roles = category_roles(session, categories=categories, user_id=user_id)
+    colors = category_colors(session, user_id=user_id)
+    return [
+        CategoryRead(
+            id=c.id,
+            name=c.name,
+            kind=c.kind,
+            is_seeded=c.is_seeded,
+            archived_at=c.archived_at,
+            color=c.color,
+            display_color=colors[c.id].display,
+            parent_id=c.parent_id,
+            role=roles[c.id],
+        )
+        for c in categories
+    ]
 
 
 @router.get("", response_model=None)
@@ -87,8 +146,9 @@ def list_categories(
     stmt = stmt.order_by(Category.name.asc())
     categories = list(session.scalars(stmt))
 
+    reads = {r.id: r for r in _reads(session, categories, user_id)}
     if not tree:
-        return [CategoryRead.model_validate(c) for c in categories]
+        return [reads[c.id] for c in categories]
 
     # Tree view: nest subcategories under parents. A child whose parent is
     # missing from THIS result set (the parent is archived, or was filtered
@@ -103,20 +163,9 @@ def list_categories(
     children_by_parent: dict[int, list[CategoryRead]] = {}
     for c in categories:
         if c.parent_id is not None and c.parent_id in all_ids:
-            children_by_parent.setdefault(c.parent_id, []).append(CategoryRead.model_validate(c))
+            children_by_parent.setdefault(c.parent_id, []).append(reads[c.id])
         else:
-            parents.append(
-                CategoryTreeRead(
-                    id=c.id,
-                    name=c.name,
-                    kind=c.kind,
-                    is_seeded=c.is_seeded,
-                    archived_at=c.archived_at,
-                    color=c.color,
-                    parent_id=c.parent_id,
-                    subcategories=[],
-                )
-            )
+            parents.append(CategoryTreeRead(**reads[c.id].model_dump(), subcategories=[]))
 
     for p in parents:
         p.subcategories = children_by_parent.get(p.id, [])
@@ -124,12 +173,17 @@ def list_categories(
     return parents
 
 
+@router.get("/palette", response_model=CategoryPaletteRead)
+def get_category_palette(_user_id: CurrentUserId) -> CategoryPaletteRead:
+    return CategoryPaletteRead(colors=list(CATEGORY_PALETTE))
+
+
 @router.post("", response_model=CategoryRead, status_code=status.HTTP_201_CREATED)
 def create_category(
     payload: CategoryCreate,
     session: SessionDep,
     user_id: CurrentUserId,
-) -> Category:
+) -> CategoryRead:
     if payload.parent_id is not None:
         parent = session.scalar(
             select(Category).where(
@@ -154,11 +208,22 @@ def create_category(
                 detail="category kind must match parent category kind",
             )
 
+    color = payload.color
+    if payload.parent_id is None:
+        if "color" in payload.model_fields_set and payload.color is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="a root category must have a color",
+            )
+        color = payload.color or next_root_color(
+            active_root_colors(session, user_id=user_id, kind=payload.kind)
+        )
+
     category = Category(
         user_id=user_id,
         name=payload.name,
         kind=payload.kind,
-        color=payload.color,
+        color=color,
         parent_id=payload.parent_id,
         is_seeded=False,
     )
@@ -174,7 +239,7 @@ def create_category(
             ) from e
         raise
     session.refresh(category)
-    return category
+    return _reads(session, [category], user_id)[0]
 
 
 @router.patch("/{category_id}", response_model=CategoryRead)
@@ -183,7 +248,7 @@ def update_category(
     payload: CategoryUpdate,
     session: SessionDep,
     user_id: CurrentUserId,
-) -> Category:
+) -> CategoryRead:
     category = session.scalar(
         select(Category).where(
             Category.id == category_id,
@@ -199,7 +264,34 @@ def update_category(
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         # Empty body — no DB round-trip, no spurious updated_at bump.
-        return category
+        return _reads(session, [category], user_id)[0]
+
+    # The fallback "Other" is found by name + kind and must stay a root (ADR-0012
+    # rule 8), so it keeps both. Checked before the parent lookup: the answer does
+    # not depend on which parent was asked for.
+    if is_fallback_category(category):
+        if updates.get("parent_id") is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="the fallback category cannot have a parent",
+            )
+        if "name" in updates and updates["name"] != category.name:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="the fallback category cannot be renamed",
+            )
+
+    ends_as_root = (
+        updates["parent_id"] is None if "parent_id" in updates else category.parent_id is None
+    )
+    promotes = (
+        "parent_id" in updates and updates["parent_id"] is None and category.parent_id is not None
+    )
+    if "color" in updates and updates["color"] is None and ends_as_root:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="a root category must have a color",
+        )
 
     # Gate on key PRESENCE alone, not truthiness — `parent_id: null` (promote
     # to root) is a legitimate, validation-free write and must not fall
@@ -252,6 +344,11 @@ def update_category(
                     detail="category kind must match parent category kind",
                 )
 
+    if promotes and category.color is None and updates.get("color") is None:
+        updates["color"] = next_root_color(
+            active_root_colors(session, user_id=user_id, kind=category.kind)
+        )
+
     if "name" in updates and updates["name"] == category.name:
         del updates["name"]
 
@@ -268,7 +365,7 @@ def update_category(
             ) from e
         raise
     session.refresh(category)
-    return category
+    return _reads(session, [category], user_id)[0]
 
 
 @router.delete("/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -276,6 +373,7 @@ def delete_category(
     category_id: int,
     session: SessionDep,
     user_id: CurrentUserId,
+    reassign_to: Annotated[int | None, Query(gt=0)] = None,
 ) -> None:
     category = session.scalar(
         select(Category).where(
@@ -289,6 +387,33 @@ def delete_category(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="category not found",
         ) from None
+    if is_fallback_category(category):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="the fallback category cannot be archived",
+        )
+    # The set this request archives, computed before any stamping.
+    subcategories = session.scalars(
+        select(Category).where(
+            Category.parent_id == category_id,
+            Category.user_id == user_id,
+            Category.archived_at.is_(None),
+        )
+    ).all()
+    archived_ids = {category_id, *(sub.id for sub in subcategories)}
+    if reassign_to is not None:
+        if reassign_to not in validate_category_ids(
+            session, category_ids=[reassign_to], user_id=user_id, kind=category.kind
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="reassign target not found, archived, or a different kind",
+            )
+        if reassign_to in archived_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="cannot reassign to a category being archived",
+            )
     # naive_utcnow, not utcnow — this is written and later read back /
     # compared (see `archived_at IS NULL` filters app-wide); an aware value
     # would assignment-cast through the server's TimeZone on Postgres v2 and
@@ -296,28 +421,38 @@ def delete_category(
     now = clock.naive_utcnow()
     category.archived_at = now
 
-    # Also archive any active subcategories if a parent is archived — EXCEPT the
-    # kind's fallback bucket. `demo_seed._categories_by_kind` requires an active
-    # "Other" per kind and RAISES without one, and archiving is one-way: nothing
-    # in the API or UI clears `archived_at` (`CategoryUpdate` has no such field
-    # and PATCH 404s on an archived row). So a user archiving `Income` — whose
-    # child the income "Other" is — took the fallback with it and broke demo
-    # seeding on every later startup, permanently, without ever naming it.
-    # Exempting it leaves an active child under an archived parent, which is
-    # already a handled state: `list_categories` promotes such a child to root
-    # (see the tree-view comment above), as does the frontend `buildCategoryTree`.
-    # A direct DELETE of the fallback itself is still honoured — that is an
-    # explicit act on that category, not a silent side effect of archiving another.
-    subcategories = session.scalars(
-        select(Category).where(
-            Category.parent_id == category_id,
-            Category.user_id == user_id,
-            Category.archived_at.is_(None),
-            Category.name != FALLBACK_CATEGORY_NAME,
-        )
-    ).all()
+    # Archiving a parent archives all its active subcategories with the same stamp,
+    # no exceptions (ADR-0012 rule 9). The fallback "Other" is a root that can never
+    # be given a parent, so it is never caught here.
     for sub in subcategories:
         sub.archived_at = now
+
+    if reassign_to is not None:
+        rows = session.scalars(
+            confirmed_only(
+                select(Transaction).where(
+                    Transaction.user_id == user_id,
+                    Transaction.category_id.in_(archived_ids),
+                )
+            )
+        ).all()
+        bulk_categorise(
+            session,
+            user_id=user_id,
+            rows=rows,
+            category_id=reassign_to,
+            resolver=load_alias_resolver(session, user_id=user_id),
+        )
+        # ADR-0012 rule 10: a linked leg's saved pre-link category is rewritten like a live
+        # one. category_id stays NULL on those rows, so the CHECK holds; nothing is taught.
+        session.execute(
+            update(Transaction)
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.pre_link_category_id.in_(archived_ids),
+            )
+            .values(pre_link_category_id=reassign_to)
+        )
 
     session.commit()
     return None

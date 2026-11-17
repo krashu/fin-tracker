@@ -7,15 +7,17 @@ categories to tag against.
 
 This is the **runtime source of truth** for that default set, and since
 [ADR-0012](../../../docs/adr/0012-category-hierarchy.md) that set is a *two-level
-taxonomy*, not a flat list: ``_DEFAULT_SPEND_TAXONOMY`` (9 parents) and
-``_DEFAULT_INCOME_TAXONOMY`` (1 parent, "Income"), each parent carrying its hex
-and **every subcategory carrying ``color=None``** so it inherits the parent's hue
-(PRD §F5). Migration ``0034_seed_category_taxonomy`` brings an existing user to
-the same shape by reparenting the old flat defaults, and
+taxonomy*, not a flat list: ``_DEFAULT_SPEND_TAXONOMY`` and
+``_DEFAULT_INCOME_TAXONOMY``, each root carrying its hex and **every subcategory
+carrying ``color=None``** so it inherits the parent's hue (PRD §F5). Each kind has
+a root fallback "Other" (ADR-0012 rule 8). Migrations ``0034_seed_category_taxonomy``
+and ``0039_fallback_roots_and_cashback_spend`` bring an existing user to the same
+shape, and
 ``tests/test_migration_parity.py::test_provisioning_matches_migration_seed``
 polices the two staying in agreement — including colour, which no other test
 pins. Migrations stay frozen snapshots and never import this module; only
-:mod:`app.services.auth_service` (register) calls it.
+:mod:`app.services.auth_service` (register) and :mod:`app.services.guest_service` (guest
+sandbox) call it.
 
 Also the runtime source of truth for the seed *merchant* dictionary (merchant-
 alias arc, Phase A5 — research §13.6): ~96 seed ``(pattern, canonical,
@@ -129,11 +131,16 @@ _DEFAULT_SPEND_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "#c23b6b",
         (
             "EMI",
-            "Credit Card Payments",
             "Loan EMIs & Repayments",
             "Home & Personal Loans",
             "Shared Expenses & Splits",
         ),
+    ),
+    # Purchase cashback is a rebate on spending, so it is spend-kind (ADR-0013).
+    (
+        "Cashback",
+        "#c98500",
+        (),
     ),
     (
         "Other",
@@ -149,11 +156,14 @@ _DEFAULT_INCOME_TAXONOMY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "Salary",
             "Freelancing",
-            "Cashback",
             "Investment Returns",
             "Rental Income",
-            "Other",
         ),
+    ),
+    (
+        "Other",
+        "#94a3b8",
+        (),
     ),
 )
 
@@ -288,6 +298,38 @@ _MERCHANT_DICTIONARY: tuple[tuple[str, str, str], ...] = (
     ("pvr", "pvr", "Entertainment"),
 )
 
+# Payment-gateway fallback (ADR-0011 rule 12: "the PSP list beside the seed dictionary").
+# Code, not alias rows: applied only when no alias matches, and never seeded. The entries
+# come from general knowledge of Indian UPI handles, not from measured statements; every
+# entry has a literal example in tests/services/test_merchant_alias.py, and a test fails if
+# one is added without it. Reopen when a bank parser emits a clean payee field (ADR-0011
+# Consequences).
+PAYMENT_GATEWAYS: tuple[str, ...] = ("razorpay", "cashfree", "payu", "billdesk", "ccavenue")
+# (regex fully matching a VPA local part, issuer; None means use the handle's own PSP name)
+UPI_QR_IDS: tuple[tuple[str, str | None], ...] = (
+    (r"paytmqr[a-z0-9]{6,}", "paytm"),
+    (r"q[0-9]{6,}", None),
+    (r"bharatpe[._]?[0-9]{6,}", "bharatpe"),
+)
+# (UPI handle after the "@", the app that issues it)
+PSP_HANDLES: tuple[tuple[str, str], ...] = (
+    ("ybl", "phonepe"),
+    ("ibl", "phonepe"),
+    ("axl", "phonepe"),
+    ("paytm", "paytm"),
+    ("ptyes", "paytm"),
+    ("ptaxis", "paytm"),
+    ("pthdfc", "paytm"),
+    ("ptsbi", "paytm"),
+    ("okaxis", "google pay"),
+    ("okhdfcbank", "google pay"),
+    ("okicici", "google pay"),
+    ("oksbi", "google pay"),
+    ("apl", "amazon pay"),
+    ("fbpe", "bharatpe"),
+    ("upi", "bhim"),
+)
+
 
 def provision_default_categories(session: Session, user_id: UUID) -> None:
     """Insert the default spend + income 2-level category taxonomy for ``user_id``.
@@ -380,8 +422,8 @@ def provision_seed_merchant_dictionary(session: Session, user_id: UUID) -> None:
     Skips — never merges, never bumps — any ``(user_id, pattern)`` already in
     ``merchant_alias`` and any ``(user_id, canonical, category_id)`` already in
     ``merchant_tag_map``. A seed must never disturb a learned or user-authored row: the demo
-    user's :mod:`app.core.demo_data` teaches several of these exact brands already, at real
-    hit_counts, via the ordinary :func:`app.services.tag_service.record_tag` path.
+    user's :mod:`app.core.demo_data` writes several of these exact brands' rule rows at real
+    hit_counts directly (``demo_seed._write_demo_rule_rows``, raising a seed row's count).
 
     A dictionary entry naming a category that isn't in this user's active provisioned set
     (renamed or archived before this ran — ``uq_categories_active_user_name`` is a *partial*

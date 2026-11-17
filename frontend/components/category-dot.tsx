@@ -3,17 +3,13 @@ import { cn } from "@/lib/utils";
 import type { CategoryColor } from "@/lib/api/client";
 
 /**
- * A small colored dot keying a category by its color (see `categoryColorVar`):
- * a user-picked `color` token if given, else the color derived from the id.
- * Decorative — `aria-hidden`, the category name carries the meaning.
- * `categoryId={null}` (uncategorized) renders a neutral muted dot.
+ * A small colored dot keying a category by its server-resolved `display_color`; `null`
+ * (uncategorised, or an id with no colour in hand) renders a neutral muted dot. Never
+ * derived from the id. Decorative — `aria-hidden`, the category name carries the meaning.
  *
- * Pass `color` wherever the full category is in hand (its picked token); omit it
- * where only the id is available (archived category, no lookup) and the dot
- * falls back to the derived color. Used wherever a category name appears so the
- * same color recurs on the spend-by-category bar, the board row, and the
- * settings list. NOT used in the import review TagPicker, whose dot encodes F3
- * confidence (a different signal).
+ * Used wherever a category name appears so the same colour recurs on the spend-by-category
+ * bar, the board row, and the settings list. NOT used in the import review TagPicker, whose
+ * dot encodes F3 confidence (a different signal).
  */
 export function CategoryDot({
   categoryId,

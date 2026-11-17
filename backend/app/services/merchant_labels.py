@@ -32,10 +32,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.core.db_errors import is_unique_violation, savepoint_insert
+from app.core.db_errors import insert_or_increment, is_unique_violation, savepoint_insert
 from app.core.log_config import get_logger
 from app.models import Label, MerchantLabelMap
-from app.services.merchant_alias import AliasResolver
+from app.services.merchant_alias import AliasResolver, is_unknown_via
 from app.services.tag_service import record_tag, should_learn_tag
 
 logger = get_logger(__name__)
@@ -90,8 +90,9 @@ def prefetch_label_map(
     With ``EMPTY_RESOLVER``, ``canonical(m) == m`` and the map's
     ``UniqueConstraint(user_id, merchant_normalized, label_id)`` guarantees at
     most one row per ``(user, merchant, label)`` — so every group has exactly
-    one member and this reduces to the original per-row filter,
-    byte-identical to pre-alias behaviour.
+    one member and this reduces to the original per-row filter, identical to the
+    pre-alias pick, except keys that resolve to an unknown-via canonical, which are
+    skipped (ADR-0011 rule 12).
     """
     stmt = (
         select(
@@ -109,6 +110,8 @@ def prefetch_label_map(
     sums: dict[str, dict[int, tuple[int, bool]]] = {}
     for merchant_normalized, label_id, hit_count, pinned in session.execute(stmt):
         canonical = resolver.canonical(merchant_normalized)
+        if is_unknown_via(canonical):
+            continue  # a gateway handle names no merchant (ADR-0011 rule 12)
         by_label = sums.setdefault(canonical, {})
         prev_count, prev_pinned = by_label.get(label_id, (0, False))
         by_label[label_id] = (prev_count + hit_count, prev_pinned or pinned)
@@ -154,73 +157,51 @@ def record_label(
     """Upsert a (user, merchant, label) row: insert or bump hit_count + last_used.
 
     No-op on empty merchant string (a blank-merchant row shouldn't pollute the
-    map). Caller owns the commit.
-
-    Race handling / asymmetric flush mirror ``tag_service.record_tag`` exactly:
-    the INSERT runs in a ``begin_nested()`` SAVEPOINT so a concurrent-insert
-    ``IntegrityError`` rolls back only the insert (caller-side pending state
-    survives), then the winner is refetched and bumped. For the Postgres v2 swap see
-    :func:`app.core.db_errors.savepoint_insert` — it is not a single edit, and that
-    docstring is the one place scoping it.
+    map). Caller owns the commit. One ``INSERT … ON CONFLICT DO UPDATE`` statement,
+    exactly as :func:`app.services.tag_service.record_tag`.
     """
     if not merchant_normalized:
         return
 
-    existing = session.scalar(
-        select(MerchantLabelMap).where(
-            MerchantLabelMap.user_id == user_id,
-            MerchantLabelMap.merchant_normalized == merchant_normalized,
-            MerchantLabelMap.label_id == label_id,
-        )
-    )
-    if existing is not None:
-        existing.hit_count += 1
-        existing.last_used = clock.naive_utcnow()
-        return
-
-    # savepoint_insert mirrors record_tag: True → inserted; False → the
-    # (user, merchant, label) uniqueness violation, rolled back — refetch + bump.
-    if not savepoint_insert(
+    now = clock.naive_utcnow()
+    insert_or_increment(
         session,
-        MerchantLabelMap(
-            user_id=user_id,
-            merchant_normalized=merchant_normalized,
-            label_id=label_id,
-        ),
-        is_conflict=_is_merchant_label_conflict,
-    ):
-        winner = session.scalar(
-            select(MerchantLabelMap).where(
-                MerchantLabelMap.user_id == user_id,
-                MerchantLabelMap.merchant_normalized == merchant_normalized,
-                MerchantLabelMap.label_id == label_id,
-            )
-        )
-        if winner is None:
-            # The refetch should always find the row the unique constraint just
-            # collided with. A miss means the decision is being lost — surface it
-            # (PII: never log merchant_normalized; it can carry names).
-            logger.warning(
-                "record_label_conflict_no_winner",
-                user_id=str(user_id),
-                label_id=label_id,
-            )
-            return
-        winner.hit_count += 1
-        winner.last_used = clock.naive_utcnow()
+        MerchantLabelMap,
+        values={
+            "user_id": user_id,
+            "merchant_normalized": merchant_normalized,
+            "label_id": label_id,
+            "hit_count": 1,
+            "last_used": now,
+        },
+        conflict_cols=["user_id", "merchant_normalized", "label_id"],
+        counter="hit_count",
+        touch={"last_used": now, "updated_at": now},
+        label="merchant_label_map",
+    )
 
 
 def learn_merchant_memory(
     session: Session,
     *,
     user_id: UUID,
+    resolver: AliasResolver,
     merchant_normalized: str,
     transaction_type: str,
     category_id: int | None = None,
     label_ids: Iterable[int] = (),
-) -> None:
+) -> bool:
     """Teach merchant→category (F3) and merchant→label (F3a) from one confirmed
     spend-type decision, behind the single :func:`should_learn_tag` gate.
+
+    Returns ``True`` iff the gate passed (a bulk gesture counts these as the
+    merchants it taught); a gateway-handle canonical never passes (ADR-0011 rule 12).
+
+    Writes the **canonical** merchant (ADR-0004 rule 1): ``merchant_normalized`` is
+    folded through ``resolver`` first, so the map key is the same one the read side
+    (``prefetch_*``) aggregates on. ``resolver`` is required, never defaulted — the
+    ``prefetch_tag_map`` pattern (ADR-0011 rule 8). The ``merchant_normalized``
+    *column* keeps its name but holds the canonical for new teaches.
 
     De-dups the gate + loop that ``create_transaction``, ``update_transaction``,
     and the demo seeder each hand-rolled (a divergence that already let one write
@@ -235,24 +216,24 @@ def learn_merchant_memory(
     callers pass ids derived from :func:`resolve_label_names` or a diff set, both
     already unique.
     """
-    if not should_learn_tag(
-        transaction_type=transaction_type, merchant_normalized=merchant_normalized
-    ):
-        return
+    canonical = resolver.canonical(merchant_normalized)
+    if not should_learn_tag(transaction_type=transaction_type, merchant_normalized=canonical):
+        return False
     if category_id is not None:
         record_tag(
             session,
             user_id=user_id,
-            merchant_normalized=merchant_normalized,
+            merchant_normalized=canonical,
             category_id=category_id,
         )
     for label_id in label_ids:
         record_label(
             session,
             user_id=user_id,
-            merchant_normalized=merchant_normalized,
+            merchant_normalized=canonical,
             label_id=label_id,
         )
+    return True
 
 
 def pin_label(

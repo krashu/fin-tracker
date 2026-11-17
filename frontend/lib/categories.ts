@@ -24,61 +24,14 @@ export const CATEGORY_KIND_LABELS: Record<CategoryKind, string> = {
   income: "Income",
 };
 
-/** CSS color value for a category's dot/bar/swatch. Color is purely the user's
- * choice (a `#rrggbb` hex picked in settings) — there is no auto-generated or
- * derived default. A category with no chosen color (and the uncategorized
- * bucket) renders a neutral muted dot. The `id` arg is unused (kept for a
- * stable call signature across the dots/bars). */
+/** CSS colour for a server-resolved category colour (`display_color`, or a trend series
+ * `color`); `null`/absent (uncategorised) renders `--muted-foreground`. The `id` arg is
+ * unused. */
 export function categoryColorVar(
   _id: number | null,
   color?: CategoryColor | null,
 ): string {
   return color ?? "var(--muted-foreground)";
-}
-
-/** Curated categorical swatch palette for category colors. The picker offers
- * exactly these; a freeform picker is overkill for tagging and risks clashing /
- * low-contrast colors.
- *
- * The order is load-bearing, not cosmetic: `nextCategoryColor` hands out slots
- * in sequence, and a chart colours its series in the same order, so array
- * neighbours are visual neighbours. This order is validated (OKLab CVD/contrast,
- * both light `#ffffff` and dark `#171c22` surfaces) — every adjacent pair clears
- * the ≥8 CVD target and the ≥15 normal-vision floor in both modes. The first
- * eight hues are additionally a fully CVD-safe categorical set on their own (the
- * method's guaranteed ceiling); the remaining six extend the picker for finance's
- * many categories and stay adjacent-safe, but past eight *simultaneously* shown
- * series lean on the direct labels the spend-by-category view already draws.
- * A single hex per slot renders in both themes (categories store one colour);
- * these were tuned to clear both surfaces, so don't "brighten" them per-theme. */
-export const CATEGORY_PALETTE: readonly CategoryColor[] = [
-  "#2a78d6", // blue
-  "#008300", // green
-  "#d55181", // magenta
-  "#c98500", // amber
-  "#1baf7a", // aqua
-  "#d95926", // orange
-  "#6c5cd6", // violet
-  "#e34948", // red
-  "#0e97c4", // cyan
-  "#c23b6b", // raspberry
-  "#6f9e15", // lime
-  "#b246c0", // purple
-  "#a9682f", // brown
-  "#0e9488", // teal
-];
-
-/** The first palette color not already used by an existing category, so a new
- * category gets a distinct hue automatically (no picking required). Wraps once
- * there are more categories than palette entries. */
-export function nextCategoryColor(
-  used: readonly (CategoryColor | null)[],
-): CategoryColor {
-  const taken = new Set(used.filter((c): c is CategoryColor => c != null));
-  return (
-    CATEGORY_PALETTE.find((c) => !taken.has(c)) ??
-    CATEGORY_PALETTE[taken.size % CATEGORY_PALETTE.length]
-  );
 }
 
 export type CategoryTreeNode = CategoryRead & {
@@ -145,146 +98,8 @@ function ensureCategoryMap(
   return new Map(lookup.map((c) => [c.id, c]));
 }
 
-/** Resolve category color with inheritance: if a subcategory has no explicit color,
- * it inherits its parent category's color. */
-export function resolveCategoryColor(
-  category: CategoryRead | null | undefined,
-  lookup: Map<number, CategoryRead> | readonly CategoryRead[],
-): CategoryColor | null {
-  if (!category) return null;
-  if (category.color) return category.color;
-  if (category.parent_id != null) {
-    const map = ensureCategoryMap(lookup);
-    const parent = map.get(category.parent_id);
-    if (parent?.color) return parent.color;
-  }
-  return null;
-}
-
-function hexToRgb(hex: string): [number, number, number] {
-  const n = parseInt(hex.replace("#", ""), 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-function rgbToHex(r: number, g: number, b: number): CategoryColor {
-  const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
-  return `#${[r, g, b].map((v) => clamp(v).toString(16).padStart(2, "0")).join("")}`;
-}
-
-function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
-  const rn = r / 255;
-  const gn = g / 255;
-  const bn = b / 255;
-  const max = Math.max(rn, gn, bn);
-  const min = Math.min(rn, gn, bn);
-  const l = (max + min) / 2;
-  const d = max - min;
-  if (d === 0) return [0, 0, l];
-  const s = d / (1 - Math.abs(2 * l - 1));
-  let h: number;
-  if (max === rn) h = ((gn - bn) / d) % 6;
-  else if (max === gn) h = (bn - rn) / d + 2;
-  else h = (rn - gn) / d + 4;
-  h *= 60;
-  if (h < 0) h += 360;
-  return [h, s, l];
-}
-
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
-  const m = l - c / 2;
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  if (h < 60) [r, g, b] = [c, x, 0];
-  else if (h < 120) [r, g, b] = [x, c, 0];
-  else if (h < 180) [r, g, b] = [0, c, x];
-  else if (h < 240) [r, g, b] = [0, x, c];
-  else if (h < 300) [r, g, b] = [x, 0, c];
-  else [r, g, b] = [c, 0, x];
-  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
-}
-
-/** Fixed HSL-lightness deltas, cycled by sibling index. Symmetric around 0 so
- * early siblings don't all skew lighter (or darker) in the same direction;
- * six entries cover the seeded taxonomy's largest sibling groups without a
- * repeat, and the cycle repeats past that rather than growing unboundedly. */
-const SHADE_LIGHTNESS_DELTA = [0, -0.16, 0.14, -0.28, 0.24, -0.08] as const;
-
-/**
- * A distinct shade of `parentHue` for the sibling at `siblingIndex` — locked
- * decision #5 (color inherits one hop; siblings are separated by a derived
- * shade of the parent hue, never an unrelated colour). Takes the *resolved*
- * hue (`resolveCategoryColor`'s output, never a raw `category.color`, which
- * can't inherit and renders grey for a `NULL` child — see `CategoryDot`) and
- * varies HSL lightness by a fixed per-index delta, clamped well clear of
- * white/black so the result still reads as the same family. Purely a display
- * derivation: never stored, never round-tripped through the API.
- *
- * `resolveCategoryColor` itself is untouched by this — it keeps returning the
- * plain family hue for a lone dot (e.g. the board row, one transaction at a
- * time). Apply this shade only where two siblings render side by side: a flat
- * list, a drilldown, a dropdown.
- */
-export function siblingShade(
-  parentHue: CategoryColor,
-  siblingIndex: number,
-): CategoryColor {
-  const [r, g, b] = hexToRgb(parentHue);
-  const [h, s, l] = rgbToHsl(r, g, b);
-  const delta =
-    SHADE_LIGHTNESS_DELTA[
-      ((siblingIndex % SHADE_LIGHTNESS_DELTA.length) +
-        SHADE_LIGHTNESS_DELTA.length) %
-        SHADE_LIGHTNESS_DELTA.length
-    ];
-  const shadedL = Math.min(0.82, Math.max(0.18, l + delta));
-  const [nr, ng, nb] = hslToRgb(h, s, shadedL);
-  return rgbToHex(nr, ng, nb);
-}
-
-/**
- * Safely derives a shade for a subcategory within a hierarchical chart.
- * If the parent has no hex color (e.g. Uncategorized or CSS variable),
- * it safely falls back to a neutral CSS variable.
- */
-export function deriveSubcategoryColor(
-  parentHue: CategoryColor | string | null | undefined,
-  siblingIndex: number,
-  _totalSiblings?: number,
-): string {
-  if (!parentHue || !parentHue.startsWith("#")) {
-    return "var(--muted-foreground)";
-  }
-  return siblingShade(parentHue as CategoryColor, siblingIndex);
-}
-
-
-/**
- * Resolve the *display* color for a category shown alongside its siblings —
- * `resolveCategoryColor`'s hue, shaded by `siblingShade` when the category is
- * an inheriting child (no color of its own, per locked decision #5's `NULL`
- * seed). A root, or a child carrying its own explicit color, renders as-is —
- * only the inherited case needs separating from its siblings. The sibling
- * index is derived from `allCategories` sorted by id, not from the order rows
- * happen to appear in a particular query result, so a category's shade stays
- * the same across periods and views.
- */
-export function resolveSiblingDisplayColor(
-  category: CategoryRead | null | undefined,
-  allCategories: readonly CategoryRead[],
-): CategoryColor | null {
-  if (!category) return null;
-  const resolved = resolveCategoryColor(category, ensureCategoryMap(allCategories));
-  if (!resolved) return null;
-  if (category.color || category.parent_id == null) return resolved;
-  const siblings = allCategories
-    .filter((c) => c.parent_id === category.parent_id)
-    .sort((a, b) => a.id - b.id);
-  const index = siblings.findIndex((c) => c.id === category.id);
-  return siblingShade(resolved, index < 0 ? 0 : index);
-}
+/** What an id with no name on the wire (and no active row) is called. */
+const ARCHIVED_CATEGORY_LABEL = "Archived category";
 
 /** Display label for a category **id**, tolerating an ARCHIVED category.
  *
@@ -303,8 +118,9 @@ export function resolveSiblingDisplayColor(
  *
  * Callers with a denormalized name on the wire: `TransactionRead`
  * (`category_name` + `category_parent_name`, so an archived row keeps its
- * breadcrumb), `SpendByCategoryRow.category_name` and
- * `SpendCategoryRef.category_name` (own name only — those aggregates carry no
+ * breadcrumb), `SpendByCategoryRow` (`category_name` +
+ * `parent_name`, so an archived subcategory keeps its breadcrumb) and
+ * `CategoryTrendSubcategory.category_name` (own name only — that aggregate carries no
  * parent, so an archived row there renders unqualified). All are joined on
  * id + `user_id`, deliberately never `archived_at`.
  *
@@ -324,7 +140,7 @@ export function categoryLabel(
   // Active rows resolve through the live list, never the stored copy, so a
   // rename shows up without refetching every transaction that references it.
   if (category) return categoryDisplayName(category, map);
-  if (!storedName) return "Archived category";
+  if (!storedName) return ARCHIVED_CATEGORY_LABEL;
   return storedParentName ? `${storedParentName} → ${storedName}` : storedName;
 }
 
@@ -410,16 +226,19 @@ export type ParentSpendRollup = {
 
 /**
  * Roll up a flat list of `SpendByCategoryRow` into parent categories based on
- * the 2-level taxonomy. If a row belongs to a subcategory, its total is added to
- * the parent's total and recorded in the parent's `subcategories` list.
+ * the 2-level taxonomy. A row with a `parent_id` is a subcategory: its total is
+ * added to the parent's total and recorded in the parent's `subcategories` list.
  * Any spend assigned directly to the parent category is tracked as directPaise.
  * Uncategorized spend is preserved with `parentId: null`.
+ *
+ * Works from the rows alone (ADR-0012 rule 6): each row carries its own
+ * `parent_id` / `parent_name` whatever the archive state, so an archived
+ * subcategory still rolls up under its parent, which the active-only category
+ * list could not place.
  */
 export function rollUpSpendByCategory(
   rows: readonly SpendByCategoryRow[],
-  allCategories: readonly CategoryRead[],
 ): ParentSpendRollup[] {
-  const catMap = ensureCategoryMap(allCategories);
   const rollupMap = new Map<number | null, ParentSpendRollup>();
 
   for (const row of rows) {
@@ -438,48 +257,29 @@ export function rollUpSpendByCategory(
       continue;
     }
 
-    const cat = catMap.get(row.category_id);
-    if (!cat) {
-      // Category not found in lookup: treat as its own parent
-      const existing = rollupMap.get(row.category_id) ?? {
-        parentId: row.category_id,
-        parentName: row.category_name,
-        totalPaise: 0,
-        directPaise: 0,
-        subcategories: [],
-      };
-      existing.totalPaise += row.total_paise;
-      existing.directPaise += row.total_paise;
-      rollupMap.set(row.category_id, existing);
-      continue;
-    }
-
-    if (cat.parent_id != null) {
+    if (row.parent_id != null) {
       // Subcategory: roll up to parent
-      const parent = catMap.get(cat.parent_id);
-      const pId = cat.parent_id;
-      const pName = parent ? parent.name : (row.category_name ?? "Parent");
+      const pId = row.parent_id;
       const existing = rollupMap.get(pId) ?? {
         parentId: pId,
-        parentName: pName,
+        parentName: row.parent_name ?? ARCHIVED_CATEGORY_LABEL,
         totalPaise: 0,
         directPaise: 0,
         subcategories: [],
       };
       existing.totalPaise += row.total_paise;
       existing.subcategories.push({
-        categoryId: cat.id,
-        categoryName: cat.name,
+        categoryId: row.category_id,
+        categoryName: row.category_name ?? ARCHIVED_CATEGORY_LABEL,
         totalPaise: row.total_paise,
       });
       rollupMap.set(pId, existing);
     } else {
-      // Direct spend on parent category
-      const pId = cat.id;
-      const pName = cat.name;
+      // Direct spend on a root category
+      const pId = row.category_id;
       const existing = rollupMap.get(pId) ?? {
         parentId: pId,
-        parentName: pName,
+        parentName: row.category_name ?? ARCHIVED_CATEGORY_LABEL,
         totalPaise: 0,
         directPaise: 0,
         subcategories: [],
@@ -522,29 +322,30 @@ export function rollUpSpendByCategory(
 
 /**
  * Get subcategory breakdown items for a specific parent category, including
- * a direct spend entry if there was spend directly on the parent.
+ * a direct spend entry if there was spend directly on the parent. Like
+ * `rollUpSpendByCategory`, it matches on the row's own `parent_id`, so an
+ * archived subcategory is listed too.
  */
 export function getParentSubcategorySpend(
   rows: readonly SpendByCategoryRow[],
   parentId: number,
-  allCategories: readonly CategoryRead[],
 ): SubcategorySpendItem[] {
-  const catMap = ensureCategoryMap(allCategories);
-  const parent = catMap.get(parentId);
   const items: SubcategorySpendItem[] = [];
   let directPaise = 0;
+  let parentName: string | null = null;
 
   for (const row of rows) {
     if (row.category_id == null) continue;
     if (row.category_id === parentId) {
       directPaise += row.total_paise;
+      parentName = row.category_name;
       continue;
     }
-    const cat = catMap.get(row.category_id);
-    if (cat && cat.parent_id === parentId) {
+    if (row.parent_id === parentId) {
+      parentName ??= row.parent_name;
       items.push({
-        categoryId: cat.id,
-        categoryName: cat.name,
+        categoryId: row.category_id,
+        categoryName: row.category_name ?? ARCHIVED_CATEGORY_LABEL,
         totalPaise: row.total_paise,
       });
     }
@@ -554,7 +355,7 @@ export function getParentSubcategorySpend(
   if (directPaise !== 0) {
     items.push({
       categoryId: parentId,
-      categoryName: `${parent?.name ?? "General"} (Direct)`,
+      categoryName: `${parentName ?? "General"} (Direct)`,
       totalPaise: directPaise,
       isDirect: true,
     });

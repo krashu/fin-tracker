@@ -9,7 +9,7 @@ Covers:
   strength, not just the winner.
 * :func:`_aggregate_tag_rows` / :func:`merchant_agg_winner_key` — the
   aggregation + ranking `prefetch_tag_map` is built from.
-* :func:`record_tag` — INSERT or hit_count+1 upsert with race recovery.
+* :func:`record_tag` — one-statement INSERT … ON CONFLICT DO UPDATE hit_count+1 upsert.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -33,10 +33,11 @@ from app.services.tag_service import (
     set_tag_pinned,
     should_learn_tag,
 )
+from tests.fk_bypass import foreign_keys_off
 
 
 def _make_category(session: Session, user_id: uuid.UUID, name: str) -> Category:
-    c = Category(user_id=user_id, name=name)
+    c = Category(color="#2a78d6", user_id=user_id, name=name)
     session.add(c)
     session.flush()
     return c
@@ -167,11 +168,9 @@ def test_prefetch_ignores_a_map_row_pointing_at_another_users_category(
 ) -> None:
     """The join restates ``Category.user_id``, not just ``MerchantTagMap.user_id``.
 
-    Storable precisely because ``merchant_tag_map.category_id`` is a plain
-    ``ForeignKey("categories.id")`` — unlike the sibling ``merchant_label_map``, which
-    carries ADR-0002's composite same-user FK and so is rejected by the DB rather than
-    filtered on read. That divergence is why ``prefetch_label_map`` needs no equivalent
-    predicate and this one does.
+    ADR-0003 rule 7. The composite same-user FK on ``merchant_tag_map.category_id``
+    (rule 10) refuses this row, so it is stored with FKs off: the read must hold on its
+    own, independently of the DB guarantee.
 
     Defence-in-depth, NOT a live leak: every write path into ``category_id`` validates
     ownership first (``create_category_rule`` via ``validate_category_ids``,
@@ -184,15 +183,15 @@ def test_prefetch_ignores_a_map_row_pointing_at_another_users_category(
     session.add(other)
     session.flush()
     theirs = _make_category(session, other.id, "TheirGroceries")
-    session.add(
-        MerchantTagMap(
-            user_id=user.id,  # our row...
-            merchant_normalized="bigbasket",
-            category_id=theirs.id,  # ...pointing at their category
-            hit_count=9,
+    with foreign_keys_off(session):
+        session.add(
+            MerchantTagMap(
+                user_id=user.id,  # our row...
+                merchant_normalized="bigbasket",
+                category_id=theirs.id,  # ...pointing at their category
+                hit_count=9,
+            )
         )
-    )
-    session.flush()
 
     assert prefetch_tag_map(session, user_id=user.id, resolver=EMPTY_RESOLVER) == {}
 
@@ -304,55 +303,18 @@ def test_record_tag_noop_on_empty_merchant(session: Session, user: User) -> None
 
 
 def test_record_tag_handles_concurrent_insert_race(
-    engine: Engine,
-    session: Session,
-    user: User,
-    monkeypatch: pytest.MonkeyPatch,
+    engine: Engine, session: Session, user: User
 ) -> None:
-    """Loser of the SELECT-then-INSERT race falls through to UPDATE.
+    """A row committed by another connection is bumped, not duplicated.
 
-    Simulating a real two-connection race against SQLite-with-StaticPool is
-    awkward — the writer lock serialises everything so the first SELECT
-    always sees the parallel session's committed row, taking the
-    "row exists, increment" path and skipping the IntegrityError branch.
-
-    Instead force the race window deterministically: pre-insert the row via
-    a parallel session, then patch ``session.scalar`` to return ``None`` on
-    the *first* call inside :func:`record_tag` (the existence probe). The
-    subsequent INSERT trips the uniqueness constraint, the except branch
-    rolls back, re-SELECTs (this time unpatched), and bumps ``hit_count``.
-
-    This is the v2 Postgres scenario: two workers, two connections, both
-    SELECT-miss, one INSERTs and commits, the other INSERTs and IntegrityErrors.
+    The two-connection race is not reproducible on SQLite-with-StaticPool (the writer
+    lock serialises it), but the upsert has no read-then-write window to lose: this
+    pins the observable outcome — one row, hit_count bumped — for a rule another
+    session committed first.
     """
     food = _make_category(session, user.id, "Food")
     session.commit()
-
-    other_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    other = other_factory()
-    try:
-        other.add(
-            MerchantTagMap(
-                user_id=user.id,
-                merchant_normalized="racy",
-                category_id=food.id,
-                hit_count=1,
-            )
-        )
-        other.commit()
-    finally:
-        other.close()
-
-    real_scalar = session.scalar
-    miss_remaining = [1]
-
-    def stubbed_scalar(*args: object, **kwargs: object) -> object:
-        if miss_remaining[0] > 0:
-            miss_remaining[0] -= 1
-            return None
-        return real_scalar(*args, **kwargs)
-
-    monkeypatch.setattr(session, "scalar", stubbed_scalar)
+    _preinsert_racy(engine, user, food.id)
 
     record_tag(
         session,
@@ -370,63 +332,21 @@ def test_record_tag_handles_concurrent_insert_race(
 
 
 def test_record_tag_race_preserves_caller_pending_state(
-    engine: Engine,
-    session: Session,
-    user: User,
-    monkeypatch: pytest.MonkeyPatch,
+    engine: Engine, session: Session, user: User
 ) -> None:
-    """Regression for the original silent-data-loss bug.
+    """record_tag leaves the caller's pending, unflushed state alone.
 
-    Before the savepoint fix, ``record_tag`` called ``session.rollback()``
-    on IntegrityError — which discards the *entire* parent transaction
-    including any pending mutations the caller had staged. The PATCH route's
-    ``setattr(txn, "category_id", new_id)`` would get reverted, the route
-    would commit only the tag-map bump, and the user's category change
-    would silently disappear.
-
-    Test shape: stage a pending mutation in the session, force the race
-    path inside ``record_tag``, then assert the staged mutation survives
-    the commit. Mirrors the PATCH route's session usage exactly — same
-    session, ``setattr`` before record_tag, single commit after.
+    Regression guard for the original silent-data-loss bug (a ``session.rollback()``
+    in the conflict path discarded the PATCH route's staged ``setattr``). The upsert
+    opens no SAVEPOINT and rolls nothing back, so a pending mutation staged before
+    the call must commit with it.
     """
     food = _make_category(session, user.id, "Food")
     session.commit()
+    _preinsert_racy(engine, user, food.id)
 
-    # Pre-insert via parallel session so the IntegrityError actually fires.
-    other_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    other = other_factory()
-    try:
-        other.add(
-            MerchantTagMap(
-                user_id=user.id,
-                merchant_normalized="racy",
-                category_id=food.id,
-                hit_count=1,
-            )
-        )
-        other.commit()
-    finally:
-        other.close()
-
-    # Stage caller-side pending state: a brand-new Category mutation. The
-    # PATCH route's setattr(txn, "category_id", ...) is the analogous case;
-    # using a fresh Category here keeps the test free of Transaction setup.
-    pending = Category(user_id=user.id, name="PendingMutation")
-    session.add(pending)
-    # NOTE: no flush — leave it pending so any rollback would discard it.
-
-    # Force the race window: stub session.scalar so record_tag's existence
-    # probe misses, triggering the INSERT-then-IntegrityError fallback.
-    real_scalar = session.scalar
-    miss_remaining = [1]
-
-    def stubbed_scalar(*args: object, **kwargs: object) -> object:
-        if miss_remaining[0] > 0:
-            miss_remaining[0] -= 1
-            return None
-        return real_scalar(*args, **kwargs)
-
-    monkeypatch.setattr(session, "scalar", stubbed_scalar)
+    pending = Category(color="#2a78d6", user_id=user.id, name="PendingMutation")
+    session.add(pending)  # no flush — any rollback would discard it
 
     record_tag(
         session,
@@ -436,13 +356,9 @@ def test_record_tag_race_preserves_caller_pending_state(
     )
     session.commit()
 
-    # The savepoint contract: the failed INSERT rolled back, but the
-    # caller's pending Category survived and was committed.
     assert pending.id is not None
     persisted = session.scalar(select(Category).where(Category.name == "PendingMutation"))
     assert persisted is not None
-
-    # And the tag-map row bumped correctly.
     rows = session.scalars(
         select(MerchantTagMap).where(MerchantTagMap.merchant_normalized == "racy")
     ).all()
@@ -453,9 +369,8 @@ def test_record_tag_race_preserves_caller_pending_state(
 def test_record_tag_repeated_bumps_accumulate(session: Session, user: User) -> None:
     """Two same-triple bumps on a pre-existing rule add +2, not +1.
 
-    Locks the read-modify-write increment (``hit_count += 1``) against a
-    regression to a deferred SQL-expression form, which under ``autoflush=False``
-    would collapse repeated same-instance bumps to a single +1.
+    Locks ADR-0004 rule 7 against a regression to a deferred increment, which under
+    ``autoflush=False`` would collapse repeated same-instance bumps to a single +1.
     """
     food = _make_category(session, user.id, "Food")
     session.add(
@@ -474,6 +389,49 @@ def test_record_tag_repeated_bumps_accumulate(session: Session, user: User) -> N
     )
     assert row is not None
     assert row.hit_count == 7  # 5 + 2
+
+
+def test_record_tag_increment_is_a_single_statement(
+    engine: Engine, session: Session, user: User
+) -> None:
+    """ADR-0004 rule 7: the bump is one ``INSERT … ON CONFLICT DO UPDATE``, no SELECT."""
+    food = _make_category(session, user.id, "Food")
+    session.add(
+        MerchantTagMap(
+            user_id=user.id, merchant_normalized="swiggy", category_id=food.id, hit_count=5
+        )
+    )
+    session.flush()
+
+    statements: list[str] = []
+
+    def capture(conn: object, cursor: object, statement: str, *rest: object) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        record_tag(session, user_id=user.id, merchant_normalized="swiggy", category_id=food.id)
+        assert len(statements) == 1
+        sql = statements[0].upper()
+        assert sql.startswith("INSERT INTO MERCHANT_TAG_MAP")
+        assert "ON CONFLICT" in sql
+        assert "DO UPDATE" in sql
+        assert "SELECT" not in sql.split("RETURNING")[0]
+        row = session.scalar(select(MerchantTagMap))
+        assert row is not None
+        assert row.hit_count == 6
+
+        # Missing-row case: still exactly one statement, row lands at 1.
+        statements.clear()
+        record_tag(session, user_id=user.id, merchant_normalized="zomato", category_id=food.id)
+        assert len(statements) == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    zomato = session.scalar(
+        select(MerchantTagMap).where(MerchantTagMap.merchant_normalized == "zomato")
+    )
+    assert zomato is not None
+    assert zomato.hit_count == 1
 
 
 # ---------- should_learn_tag ----------------------------------------------
@@ -529,51 +487,10 @@ def _stub_scalar_misses(session: Session, monkeypatch: pytest.MonkeyPatch, misse
     monkeypatch.setattr(session, "scalar", stubbed)
 
 
-def test_record_tag_reraises_unexpected_integrity_error(
-    engine: Engine,
-    session: Session,
-    user: User,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A non-(user,merchant,category) IntegrityError propagates, not swallowed.
-
-    The over-broad ``except IntegrityError`` previously dropped the user's tag
-    silently on ANY integrity failure. We simulate an "unexpected" error by
-    forcing the conflict predicate to reject the (real, uq) error; record_tag
-    must re-raise rather than no-op.
-    """
-    food = _make_category(session, user.id, "Food")
-    session.commit()
-    _preinsert_racy(engine, user, food.id)
-
-    _stub_scalar_misses(session, monkeypatch, 1)  # probe misses → INSERT fires
-    monkeypatch.setattr(tag_service, "_is_merchant_tag_conflict", lambda orig: False)
-
+def test_record_tag_reraises_unexpected_integrity_error(session: Session, user: User) -> None:
+    """A non-conflict IntegrityError (FK to a nonexistent category) propagates."""
     with pytest.raises(IntegrityError):
-        record_tag(session, user_id=user.id, merchant_normalized="racy", category_id=food.id)
-
-
-def test_record_tag_conflict_no_winner_returns_without_raising(
-    engine: Engine,
-    session: Session,
-    user: User,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the post-conflict refetch finds no winner, record_tag logs and returns
-    (no bump, no crash) instead of dereferencing None."""
-    food = _make_category(session, user.id, "Food")
-    session.commit()
-    _preinsert_racy(engine, user, food.id)
-
-    # Miss on BOTH the existence probe and the post-conflict refetch.
-    _stub_scalar_misses(session, monkeypatch, 2)
-
-    # Returns cleanly (no exception); the pre-existing rule is left untouched.
-    record_tag(session, user_id=user.id, merchant_normalized="racy", category_id=food.id)
-
-    row = session.scalar(select(MerchantTagMap).where(MerchantTagMap.merchant_normalized == "racy"))
-    assert row is not None
-    assert row.hit_count == 1  # unchanged — no bump applied
+        record_tag(session, user_id=user.id, merchant_normalized="racy", category_id=999_999)
 
 
 # ---------- pin_tag / set_tag_pinned (F3 rule authoring) ------------------
@@ -954,3 +871,97 @@ def test_record_tag_bump_preserves_pinned(session: Session, user: User) -> None:
     assert row is not None
     assert row.pinned is True
     assert row.hit_count == 2  # 1 (authored floor) + 1 (learned)
+
+
+# ---------- A36: learning writes the canonical key (ADR-0004 rule 1) -------
+
+
+def test_learn_writes_the_canonical_key(session: Session, user: User) -> None:
+    """A teach on a raw descriptor lands on the alias canonical, never the raw string."""
+    from app.models import Label, MerchantLabelMap
+    from app.services.merchant_alias import build_resolver
+    from app.services.merchant_labels import learn_merchant_memory
+
+    resolver = build_resolver([("swiggy", "swiggy")])
+    food = _make_category(session, user.id, "Food")
+    lbl = Label(user_id=user.id, name="online")
+    session.add(lbl)
+    session.flush()
+
+    learn_merchant_memory(
+        session,
+        user_id=user.id,
+        resolver=resolver,
+        merchant_normalized="upi swiggy 12345",
+        transaction_type="spend",
+        category_id=food.id,
+        label_ids=[lbl.id],
+    )
+    session.flush()
+
+    tags = session.scalars(select(MerchantTagMap)).all()
+    assert [(t.merchant_normalized, t.hit_count) for t in tags] == [("swiggy", 1)]
+    labels = session.scalars(select(MerchantLabelMap)).all()
+    assert [(m.merchant_normalized, m.hit_count) for m in labels] == [("swiggy", 1)]
+
+
+# ---------- unknown-via canonicals (ADR-0011 rule 12) ------------------------
+
+
+def test_unknown_via_canonical_is_never_taught(session: Session, user: User) -> None:
+    from app.models import Label, MerchantLabelMap
+    from app.services.merchant_alias import build_resolver
+    from app.services.merchant_labels import learn_merchant_memory
+
+    food = _make_category(session, user.id, "Food")
+    lbl = Label(user_id=user.id, name="online")
+    session.add(lbl)
+    session.flush()
+    resolver = build_resolver([])
+
+    taught = learn_merchant_memory(
+        session,
+        user_id=user.id,
+        resolver=resolver,
+        merchant_normalized="upi/9876543210@ybl",
+        transaction_type="spend",
+        category_id=food.id,
+        label_ids=[lbl.id],
+    )
+    session.flush()
+    assert taught is False
+    assert session.scalars(select(MerchantTagMap)).all() == []
+    assert session.scalars(select(MerchantLabelMap)).all() == []
+
+    # Counter-check: a VPA that names someone still teaches.
+    assert (
+        learn_merchant_memory(
+            session,
+            user_id=user.id,
+            resolver=resolver,
+            merchant_normalized="upi/zomatoonline@paytm",
+            transaction_type="spend",
+            category_id=food.id,
+        )
+        is True
+    )
+    session.flush()
+    assert len(session.scalars(select(MerchantTagMap)).all()) == 1
+
+
+def test_prefetch_skips_unknown_via_groups(session: Session, user: User) -> None:
+    from app.services.merchant_alias import build_resolver
+
+    food = _make_category(session, user.id, "Food")
+    session.add(
+        MerchantTagMap(
+            user_id=user.id,
+            merchant_normalized="upi/9876543210@ybl",
+            category_id=food.id,
+            hit_count=5,
+        )
+    )
+    session.flush()
+    resolver = build_resolver([])
+    assert prefetch_tag_map(session, user_id=user.id, resolver=resolver) == {}
+    assert prefetch_tag_strength(session, user_id=user.id, resolver=resolver) == {}

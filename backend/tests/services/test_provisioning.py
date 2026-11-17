@@ -13,6 +13,7 @@ seed's fold rows don't produce.
 
 from __future__ import annotations
 
+import re
 import uuid
 
 from sqlalchemy import select
@@ -23,11 +24,14 @@ from app.core import clock
 from app.models import Category, MerchantAlias, MerchantTagMap, User
 from app.services import auth_service
 from app.services.merchant import normalize_merchant
-from app.services.merchant_alias import load_alias_resolver
+from app.services.merchant_alias import load_alias_resolver, tokenize
 from app.services.provisioning import (
     _DEFAULT_INCOME_TAXONOMY,
     _DEFAULT_SPEND_TAXONOMY,
     _MERCHANT_DICTIONARY,
+    PAYMENT_GATEWAYS,
+    PSP_HANDLES,
+    UPI_QR_IDS,
     provision_default_categories,
     provision_seed_merchant_dictionary,
 )
@@ -44,11 +48,21 @@ def _category_id(session: Session, user_id: uuid.UUID, name: str) -> int:
 
 def test_seed_dictionary_entries_are_pre_normalized() -> None:
     """Every pattern/canonical is already ``normalize_merchant()``-normalized — a typo (stray
-    capital, double space) would otherwise produce a pattern that can never match anything,
-    silently, since nothing else calls ``normalize_merchant()`` on these literals."""
+    capital, double space, decomposed accent) would otherwise produce a pattern that can never
+    match anything, silently, since nothing else calls ``normalize_merchant()`` on these
+    literals."""
     for pattern, canonical, _ in _MERCHANT_DICTIONARY:
         assert normalize_merchant(pattern) == pattern
         assert normalize_merchant(canonical) == canonical
+
+
+def test_psp_lists_are_pre_normalized() -> None:
+    """Each gateway and handle is already normalized and a single token; each QR regex compiles."""
+    for name in [*PAYMENT_GATEWAYS, *(handle for handle, _ in PSP_HANDLES)]:
+        assert normalize_merchant(name) == name
+        assert len(tokenize(name)) == 1
+    for pattern, _ in UPI_QR_IDS:
+        re.compile(pattern)
 
 
 def test_provision_seed_merchant_dictionary_creates_aliases_and_map_rows(
@@ -210,7 +224,7 @@ def test_seed_does_not_fold_uber_eats_onto_uber(engine: Engine) -> None:
 
 def test_provision_default_categories_creates_two_level_tree(session: Session, user: User) -> None:
     """Verify that provision_default_categories constructs a valid 2-level hierarchy
-    with 10 parents (9 spend + 1 income) and the exact subcategory set each names —
+    with one parent per taxonomy entry and the exact subcategory set each names —
     derived from the taxonomy constants themselves (ADR-0012: "do not enumerate the
     taxonomy anywhere but provisioning.py"), not restated here as a literal count."""
     provision_default_categories(session, user.id)
@@ -224,7 +238,7 @@ def test_provision_default_categories_creates_two_level_tree(session: Session, u
         sub for _, _, subs in _DEFAULT_INCOME_TAXONOMY for sub in subs
     }
 
-    assert len(parents) == 10
+    assert len(parents) == len(_DEFAULT_SPEND_TAXONOMY) + len(_DEFAULT_INCOME_TAXONOMY)
     assert {c.name for c in children} == expected_child_names
     assert len(children) == len(expected_child_names)
 

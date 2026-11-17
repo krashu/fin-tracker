@@ -5,7 +5,7 @@ Covers:
 * :func:`prefetch_label_map` — single SELECT, returns the *set* of labels per
   merchant whose ``hit_count`` clears :data:`LABEL_PREFILL_MIN` (< threshold
   excluded); user-scoped.
-* :func:`record_label` — INSERT or hit_count+1 upsert with race recovery.
+* :func:`record_label` — one-statement INSERT … ON CONFLICT DO UPDATE hit_count+1 upsert.
 * The composite same-user FK cascade: hard-deleting a label clears its map rows.
 """
 
@@ -15,12 +15,11 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Label, MerchantLabelMap, User
-from app.services import merchant_labels
 from app.services.merchant_alias import EMPTY_RESOLVER, AliasResolver
 from app.services.merchant_labels import (
     LABEL_PREFILL_MIN,
@@ -212,7 +211,7 @@ def test_hard_delete_label_cascades_map_rows(session: Session, user: User) -> No
     assert remaining[0].label_id == keep.id
 
 
-# ---------- race recovery (mirrors tag_service) ---------------------------
+# ---------- concurrent rows / statement shape (mirrors tag_service) -------
 
 
 def _preinsert_racy(engine: Engine, user: User, label_id: int) -> None:
@@ -246,14 +245,12 @@ def _stub_scalar_misses(session: Session, monkeypatch: pytest.MonkeyPatch, misse
 
 
 def test_record_label_handles_concurrent_insert_race(
-    engine: Engine, session: Session, user: User, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, session: Session, user: User
 ) -> None:
-    """Loser of the SELECT-then-INSERT race falls through to the refetch+UPDATE."""
+    """A row committed by another connection is bumped, not duplicated."""
     online = _make_label(session, user.id, "online")
     session.commit()
     _preinsert_racy(engine, user, online.id)
-
-    _stub_scalar_misses(session, monkeypatch, 1)  # existence probe misses → INSERT fires
 
     record_label(session, user_id=user.id, merchant_normalized="racy", label_id=online.id)
     session.commit()
@@ -266,18 +263,16 @@ def test_record_label_handles_concurrent_insert_race(
 
 
 def test_record_label_race_preserves_caller_pending_state(
-    engine: Engine, session: Session, user: User, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, session: Session, user: User
 ) -> None:
-    """The savepoint contract: a failed INSERT rolls back only itself, leaving the
-    caller's pending mutation intact (the silent-data-loss regression guard)."""
+    """record_label leaves the caller's pending, unflushed mutation alone (no
+    SAVEPOINT, no rollback — the silent-data-loss regression guard)."""
     online = _make_label(session, user.id, "online")
     session.commit()
     _preinsert_racy(engine, user, online.id)
 
     pending = Label(user_id=user.id, name="pendingmutation")
     session.add(pending)  # no flush — a full rollback would discard it
-
-    _stub_scalar_misses(session, monkeypatch, 1)
 
     record_label(session, user_id=user.id, merchant_normalized="racy", label_id=online.id)
     session.commit()
@@ -291,39 +286,44 @@ def test_record_label_race_preserves_caller_pending_state(
     assert rows[0].hit_count == 2
 
 
-def test_record_label_reraises_unexpected_integrity_error(
-    engine: Engine, session: Session, user: User, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A non-(user,merchant,label) IntegrityError propagates, not swallowed."""
-    online = _make_label(session, user.id, "online")
-    session.commit()
-    _preinsert_racy(engine, user, online.id)
-
-    _stub_scalar_misses(session, monkeypatch, 1)
-    monkeypatch.setattr(merchant_labels, "_is_merchant_label_conflict", lambda orig: False)
-
+def test_record_label_reraises_unexpected_integrity_error(session: Session, user: User) -> None:
+    """A non-conflict IntegrityError (FK to a nonexistent label) propagates."""
     with pytest.raises(IntegrityError):
-        record_label(session, user_id=user.id, merchant_normalized="racy", label_id=online.id)
+        record_label(session, user_id=user.id, merchant_normalized="racy", label_id=999_999)
 
 
-def test_record_label_conflict_no_winner_returns_without_raising(
-    engine: Engine, session: Session, user: User, monkeypatch: pytest.MonkeyPatch
+def test_record_label_increment_is_a_single_statement(
+    engine: Engine, session: Session, user: User
 ) -> None:
-    """If the post-conflict refetch finds no winner, record_label logs and returns
-    (no bump, no crash)."""
+    """ADR-0004 rule 7: the bump is one ``INSERT … ON CONFLICT DO UPDATE``, no SELECT."""
     online = _make_label(session, user.id, "online")
-    session.commit()
-    _preinsert_racy(engine, user, online.id)
-
-    _stub_scalar_misses(session, monkeypatch, 2)  # probe AND refetch miss
-
-    record_label(session, user_id=user.id, merchant_normalized="racy", label_id=online.id)
-
-    row = session.scalar(
-        select(MerchantLabelMap).where(MerchantLabelMap.merchant_normalized == "racy")
+    session.add(
+        MerchantLabelMap(
+            user_id=user.id, merchant_normalized="swiggy", label_id=online.id, hit_count=5
+        )
     )
+    session.flush()
+
+    statements: list[str] = []
+
+    def capture(conn: object, cursor: object, statement: str, *rest: object) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        record_label(session, user_id=user.id, merchant_normalized="swiggy", label_id=online.id)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert len(statements) == 1
+    sql = statements[0].upper()
+    assert sql.startswith("INSERT INTO MERCHANT_LABEL_MAP")
+    assert "ON CONFLICT" in sql
+    assert "DO UPDATE" in sql
+    assert "SELECT" not in sql.split("RETURNING")[0]
+    row = session.scalar(select(MerchantLabelMap))
     assert row is not None
-    assert row.hit_count == 1  # unchanged
+    assert row.hit_count == 6
 
 
 # ---------- pin_label / set_label_pinned (F3a rule authoring) -------------
@@ -512,3 +512,19 @@ def test_prefetch_label_map_sums_hit_count_across_aliased_merchants(
     )
     session.flush()
     assert prefetch_label_map(session, user_id=user.id, resolver=resolver) == {"food": [online.id]}
+
+
+def test_prefetch_label_map_skips_unknown_via_groups(session: Session, user: User) -> None:
+    from app.services.merchant_alias import build_resolver
+
+    online = _make_label(session, user.id, "online")
+    session.add(
+        MerchantLabelMap(
+            user_id=user.id,
+            merchant_normalized="upi/9876543210@ybl",
+            label_id=online.id,
+            hit_count=LABEL_PREFILL_MIN + 1,
+        )
+    )
+    session.flush()
+    assert prefetch_label_map(session, user_id=user.id, resolver=build_resolver([])) == {}

@@ -1,6 +1,8 @@
 """Schema parity: ``alembic upgrade head`` must match ``Base.metadata.create_all``.
 
-Runs on every pytest invocation (~150 ms). Catches the bug where a model
+Runs on every pytest invocation, the fast loop included; the tests below that
+run upgrade/downgrade steps of their own are marked ``slow`` and run only in
+the full suite. Catches the bug where a model
 file is edited but the migration is not. Compares table set, column
 name/type/**default**, unique constraints, foreign keys, indexes, primary
 keys, and each CHECK constraint's **name + clause text** — plus an assertion
@@ -47,7 +49,7 @@ from pathlib import Path
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import Engine, create_engine, event, inspect, select, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, select, text
 from sqlalchemy.dialects import postgresql as postgresql_dialect
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.exc import IntegrityError
@@ -69,6 +71,8 @@ from app.models import (
     User,
 )
 from app.services.provisioning import (
+    _DEFAULT_INCOME_TAXONOMY,
+    _DEFAULT_SPEND_TAXONOMY,
     _MERCHANT_DICTIONARY,
     provision_default_categories,
 )
@@ -239,6 +243,12 @@ def test_migrations_stairway(alembic_config: Config, tmp_path: Path) -> None:
 def _snapshot(engine: object) -> dict[str, dict]:
     """Introspect an engine into a comparable dict.
 
+    FKs and UQs carry their names, not just their columns: ADR-0001 rule 3 requires every
+    constraint name to match between ``create_all`` and ``alembic upgrade head``, and a
+    migration that names one by hand (or leaves it to the engine default) is otherwise
+    invisible here until the first Postgres ``drop_constraint`` misses it. FKs also carry
+    their ``ON DELETE``, which ADR-0012 rule 1 pins for ``categories.parent_id``.
+
     Skips the ``alembic_version`` bookkeeping table — present only on the
     migration side, would always cause a spurious diff.
     """
@@ -256,16 +266,21 @@ def _snapshot(engine: object) -> dict[str, dict]:
                 c["name"]: (str(c["type"]), bool(c["nullable"]), c.get("default"))
                 for c in insp.get_columns(t)
             },
-            "uqs": sorted(tuple(u["column_names"]) for u in insp.get_unique_constraints(t)),
+            "uqs": sorted(
+                (u["name"] or "", tuple(u["column_names"])) for u in insp.get_unique_constraints(t)
+            ),
             "ixs": sorted(
                 (i["name"], tuple(i["column_names"]), bool(i["unique"]))
                 for i in insp.get_indexes(t)
             ),
             "fks": sorted(
                 (
+                    f["name"] or "",  # unnamed reflects as None, unsortable beside a str
                     tuple(f["constrained_columns"]),
                     f["referred_table"],
                     tuple(f["referred_columns"]),
+                    # ADR-0012 rule 1: CASCADE vs NO ACTION is schema, so it must match too.
+                    f.get("options", {}).get("ondelete") or "",
                 )
                 for f in insp.get_foreign_keys(t)
             ),
@@ -327,6 +342,10 @@ def test_migration_matches_models() -> None:
                 assert len(names) == len(set(names)), (
                     f"{side}: table {t} has duplicate CHECK constraint names: {names}"
                 )
+                # ADR-0001 rule 3: a CHECK carries just its suffix; the naming convention adds
+                # the ``ck_<table>_`` prefix, so a hand-written full name renders it twice.
+                doubled = [n for n in names if n and n.startswith(f"ck_{t}_ck_")]
+                assert doubled == [], f"{side}: table {t} has double-prefixed CHECKs: {doubled}"
     finally:
         eng_migrate.dispose()
         eng_orm.dispose()
@@ -372,7 +391,17 @@ _EXPECTED_SEED_NAMES = frozenset(
     }
 )
 _INCOME_SEED_NAMES = frozenset({"Salary", "Freelancing", "Cashback", "Other"})
-_ARCHIVED_FLAT_SEEDS = frozenset({"Income", "Transfer"})
+# Archived by the chain, frozen history: the flat Income/Transfer seeds (0008), the income
+# Cashback that cashback-to-spend retired (ADR-0013), and the card-bill spend category 0047
+# retired (ADR-0002 rule 7b).
+_ARCHIVED_SEEDS = frozenset(
+    {
+        ("Income", "spend"),
+        ("Transfer", "spend"),
+        ("Cashback", "income"),
+        ("Credit Card Payments", "spend"),
+    }
+)
 
 
 def test_default_categories_seeded() -> None:
@@ -387,38 +416,29 @@ def test_default_categories_seeded() -> None:
             active = [c for c in cats if c.archived_at is None]
             parents = [c for c in active if c.parent_id is None]
             children = [c for c in active if c.parent_id is not None]
-
-            # 9 spend parents (Food & Dining, Household & Living, Bills & Utilities,
-            # Commute & Transportation, Shopping & Lifestyle, Family & Social,
-            # Savings & Investments, Loans & Settlements, Other) + 1 income parent = 10,
-            # holding 55 children total (49 spend + 6 income) — see provisioning.py's
-            # _DEFAULT_SPEND_TAXONOMY / _DEFAULT_INCOME_TAXONOMY, the taxonomy's one source
-            # of truth (ADR-0012).
-            assert len(parents) == 10
-            assert len(children) == 55
             assert all(c.is_seeded is True for c in cats)
             assert all(c.created_at is not None for c in cats)
 
-            # A per-parent child-NAME set, not just a count — a same-count swap between two
-            # siblings (e.g. a typo trading "Coffee & Tea" for something else) would still
-            # pass len(children) == 55.
-            food_parent = next(
-                c for c in parents if c.kind == "spend" and c.name == "Food & Dining"
-            )
-            food_children = {c.name for c in children if c.parent_id == food_parent.id}
-            assert food_children == {
-                "Food",
-                "Groceries",
-                "Online Food Delivery",
-                "Restaurants & Cafes",
-                "Quick Bites & Snacks",
-                "Coffee & Tea",
+            # The expected shape is read from provisioning.py's taxonomy constants, the one
+            # source of truth (ADR-0012 rule 14), never restated here as counts or names.
+            taxonomy = [("spend", entry) for entry in _DEFAULT_SPEND_TAXONOMY] + [
+                ("income", entry) for entry in _DEFAULT_INCOME_TAXONOMY
+            ]
+            assert {(c.name, c.kind) for c in parents} == {
+                (name, kind) for kind, (name, _, _) in taxonomy
             }
 
-            # Vestigial flat seeds: still spend-kind, now archived.
+            # A per-parent child-NAME set, not just a count — a same-count swap between two
+            # siblings (e.g. a typo trading "Coffee & Tea" for something else) would still
+            # pass a count.
+            parent_ids = {(c.name, c.kind): c.id for c in parents}
+            for kind, (name, _, subcategories) in taxonomy:
+                pid = parent_ids[(name, kind)]
+                assert {c.name for c in children if c.parent_id == pid} == set(subcategories), name
+            assert len(children) == sum(len(subs) for _, (_, _, subs) in taxonomy)
+
             archived = [c for c in cats if c.archived_at is not None]
-            assert {c.name for c in archived} == _ARCHIVED_FLAT_SEEDS
-            assert all(c.kind == "spend" for c in archived)
+            assert {(c.name, c.kind) for c in archived} == _ARCHIVED_SEEDS
     finally:
         eng.dispose()
 
@@ -518,6 +538,7 @@ def test_benchmarks_seeded() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0014_downgrade_drops_benchmark_tables() -> None:
     """``alembic downgrade 0013`` from head drops both benchmark tables.
 
@@ -536,6 +557,7 @@ def test_0014_downgrade_drops_benchmark_tables() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0015_downgrade_drops_fx_rates() -> None:
     """``alembic downgrade 0014`` from head drops the ``fx_rates`` table.
 
@@ -552,6 +574,7 @@ def test_0015_downgrade_drops_fx_rates() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0016_downgrade_narrows_instrument_index() -> None:
     """``alembic downgrade 0015`` from head reverts the instruments active-symbol unique index
     to the 2-column ``(user_id, symbol)`` form.
@@ -662,6 +685,7 @@ def test_partial_index_where_clause_preserved() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0005_downgrade_removes_constraints() -> None:
     """``alembic downgrade 0004_*`` from head removes the ADR-0002 constraints.
 
@@ -707,6 +731,7 @@ def test_0005_downgrade_removes_constraints() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_default_categories_downgrade_removes_seeded_only() -> None:
     """0003 downgrade deletes seeded rows (incl. archived) and keeps user-made (incl. archived)."""
     eng = _head_engine()
@@ -723,17 +748,20 @@ def test_default_categories_downgrade_removes_seeded_only() -> None:
             s.add_all(
                 [
                     Category(
+                        color="#2a78d6",
                         user_id=get_settings().v1_user_id,
                         name="UserMade",
                         is_seeded=False,
                     ),
                     Category(
+                        color="#2a78d6",
                         user_id=get_settings().v1_user_id,
                         name="ArchivedUserMade",
                         is_seeded=False,
                         archived_at=now,
                     ),
                     Category(
+                        color="#2a78d6",
                         user_id=get_settings().v1_user_id,
                         name="ArchivedSeeded",
                         is_seeded=True,
@@ -766,6 +794,7 @@ def test_default_categories_downgrade_removes_seeded_only() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_cli_upgrade_with_referencing_data_succeeds(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     """Regression: a *populated* DB must survive batch table-rebuild migrations.
 
@@ -778,6 +807,8 @@ def test_cli_upgrade_with_referencing_data_succeeds(tmp_path, monkeypatch) -> No
     a temp-file DB carrying a ``merchant_tag_map`` row that references a category
     staged at 0007, then asserts the upgrade to head completes and the reference
     survives the rebuild (batch preserves ids).
+
+    The category gets a colour at 0011, since 0046's CHECK refuses a colourless root.
     """
     import app.core.config as config_mod
 
@@ -821,6 +852,15 @@ def test_cli_upgrade_with_referencing_data_succeeds(tmp_path, monkeypatch) -> No
         seed.dispose()
 
     # The line that failed pre-fix (IntegrityError at 0008's DROP TABLE categories).
+    # The category is staged at 0007, before ``color`` exists (0011). Root categories need a
+    # colour from 0046 on, so give it one once the column is there, then run the rest of the chain.
+    command.upgrade(_cli_cfg(), "0011_category_color")
+    colour = make_engine(db_url)
+    try:
+        with colour.begin() as conn:
+            conn.execute(text("UPDATE categories SET color = '#2a78d6' WHERE name = 'RegCat'"))
+    finally:
+        colour.dispose()
     command.upgrade(_cli_cfg(), "head")
 
     check = make_engine(db_url)
@@ -840,6 +880,7 @@ def test_cli_upgrade_with_referencing_data_succeeds(tmp_path, monkeypatch) -> No
         check.dispose()
 
 
+@pytest.mark.slow
 def test_cli_upgrade_with_investment_data_succeeds(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     """Regression: 0010 rebuilds *populated* ``investment_transactions`` cleanly.
 
@@ -980,6 +1021,7 @@ def test_cli_upgrade_with_investment_data_succeeds(tmp_path, monkeypatch) -> Non
         check.dispose()
 
 
+@pytest.mark.slow
 def test_0008_downgrade_removes_kind_and_income_seeds() -> None:
     """``alembic downgrade 0007`` from head reverses the category-kind migration.
 
@@ -1044,6 +1086,7 @@ def _insert_spend_row(conn: object, *, uid_hex: str, acct_id: int, fingerprint: 
     )
 
 
+@pytest.mark.slow
 def test_0026_downgrade_restores_switch_pair_id() -> None:
     """``alembic downgrade 0025`` from head renames ``pair_id`` back.
 
@@ -1059,10 +1102,12 @@ def test_0026_downgrade_restores_switch_pair_id() -> None:
         def _state() -> tuple[set[str], tuple[str, ...], str]:
             insp = inspect(eng)
             cols = {c["name"] for c in insp.get_columns("investment_transactions")}
+            # The self-referential pair FK — not "the first composite FK": 0037 added two more,
+            # and a later batch rebuild is free to reorder them.
             fk = next(
                 tuple(f["constrained_columns"])
                 for f in insp.get_foreign_keys("investment_transactions")
-                if len(f["constrained_columns"]) == 2
+                if f["referred_table"] == "investment_transactions"
             )
             with eng.connect() as conn:
                 ddl = conn.execute(
@@ -1095,6 +1140,7 @@ def test_0026_downgrade_restores_switch_pair_id() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0025_recomputes_existing_fingerprints() -> None:
     """The only test that proves 0025's backfill actually ran.
 
@@ -1135,6 +1181,7 @@ def test_0025_recomputes_existing_fingerprints() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0025_downgrade_restores_the_old_key_and_is_reversible() -> None:
     """``alembic downgrade 0024`` from head drops ``occurrence``, re-narrows the
     unique constraint to 3 columns, and restores the separatorless fingerprints;
@@ -1262,6 +1309,7 @@ def _investment_uq_columns(engine: object) -> list[str]:
     )
 
 
+@pytest.mark.slow
 def test_0027_recomputes_investment_fingerprints() -> None:
     """The only test that proves 0027's backfill actually ran.
 
@@ -1299,6 +1347,7 @@ def test_0027_recomputes_investment_fingerprints() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0027_recompute_leaves_manual_null_fingerprints_alone() -> None:
     """A manual row carries ``fingerprint = NULL``, and NULLs-are-distinct is what keeps
     the unique index inert for manual entry. Hashing one would silently enrol it in
@@ -1334,6 +1383,7 @@ def test_0027_recompute_leaves_manual_null_fingerprints_alone() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0027_downgrade_restores_the_old_key_and_is_reversible() -> None:
     """``alembic downgrade 0026`` from head drops ``occurrence``, re-narrows the unique
     index to 3 columns, and restores the separatorless fingerprints; re-upgrading returns
@@ -1375,6 +1425,7 @@ def test_0027_downgrade_restores_the_old_key_and_is_reversible() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0027_downgrade_refuses_to_merge_two_real_duplicates() -> None:
     """The conditional half of 0027's reversibility, asserted rather than just documented.
 
@@ -1405,6 +1456,7 @@ def test_0027_downgrade_refuses_to_merge_two_real_duplicates() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0022_downgrade_readds_note_and_is_reversible() -> None:
     """``alembic downgrade 0021`` from head re-adds ``transactions.note`` (leaving
     the label tables in place); re-upgrading drops it again — the drop is
@@ -1428,6 +1480,7 @@ def test_0022_downgrade_readds_note_and_is_reversible() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0023_downgrade_drops_merchant_label_map() -> None:
     """``alembic downgrade 0022`` from head drops ``merchant_label_map``; re-upgrading
     re-creates it — the table is schema-reversible. House precedent: each migration
@@ -1447,6 +1500,7 @@ def test_0023_downgrade_drops_merchant_label_map() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0021_downgrade_drops_label_tables() -> None:
     """``alembic downgrade 0020`` from head drops both label tables (reverse FK
     order: transaction_labels before labels). ``note`` is back at 0020 because
@@ -1521,6 +1575,7 @@ def test_transaction_labels_timestamps_have_server_default() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0028_backfills_origin_fingerprint_for_import_rows_only() -> None:
     """The only test that proves 0028's backfill ran, and that it is source-scoped.
 
@@ -1593,6 +1648,7 @@ def _seed_refund_row(conn: object, *, uid_hex: str, acct_id: int) -> int:
     ).scalar()
 
 
+@pytest.mark.slow
 def test_0029_recomputes_refund_rows_to_positive_spend() -> None:
     """The only test that proves 0029's data step actually ran (ADR-0009).
 
@@ -1643,6 +1699,7 @@ def test_0029_recomputes_refund_rows_to_positive_spend() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0029_partial_index_predicate_survives_up_and_down() -> None:
     """``ix_transactions_user_confirmed_date`` keeps ``confirmed_at IS NOT NULL``
     through 0029's rebuild in BOTH directions.
@@ -1681,6 +1738,7 @@ def test_0029_partial_index_predicate_survives_up_and_down() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0029_downgrade_restores_refund_type_and_is_reversible() -> None:
     """``alembic downgrade 0028`` from head re-widens the CHECK and retypes every
     positive ``spend`` back to ``refund``; re-upgrading collapses it to ``spend``
@@ -1818,6 +1876,7 @@ _LEGACY_FLAT_INCOME_CATEGORIES: tuple[tuple[str, str], ...] = (
 )
 
 
+@pytest.mark.slow
 def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
     """The realistic Phase A5 trap-1 scenario: an existing deployment already ran
     ``app.services.demo_seed.seed_demo_data`` (12 of this dictionary's canonicals collide with
@@ -1942,6 +2001,7 @@ def test_backfill_skips_demo_taught_merchants_and_is_user_scoped() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0032_downgrade_preserves_pinned_seed_row() -> None:
     """``downgrade()`` must not delete a seed row the user has PINNED.
 
@@ -1993,6 +2053,7 @@ def test_0032_downgrade_preserves_pinned_seed_row() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_seed_bound_to_archived_category_not_created_via_migration() -> None:
     """Phase A5 trap 3, retargeted for the hierarchy: ``uq_categories_active_user_name`` is a
     *partial* index, so an archived category can share a name with an active one. 0035
@@ -2075,6 +2136,7 @@ def test_seed_bound_to_archived_category_not_created_via_migration() -> None:
         eng.dispose()
 
 
+@pytest.mark.slow
 def test_0034_downgrade_preserves_referenced_and_user_authored_categories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2112,7 +2174,10 @@ def test_0034_downgrade_preserves_referenced_and_user_authored_categories(
         cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
         return cfg
 
-    command.upgrade(_cli_cfg(), "head")
+    # Pinned to 0036, not head: the subject is 0035/0034's downgrade. 0037's downgrade
+    # batch-rebuilds referenced tables, which (ADR-0001 rule 4b) only ever runs FK-off,
+    # so it cannot ride along on this FK-ON connection.
+    command.upgrade(_cli_cfg(), "0036_add_guest_user_fields")
 
     eng = make_engine(db_url)  # FK ON at connect — the real enforcement this test needs.
     try:
@@ -2210,5 +2275,1117 @@ def test_0034_downgrade_preserves_referenced_and_user_authored_categories(
                 text("SELECT parent_id FROM categories WHERE id = :c").bindparams(c=user_child_id)
             ).scalar()
             assert child_parent_id == user_parent_id
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0037_refuses_to_run_over_a_cross_user_reference() -> None:
+    """ADR-0003 rule 10: 0037 counts cross-user links before adding the composite FKs.
+
+    SQLite migrates with FKs off, so without the preflight a corrupt row would be copied into
+    the rebuilt table silently (Postgres would refuse it). The error names table, column and
+    count only — never a row id or anything a user typed.
+    """
+    eng = _migration_engine()
+    try:
+        v1 = get_settings().v1_user_id
+        v1_val = v1.hex if hasattr(v1, "hex") else str(v1)
+        other_val = uuid.UUID("00000000-0000-0000-0000-0000000000a1").hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "0036_add_guest_user_fields")
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": other_val})
+            their_parent = conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name) VALUES (:u, 'Their Secret') "
+                    "RETURNING id"
+                ),
+                {"u": other_val},
+            ).scalar_one()
+            conn.execute(
+                text("INSERT INTO categories (user_id, name, parent_id) VALUES (:u, 'Mine', :p)"),
+                {"u": v1_val, "p": their_parent},
+            )
+
+        with pytest.raises(RuntimeError) as exc, eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        message = str(exc.value)
+        assert "categories.parent_id: 1 row(s) reference another user's categories" in message
+        assert "Their Secret" not in message
+    finally:
+        eng.dispose()
+
+
+def _table_ddl(eng: Engine, table: str) -> str:
+    with eng.connect() as conn:
+        return (
+            conn.execute(
+                text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :t"),
+                {"t": table},
+            ).scalar()
+            or ""
+        )
+
+
+def _confirmed_index_sql(eng: Engine) -> str:
+    with eng.connect() as conn:
+        return (
+            conn.execute(
+                text(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                    "AND name = 'ix_transactions_user_confirmed_date'"
+                )
+            ).scalar()
+            or ""
+        )
+
+
+@pytest.mark.slow
+def test_0038_downgrade_is_reversible() -> None:
+    """``alembic downgrade 0037`` from head restores the doubled CHECK names, drops
+    ``paired_is_transfer``, ``pre_link_type`` and ``refund_of_id`` (with its FK) and puts back
+    the ``fx_rate_to_inr`` default; re-upgrading reverses each. Both directions rebuild
+    ``transactions``, so the partial-index predicate is checked on each side too."""
+    eng = _head_engine()
+    try:
+
+        def _assert_head() -> None:
+            txn_ddl = _table_ddl(eng, "transactions")
+            inv_ddl = _table_ddl(eng, "investment_transactions")
+            assert "CONSTRAINT ck_transactions_no_self_pair CHECK" in txn_ddl
+            assert "ck_transactions_ck_" not in txn_ddl
+            assert "CONSTRAINT ck_investment_transactions_no_self_pair CHECK" in inv_ddl
+            assert "ck_investment_transactions_ck_" not in inv_ddl
+            assert "confirmed_at IS NOT NULL" in _confirmed_index_sql(eng)
+            assert _fx_default() is None
+            assert {"pre_link_type", "refund_of_id"} <= _txn_columns()
+
+        def _txn_columns() -> set[str]:
+            return {c["name"] for c in inspect(eng).get_columns("transactions")}
+
+        def _fx_default() -> object:
+            cols = inspect(eng).get_columns("investment_transactions")
+            return next(c for c in cols if c["name"] == "fx_rate_to_inr").get("default")
+
+        _assert_head()
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), "0037_composite_same_user_fks")
+        txn_ddl = _table_ddl(eng, "transactions")
+        inv_ddl = _table_ddl(eng, "investment_transactions")
+        assert "ck_transactions_ck_transactions_no_self_pair" in txn_ddl
+        assert "ck_investment_transactions_ck_investment_transactions_no_self_pair" in inv_ddl
+        assert "confirmed_at IS NOT NULL" in _confirmed_index_sql(eng)
+
+        assert "paired_is_transfer" not in txn_ddl
+        assert _fx_default() == "1000000"
+        assert not {"pre_link_type", "refund_of_id"} & _txn_columns()
+        fk_names = {f["name"] for f in inspect(eng).get_foreign_keys("transactions")}
+        assert "fk_transactions_refund_of_id_transactions" not in fk_names
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        _assert_head()
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0038_refuses_to_run_over_a_paired_non_transfer_row() -> None:
+    """ADR-0002 rule 8: 0038 counts paired non-transfer rows before adding CHECK
+    ``paired_is_transfer`` and aborts with the count only — no id, no merchant text."""
+    eng = _migration_engine()
+    try:
+        v1 = get_settings().v1_user_id
+        uid = v1.hex if hasattr(v1, "hex") else str(v1)
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "0037_composite_same_user_fks")
+            acct = conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type) VALUES (:u, 'Acc', 'bank') "
+                    "RETURNING id"
+                ),
+                {"u": uid},
+            ).scalar_one()
+            ids = []
+            for txn_type, amount, fp in (("spend", -5000, "fp-a"), ("transfer", 5000, "fp-b")):
+                ids.append(
+                    conn.execute(
+                        text(
+                            "INSERT INTO transactions (user_id, account_id, date, amount_paise, "
+                            " transaction_type, merchant_normalized, fingerprint, source) "
+                            "VALUES (:u, :a, '2025-01-10', :amt, :t, 'secret merchant', :fp, "
+                            " 'import') RETURNING id"
+                        ),
+                        {"u": uid, "a": acct, "amt": amount, "t": txn_type, "fp": fp},
+                    ).scalar_one()
+                )
+            conn.execute(
+                text("UPDATE transactions SET transfer_pair_id = :p WHERE id = :i"),
+                [{"p": ids[1], "i": ids[0]}, {"p": ids[0], "i": ids[1]}],
+            )
+
+        with pytest.raises(RuntimeError) as exc, eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        message = str(exc.value)
+        assert message.startswith("1 paired transaction row(s) are not of type 'transfer'")
+        assert "secret merchant" not in message
+    finally:
+        eng.dispose()
+
+
+# The fallback-roots / cashback-to-spend revision. Written once so a re-chain of the revision
+# touches only this constant; the pre-state is read from the script directory, never named.
+_REV_FALLBACK_CASHBACK = "0039_fallback_roots_and_cashback_spend"
+
+
+def _before_fallback_cashback() -> str:
+    cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    script = ScriptDirectory.from_config(cfg).get_revision(_REV_FALLBACK_CASHBACK)
+    assert script is not None
+    assert isinstance(script.down_revision, str)
+    return script.down_revision
+
+
+@pytest.mark.slow
+def test_fallback_migration_leaves_one_active_root_other_per_kind() -> None:
+    """ADR-0012 rule 8: after the upgrade each user has exactly one active root "Other" per
+    kind. The v1 user's income "Other" (a child of "Income" since 0034, colour nulled) is
+    re-rooted and gets the seed hex; a user whose spend "Other" is archived and whose income
+    "Other" was renamed away gets fresh roots, and the renamed row is left untouched."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        other_val = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _before_fallback_cashback())
+            income_other = conn.execute(
+                text(
+                    "SELECT parent_id, color FROM categories "
+                    "WHERE user_id = :u AND name = 'Other' AND kind = 'income'"
+                ),
+                {"u": v1_val},
+            ).one()
+            assert income_other.parent_id is not None, "pre-state: income Other is a child"
+            assert income_other.color is None
+
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": other_val})
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, archived_at, color) "
+                    "VALUES (:u, 'Other', 'spend', 1, '2026-01-01 00:00:00', '#94a3b8')"
+                ),
+                {"u": other_val},
+            )
+            renamed_id = conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, color) "
+                    "VALUES (:u, 'Misc income', 'income', 1, '#123456') RETURNING id"
+                ),
+                {"u": other_val},
+            ).scalar_one()
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+
+        with eng.connect() as conn:
+            for uid in (v1_val, other_val):
+                for kind in ("spend", "income"):
+                    rows = conn.execute(
+                        text(
+                            "SELECT parent_id, color FROM categories WHERE user_id = :u "
+                            "AND name = 'Other' AND kind = :k AND archived_at IS NULL"
+                        ),
+                        {"u": uid, "k": kind},
+                    ).all()
+                    assert len(rows) == 1, (uid, kind)
+                    assert rows[0].parent_id is None, (uid, kind)
+                    assert rows[0].color == "#94a3b8", (uid, kind)
+            renamed = conn.execute(
+                text("SELECT name, color, parent_id, archived_at FROM categories WHERE id = :i"),
+                {"i": renamed_id},
+            ).one()
+            assert tuple(renamed) == ("Misc income", "#123456", None, None)
+    finally:
+        eng.dispose()
+
+
+def _seed_cashback_income_rows(conn: object) -> dict[str, int]:
+    """At the pre-revision: the v1 user's account plus three income rows — two in the seeded
+    income "Cashback" (a credit and a reversal), one in "Salary". Returns fingerprint → id."""
+    v1_val = get_settings().v1_user_id.hex
+    conn.execute(  # ty: ignore[unresolved-attribute]
+        text("INSERT INTO accounts (user_id, name, type) VALUES (:u, 'Axis CC', 'credit_card')"),
+        {"u": v1_val},
+    )
+    acct_id = conn.execute(text("SELECT id FROM accounts")).scalar()  # ty: ignore[unresolved-attribute]
+    ids: dict[str, int] = {}
+    for fingerprint, amount, category in (
+        ("fp-cb-credit", 5000, "Cashback"),
+        ("fp-cb-reversal", -1000, "Cashback"),
+        ("fp-salary", 50000, "Salary"),
+    ):
+        ids[fingerprint] = conn.execute(  # ty: ignore[unresolved-attribute]
+            text(
+                "INSERT INTO transactions "
+                "(user_id, account_id, date, amount_paise, transaction_type, "
+                " merchant_normalized, fingerprint, source, category_id) "
+                "VALUES (:u, :a, '2026-03-10', :amt, 'income', 'axis bank', :f, 'import', "
+                " (SELECT id FROM categories WHERE user_id = :u AND name = :c "
+                "  AND kind = 'income' AND archived_at IS NULL)) RETURNING id"
+            ),
+            {"u": v1_val, "a": acct_id, "amt": amount, "f": fingerprint, "c": category},
+        ).scalar_one()
+    return ids
+
+
+@pytest.mark.slow
+def test_cashback_rows_move_to_spend() -> None:
+    """ADR-0013 rule 5: income rows in the income "Cashback" become ``spend`` rows of the same
+    sign in an active root spend "Cashback" — a pure retype, fingerprints untouched — and the
+    income "Cashback" is archived. A Salary row is not touched."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _before_fallback_cashback())
+            ids = _seed_cashback_income_rows(conn)
+            salary_cat = conn.execute(
+                text("SELECT category_id FROM transactions WHERE id = :i"),
+                {"i": ids["fp-salary"]},
+            ).scalar_one()
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+
+        with eng.connect() as conn:
+            spend_cashback = conn.execute(
+                text(
+                    "SELECT id, parent_id, color, is_seeded FROM categories WHERE user_id = :u "
+                    "AND name = 'Cashback' AND kind = 'spend' AND archived_at IS NULL"
+                ),
+                {"u": v1_val},
+            ).one()
+            assert spend_cashback.parent_id is None
+            assert spend_cashback.color == "#c98500"
+            assert spend_cashback.is_seeded
+
+            rows = {
+                r.fingerprint: r
+                for r in conn.execute(
+                    text(
+                        "SELECT fingerprint, transaction_type, amount_paise, category_id "
+                        "FROM transactions"
+                    )
+                )
+            }
+            assert tuple(rows["fp-cb-credit"])[1:] == ("spend", 5000, spend_cashback.id)
+            assert tuple(rows["fp-cb-reversal"])[1:] == ("spend", -1000, spend_cashback.id)
+            assert tuple(rows["fp-salary"])[1:] == ("income", 50000, salary_cat)
+
+            income_cashback = conn.execute(
+                text(
+                    "SELECT archived_at FROM categories WHERE user_id = :u "
+                    "AND name = 'Cashback' AND kind = 'income'"
+                ),
+                {"u": v1_val},
+            ).all()
+            assert len(income_cashback) == 1
+            assert income_cashback[0].archived_at is not None
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_cashback_migration_downgrade_moves_cashback_back_to_income() -> None:
+    """The downgrade is reconstructive: spend-Cashback rows go back to ``income`` (sign kept)
+    in the un-archived income "Cashback", and the seeded spend "Cashback", now unreferenced,
+    is deleted."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        before = _before_fallback_cashback()
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), before)
+            ids = _seed_cashback_income_rows(conn)
+            income_cashback_id = conn.execute(
+                text("SELECT category_id FROM transactions WHERE id = :i"),
+                {"i": ids["fp-cb-credit"]},
+            ).scalar_one()
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), before)
+
+        with eng.connect() as conn:
+            rows = {
+                r.fingerprint: tuple(r)[1:]
+                for r in conn.execute(
+                    text(
+                        "SELECT fingerprint, transaction_type, amount_paise, category_id "
+                        "FROM transactions"
+                    )
+                )
+            }
+            assert rows["fp-cb-credit"] == ("income", 5000, income_cashback_id)
+            assert rows["fp-cb-reversal"] == ("income", -1000, income_cashback_id)
+            assert (
+                conn.execute(
+                    text("SELECT archived_at FROM categories WHERE id = :i"),
+                    {"i": income_cashback_id},
+                ).scalar_one()
+                is None
+            )
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT count(*) FROM categories WHERE user_id = :u "
+                        "AND name = 'Cashback' AND kind = 'spend'"
+                    ),
+                    {"u": v1_val},
+                ).scalar_one()
+                == 0
+            )
+    finally:
+        eng.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 0040_add_realised_lots (ADR-0015 rule 5). Written once; the pre-state is derived.
+# ---------------------------------------------------------------------------
+
+_REV_REALISED_LOTS = "0040_add_realised_lots"
+
+
+def _before_realised_lots() -> str:
+    cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    script = ScriptDirectory.from_config(cfg).get_revision(_REV_REALISED_LOTS)
+    assert script is not None
+    assert isinstance(script.down_revision, str)
+    return script.down_revision
+
+
+def _assert_realised_lots_schema(conn) -> None:  # type: ignore[no-untyped-def]
+    insp = inspect(conn)
+    assert "realised_lots" in insp.get_table_names()
+    assert "ix_realised_lots_user_buy" in {i["name"] for i in insp.get_indexes("realised_lots")}
+    assert "uq_realised_lots_user_sell_buy" in {
+        u["name"] for u in insp.get_unique_constraints("realised_lots")
+    }
+    fks = {f["name"]: f for f in insp.get_foreign_keys("realised_lots")}
+    assert set(fks) == {
+        "fk_realised_lots_sell_txn_id_investment_transactions",
+        "fk_realised_lots_buy_txn_id_investment_transactions",
+    }
+    assert all(f["options"].get("ondelete") == "CASCADE" for f in fks.values())
+    assert {c["name"] for c in insp.get_check_constraints("realised_lots")} == {
+        f"ck_realised_lots_{s}"
+        for s in (
+            "positive_units",
+            "non_negative_cost",
+            "non_negative_proceeds",
+            "non_negative_sell_fees",
+            "buy_not_after_sell",
+        )
+    }
+
+
+@pytest.mark.slow
+def test_realised_lots_migration_is_reversible() -> None:
+    eng = _migration_engine()
+    try:
+        before = _before_realised_lots()
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), before)
+            assert "realised_lots" not in inspect(conn).get_table_names()
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_REALISED_LOTS)
+        with eng.connect() as conn:
+            _assert_realised_lots_schema(conn)
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), before)
+        with eng.connect() as conn:
+            assert "realised_lots" not in inspect(conn).get_table_names()
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_REALISED_LOTS)
+        with eng.connect() as conn:
+            _assert_realised_lots_schema(conn)
+    finally:
+        eng.dispose()
+
+
+# The portable-origin-inputs revision. Written once; the pre-state is read from the script
+# directory, never named.
+_REV_PORTABLE_ORIGIN = "0041_portable_origin_inputs"
+
+
+def _before_portable_origin() -> str:
+    cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    script = ScriptDirectory.from_config(cfg).get_revision(_REV_PORTABLE_ORIGIN)
+    assert script is not None
+    assert isinstance(script.down_revision, str)
+    return script.down_revision
+
+
+def _insert_origin_row(conn: object, acct_id: int, fp: str, origin: str | None) -> None:
+    conn.execute(  # ty: ignore[unresolved-attribute]
+        text(
+            "INSERT INTO transactions "
+            "(user_id, account_id, date, amount_paise, transaction_type, merchant_normalized, "
+            " fingerprint, origin_fingerprint, source) "
+            "VALUES (:u, :a, '2026-03-10', -100, 'spend', 'shop', :f, :o, 'import')"
+        ),
+        {"u": get_settings().v1_user_id.hex, "a": acct_id, "f": fp, "o": origin},
+    )
+
+
+@pytest.mark.slow
+def test_portable_origin_migration_nulls_edited_origins_only() -> None:
+    """An unedited import row (origin == fingerprint) keeps its origin; an edited one (origin !=
+    fingerprint, inputs unrecoverable) and a manual one end with NULL; the new columns are NULL."""
+    eng = _migration_engine()
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _before_portable_origin())
+            conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type) "
+                    "VALUES (:u, 'Axis CC', 'credit_card')"
+                ),
+                {"u": get_settings().v1_user_id.hex},
+            )
+            acct_id = conn.execute(text("SELECT id FROM accounts")).scalar_one()
+            _insert_origin_row(conn, acct_id, "fp-unedited", "fp-unedited")
+            _insert_origin_row(conn, acct_id, "fp-edited", "fp-before-the-edit")
+            _insert_origin_row(conn, acct_id, "fp-manual", None)
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+
+        with eng.connect() as conn:
+            rows = {
+                r.fingerprint: r
+                for r in conn.execute(
+                    text(
+                        "SELECT fingerprint, origin_fingerprint, origin_date, "
+                        "origin_amount_paise, origin_merchant_normalized, origin_account_id "
+                        "FROM transactions"
+                    )
+                )
+            }
+        assert rows["fp-unedited"].origin_fingerprint == "fp-unedited"
+        assert rows["fp-edited"].origin_fingerprint is None
+        assert rows["fp-manual"].origin_fingerprint is None
+        for row in rows.values():
+            assert tuple(row)[2:] == (None, None, None, None)
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_portable_origin_migration_downgrade_is_reversible() -> None:
+    """At head a row with origin inputs downgrades cleanly (columns gone, origin_fingerprint
+    intact) and the revision applies again."""
+    eng = _migration_engine()
+    try:
+        before = _before_portable_origin()
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+            conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type) "
+                    "VALUES (:u, 'Axis CC', 'credit_card')"
+                ),
+                {"u": get_settings().v1_user_id.hex},
+            )
+            acct_id = conn.execute(text("SELECT id FROM accounts")).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO transactions "
+                    "(user_id, account_id, date, amount_paise, transaction_type, "
+                    " merchant_normalized, fingerprint, origin_fingerprint, source, "
+                    " origin_date, origin_amount_paise, origin_merchant_normalized, "
+                    " origin_account_id) "
+                    "VALUES (:u, :a, '2026-03-10', -200, 'spend', 'shop', 'fp-now', 'fp-then', "
+                    " 'import', '2026-03-09', -100, 'shop', :a)"
+                ),
+                {"u": get_settings().v1_user_id.hex, "a": acct_id},
+            )
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), before)
+        with eng.connect() as conn:
+            columns = {c["name"] for c in inspect(conn).get_columns("transactions")}
+            assert not {c for c in columns if c.startswith("origin_")} - {"origin_fingerprint"}
+            assert (
+                conn.execute(text("SELECT origin_fingerprint FROM transactions")).scalar_one()
+                == "fp-then"
+            )
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        with eng.connect() as conn:
+            assert "origin_date" in {c["name"] for c in inspect(conn).get_columns("transactions")}
+    finally:
+        eng.dispose()
+
+
+_REV_DROP_ERROR_MESSAGE = "0042_drop_import_batch_error_message"
+
+
+def _down_revision_of(revision: str) -> str:
+    cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    script = ScriptDirectory.from_config(cfg).get_revision(revision)
+    assert script is not None
+    assert isinstance(script.down_revision, str)
+    return script.down_revision
+
+
+@pytest.mark.slow
+def test_drop_import_batch_error_message_is_reversible() -> None:
+    """The drop keeps the batch row and its inbound FK from ``transactions`` intact, the
+    downgrade restores a nullable column, and up -> down -> up is clean."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_DROP_ERROR_MESSAGE))
+            assert "error_message" in {
+                c["name"] for c in inspect(conn).get_columns("import_batches")
+            }
+            conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type, currency, opening_balance_paise) "
+                    "VALUES (:u, 'Axis CC', 'credit_card', 'INR', 0)"
+                ),
+                {"u": v1_val},
+            )
+            account_id = conn.execute(text("SELECT id FROM accounts")).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO import_batches (user_id, account_id, source_file_hash, "
+                    "parser_name, status) VALUES (:u, :a, :h, 'axis_cc', 'completed')"
+                ),
+                {"u": v1_val, "a": account_id, "h": "0" * 64},
+            )
+            batch_id = conn.execute(text("SELECT id FROM import_batches")).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO transactions (user_id, account_id, date, amount_paise, "
+                    "merchant_raw, merchant_normalized, transaction_type, source, "
+                    "import_batch_id, fingerprint, occurrence) VALUES (:u, :a, '2026-03-05', "
+                    "-100, 'X', 'x', 'spend', 'import', :b, :f, 1)"
+                ),
+                {"u": v1_val, "a": account_id, "b": batch_id, "f": "f" * 64},
+            )
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_DROP_ERROR_MESSAGE)
+        insp = inspect(eng)
+        assert "error_message" not in {c["name"] for c in insp.get_columns("import_batches")}
+        assert "uq_import_batches_id_user" in {
+            u["name"] for u in insp.get_unique_constraints("import_batches")
+        } | {i["name"] for i in insp.get_indexes("import_batches")}
+        with eng.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM import_batches")).scalar_one() == 1
+            assert conn.execute(text("PRAGMA foreign_key_check")).all() == []
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_DROP_ERROR_MESSAGE))
+        cols = {c["name"]: c for c in inspect(eng).get_columns("import_batches")}
+        assert cols["error_message"]["nullable"] is True
+        with eng.connect() as conn:
+            assert (
+                conn.execute(text("SELECT error_message FROM import_batches")).scalar_one() is None
+            )
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        assert "error_message" not in {
+            c["name"] for c in inspect(eng).get_columns("import_batches")
+        }
+    finally:
+        eng.dispose()
+
+
+_REV_REALISED_LOT_KIND = "0043_realised_lot_kind"
+
+
+@pytest.mark.slow
+def test_realised_lot_kind_migration_is_reversible() -> None:
+    """Existing rows become ``fifo``; the column ends with no default; the CHECKs exist; a
+    writer that omits ``kind`` fails NOT NULL; the downgrade drops it and keeps the row."""
+    original_checks = {
+        f"ck_realised_lots_{s}"
+        for s in (
+            "positive_units",
+            "non_negative_cost",
+            "non_negative_proceeds",
+            "non_negative_sell_fees",
+            "buy_not_after_sell",
+        )
+    }
+    insert = (
+        "INSERT INTO realised_lots (user_id, sell_txn_id, buy_txn_id, units, "
+        "cost_native_paise, proceeds_native_paise, sell_fees_native_paise, buy_date, "
+        "sell_date) VALUES (:u, 1, 2, 100000000, 1, 1, 0, '2026-01-01', '2026-02-01')"
+    )
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_REALISED_LOT_KIND))
+            conn.execute(text(insert), {"u": v1_val})
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_REALISED_LOT_KIND)
+        insp = inspect(eng)
+        cols = {c["name"]: c for c in insp.get_columns("realised_lots")}
+        assert cols["kind"]["default"] is None
+        assert cols["kind"]["nullable"] is False
+        assert {c["name"] for c in insp.get_check_constraints("realised_lots")} == (
+            original_checks
+            | {"ck_realised_lots_realised_lot_kind", "ck_realised_lots_intraday_same_day"}
+        )
+        with eng.connect() as conn:
+            assert conn.execute(text("SELECT kind FROM realised_lots")).scalar_one() == "fifo"
+        with pytest.raises(IntegrityError), eng.begin() as conn:
+            conn.execute(text(insert.replace("(:u, 1, 2,", "(:u, 1, 3,")), {"u": v1_val})
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_REALISED_LOT_KIND))
+        insp = inspect(eng)
+        assert "kind" not in {c["name"] for c in insp.get_columns("realised_lots")}
+        assert {c["name"] for c in insp.get_check_constraints("realised_lots")} == original_checks
+        with eng.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM realised_lots")).scalar_one() == 1
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+# The pre-link-category revision. Written once; the pre-state comes from the script directory.
+_REV_PRE_LINK_CATEGORY = "0044_pre_link_category"
+
+
+def _seed_linked_categorised_pair(conn: Connection) -> tuple[int, int, int]:
+    """An account, a category and two paired transfer legs; returns (category, leg a, leg b)."""
+    uid = get_settings().v1_user_id.hex
+    conn.execute(
+        text("INSERT INTO accounts (user_id, name, type) VALUES (:u, 'Bank', 'bank')"),
+        {"u": uid},
+    )
+    acct = conn.execute(text("SELECT id FROM accounts")).scalar_one()
+    conn.execute(
+        text(
+            "INSERT INTO categories (user_id, name, color) VALUES (:u, 'Pre-link test', '#2a78d6')"
+        ),
+        {"u": uid},
+    )
+    cat = conn.execute(text("SELECT id FROM categories WHERE name = 'Pre-link test'")).scalar_one()
+    ids = []
+    for fp, amt in (("fp-a", -100), ("fp-b", 100)):
+        conn.execute(
+            text(
+                "INSERT INTO transactions (user_id, account_id, date, amount_paise, "
+                "transaction_type, merchant_normalized, fingerprint, source) "
+                "VALUES (:u, :a, '2026-03-10', :p, 'transfer', 'x', :f, 'import')"
+            ),
+            {"u": uid, "a": acct, "p": amt, "f": fp},
+        )
+        ids.append(
+            conn.execute(
+                text("SELECT id FROM transactions WHERE fingerprint = :f"), {"f": fp}
+            ).scalar_one()
+        )
+    a, b = ids
+    for me, other in ((a, b), (b, a)):
+        conn.execute(
+            text("UPDATE transactions SET transfer_pair_id = :o, category_id = :c WHERE id = :i"),
+            {"o": other, "c": cat, "i": me},
+        )
+    return cat, a, b
+
+
+@pytest.mark.slow
+def test_pre_link_category_migration_adds_an_empty_column() -> None:
+    """The column lands NULL everywhere; linked rows keep their category (no backfill)."""
+    eng = _migration_engine()
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_PRE_LINK_CATEGORY))
+            cat, _, _ = _seed_linked_categorised_pair(conn)
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_PRE_LINK_CATEGORY)
+        with eng.connect() as conn:
+            assert "pre_link_category_id" in {
+                c["name"] for c in inspect(conn).get_columns("transactions")
+            }
+            rows = conn.execute(
+                text("SELECT category_id, pre_link_category_id FROM transactions")
+            ).all()
+        assert [tuple(r) for r in rows] == [(cat, None), (cat, None)]
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_pre_link_category_migration_downgrade_folds_back_and_is_reversible() -> None:
+    """Downgrade moves each saved category back onto its row in one UPDATE (the CHECK is still
+    enforced then), drops column and CHECK, and the revision applies again."""
+    eng = _migration_engine()
+    try:
+        pre = _down_revision_of(_REV_PRE_LINK_CATEGORY)
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_PRE_LINK_CATEGORY)
+            cat, a, b = _seed_linked_categorised_pair(conn)
+            # Link-shaped state: the category moved aside on leg a, none saved on leg b.
+            conn.execute(
+                text(
+                    "UPDATE transactions SET category_id = NULL, pre_link_category_id = :c "
+                    "WHERE id = :i"
+                ),
+                {"c": cat, "i": a},
+            )
+            conn.execute(text("UPDATE transactions SET category_id = NULL WHERE id = :i"), {"i": b})
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), pre)
+        with eng.connect() as conn:
+            assert "pre_link_category_id" not in {
+                c["name"] for c in inspect(conn).get_columns("transactions")
+            }
+            folded = dict(conn.execute(text("SELECT id, category_id FROM transactions")).all())
+        assert folded == {a: cat, b: None}
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+        with eng.connect() as conn:
+            saved = conn.execute(
+                text("SELECT count(*) FROM transactions WHERE pre_link_category_id IS NOT NULL")
+            ).scalar_one()
+        assert saved == 0
+    finally:
+        eng.dispose()
+
+
+# Written once; the pre-state comes from the script directory.
+_REV_ASSET_CLASS_CURRENCY = "0045_asset_class_currency"
+_ASSET_CLASS_CHECKS = {"ck_instruments_usd_only_asset_class", "ck_instruments_inr_only_asset_class"}
+_INSERT_INSTRUMENT = (
+    "INSERT INTO instruments (user_id, symbol, name, asset_class, currency, exchange) "
+    "VALUES (:u, :s, :n, :a, :c, :e)"
+)
+
+
+@pytest.mark.slow
+def test_asset_class_currency_migration_adds_the_checks_and_keeps_rows() -> None:
+    """The CHECKs land, the three seeded instruments (and the FK into them) survive the batch
+    rebuild, a mismatch is refused afterwards, and the downgrade drops the CHECKs but keeps the
+    partial index's predicate (the only gate on the downgrade's re-create)."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_ASSET_CLASS_CURRENCY))
+            for sym, name, cls, cur, exch in (
+                ("AAPL", "Apple", "us_equity", "USD", "NASDAQ"),
+                ("INF1", "Fund", "indian_mf", "INR", "MFCentral"),
+                ("FCNR", "FCNR deposit", "fd", "USD", "OTHER"),
+            ):
+                conn.execute(
+                    text(_INSERT_INSTRUMENT),
+                    {"u": v1_val, "s": sym, "n": name, "a": cls, "c": cur, "e": exch},
+                )
+            aapl = conn.execute(text("SELECT id FROM instruments WHERE symbol = 'AAPL'")).scalar()
+            conn.execute(
+                text(
+                    "INSERT INTO investment_transactions "
+                    "(user_id, instrument_id, date, transaction_type, units, "
+                    " amount_native_paise, fees_native_paise, fx_rate_to_inr, fingerprint) "
+                    "VALUES (:u, :i, '2025-01-15', 'buy', 1000000000, 100000, 0, 1000000, :f)"
+                ),
+                {"u": v1_val, "i": aapl, "f": "f" * 64},
+            )
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_ASSET_CLASS_CURRENCY)
+        with eng.connect() as conn:
+            names = {c["name"] for c in inspect(conn).get_check_constraints("instruments")}
+            assert names >= _ASSET_CLASS_CHECKS
+            assert conn.execute(text("SELECT count(*) FROM instruments")).scalar_one() == 3
+            assert conn.execute(text("PRAGMA foreign_key_check")).all() == []
+        with pytest.raises(IntegrityError), eng.begin() as conn:
+            conn.execute(
+                text(_INSERT_INSTRUMENT),
+                {"u": v1_val, "s": "X", "n": "X", "a": "indian_equity", "c": "USD", "e": "NSE"},
+            )
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_ASSET_CLASS_CURRENCY))
+        with eng.connect() as conn:
+            names = {c["name"] for c in inspect(conn).get_check_constraints("instruments")}
+            assert not _ASSET_CLASS_CHECKS & names
+            assert conn.execute(text("SELECT count(*) FROM instruments")).scalar_one() == 3
+            index_sql = conn.execute(
+                text(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE name = 'uq_instruments_active_user_symbol_currency'"
+                )
+            ).scalar_one_or_none()
+        assert index_sql is not None and "archived_at IS NULL" in index_sql
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_asset_class_currency_migration_refuses_a_mismatched_row() -> None:
+    """A row the CHECK would refuse stops the upgrade at the count-only preflight: the message
+    says how many and how to fix it, and names no symbol."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_ASSET_CLASS_CURRENCY))
+            conn.execute(
+                text(_INSERT_INSTRUMENT),
+                {
+                    "u": v1_val,
+                    "s": "SECRETSYM",
+                    "n": "Secret",
+                    "a": "indian_equity",
+                    "c": "USD",
+                    "e": "NSE",
+                },
+            )
+        with pytest.raises(RuntimeError) as exc, eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_ASSET_CLASS_CURRENCY)
+        assert "1 instrument row(s) of an INR-only asset class" in str(exc.value)
+        assert "fix in SQL" in str(exc.value)
+        assert "SECRETSYM" not in str(exc.value)
+    finally:
+        eng.dispose()
+
+
+_REV_ROOT_COLOR = "0046_root_category_color"
+_INSERT_CATEGORY = (
+    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id) "
+    "VALUES (:u, :n, 'spend', 0, :c, :p)"
+)
+
+
+@pytest.mark.slow
+def test_root_color_migration_adds_the_check_and_keeps_rows() -> None:
+    """The CHECK lands, a root, its inheriting child and the FK into the child survive the batch
+    rebuild, a colourless root is refused afterwards, and the downgrade drops the CHECK but keeps
+    the partial index's predicate (the only gate on the downgrade's re-create)."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_ROOT_COLOR))
+            conn.execute(
+                text(_INSERT_CATEGORY), {"u": v1_val, "n": "ProbeRoot", "c": "#2a78d6", "p": None}
+            )
+            root = conn.execute(
+                text("SELECT id FROM categories WHERE name = 'ProbeRoot'")
+            ).scalar_one()
+            conn.execute(
+                text(_INSERT_CATEGORY), {"u": v1_val, "n": "ProbeChild", "c": None, "p": root}
+            )
+            child = conn.execute(
+                text("SELECT id FROM categories WHERE name = 'ProbeChild'")
+            ).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO merchant_tag_map (user_id, merchant_normalized, category_id) "
+                    "VALUES (:u, 'probemerchant', :c)"
+                ),
+                {"u": v1_val, "c": child},
+            )
+            before = conn.execute(text("SELECT count(*) FROM categories")).scalar_one()
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_ROOT_COLOR)
+        with eng.connect() as conn:
+            names = {c["name"] for c in inspect(conn).get_check_constraints("categories")}
+            assert "ck_categories_root_has_color" in names
+            assert conn.execute(text("SELECT count(*) FROM categories")).scalar_one() == before
+            assert conn.execute(text("PRAGMA foreign_key_check")).all() == []
+        with pytest.raises(IntegrityError), eng.begin() as conn:
+            conn.execute(
+                text(_INSERT_CATEGORY), {"u": v1_val, "n": "Colourless", "c": None, "p": None}
+            )
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_ROOT_COLOR))
+        with eng.connect() as conn:
+            names = {c["name"] for c in inspect(conn).get_check_constraints("categories")}
+            assert "ck_categories_root_has_color" not in names
+            assert conn.execute(text("SELECT count(*) FROM categories")).scalar_one() == before
+            index_sql = conn.execute(
+                text("SELECT sql FROM sqlite_master WHERE name = 'uq_categories_active_user_name'")
+            ).scalar_one_or_none()
+        assert index_sql is not None and "archived_at IS NULL" in index_sql
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_root_color_migration_refuses_a_colourless_root() -> None:
+    """A colourless root stops the upgrade at the count-only preflight: the message says how many
+    and how to fix it, and names no category."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_ROOT_COLOR))
+            conn.execute(
+                text(_INSERT_CATEGORY), {"u": v1_val, "n": "SECRETCAT", "c": None, "p": None}
+            )
+        with pytest.raises(RuntimeError) as exc, eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_ROOT_COLOR)
+        assert "1 root category row(s) have no color" in str(exc.value)
+        assert "fix in SQL" in str(exc.value)
+        assert "SECRETCAT" not in str(exc.value)
+    finally:
+        eng.dispose()
+
+
+# Written once; the pre-state comes from the script directory.
+_REV_RETIRE_CARD_BILL = "0047_retire_card_bill_category"
+_CARD_BILL = "Credit Card Payments"
+_INSERT_CARD_BILL_CATEGORY = (
+    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id) "
+    "VALUES (:u, :n, 'spend', :s, :c, :p)"
+)
+
+
+def _category_id(conn: Connection, user: str, name: str) -> int:
+    return conn.execute(
+        text("SELECT id FROM categories WHERE user_id = :u AND name = :n AND archived_at IS NULL"),
+        {"u": user, "n": name},
+    ).scalar_one()
+
+
+def _archived_at(conn: Connection, category_id: int) -> object:
+    return conn.execute(
+        text("SELECT archived_at FROM categories WHERE id = :i"), {"i": category_id}
+    ).scalar_one()
+
+
+@pytest.mark.slow
+def test_card_bill_category_migration_archives_the_seed_and_keeps_rows() -> None:
+    """ADR-0002 rule 7b: the seeded spend "Credit Card Payments" is archived for every user, rows
+    and tag rules pointing at it keep it, a user-made root of the same name is left alone, and
+    the downgrade un-archives the seed."""
+    eng = _migration_engine()
+    try:
+        v1_val = get_settings().v1_user_id.hex
+        other_user = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_RETIRE_CARD_BILL))
+            seed = _category_id(conn, v1_val, _CARD_BILL)
+            assert _archived_at(conn, seed) is None
+            conn.execute(
+                text("INSERT INTO accounts (user_id, name, type) VALUES (:u, 'HDFC', 'bank')"),
+                {"u": v1_val},
+            )
+            acct = conn.execute(text("SELECT id FROM accounts")).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO transactions "
+                    "(user_id, account_id, date, amount_paise, transaction_type, "
+                    " merchant_normalized, fingerprint, source, category_id) "
+                    "VALUES (:u, :a, '2026-03-10', -50000, 'spend', 'cc autopay', 'fp-bill', "
+                    " 'import', :c)"
+                ),
+                {"u": v1_val, "a": acct, "c": seed},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO merchant_tag_map (user_id, merchant_normalized, category_id) "
+                    "VALUES (:u, 'cc autopay', :c)"
+                ),
+                {"u": v1_val, "c": seed},
+            )
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": other_user})
+            conn.execute(
+                text(_INSERT_CARD_BILL_CATEGORY),
+                {"u": other_user, "n": _CARD_BILL, "s": 0, "c": "#2a78d6", "p": None},
+            )
+            mine = _category_id(conn, other_user, _CARD_BILL)
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_RETIRE_CARD_BILL)
+        with eng.connect() as conn:
+            assert _archived_at(conn, seed) is not None
+            txn = conn.execute(text("SELECT category_id, transaction_type FROM transactions")).one()
+            assert tuple(txn) == (seed, "spend")
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT category_id FROM merchant_tag_map "
+                        "WHERE merchant_normalized = 'cc autopay'"
+                    )
+                ).scalar_one()
+                == seed
+            )
+            assert _archived_at(conn, mine) is None
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_RETIRE_CARD_BILL))
+        with eng.connect() as conn:
+            assert _archived_at(conn, seed) is None
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_card_bill_category_migration_archives_a_promoted_seed_with_its_children() -> None:
+    """A user who promoted the seed to a root keeps its children under it (ADR-0012 rule 9), so
+    archiving the root archives them too, with the same stamp."""
+    eng = _migration_engine()
+    try:
+        promoted_user = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_RETIRE_CARD_BILL))
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": promoted_user})
+            conn.execute(
+                text(_INSERT_CARD_BILL_CATEGORY),
+                {"u": promoted_user, "n": _CARD_BILL, "s": 1, "c": "#c23b6b", "p": None},
+            )
+            root = _category_id(conn, promoted_user, _CARD_BILL)
+            conn.execute(
+                text(_INSERT_CARD_BILL_CATEGORY),
+                {"u": promoted_user, "n": "Card Fees", "s": 1, "c": None, "p": root},
+            )
+            child = _category_id(conn, promoted_user, "Card Fees")
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_RETIRE_CARD_BILL)
+        with eng.connect() as conn:
+            stamp = _archived_at(conn, root)
+            assert stamp is not None
+            assert _archived_at(conn, child) == stamp
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
     finally:
         eng.dispose()

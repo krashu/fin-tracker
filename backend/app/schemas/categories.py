@@ -11,6 +11,17 @@ and ``archived_at`` so clients can filter without re-querying. ``user_id``
 is intentionally omitted to keep the wire shape narrow (and to keep the
 single-user → multi-user v2 boundary clean).
 
+``role`` is the one fact about a category the backend owns and the frontend must
+not re-derive by matching names: the kind's fallback "Other" or the spend-kind
+Cashback (and its children). It is **required** on both read schemas, so an ORM row
+cannot be validated into one directly; every route builds them through
+``app.api.v1.categories``'s ``_reads`` (computed by
+:func:`app.services.category_service.category_roles`).
+
+``display_color`` (the category's own colour, else its parent's; ADR-0012 rule 7) is also
+computed server-side (:func:`app.services.category_colors.category_colors`) and never
+re-derived on the client; it is required on both read schemas and built in ``_reads``.
+
 ``kind`` (spend|income) is set at create and **immutable** thereafter —
 see ``CategoryUpdate``.
 """
@@ -24,17 +35,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import CategoryKindStr
 from app.schemas._common import reject_null_name
+from app.services.category_service import CategoryRoleStr
 
 # A category's color is an arbitrary ``#rrggbb`` hex (the frontend offers a
 # curated palette plus a custom picker). Stored lowercase in the ``String(16)``
-# column; NULL on the wire and in the DB means "derive the color from the id"
-# (the Auto fallback in ``frontend/lib/categories.ts``). The 3-digit (#rgb) and
+# column; NULL is legal only on a subcategory (it inherits its parent's hue); a root
+# always carries one (ADR-0012 rule 7). The 3-digit (#rgb) and
 # 8-digit (#rrggbbaa) forms are intentionally rejected — one canonical shape.
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-f]{6}$")
 
 
 def _normalize_color(value: str | None) -> str | None:
-    """Lower-case + validate a ``#rrggbb`` hex; pass ``None`` (Auto) through."""
+    """Lower-case + validate a ``#rrggbb`` hex.
+
+    Pass ``None`` (inherit, or let the server assign on a root) through.
+    """
     if value is None:
         return None
     normalized = value.strip().lower()
@@ -57,7 +72,8 @@ class CategoryCreate(BaseModel):
     # Defaults to spend so the existing {name}-only POST stays valid until the
     # frontend sends kind. Literal-bound → an invalid kind 422s.
     kind: CategoryKindStr = "spend"
-    # Optional hex color; None (default) keeps the derive-from-id behaviour.
+    # Optional hex color. Omitted on a root: the server assigns the least-used palette slot
+    # of its kind; null on a root is a 422. Null or omitted on a subcategory inherits.
     color: str | None = None
     # Optional parent category ID (must be a top-level category with parent_id IS NULL).
     parent_id: int | None = None
@@ -82,7 +98,9 @@ class CategoryRead(BaseModel):
     is_seeded: bool
     archived_at: datetime | None
     color: str | None
+    display_color: str
     parent_id: int | None = None
+    role: CategoryRoleStr | None
 
 
 class CategoryTreeRead(BaseModel):
@@ -96,7 +114,9 @@ class CategoryTreeRead(BaseModel):
     is_seeded: bool
     archived_at: datetime | None
     color: str | None
+    display_color: str
     parent_id: int | None = None
+    role: CategoryRoleStr | None
     subcategories: list[CategoryRead] = Field(default_factory=list)
 
 
@@ -114,7 +134,8 @@ class CategoryUpdate(BaseModel):
     NULL constraint.
 
     Seeded categories ARE renameable; ``is_seeded`` records origin, not
-    the current name.
+    the current name. The one exception is each kind's fallback "Other",
+    which the router refuses to rename or reparent (ADR-0012 rule 8).
 
     ``kind`` is deliberately **not** a field here — it is immutable after
     create. Flipping a category's scope would orphan every transaction
@@ -133,8 +154,8 @@ class CategoryUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(default=None, min_length=1, max_length=64)
-    # Unlike ``name``, ``color`` IS nullable: an explicit ``null`` is the
-    # documented way to clear a picked color and revert to derive-from-id.
+    # Unlike ``name``, ``color`` IS nullable: an explicit ``null`` reverts a subcategory
+    # to inheriting its parent's hue; on a root, or with a promotion, it is a 422.
     # Omitted (not in model_fields_set) is a no-op via exclude_unset in the route.
     color: str | None = None
     # Optional parent category ID (can be set to null to promote to root).
@@ -148,5 +169,11 @@ class CategoryUpdate(BaseModel):
     @field_validator("color", mode="after")
     @classmethod
     def _color(cls, v: str | None) -> str | None:
-        # Explicit null is allowed here (reverts to Auto), unlike name.
+        # Explicit null is allowed here (a subcategory inherits again), unlike name.
         return _normalize_color(v)
+
+
+class CategoryPaletteRead(BaseModel):
+    """``GET /categories/palette``: the colours the app hands out, in slot order."""
+
+    colors: list[str]
