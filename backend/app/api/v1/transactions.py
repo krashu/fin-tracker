@@ -11,13 +11,28 @@
   PRD §F4 fingerprint, learns the merchant → category/label memory before
   adding the txn, then commits. A duplicate fingerprint returns 409.
 
-  Load-bearing ordering: ``learn_merchant_memory`` runs BEFORE
-  ``session.add(txn)``. It opens per-write SAVEPOINTs whose entry-flush would,
-  if the txn were already added, emit the Transaction INSERT and fire a
-  fingerprint conflict inside a savepoint exit — outside the route's
-  commit-level ``try/except``. Learning first keeps that flush a no-op on the
-  still-absent txn; both writes stay on the parent transaction and the
-  commit-level handler owns the 409 conversion.
+  Load-bearing ordering: label resolution and ``learn_merchant_memory`` run
+  BEFORE ``session.add(txn)``. ``resolve_label_names`` (and later ``set_labels``)
+  open SAVEPOINTs whose entry-flush would, if the txn were already added, emit
+  the Transaction INSERT and fire a fingerprint conflict inside a savepoint exit
+  — outside the route's commit-level ``try/except``. The learning upserts are
+  single statements (no SAVEPOINT) but keep their slot, so both writes stay on
+  the parent transaction and the commit-level handler owns the 409 conversion.
+
+* ``POST /api/v1/transactions/bulk-categorise`` — move up to 500 board rows
+  onto one category in a single request (ADR-0004 rules 2b and 4): teaches once
+  per canonical merchant, all-or-nothing (422 ``invalid_ids`` before any write).
+  Returns ``{updated, taught}``.
+
+* ``POST /api/v1/transactions/bulk-delete`` — hard-delete up to 500 of the caller's rows
+  (pending included) in one request, all-or-nothing (422 ``invalid_ids`` before any write);
+  each row goes the way a single ``DELETE`` takes it
+  (:func:`app.services.transaction_delete.delete_owned_transactions`). 204.
+
+* ``GET /api/v1/transactions/{transaction_id}/past-rows`` — the "apply to past
+  rows" offer after a correction: recent board rows of the same canonical merchant
+  and type still on a machine-assigned category. The client applies them through
+  ``bulk-categorise``, which validates again and teaches +1.
 
 * ``PATCH /api/v1/transactions/{transaction_id}`` — partial-update via
   :class:`TransactionUpdate`. ``model_dump(exclude_unset=True)`` means omitted
@@ -31,6 +46,20 @@
   (409 on collision), while the immutable ``origin_fingerprint`` keeps that edit
   from resurrecting its own pre-edit version on the next statement re-import. See
   the route docstring for the ordering of the 422 gates.
+
+* ``POST /api/v1/transactions/{transaction_id}/link`` — the manual link (ADR-0002
+  rule 11b): pair two equal-and-opposite confirmed rows the F4a auto-link missed. Each
+  leg keeps its pre-link type and category for unlink; never teaches.
+
+* ``GET /api/v1/transactions/{transaction_id}/link-candidates`` — the closest 20 rows the
+  manual link would accept for this one, so the picker never offers a refusal.
+
+* ``PUT`` / ``DELETE /api/v1/transactions/{transaction_id}/refund-link`` — the
+  optional refund → original link (ADR-0009 rule 13). Its own endpoints because
+  PATCH takes the seven user-visible fields only (ADR-0006 rule 10).
+
+* ``GET /api/v1/transactions/{transaction_id}/refund-candidates`` — the originals that
+  refund may link to (at most 20, ranked), so the picker never offers a refusal.
 
 All queries scope to ``user_id`` from :data:`CurrentUserId` (habit-shaping
 for v2 multi-user — single-user v0.1 doesn't strictly need it).
@@ -51,11 +80,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date as date_t
+from datetime import timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -71,23 +101,47 @@ from app.models import (
     TransactionTypeStr,
 )
 from app.schemas import (
+    BulkCategorise,
+    BulkCategoriseResult,
+    BulkDelete,
+    PastRowsRead,
     TransactionCreate,
     TransactionRead,
     TransactionTransferCreate,
     TransactionUpdate,
     TransferRead,
 )
-from app.schemas.transactions import sign_error
+from app.schemas.transactions import RefundLinkSet, TransactionLinkSet, sign_error
+from app.services.bulk_categorise import (
+    PAST_ROWS_WINDOW_DAYS,
+    bulk_categorise,
+    past_rows_like,
+)
 from app.services.category_service import (
     kind_for_type,
-    resolve_category_labels,
     validate_category_ids,
 )
 from app.services.fingerprint import transaction_fingerprint
 from app.services.merchant import normalize_merchant
+from app.services.merchant_alias import load_alias_resolver
 from app.services.merchant_labels import learn_merchant_memory
+from app.services.reconciliation_service import (
+    link_candidates,
+    manual_link_problem,
+    pair_existing_rows,
+    release_leg,
+)
+from app.services.refund_link import (
+    NOT_A_REFUND,
+    is_refund,
+    is_refundable_original,
+    refund_candidates,
+    refund_link_problem,
+)
+from app.services.transaction_delete import delete_owned_transactions
 from app.services.transaction_labels import resolve_label_names, set_labels_on_transaction
 from app.services.transaction_queries import confirmed_only
+from app.services.transaction_reads import transaction_reads
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -104,31 +158,8 @@ _PAIR_LOCKED_FIELDS = _IDENTITY_FIELDS | {"transaction_type"}
 def _to_read(
     session: Session, txns: Sequence[Transaction], *, user_id: UUID
 ) -> list[TransactionRead]:
-    """Project ORM rows onto the wire schema, naming each row's category.
-
-    The names cannot be read off the ORM object: ``Transaction`` has no
-    ``category`` relationship — ``labels`` is documented as its only one, and
-    ADR-0012 keeps ORM cascades off ``categories`` after a ``delete-orphan``
-    there turned a reparent into silent row deletion. So they arrive from one
-    batched query that deliberately ignores ``archived_at``
-    (:func:`app.services.category_service.resolve_category_labels`), which is
-    what lets a transaction on an archived category still render its real name
-    instead of "Uncategorized".
-    """
-    names = resolve_category_labels(
-        session,
-        category_ids=[t.category_id for t in txns if t.category_id is not None],
-        user_id=user_id,
-    )
-    reads: list[TransactionRead] = []
-    for t in txns:
-        read = TransactionRead.model_validate(t)
-        if t.category_id is not None:
-            # A miss means the id is not owned by this user, so it is left unnamed
-            # rather than reaching for a name across the tenant boundary.
-            read.category_name, read.category_parent_name = names.get(t.category_id, (None, None))
-        reads.append(read)
-    return reads
+    """Project ORM rows onto the wire schema (:func:`transaction_reads`)."""
+    return transaction_reads(session, txns, user_id=user_id)
 
 
 # `response_model=` is deliberate: the wire schema is narrower than the ORM model
@@ -261,7 +292,7 @@ def _assert_account_or_422(session: Session, *, account_id: int, user_id: UUID) 
     The four create-path account checks, shared with ``PATCH /transactions`` now that
     ADR-0007 rule 6 makes ``account_id`` editable — a re-filed row must clear exactly
     the same bar as a newly-created one. Cross-user ids 422 rather than being silently
-    honoured (``backend/CLAUDE.md`` tenant rule 3); the row is fetched whole because
+    honoured (root ``AGENTS.md`` §Tenant isolation rule 3); the row is fetched whole because
     two of the checks read columns, not just existence.
     """
     account = session.scalar(
@@ -295,12 +326,16 @@ def _assert_account_or_422(session: Session, *, account_id: int, user_id: UUID) 
 
 
 def _is_fingerprint_conflict(orig: BaseException | None) -> bool:
-    """True when an ``IntegrityError.orig`` is the
-    ``(user_id, account_id, fingerprint)`` uniqueness violation (PRD §F4 dedup).
+    """True when an ``IntegrityError.orig`` is the dedup-key uniqueness violation.
 
-    Shared by ``POST /transactions`` and ``POST /transactions/transfer`` so the
-    dedup → 409 mapping lives in one place; delegates the dialect-aware matching
-    to :func:`app.core.db_errors.is_unique_violation`.
+    The constraint is the 4-column ``UNIQUE(user_id, account_id, fingerprint,
+    occurrence)``, ``uq_transactions_user_account_fingerprint`` (ADR-0006 rule 6).
+    Shared by ``POST /transactions``, ``POST /transactions/transfer`` and ``PATCH
+    /transactions/{id}`` so the dedup → 409 mapping lives in one place; delegates the
+    dialect-aware matching to :func:`app.core.db_errors.is_unique_violation`. Postgres
+    matches the index name; SQLite matches ``columns=`` as a subset — every listed
+    ``table.col`` token must appear among the failing columns, so the three listed
+    here identify the constraint without naming ``occurrence``.
     """
     return is_unique_violation(
         orig,
@@ -342,19 +377,18 @@ def create_transaction(
     # set_labels runs after the flush below, once txn.id exists.
     resolved_labels = resolve_label_names(session, user_id=user_id, names=payload.labels)
 
-    # F3 + F3a learning, BEFORE session.add(txn) — load-bearing ordering.
-    # learn_merchant_memory opens record_tag/record_label begin_nested()
-    # SAVEPOINTs; their entry-flush (SessionTransaction._take_snapshot →
-    # Session.flush() for nested savepoints) must stay a no-op on the still-absent
-    # txn INSERT, so a fingerprint dup surfaces at session.commit() inside the
-    # route's try/except (→ 409), not mid-learning (→ 500). Both writes share the
-    # parent transaction, so a 409 rolls the tag/label increments back atomically.
+    # F3 + F3a learning, BEFORE session.add(txn) — ordering kept. record_tag /
+    # record_label are single-statement upserts (no SAVEPOINT), but the txn INSERT
+    # must still surface at session.commit() inside the route's try/except (→ 409),
+    # not mid-learning (→ 500). Both writes share the parent transaction, so a 409
+    # rolls the tag/label increments back atomically.
     # The shared should_learn_tag gate keeps income/transfer (hand-classified) out
     # of the spend→category/label maps; a #salary on an income row still persists
     # via set_labels below but is never learned.
     learn_merchant_memory(
         session,
         user_id=user_id,
+        resolver=load_alias_resolver(session, user_id=user_id),
         merchant_normalized=merchant_normalized,
         transaction_type=payload.transaction_type,
         category_id=payload.category_id,
@@ -377,7 +411,7 @@ def create_transaction(
         # itself stays nullable so genuinely pending import rows are
         # distinguishable from F2 rows; the stamp is set here, not as a
         # column server_default.
-        confirmed_at=clock.utcnow(),
+        confirmed_at=clock.naive_utcnow(),
     )
     session.add(txn)
 
@@ -476,7 +510,7 @@ def create_transfer(
 
     source_merchant = f"Transfer to {dest_account.name}"
     dest_merchant = f"Transfer from {source_account.name}"
-    now = clock.utcnow()
+    now = clock.naive_utcnow()
     source = Transaction(
         user_id=user_id,
         account_id=source_account.id,
@@ -535,10 +569,8 @@ def create_transfer(
         raise
     session.refresh(source)
     session.refresh(dest)
-    return TransferRead(
-        source=TransactionRead.model_validate(source),
-        dest=TransactionRead.model_validate(dest),
-    )
+    source_read, dest_read = _to_read(session, [source, dest], user_id=user_id)
+    return TransferRead(source=source_read, dest=dest_read)
 
 
 @router.patch("/{transaction_id}", response_model=TransactionRead)
@@ -559,14 +591,19 @@ def update_transaction(
     Order below is deliberate: every 422 gate runs on the merged state *before* the
     first ``setattr``, so a rejected request leaves the row untouched.
 
-    * **Transfer guard** (rule 7) — a paired row rejects identity/type edits with
-      422 (unlink first); ``category_id`` / ``labels`` stay editable, since neither
-      participates in the pairing. ``transfer`` is not a valid *target* either:
-      pairs are born via ``POST /transactions/transfer``, and a lone leg minted here
-      would violate ADR-0002's exactly-two-pairing invariant.
+    * **Transfer guard** (ADR-0006 rule 15) — a paired row rejects identity/type
+      *changes* with 422 (unlink first); ``category_id`` / ``labels`` stay editable,
+      since neither participates in the pairing. An unpaired row may change its type
+      to or from ``transfer`` (ADR-0002 rule 7d): the patch writes no pair column.
+      The guard compares against the stored row, so re-sending a stored value — the
+      ``transfer`` type of an unpaired transfer row, or a leg's own amount — is a
+      no-op, not a 422.
     * **Sign/type is a merged pair** (rule 4) — shared with
       ``TransactionCreate._check_sign`` via :func:`sign_error`, because the schema
       validator cannot see the stored row.
+    * **A refund link stays true** (ADR-0009 rule 13) — when sign or type is in
+      play, a linked refund must stay a positive spend and a linked original a
+      negative one; otherwise 422 until the link is removed.
     * **Category kind follows the POST-patch type** (rule 5). A kind flip must carry
       a compatible ``category_id`` — or an explicit ``null`` — in the same request.
       No silent clearing: the picker already knows the required kind, and clearing
@@ -579,9 +616,11 @@ def update_transaction(
       raw input is what keeps a cosmetic re-casing of ``merchant_raw`` — which
       normalizes to the same string — from vacating an occupied slot in a duplicate
       group and 409-ing on itself.
-    * ``origin_fingerprint`` is **never** touched here (rule 9): it answers which
+    * ``origin_fingerprint`` is **never** touched here (rule 17): it answers which
       statement line produced the row, so an edit must not make the row look
-      deleted to the importer.
+      deleted to the importer. The first identity edit of a row that has one instead
+      freezes the pre-edit inputs in the ``origin_*`` columns (later edits leave them),
+      so the origin stays recomputable on any install.
 
     Pending and confirmed rows are equally editable (rule 10) — the loader scopes on
     ``id`` + ``user_id`` alone, symmetric with DELETE. The review queue is a
@@ -611,12 +650,12 @@ def update_transaction(
     label_names = updates.pop("labels", None) or []
 
     # --- Rule 7: transfer guard -------------------------------------------------
-    if updates.get("transaction_type") == "transfer":
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="cannot change transaction_type to transfer; use POST /transactions/transfer",
-        )
-    if txn.transfer_pair_id is not None and _PAIR_LOCKED_FIELDS & updates.keys():
+    # Fires on a real change only: a body that re-sends a stored value (a client
+    # echoing the row back) is a no-op, not an edit (ADR-0006 rule 15).
+    pair_locked_changes = {
+        f for f in _PAIR_LOCKED_FIELDS & updates.keys() if updates[f] != getattr(txn, f)
+    }
+    if txn.transfer_pair_id is not None and pair_locked_changes:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="unlink this transfer before editing its identity fields or type",
@@ -630,19 +669,42 @@ def update_transaction(
         _assert_account_or_422(session, account_id=updates["account_id"], user_id=user_id)
 
     # --- Rule 4: sign and type validated as a post-patch PAIR -------------------
-    # Only when the request actually puts that pair in play. Validating an untouched
-    # pair would strand a row the caller is not changing: `backup_csv` checks the type
-    # vocabulary and that the amount parses, but NOT the sign pairing, and a
-    # hand-edited zip is its declared threat model — so a stored `income` carrying a
-    # negative amount is reachable, and a labels-only PATCH on it must not 422.
-    # (A stored `spend` with a positive amount needs no such exemption since
-    # ADR-0009: that IS a refund, and sign_error accepts it outright.)
+    # Only when the request actually puts that pair in play (ADR-0006 rule 12).
+    # Validating an untouched pair would strand a row the caller is not changing. Since
+    # ADR-0009 every type takes either sign, so the only pair sign_error rejects is a
+    # zero amount — which no API path writes, but a labels-only PATCH on such a row
+    # must still not 422 on state it never touched.
     merged_type = updates.get("transaction_type", txn.transaction_type)
     if {"transaction_type", "amount_paise"} & updates.keys():
         sign_problem = sign_error(merged_type, updates.get("amount_paise", txn.amount_paise))
         if sign_problem is not None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=sign_problem
+            )
+
+    # --- ADR-0009 rule 13: a refund link stays true -----------------------------
+    # Only when the request puts sign or type in play. A linked refund must remain a
+    # positive spend, and a linked original a negative one; the link is removed first
+    # (DELETE /transactions/{id}/refund-link), never silently dropped here.
+    if {"transaction_type", "amount_paise"} & updates.keys():
+        merged_amount = updates.get("amount_paise", txn.amount_paise)
+        if txn.refund_of_id is not None and not is_refund(merged_type, merged_amount):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="remove the refund link before changing this row's sign or type",
+            )
+        if not is_refundable_original(merged_type, merged_amount) and session.scalar(
+            select(
+                exists().where(
+                    Transaction.user_id == user_id,
+                    Transaction.refund_of_id == txn.id,
+                )
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="a refund links to this row; remove that link before changing "
+                "its sign or type",
             )
 
     # --- Rule 5: the category kind follows the POST-patch type ------------------
@@ -678,8 +740,27 @@ def update_transaction(
     # from that schema) is never written here — and must NOT be: it's the frozen
     # import suggestion, and a category_id PATCH is exactly the "edit" the
     # acceptance-rate metric (GET /dashboards/tagging-stats) counts as not-kept.
+    if identity_changed and txn.origin_fingerprint is not None and txn.origin_date is None:
+        # ADR-0006 rule 17: the first identity edit of an imported row freezes the origin's
+        # inputs, so its hash stays recomputable (and portable) after the edit. Later edits
+        # leave them alone; origin_fingerprint itself is never touched.
+        txn.origin_date, txn.origin_amount_paise = txn.date, txn.amount_paise
+        txn.origin_merchant_normalized, txn.origin_account_id = (
+            txn.merchant_normalized,
+            txn.account_id,
+        )
+
     for field, value in updates.items():
         setattr(txn, field, value)
+    # ADR-0002 rule 9: a real category change on a linked leg is the user's newer choice, so
+    # the category the link set aside is discarded in the same UPDATE (the DB CHECK demands
+    # it). An echo of the stored value is not a change (ADR-0006 rule 15).
+    if (
+        "category_id" in updates
+        and updates["category_id"] != prev_category_id
+        and txn.transfer_pair_id is not None
+    ):
+        txn.pre_link_category_id = None
 
     # --- Rule 3: recompute the derived identity columns -------------------------
     if identity_changed:
@@ -696,13 +777,14 @@ def update_transaction(
             txn.fingerprint = recomputed
             txn.occurrence = 0
         try:
-            # Flush the column edits HERE, not at the commit below. The label and
-            # learning helpers open begin_nested() SAVEPOINTs whose entry-flush would
-            # otherwise emit this UPDATE inside a savepoint owned by the label/tag
-            # conflict predicate, which re-raises past a commit-level handler → 500
-            # instead of 409. POST solves the same hazard by ordering learning before
-            # session.add; PATCH cannot, because rule 8 needs the post-patch merchant
-            # and type. Mirrors create_transfer's two-flush shape.
+            # Flush the column edits HERE, not at the commit below. The label
+            # helpers (resolve_label_names, set_labels) open begin_nested() SAVEPOINTs
+            # whose entry-flush would otherwise emit this UPDATE inside a savepoint
+            # owned by the label conflict predicate, which re-raises past a
+            # commit-level handler → 500 instead of 409. POST solves the same hazard
+            # by ordering label work before session.add; PATCH cannot, because rule 8
+            # needs the post-patch merchant and type. Mirrors create_transfer's
+            # two-flush shape.
             session.flush()
         except IntegrityError as e:
             session.rollback()
@@ -747,6 +829,7 @@ def update_transaction(
         learn_merchant_memory(
             session,
             user_id=user_id,
+            resolver=load_alias_resolver(session, user_id=user_id),
             merchant_normalized=txn.merchant_normalized,
             transaction_type=txn.transaction_type,
             category_id=new_category_id if learn_category else None,
@@ -766,27 +849,11 @@ def delete_transaction(
 ) -> None:
     """Hard delete (PRD §F4a-4 resolution path for re-imported / corrected rows).
 
-    **Hard, not soft.** Transactions are leaves in v0.1 — nothing else
-    FKs to ``transactions.id`` except ``transfer_pair_id``. The
-    project-wide rule: soft-delete for entities other rows reference
-    (Account, Category), hard-delete for leaves.
-
-    **Paired-row pre-flight.** F4a-1 (CC-bill auto-link) is a writer of
-    ``transfer_pair_id``. Deleting one half of a pair without nulling
-    the partner first would trip the composite FK from migration 0005.
-    Solution: null the partner's ``transfer_pair_id`` in the same
-    session before the delete. The partner's ``transaction_type``
-    stays ``"transfer"`` — PRD doesn't pin a restoration value and no
-    provenance column exists to know whether the original was
-    ``"spend"`` or ``"income"``. The user can manually relabel via a
-    future widened PATCH; cosmetic anomaly, not a data-integrity bug.
-
-    **No ``merchant_tag_map`` write.** Per PRD §F3 ``hit_count`` is a
-    monotonic positive signal. PATCH writes to the map because PATCH
-    expresses a *new positive decision* about the merchant→category
-    binding; DELETE expresses *no decision* (the user is removing a
-    row, not retracting their judgement about what the merchant means).
-    Not symmetric ops on the same signal.
+    The row goes through :func:`app.services.transaction_delete.delete_owned_transactions`,
+    which nulls the refund links pointing at it (ADR-0009 rule 13) and releases its partner
+    (ADR-0002 rules 5 and 9). Hard, not soft: the only references to ``transactions.id`` are the
+    two self-FKs and ``transaction_labels`` (CASCADE). The project-wide rule: soft-delete for
+    entities other rows reference (Account, Category), hard-delete for leaves.
 
     **Pending rows are deletable.** Loader scopes on ``id`` + ``user_id``
     only — no ``confirmed_at`` gate. Symmetric with PATCH
@@ -805,20 +872,7 @@ def delete_transaction(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="transaction not found",
         )
-
-    # Paired-row pre-flight — see docstring. Null the partner's
-    # transfer_pair_id in the same outer transaction as the delete.
-    if txn.transfer_pair_id is not None:
-        partner = session.scalar(
-            select(Transaction).where(
-                Transaction.id == txn.transfer_pair_id,
-                Transaction.user_id == user_id,
-            )
-        )
-        if partner is not None:
-            partner.transfer_pair_id = None
-
-    session.delete(txn)
+    delete_owned_transactions(session, user_id=user_id, ids=[txn.id])
     session.commit()
     return None
 
@@ -831,19 +885,21 @@ def unlink_transaction(
 ) -> None:
     """Break a transfer pair (PRD §F4a-1 "break the link if the auto-detection got it wrong").
 
-    Clears ``transfer_pair_id`` on BOTH legs symmetrically; leaves
-    ``transaction_type="transfer"`` on both — no provenance column exists to
-    restore the pre-link spend/income type, consistent with the DELETE-leg
-    precedent above. Idempotent: a row with no ``transfer_pair_id`` is a 204
-    no-op. Origin-agnostic — clears an F4a auto-link or an F2 manual-transfer
-    pair alike; the F2-vs-F4a distinction is a product-surface concern (the
-    unlink affordance lives only on the F4a banner per PRD §F4a-1), not a
-    runtime guard.
+    Clears ``transfer_pair_id`` on BOTH legs symmetrically and restores each
+    leg's ``pre_link_type`` where a link made it a transfer (ADR-0002 rule 9);
+    a leg born as a transfer (F2) has none and stays ``"transfer"``. The same
+    release the shared delete gives a deleted leg's partner. Idempotent: a row with no
+    ``transfer_pair_id`` is a 204 no-op. Origin-agnostic — clears an F4a
+    auto-link or an F2 manual-transfer pair alike; the F2-vs-F4a distinction is
+    a product-surface concern (the unlink affordance lives only on the F4a
+    banner per PRD §F4a-1), not a runtime guard.
 
     The inverse of ``POST /transactions/transfer``. Clearing
     ``transfer_pair_id`` to NULL can't trip the constraints — a composite-FK
     tuple with a NULL member isn't checked (MATCH SIMPLE), and
-    ``ck_transactions_no_self_pair`` is itself NULL-tolerant — so order is
+    ``ck_transactions_no_self_pair`` and ``ck_transactions_paired_is_transfer``
+    are NULL-tolerant, the latter because each row's UPDATE clears its pair in
+    the same statement that restores its type — so order is
     irrelevant and no ``begin_nested`` / savepoint is needed (contrast
     ``create_transfer``, which two-flushes because it SETS a non-null pair that
     must validate).
@@ -871,9 +927,260 @@ def unlink_transaction(
                 Transaction.user_id == user_id,
             )
         )
-        txn.transfer_pair_id = None
+        release_leg(txn)
         if partner is not None:
-            partner.transfer_pair_id = None
+            release_leg(partner)
 
     session.commit()
     return None
+
+
+def _load_owned(session: Session, *, transaction_id: int, user_id: UUID) -> Transaction | None:
+    return session.scalar(
+        select(Transaction).where(
+            Transaction.id == transaction_id,
+            Transaction.user_id == user_id,
+        )
+    )
+
+
+@router.post("/{transaction_id}/link", status_code=status.HTTP_204_NO_CONTENT)
+def link_transaction(
+    transaction_id: int,
+    payload: TransactionLinkSet,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> None:
+    """Manually pair two existing confirmed rows as a transfer (ADR-0002 rule 11b).
+
+    "Paid your card bill elsewhere?": for when the F4a auto-link missed. The row in the path
+    must be the caller's (404 otherwise, ADR-0003 rule 8); a missing or foreign ``partner_id``
+    is a 422 (rule 9). Then :func:`manual_link_problem` decides eligibility (422 with its
+    reason), and :func:`pair_existing_rows` writes the pair, each leg's pre-link type and
+    category. A link is not a categorisation, so it never teaches (ADR-0004).
+    """
+    txn = _load_owned(session, transaction_id=transaction_id, user_id=user_id)
+    if txn is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="transaction not found")
+    partner = _load_owned(session, transaction_id=payload.partner_id, user_id=user_id)
+    if partner is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="partner transaction not found",
+        )
+    if (
+        problem := manual_link_problem(session, user_id=user_id, txn=txn, partner=partner)
+    ) is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=problem)
+    pair_existing_rows(session, txn, partner)
+    session.commit()
+
+
+@router.get("/{transaction_id}/link-candidates", response_model=list[TransactionRead])
+def get_link_candidates(
+    transaction_id: int,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> list[TransactionRead]:
+    """The rows the manual link would accept for this one: at most 20, nearest date first
+    (ADR-0002 rule 11b). Runs the same eligibility rule as ``POST .../link``, so a listed row
+    is never refused. A row that cannot be linked itself returns ``[]``; one the caller does
+    not own is a 404 (ADR-0003 rule 8).
+    """
+    txn = _load_owned(session, transaction_id=transaction_id, user_id=user_id)
+    if txn is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="transaction not found")
+    return _to_read(session, link_candidates(session, user_id=user_id, txn=txn), user_id=user_id)
+
+
+@router.put("/{transaction_id}/refund-link", status_code=status.HTTP_204_NO_CONTENT)
+def set_refund_link(
+    transaction_id: int,
+    payload: RefundLinkSet,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> None:
+    """Link a refund to the spend it reverses (ADR-0009 rule 13).
+
+    Every check runs before the write: the row must be the caller's (404 otherwise,
+    ADR-0003 rule 8) and a refund — a positive ``spend``; the original must be the
+    caller's (422 otherwise, rule 9), a negative ``spend``, and confirmed. Confirmed,
+    because the review-queue discard deletes pending rows only, so an original cannot
+    disappear under its refund that way. Several refunds may point at one original;
+    amounts are not summed against it — the link is informational.
+    """
+    txn = _load_owned(session, transaction_id=transaction_id, user_id=user_id)
+    if txn is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="transaction not found")
+    if not is_refund(txn.transaction_type, txn.amount_paise):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=NOT_A_REFUND,
+        )
+    original = _load_owned(session, transaction_id=payload.original_id, user_id=user_id)
+    if original is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="original transaction not found",
+        )
+    if (problem := refund_link_problem(txn, original)) is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=problem)
+    txn.refund_of_id = original.id
+    session.commit()
+
+
+@router.delete("/{transaction_id}/refund-link", status_code=status.HTTP_204_NO_CONTENT)
+def delete_refund_link(
+    transaction_id: int,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> None:
+    """Remove a refund's link to its original. Idempotent: an unlinked row is a 204
+    no-op; another user's row is a 404 (ADR-0003 rule 8)."""
+    txn = _load_owned(session, transaction_id=transaction_id, user_id=user_id)
+    if txn is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="transaction not found")
+    txn.refund_of_id = None
+    session.commit()
+
+
+@router.get("/{transaction_id}/refund-candidates", response_model=list[TransactionRead])
+def get_refund_candidates(
+    transaction_id: int,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> list[TransactionRead]:
+    """The originals this refund may link to: at most 20, the current original first, then
+    the same merchant and amount (ADR-0009 rule 13). Runs the same eligibility rule as
+    ``PUT .../refund-link``, so a listed row is never refused. A row that is not a refund
+    returns ``[]``; one the caller does not own is a 404 (ADR-0003 rule 8).
+    """
+    txn = _load_owned(session, transaction_id=transaction_id, user_id=user_id)
+    if txn is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="transaction not found")
+    rows = refund_candidates(
+        session,
+        user_id=user_id,
+        refund=txn,
+        resolver=load_alias_resolver(session, user_id=user_id),
+    )
+    return _to_read(session, rows, user_id=user_id)
+
+
+@router.post("/bulk-categorise", response_model=BulkCategoriseResult)
+def bulk_categorise_transactions(
+    payload: BulkCategorise,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> BulkCategoriseResult:
+    """Categorise many board rows at once; one teach per canonical merchant.
+
+    Every check runs before any write, so the request is all-or-nothing: an unknown,
+    foreign or archived category → 422; any id that is missing or foreign, still
+    pending (staged rows never teach, ADR-0004 rule 3), or of a kind the category
+    does not accept → 422 ``{message, invalid_ids}``. Duplicate ids collapse.
+    """
+    category_ids = validate_category_ids(
+        session, category_ids=[payload.category_id], user_id=user_id
+    )
+    if payload.category_id not in category_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="category not found, archived, or wrong kind for this transaction",
+        )
+    category = session.scalar(
+        select(Category).where(Category.id == payload.category_id, Category.user_id == user_id)
+    )
+    assert category is not None  # validated above
+
+    wanted = set(payload.transaction_ids)
+    rows = session.scalars(
+        select(Transaction).where(Transaction.id.in_(wanted), Transaction.user_id == user_id)
+    ).all()
+    found = {row.id: row for row in rows}
+    invalid = {
+        txn_id
+        for txn_id in wanted
+        if (row := found.get(txn_id)) is None
+        or row.confirmed_at is None
+        or kind_for_type(row.transaction_type) != category.kind
+    }
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "message": "some transactions cannot be categorised",
+                "invalid_ids": sorted(invalid),
+            },
+        )
+
+    outcome = bulk_categorise(
+        session,
+        user_id=user_id,
+        rows=rows,
+        category_id=payload.category_id,
+        resolver=load_alias_resolver(session, user_id=user_id),
+    )
+    session.commit()
+    return BulkCategoriseResult(updated=outcome.updated, taught=outcome.taught)
+
+
+@router.post("/bulk-delete", status_code=status.HTTP_204_NO_CONTENT)
+def bulk_delete_transactions(
+    payload: BulkDelete,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> None:
+    """Hard-delete many rows at once, all-or-nothing (ADR-0003 rule 9).
+
+    Any id that is missing or another user's → 422 ``{message, invalid_ids}`` before any
+    write. Pending rows are accepted, as the single ``DELETE`` accepts them. Duplicate ids
+    collapse. Deletion semantics live in
+    :func:`app.services.transaction_delete.delete_owned_transactions`.
+    """
+    wanted = set(payload.transaction_ids)
+    found = set(
+        session.scalars(
+            select(Transaction.id).where(Transaction.id.in_(wanted), Transaction.user_id == user_id)
+        )
+    )
+    if invalid := wanted - found:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "message": "some transactions cannot be deleted",
+                "invalid_ids": sorted(invalid),
+            },
+        )
+    delete_owned_transactions(session, user_id=user_id, ids=wanted)
+    session.commit()
+
+
+@router.get("/{transaction_id}/past-rows", response_model=PastRowsRead)
+def get_past_rows(
+    transaction_id: int,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> PastRowsRead:
+    """Recent rows like this one that "apply to past rows" would recategorise.
+
+    404 for a missing or foreign row. A pending or uncategorised source is not an
+    error — it simply offers nothing. Window and cap: :data:`PAST_ROWS_WINDOW_DAYS`
+    and ``BULK_MAX``.
+    """
+    source = _load_owned(session, transaction_id=transaction_id, user_id=user_id)
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="transaction not found")
+    resolver = load_alias_resolver(session, user_id=user_id)
+    rows = past_rows_like(
+        session,
+        user_id=user_id,
+        source=source,
+        resolver=resolver,
+        since=clock.today() - timedelta(days=PAST_ROWS_WINDOW_DAYS),
+    )
+    return PastRowsRead(
+        merchant=resolver.canonical(source.merchant_normalized),
+        category_id=source.category_id,
+        transaction_ids=[row.id for row in rows],
+    )

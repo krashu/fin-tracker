@@ -65,13 +65,15 @@ from app.schemas import (
 from app.services.category_service import validate_category_ids
 from app.services.merchant import normalize_merchant
 from app.services.merchant_alias import (
+    alias_tokens,
     build_resolver,
+    is_unknown_via,
     load_alias_resolver,
-    tokenize,
     tokens_match,
 )
 from app.services.merchant_labels import LABEL_PREFILL_MIN, pin_label, set_label_pinned
 from app.services.tag_service import (
+    is_seeded,
     merchant_map_winner_order,
     pin_tag,
     prefetch_tag_map,
@@ -119,13 +121,14 @@ def list_rules(
 
     The category JOIN filters ``Category.user_id == user_id`` in addition to
     ``MerchantTagMap.user_id`` — the same pair ``prefetch_tag_map`` now uses (this read
-    was hardened first; the write-side prefill caught up in the A1.3/A3.3 pass). It
-    closes a defence-in-depth gap where a corrupt cross-user map row could otherwise
-    surface another user's ``category_name`` here. Archived categories are excluded
-    (mirrors ``prefetch_tag_map``): DELETE /categories keeps their map rows
+    was hardened first; the write-side prefill caught up in the A1.3/A3.3 pass). The
+    composite same-user FK already refuses a cross-user map row (ADR-0003 rule 10); the
+    restated predicate is rule 7's independent defence, so another user's
+    ``category_name`` can never surface here even if that FK were bypassed. Archived
+    categories are excluded (mirrors ``prefetch_tag_map``): DELETE /categories keeps their map rows
     (archive is a pure ``archived_at`` UPDATE), so this filter is the
-    load-bearing guard that hides an archived category's rules from the list —
-    they return if the category is ever un-archived.
+    load-bearing guard that hides an archived category's rules from the list.
+    Archive is one-way; reassigning the rows is the recovery path (ADR-0012).
     """
     resolver = load_alias_resolver(session, user_id=user_id)
     # {canonical: winning category_id} — the exact aggregate prefetch_tag_map
@@ -179,7 +182,7 @@ def list_rules(
         rule = grouped.get(canonical)
         if rule is None:
             rule = MerchantRuleRead(
-                merchant_normalized=canonical,
+                merchant_canonical=canonical,
                 categories=[],
                 labels=[],
                 alias_count=alias_counts.get(canonical, 1),
@@ -190,6 +193,8 @@ def list_rules(
 
     for row, category_name, parent_id, parent_name in session.execute(cat_stmt):
         canonical = resolver.canonical(row.merchant_normalized)
+        if is_unknown_via(canonical):
+            continue  # inert: a gateway handle names no merchant (ADR-0011 rule 12)
         rule = _bucket(canonical)
         rule.categories.append(
             CategoryRuleRead(
@@ -211,6 +216,8 @@ def list_rules(
     label_slots: dict[str, dict[int, LabelRuleRead]] = {}
     for row, label_name in session.execute(label_stmt):
         canonical = resolver.canonical(row.merchant_normalized)
+        if is_unknown_via(canonical):
+            continue
         rule = _bucket(canonical)
         by_label = label_slots.setdefault(canonical, {})
         merged = by_label.get(row.label_id)
@@ -249,10 +256,8 @@ def list_rules(
         # pinning a seed row leaves it at hit_count == 0, pinned=True. Without
         # this, the user's own authored rule renders with the dashed "seeded"
         # badge titled "not yet confirmed".
-        rule.seeded = (
-            bool(rule.categories)
-            and all(c.hit_count == 0 for c in rule.categories)
-            and not any(c.pinned for c in rule.categories)
+        rule.seeded = bool(rule.categories) and all(
+            is_seeded(hit_count=c.hit_count, pinned=c.pinned) for c in rule.categories
         )
 
     return [grouped[m] for m in sorted(grouped)]
@@ -281,6 +286,9 @@ def list_rule_merchants(
     endpoint is a Stage B question — do **not** add a ``?kind=`` filter param
     for a hypothetical UX need that hasn't been observed (AGENTS.md
     §Simplicity first).
+
+    A key that resolves to an unknown-via canonical (a gateway handle, ADR-0011 rule 12)
+    is omitted: a rule for it is 422, so offering it would only lead to the error.
     """
     union_stmt = (
         select(Transaction.merchant_normalized)
@@ -299,7 +307,16 @@ def list_rule_merchants(
             ),
         )
     )
-    return sorted(session.scalars(union_stmt))
+    resolver = load_alias_resolver(session, user_id=user_id)
+    return sorted(
+        m for m in session.scalars(union_stmt) if not is_unknown_via(resolver.canonical(m))
+    )
+
+
+_GATEWAY_RULE_DETAIL = (
+    "this is a payment-gateway handle, which names no merchant; "
+    "add an alias for the payee first (Settings → Rules → Aliases)"
+)
 
 
 @router.post(
@@ -328,6 +345,11 @@ def create_category_rule(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="merchant is blank after normalization",
+        )
+    if is_unknown_via(load_alias_resolver(session, user_id=user_id).canonical(merchant)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_GATEWAY_RULE_DETAIL,
         )
     if payload.category_id not in validate_category_ids(
         session, category_ids=[payload.category_id], user_id=user_id, kind="spend"
@@ -393,6 +415,11 @@ def create_label_rule(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="merchant is blank after normalization",
+        )
+    if is_unknown_via(load_alias_resolver(session, user_id=user_id).canonical(merchant)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_GATEWAY_RULE_DETAIL,
         )
     label = session.scalar(
         select(Label).where(Label.id == payload.label_id, Label.user_id == user_id)
@@ -493,7 +520,7 @@ def _alias_conflict(
     check_duplicate: bool,
     exclude_id: int | None,
 ) -> str | None:
-    """Decision 7's no-chaining conflict check, enforced where it can be.
+    """ADR-0011 rule 5's no-chaining conflict check, enforced where it can be.
 
     Returns a 422 detail string on the first conflict found, else ``None``.
     ``pattern`` is always the submission's pattern (on PATCH the row's own,
@@ -505,7 +532,7 @@ def _alias_conflict(
     * **Direction 1, the canonical must be a FIXED POINT.** Resolve the new
       canonical through the *prospective* rule set — every other row the user
       owns, PLUS the row being written — and reject only if it comes back as
-      something else. That is what decision 7's "no chaining" actually
+      something else. That is what ADR-0011 rule 5's "no chaining" actually
       forbids: a canonical another rule rewrites, so the fan-in the alias was
       meant to create silently lands somewhere else.
 
@@ -535,16 +562,19 @@ def _alias_conflict(
         (other_pattern, other_canonical) for other_pattern, other_canonical in session.execute(stmt)
     ]
 
-    pattern_tokens = tokenize(pattern)
+    pattern_tokens = alias_tokens(pattern)
     for other_pattern, other_canonical in others:
         if check_duplicate and other_pattern == pattern:
             return "an alias for this pattern already exists"
-        other_canonical_tokens = tokenize(other_canonical)
+        other_canonical_tokens = alias_tokens(other_canonical)
         if other_canonical_tokens and tokens_match(pattern_tokens, other_canonical_tokens):
             return "pattern would match an existing alias's canonical"
 
     prospective = build_resolver([*others, (pattern, canonical)])
-    if prospective.canonical(canonical) != canonical:
+    resolved = prospective.canonical(canonical)
+    if resolved != canonical:
+        if is_unknown_via(resolved):
+            return "canonical is a payment-gateway handle; name the payee instead"
         return "canonical would be rewritten by another alias"
     return None
 
@@ -574,12 +604,12 @@ def create_alias(
     """Add a ``pattern -> canonical`` rule (ADR-0011).
 
     Four 422 checks, all required: blank-after-normalize on either field; a
-    zero-token ``pattern`` (``tokenize(pattern) == ()`` — the false-merge
+    zero-token ``pattern`` (``alias_tokens(pattern) == ()`` — the false-merge
     hazard: an empty token tuple is a contiguous subsequence of every
     sequence, so an unguarded pattern like ``"***"`` would match everything
     and, sorted last by :func:`app.services.merchant_alias.build_resolver`,
     fire on exactly the merchants nothing else matched); a duplicate
-    ``(user_id, pattern)``; and decision 7's no-chaining conflict in either
+    ``(user_id, pattern)``; and ADR-0011 rule 5's no-chaining conflict in either
     direction (:func:`_alias_conflict` — read its direction-1 note before
     tightening anything here). A same-pattern ``IntegrityError`` that slips
     past the pre-check (a concurrent double-submit) maps to 409, not 422 — the
@@ -592,7 +622,12 @@ def create_alias(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="pattern/canonical is blank after normalization",
         )
-    pattern_tokens = tokenize(pattern)
+    if is_unknown_via(canonical):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="canonicals starting with 'unknown via' are reserved",
+        )
+    pattern_tokens = alias_tokens(pattern)
     if not pattern_tokens:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -655,6 +690,11 @@ def patch_alias(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="canonical is blank after normalization",
+        )
+    if is_unknown_via(canonical):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="canonicals starting with 'unknown via' are reserved",
         )
     conflict = _alias_conflict(
         session,

@@ -2,11 +2,17 @@
 
 /**
  * Bulk-action bar for /expenses — floats when rows are selected. Owns its
- * mutations (board owns the ids). Both ops are N parallel calls via
- * Promise.allSettled (no bulk endpoint), invalidating the ["transactions"]
- * prefix on completion (PRD §F9). Mirrors the review-queue commit bar: triggers
- * disable while in flight; full success clears the selection (unmounts the bar),
- * a partial failure keeps it open with an inline count.
+ * mutations (board owns the ids).
+ *
+ * Categorize and Delete are each ONE all-or-nothing request, capped at BULK_MAX rows
+ * (the triggers disable above the cap): POST /transactions/bulk-categorise teaches once
+ * per canonical merchant (ADR-0004 rule 4); POST /transactions/bulk-delete deletes each
+ * row as a single DELETE would (a linked partner outside the selection gets its pre-link
+ * type and category back, ADR-0002 rule 9). A 422 changes nothing and the banner says how
+ * many rows were refused; the refetch then drops vanished rows from the selection.
+ *
+ * Both invalidate ["transactions"] (PRD §F9) and ["dashboards"]. Triggers disable
+ * while in flight; full success clears the selection (unmounts the bar).
  */
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -29,14 +35,15 @@ import {
 import { IconX } from "@/components/icons";
 import {
   ApiError,
-  deleteTransaction,
-  patchTransaction,
+  BULK_MAX,
+  bulkCategorise,
+  bulkDeleteTransactions,
+  invalidIdsFromError,
   type CategoryKind,
   type CategoryRead,
 } from "@/lib/api/client";
 import {
   buildCategoryTree,
-  resolveCategoryColor,
 } from "@/lib/categories";
 import { CategoryDot } from "@/components/category-dot";
 import { invalidateRules } from "@/lib/queries/invalidate";
@@ -62,59 +69,58 @@ export function SelectionBar({
   const [banner, setBanner] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
-  // Shared completion handler: resync the board, then either finish (full
-  // success → clear selection) or surface a partial-failure count. A delete
-  // that 404s is the desired end state, so it counts as success.
-  function settle(
-    results: PromiseSettledResult<unknown>[],
-    verb: string,
-    treat404AsSuccess: boolean,
-  ) {
+  // The board and the SummaryStrip's month total depend on these rows (PRD §F9). A
+  // mounted dashboards query won't refetch on staleTime alone, so invalidate it. Runs
+  // on settle: a 422 must still refetch the board, since the rows may have changed.
+  function resync() {
     queryClient.invalidateQueries({ queryKey: ["transactions"] });
-    // The SummaryStrip's month total depends on these rows (PRD §F9). A mounted
-    // dashboards query won't refetch on staleTime alone, so invalidate it here.
     queryClient.invalidateQueries({ queryKey: ["dashboards"] });
-    // Bulk categorize hits the SAME PATCH endpoint as the single-row dialog, and
-    // transactions.py runs learn_merchant_memory on every one of the N calls — so
-    // ["rules"] and ["candidates"] go stale exactly as they would for one row. This
-    // was the one board-write site of four missing it, against the contract stated in
-    // invalidate.ts. Called unconditionally to match the other three: on delete it
-    // costs a refetch of two small queries and keeps the sites identical.
+    // Bulk categorise teaches (learn_merchant_memory), so ["rules"] and
+    // ["candidates"] go stale as they would for one row (invalidate.ts contract).
     invalidateRules(queryClient);
-    const failed = results.filter((r) => {
-      if (r.status === "fulfilled") return false;
-      if (
-        treat404AsSuccess &&
-        r.reason instanceof ApiError &&
-        r.reason.status === 404
-      )
-        return false;
-      return true;
-    }).length;
-    if (failed === 0) {
-      setBanner(null);
-      onDone();
-    } else {
-      setBanner(
-        `${ids.length - failed} of ${ids.length} ${verb}, ${failed} failed.`,
-      );
-    }
   }
+
+  const overCap = ids.length > BULK_MAX;
 
   const categorize = useMutation({
     mutationFn: (categoryId: number) =>
-      Promise.allSettled(
-        ids.map((id) => patchTransaction(id, { category_id: categoryId })),
-      ),
-    onSuccess: (results) => settle(results, "updated", false),
+      bulkCategorise({ transaction_ids: ids, category_id: categoryId }),
+    onSettled: resync,
+    onSuccess: () => {
+      setBanner(null);
+      onDone();
+    },
+    onError: (err) => {
+      const bad = invalidIdsFromError(err);
+      setBanner(
+        bad.length > 0
+          ? `Nothing changed: ${bad.length} of ${ids.length} rows can't be categorised.`
+          : err instanceof ApiError
+            ? err.detail
+            : "Couldn't categorise — try again.",
+      );
+    },
   });
 
   const remove = useMutation({
-    mutationFn: () =>
-      Promise.allSettled(ids.map((id) => deleteTransaction(id))),
-    onSuccess: (results) => {
+    mutationFn: () => bulkDeleteTransactions({ transaction_ids: ids }),
+    onSettled: () => {
       setConfirmOpen(false);
-      settle(results, "deleted", true);
+      resync();
+    },
+    onSuccess: () => {
+      setBanner(null);
+      onDone();
+    },
+    onError: (err) => {
+      const bad = invalidIdsFromError(err);
+      setBanner(
+        bad.length > 0
+          ? `Nothing deleted: ${bad.length} of ${ids.length} rows no longer exist.`
+          : err instanceof ApiError
+            ? err.detail
+            : "Couldn't delete — try again.",
+      );
     },
   });
 
@@ -153,7 +159,14 @@ export function SelectionBar({
 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <SelectionAction disabled={categorize.isPending}>
+            <SelectionAction
+              disabled={categorize.isPending || overCap}
+              title={
+                overCap
+                  ? `Select at most ${BULK_MAX} rows to categorise`
+                  : undefined
+              }
+            >
               {categorize.isPending ? "Categorizing…" : "Categorize"}
             </SelectionAction>
           </DropdownMenuTrigger>
@@ -166,7 +179,7 @@ export function SelectionBar({
                 >
                   <CategoryDot
                     categoryId={parent.id}
-                    color={resolveCategoryColor(parent, categories)}
+                    color={parent.display_color}
                   />
                   <span className="truncate">{parent.name}</span>
                 </DropdownMenuItem>
@@ -178,7 +191,7 @@ export function SelectionBar({
                   >
                     <CategoryDot
                       categoryId={sub.id}
-                      color={resolveCategoryColor(sub, categories)}
+                      color={sub.display_color}
                       className="size-1.5"
                     />
                     <span className="truncate">{sub.name}</span>
@@ -194,7 +207,8 @@ export function SelectionBar({
         <SelectionAction
           variant="danger"
           onClick={() => setConfirmOpen(true)}
-          disabled={remove.isPending}
+          disabled={remove.isPending || overCap}
+          title={overCap ? `Select at most ${BULK_MAX} rows to delete` : undefined}
         >
           Delete
         </SelectionAction>

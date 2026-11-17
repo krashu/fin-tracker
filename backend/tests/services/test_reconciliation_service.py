@@ -12,21 +12,27 @@ here; cross-user isolation is locked elsewhere (the FK + the query's
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
 from sqlalchemy import event, func, select
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Account, ImportBatch, Transaction, User
+from app.models import Account, Category, ImportBatch, Transaction, User
 from app.services.reconciliation_service import (
     auto_link_cc_bill,
+    card_bill_link_offered_ids,
+    card_bill_transfer_gate,
+    is_card_bill_debit,
     reconcile_batch,
     rows_removed_since_import,
+    statement_window,
 )
 from app.services.transaction_queries import confirmed_only
+from tests.fk_bypass import foreign_keys_off
 
 # ---------------------------------------------------------------------------
 # Local fixtures — mirror tests/services/test_tag_service.py (services tests
@@ -131,6 +137,27 @@ def _make_bank_transfer_row(
 # ---------------------------------------------------------------------------
 
 
+def test_auto_link_pairs_a_card_payment_committed_as_a_transfer(
+    session: Session, user: User
+) -> None:
+    """ADR-0002 rule 7c: an uncategorised card payment commits as an unpaired ``transfer``, and
+    the auto-link still pairs it with its bank debit, from either side, keeping ``transfer`` as
+    the card leg's pre-link type (rule 9)."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    bank_row = _make_bank_transfer_row(session, user.id, bank, transaction_type="spend")
+    cc_row = _make_cc_payment_row(session, user.id, cc, transaction_type="transfer")
+
+    auto_link_cc_bill(session, user_id=user.id, txn=cc_row)
+    session.commit()
+    session.expire_all()
+
+    cc_after = session.get(Transaction, cc_row.id)
+    bank_after = session.get(Transaction, bank_row.id)
+    assert cc_after is not None and bank_after is not None
+    assert (cc_after.transfer_pair_id, bank_after.transfer_pair_id) == (bank_after.id, cc_after.id)
+    assert cc_after.pre_link_type == "transfer"
+
+
 @pytest.mark.parametrize(
     "gate",
     ["wrong_type", "merchant_mismatch", "no_parent", "parent_archived", "already_paired"],
@@ -163,8 +190,13 @@ def test_no_op_on_ineligible_inputs(
     elif gate == "already_paired":
         # Already-paired: use a separate dummy partner so the FK is satisfied;
         # we expect step-1 short-circuit to return BEFORE any further checks.
+        # A paired row is a transfer (ADR-0002 rule 8, CHECK paired_is_transfer),
+        # so since 0038 step 1 is redundant with the step-2 type gate; it stays as
+        # the cheap idempotence check it was written as.
         partner = _make_bank_transfer_row(session, user.id, bank, fingerprint="fp-partner")
-        cc_row = _make_cc_payment_row(session, user.id, cc, transfer_pair_id=partner.id)
+        cc_row = _make_cc_payment_row(
+            session, user.id, cc, transaction_type="transfer", transfer_pair_id=partner.id
+        )
         # Mirror-link the partner so the FK invariant from PR-B isn't violated
         # by a stray test fixture.
         partner.transfer_pair_id = cc_row.id
@@ -222,6 +254,31 @@ def test_links_single_matching_bank_row(
     assert bank_after.transaction_type == "transfer"
 
 
+@pytest.mark.parametrize("bank_type", ["spend", "transfer"])
+def test_auto_link_stores_each_legs_pre_link_type(
+    bank_type: str,
+    session: Session,
+    user: User,
+) -> None:
+    """ADR-0002 rule 9: linking existing rows records each leg's own pre-link type, so
+    unlink can restore it. The bank candidate may already be a ``transfer``; that is
+    stored too (non-NULL means "an existing row was linked")."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    bank_row = _make_bank_transfer_row(session, user.id, bank, transaction_type=bank_type)
+    cc_row = _make_cc_payment_row(session, user.id, cc)
+
+    auto_link_cc_bill(session, user_id=user.id, txn=cc_row)
+    session.commit()
+    session.expire_all()
+
+    cc_after = session.get(Transaction, cc_row.id)
+    bank_after = session.get(Transaction, bank_row.id)
+    assert cc_after is not None and bank_after is not None
+    assert cc_after.transfer_pair_id == bank_after.id
+    assert cc_after.pre_link_type == "income"
+    assert bank_after.pre_link_type == bank_type
+
+
 @pytest.mark.parametrize(
     "candidate_state",
     ["no_candidate", "outside_date_window", "already_paired", "positive_refund_wrong_sign"],
@@ -233,17 +290,13 @@ def test_no_op_on_no_or_bad_candidate(
 ) -> None:
     """No link when the bank-side candidate is missing or filtered out.
 
-    ``positive_refund_wrong_sign`` is the T2 mis-pair guard (ADR-0009): since a
+    ``positive_refund_wrong_sign`` is the mis-pair guard of ADR-0009 rule 6: since a
     refund is a ``spend`` row with a positive amount, the type filter alone no
-    longer excludes one, so ``auto_link_cc_bill`` needs an explicit
-    ``amount_paise < 0`` predicate on the bank side. That guard is normally
-    *derivable* rather than stated — ``txn`` (CC-side) is an ``income`` row, and
-    ``sign_error`` pins ``income > 0``, which alone would make the bank target
-    negative and a positive refund unreachable. But ``POST /backup/import``
-    persists type + amount verbatim without ``sign_error`` (a hand-edited zip
-    is its declared threat model), so a NEGATIVE ``income`` row is reachable —
-    flipping the target positive and making a same-magnitude positive refund a
-    live mis-pair candidate without the guard.
+    longer excludes one, so ``auto_link_cc_bill`` states ``amount_paise < 0`` on
+    the bank side explicitly. The sign cannot be derived from the CC-side type: a
+    NEGATIVE ``income`` row (an income reversal, ADR-0009 rule 2) is an ordinary
+    API write, and it flips the target positive — making a same-magnitude positive
+    refund a live mis-pair candidate without the guard.
     """
     bank, cc = _make_bank_and_cc(session, user.id)
 
@@ -259,6 +312,8 @@ def test_no_op_on_no_or_bad_candidate(
             cc,
             fingerprint="fp-dummy-cc",
             merchant="some other payment received",
+            # Paired below, and a paired row is a transfer (ADR-0002 rule 8).
+            transaction_type="transfer",
         )
         bank_row = _make_bank_transfer_row(session, user.id, bank, transfer_pair_id=partner.id)
         partner.transfer_pair_id = bank_row.id
@@ -277,9 +332,9 @@ def test_no_op_on_no_or_bad_candidate(
     else:
         raise AssertionError(f"unknown candidate_state: {candidate_state}")
 
-    # `positive_refund_wrong_sign` needs the CC row itself negative — the state
-    # `sign_error` blocks at the API but `backup_csv` does not enforce on
-    # restore. Every other branch keeps the ordinary positive-income CC row.
+    # `positive_refund_wrong_sign` needs the CC row itself negative — an income
+    # reversal, which any write path accepts. Every other branch keeps the
+    # ordinary positive-income CC row.
     cc_amount = -_CC_AMOUNT if candidate_state == "positive_refund_wrong_sign" else _CC_AMOUNT
     cc_row = _make_cc_payment_row(session, user.id, cc, amount_paise=cc_amount)
     auto_link_cc_bill(session, user_id=user.id, txn=cc_row)
@@ -370,6 +425,199 @@ def test_date_window_boundary_inclusive(
         assert cc_after.transaction_type == "income"
 
 
+def test_auto_link_moves_each_legs_category_to_pre_link(
+    session: Session,
+    user: User,
+) -> None:
+    """ADR-0002 rule 9: the link clears each leg's category into ``pre_link_category_id``
+    (a pair belongs to no category)."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    spend_cat = Category(color="#2a78d6", user_id=user.id, name="Bills", kind="spend")
+    income_cat = Category(color="#2a78d6", user_id=user.id, name="Salary", kind="income")
+    session.add_all([spend_cat, income_cat])
+    session.commit()
+    bank_row = _make_bank_transfer_row(session, user.id, bank, transaction_type="spend")
+    cc_row = _make_cc_payment_row(session, user.id, cc)
+    bank_row.category_id, cc_row.category_id = spend_cat.id, income_cat.id
+    session.commit()
+
+    auto_link_cc_bill(session, user_id=user.id, txn=cc_row)
+    session.commit()
+
+    session.refresh(bank_row)
+    session.refresh(cc_row)
+    assert (bank_row.category_id, cc_row.category_id) == (None, None)
+    assert (bank_row.pre_link_category_id, cc_row.pre_link_category_id) == (
+        spend_cat.id,
+        income_cat.id,
+    )
+
+
+def test_auto_link_skips_a_refund_original(session: Session, user: User) -> None:
+    """ADR-0002 rule 7 / ADR-0009 rule 13: a bank debit that a refund points at is not a
+    candidate, or the link would turn the refund's original into a transfer."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    bank_row = _make_bank_transfer_row(session, user.id, bank, transaction_type="spend")
+    refund = _make_bank_transfer_row(
+        session,
+        user.id,
+        bank,
+        amount_paise=1000,
+        transaction_type="spend",
+        fingerprint="fp-refund",
+    )
+    refund.refund_of_id = bank_row.id
+    session.commit()
+    cc_row = _make_cc_payment_row(session, user.id, cc)
+
+    auto_link_cc_bill(session, user_id=user.id, txn=cc_row)
+    session.commit()
+
+    session.refresh(bank_row)
+    session.refresh(cc_row)
+    session.refresh(refund)
+    assert bank_row.transfer_pair_id is None and bank_row.transaction_type == "spend"
+    assert cc_row.transfer_pair_id is None and cc_row.transaction_type == "income"
+    assert refund.refund_of_id == bank_row.id
+
+
+def _stage_bank_batch_row(
+    session: Session, user_id: UUID, bank: Account, *, amount_paise: int = -_CC_AMOUNT
+) -> Transaction:
+    """A bank-statement row as the review queue holds it right before the batch commit:
+    attached to a bank batch, with ``confirmed_at`` just stamped (pass 1 of the commit)."""
+    batch = _make_batch(
+        session,
+        user_id,
+        bank.id,
+        opening_balance_paise=None,
+        closing_balance_paise=None,
+        period_start=None,
+        period_end=None,
+    )
+    row = Transaction(
+        user_id=user_id,
+        account_id=bank.id,
+        date=_CC_DATE + timedelta(days=1),
+        amount_paise=amount_paise,
+        transaction_type="spend" if amount_paise < 0 else "income",
+        merchant_raw="AXIS CARD BILL",
+        merchant_normalized="axis card bill",
+        fingerprint="fp-bank-batch",
+        source="import",
+        import_batch_id=batch.id,
+        confirmed_at=None,
+    )
+    session.add(row)
+    session.commit()
+    row.confirmed_at = datetime.now(UTC)
+    session.flush()
+    return row
+
+
+def test_auto_link_from_bank_batch_commit(session: Session, user: User) -> None:
+    """ADR-0002 rule 7 / PRD §F4a-1: the card statement was committed first, and the link
+    forms when the bank statement carrying the bill debit commits."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    cc_row = _make_cc_payment_row(session, user.id, cc)
+    bank_row = _stage_bank_batch_row(session, user.id, bank)
+
+    auto_link_cc_bill(session, user_id=user.id, txn=bank_row)
+    session.commit()
+
+    session.refresh(bank_row)
+    session.refresh(cc_row)
+    assert (bank_row.transfer_pair_id, cc_row.transfer_pair_id) == (cc_row.id, bank_row.id)
+    assert (bank_row.transaction_type, cc_row.transaction_type) == ("transfer", "transfer")
+    assert (bank_row.pre_link_type, cc_row.pre_link_type) == ("spend", "income")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no_child_card",
+        "card_archived",
+        "bank_archived",
+        "payment_pending",
+        "merchant_mismatch",
+        "positive_bank_row",
+    ],
+)
+def test_bank_side_no_op_on_ineligible_inputs(session: Session, user: User, case: str) -> None:
+    bank, cc = _make_bank_and_cc(session, user.id)
+    cc_row = _make_cc_payment_row(
+        session,
+        user.id,
+        cc,
+        merchant="some shop" if case == "merchant_mismatch" else "payment received thank you",
+    )
+    bank_row = _stage_bank_batch_row(
+        session,
+        user.id,
+        bank,
+        amount_paise=_CC_AMOUNT if case == "positive_bank_row" else -_CC_AMOUNT,
+    )
+    if case == "no_child_card":
+        cc.parent_account_id = None
+    elif case == "card_archived":
+        cc.archived_at = datetime.now(UTC)
+    elif case == "bank_archived":
+        bank.archived_at = datetime.now(UTC)
+    elif case == "payment_pending":
+        cc_row.confirmed_at = None
+    session.flush()
+
+    auto_link_cc_bill(session, user_id=user.id, txn=bank_row)
+    session.commit()
+
+    session.refresh(bank_row)
+    session.refresh(cc_row)
+    assert bank_row.transfer_pair_id is None and cc_row.transfer_pair_id is None
+    assert bank_row.transaction_type == ("income" if case == "positive_bank_row" else "spend")
+    assert cc_row.transaction_type == "income"
+
+
+def test_bank_side_skips_two_card_payments_logs_info(session: Session, user: User) -> None:
+    """Ambiguity on the card side means no link, and the log carries ids and a count only."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    second_cc = Account(
+        user_id=user.id,
+        name="Axis CC 2",
+        type="credit_card",
+        issuer="axis",
+        last4="5678",
+        parent_account_id=bank.id,
+    )
+    session.add(second_cc)
+    session.commit()
+    first = _make_cc_payment_row(session, user.id, cc, fingerprint="fp-cc-1")
+    second = _make_cc_payment_row(session, user.id, second_cc, fingerprint="fp-cc-2")
+    bank_row = _stage_bank_batch_row(session, user.id, bank)
+
+    with structlog.testing.capture_logs() as logs:
+        auto_link_cc_bill(session, user_id=user.id, txn=bank_row)
+
+    assert bank_row.transfer_pair_id is None
+    assert first.transfer_pair_id is None and second.transfer_pair_id is None
+    skipped = [entry for entry in logs if entry["event"] == "f4a_skip_ambiguous_card_candidates"]
+    assert len(skipped) == 1
+    assert skipped[0]["candidate_count"] == 2
+    assert not {"merchant", "merchant_raw", "amount_paise"} & set(skipped[0])
+
+
+def test_bank_side_skips_when_the_payment_has_two_bank_debits(session: Session, user: User) -> None:
+    """The card-side search finds two equal bank debits, so the pair is ambiguous."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    cc_row = _make_cc_payment_row(session, user.id, cc)
+    twin = _make_bank_transfer_row(session, user.id, bank, transaction_type="spend")
+    bank_row = _stage_bank_batch_row(session, user.id, bank)
+
+    auto_link_cc_bill(session, user_id=user.id, txn=bank_row)
+
+    assert bank_row.transfer_pair_id is None and twin.transfer_pair_id is None
+    assert cc_row.transfer_pair_id is None
+
+
 def test_a_constraint_failure_on_the_pair_write_is_not_swallowed(
     session: Session,
     user: User,
@@ -378,9 +626,9 @@ def test_a_constraint_failure_on_the_pair_write_is_not_swallowed(
 
     Fault injection by necessity: the branch is unreachable through the public
     surface (both rows come from one ``user_id``-scoped SELECT, and the no-self-pair
-    CHECK cannot fire because the CC row is ``income`` while candidates must be
-    ``spend``/``transfer``). The route-level consequence — the whole batch commit
-    aborts with nothing confirmed — is locked by
+    CHECK cannot fire because the CC row is positive on a card while candidates are negative
+    on its parent bank, so they are different rows on different accounts). The route-level
+    consequence — the whole batch commit aborts with nothing confirmed — is locked by
     ``test_imports_review.test_commit_f4a_pair_write_conflict_aborts_the_whole_batch``.
 
     The predicate is load-bearing: nothing is dirty with a non-null
@@ -490,14 +738,15 @@ def _make_row(
     return row
 
 
-def test_window_fallback_uses_min_max_row_date_when_period_absent(
+def test_window_fallback_is_not_stored(
     session: Session,
     user: User,
 ) -> None:
-    """Balances present, period absent (Phase 3 test 5): reconcile_batch falls
-    back to min/max row date over the batch's own rows, STAMPS that fallback
-    onto batch.period_start/period_end (so a later read sees a window either
-    way), and the check still runs to a real delta."""
+    """ADR-0010 rule 8: balances present, period absent — reconcile_batch
+    computes the window as min/max row date over the batch's own rows and
+    the check runs to a real delta, but ``period_*`` keeps only what the
+    statement printed (here nothing), so a re-check recomputes the same
+    window. A confirmed row outside that window must not count."""
     account = _make_cc_account(session, user.id)
     batch = _make_batch(
         session,
@@ -528,13 +777,117 @@ def test_window_fallback_uses_min_max_row_date_when_period_absent(
         confirmed=False,
         import_batch_id=batch.id,
     )
+    _make_row(  # same account, confirmed, after the computed window: excluded
+        session,
+        user.id,
+        account,
+        amount_paise=-999,
+        txn_date=date(2026, 4, 10),
+        fingerprint="fp-later",
+        confirmed=True,
+    )
 
     delta = reconcile_batch(session, user_id=user.id, batch=batch)
     session.commit()
+    session.refresh(batch)
 
     assert delta == 0  # actual -1500 == expected (-2500) - (-1000) == -1500
-    assert batch.period_start == date(2026, 3, 5)
-    assert batch.period_end == date(2026, 3, 20)
+    assert batch.period_start is None
+    assert batch.period_end is None
+    assert reconcile_batch(session, user_id=user.id, batch=batch) == 0
+
+
+def test_bank_statement_reconciles_with_positive_balances(
+    session: Session,
+    user: User,
+) -> None:
+    """A44 / ADR-0010 rule 7: a bank prints money held, so its balances are positive and a
+    deposit adds to them. ``opening + Σ rows = closing`` holds with the same arithmetic as a
+    card (whose balances are negative), so the delta needs no per-account-type sign flip."""
+    account = Account(user_id=user.id, name="HDFC Savings", type="bank", issuer="hdfc")
+    session.add(account)
+    session.commit()
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=20_000_000,
+        closing_balance_paise=25_942_933,
+        period_start=date(2026, 4, 1),
+        period_end=date(2026, 4, 30),
+    )
+    batch.parser_name = "HdfcBank"
+    amounts = [-125_000, 7_500_000, -49_900, 49_900, -1_234_567, -200_000, 2_500]
+    for i, amount in enumerate(amounts):
+        _make_row(
+            session,
+            user.id,
+            account,
+            amount_paise=amount,
+            txn_date=date(2026, 4, 1 + i),
+            fingerprint=f"bank-fp-{i}",
+            confirmed=False,
+            import_batch_id=batch.id,
+        )
+
+    assert reconcile_batch(session, user_id=user.id, batch=batch) == 0
+
+
+def test_window_fallback_ignores_another_users_row_on_the_batch(
+    session: Session,
+    user: User,
+) -> None:
+    """ADR-0003 rule 1: the fallback min/max read restates ``user_id``. The
+    composite same-user FK makes another user's row on this batch unstorable
+    (rule 10), so it is planted with FK checks off: rule 1 is the independent
+    defence. Without the predicate its earlier date would widen the window
+    and pull this user's confirmed February row into ``actual``."""
+    account = _make_cc_account(session, user.id)
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=-1000,
+        closing_balance_paise=-2500,
+        period_start=None,
+        period_end=None,
+    )
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-1500,
+        txn_date=date(2026, 3, 5),
+        fingerprint="fp-1",
+        confirmed=False,
+        import_batch_id=batch.id,
+    )
+    _make_row(  # this user's own board row, before the batch's true window
+        session,
+        user.id,
+        account,
+        amount_paise=-999,
+        txn_date=date(2026, 2, 10),
+        fingerprint="fp-feb",
+        confirmed=True,
+    )
+    other = User(id=uuid4())
+    session.add(other)
+    session.commit()
+    their_account = _make_cc_account(session, other.id)
+    with foreign_keys_off(session):
+        _make_row(
+            session,
+            other.id,
+            their_account,
+            amount_paise=-5,
+            txn_date=date(2026, 2, 1),
+            fingerprint="fp-theirs",
+            confirmed=False,
+            import_batch_id=batch.id,
+        )
+
+    assert reconcile_batch(session, user_id=user.id, batch=batch) == 0
 
 
 def test_window_fallback_returns_none_when_batch_has_no_rows(
@@ -714,3 +1067,216 @@ def test_rows_removed_since_import_floors_at_zero_on_reupload_growth(
     )
 
     assert rows_removed_since_import(session, batch=batch) == 0
+
+
+def test_rows_removed_ignores_another_users_row_on_the_batch(
+    session: Session,
+    user: User,
+) -> None:
+    """ADR-0003 rule 7: the live count restates ``user_id``. Another user's row
+    on this batch is unstorable under the composite same-user FK (rule 10), so
+    it is planted with FK checks off. Without the predicate it would count as
+    one of this batch's live rows and hide the one this user deleted."""
+    account = _make_cc_account(session, user.id)
+    batch = _make_batch(
+        session,
+        user.id,
+        account.id,
+        opening_balance_paise=None,
+        closing_balance_paise=None,
+        period_start=None,
+        period_end=None,
+        imported_count=2,
+    )
+    _make_row(
+        session,
+        user.id,
+        account,
+        amount_paise=-100,
+        txn_date=date(2026, 3, 5),
+        fingerprint="fp-1",
+        confirmed=True,
+        import_batch_id=batch.id,
+    )
+    other = User(id=uuid4())
+    session.add(other)
+    session.commit()
+    their_account = _make_cc_account(session, other.id)
+    with foreign_keys_off(session):
+        _make_row(
+            session,
+            other.id,
+            their_account,
+            amount_paise=-5,
+            txn_date=date(2026, 3, 6),
+            fingerprint="fp-theirs",
+            confirmed=True,
+            import_batch_id=batch.id,
+        )
+
+    assert rows_removed_since_import(session, batch=batch) == 1
+
+
+@pytest.mark.parametrize(
+    ("merchant_normalized", "expected"),
+    [
+        ("cc 000000xxxxxx0000 autopay si-tad", True),
+        ("cc payment", True),
+        ("credit card pmt 4321", True),
+        ("credit card payment", True),
+        ("credit card bill", True),
+        ("hdfc cc 000000xxxxxx0000", True),
+        ("icici cc", True),
+        ("axis cc", True),
+        ("sbi cc autopay", True),
+        ("card bill sentinel", True),
+        ("cred club", True),
+        ("cred.club", True),
+        ("bbps electricity", False),
+        ("ib billpay sentinel", False),
+        ("sentinel cafe", False),
+        ("upi-sentinel grocer-sentinelgrocer@example", False),
+        ("ncc payment", False),
+        ("payment received thank you", False),
+    ],
+)
+def test_is_card_bill_debit(merchant_normalized: str, expected: bool) -> None:
+    """The bank-side review aid (PRD §F4a-1): a debit naming a card-bill payment. Bare BBPS and
+    bill-pay wording is too general to flag, and the card-side "payment received" is not it."""
+    assert is_card_bill_debit(merchant_normalized) is expected
+
+
+@pytest.mark.parametrize(
+    ("period_start", "period_end", "rows_first", "rows_last", "expected"),
+    [
+        (
+            date(2026, 3, 1),
+            date(2026, 3, 31),
+            date(2026, 3, 5),
+            date(2026, 3, 9),
+            (date(2026, 3, 1), date(2026, 3, 31)),
+        ),
+        (
+            date(2026, 3, 1),
+            None,
+            date(2026, 3, 5),
+            date(2026, 3, 9),
+            (date(2026, 3, 5), date(2026, 3, 9)),
+        ),
+        (None, None, None, None, None),
+    ],
+    ids=["printed", "half_printed_falls_back_to_rows", "nothing"],
+)
+def test_statement_window(
+    period_start: date | None,
+    period_end: date | None,
+    rows_first: date | None,
+    rows_last: date | None,
+    expected: tuple[date, date] | None,
+) -> None:
+    """ADR-0010 rule 8: the printed period, else the first and last row dates, else none."""
+    assert (
+        statement_window(
+            period_start=period_start,
+            period_end=period_end,
+            rows_first=rows_first,
+            rows_last=rows_last,
+        )
+        == expected
+    )
+
+
+def test_card_bill_gate_reads_the_card_statements_in_one_query(
+    engine: Engine,
+    session: Session,
+    user: User,
+) -> None:
+    """ADR-0002 rule 7b: the gate loads the card statements once per batch, never per row."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    for i, month in enumerate((1, 2, 3)):
+        batch = _make_batch(
+            session,
+            user.id,
+            cc.id,
+            opening_balance_paise=None,
+            closing_balance_paise=None,
+            period_start=date(2026, month, 1),
+            period_end=date(2026, month, 28),
+            source_file_hash=f"card-{i}",
+        )
+        row = _make_cc_payment_row(
+            session,
+            user.id,
+            cc,
+            fingerprint=f"fp-card-{i}",
+            txn_date=date(2026, month, 10),
+        )
+        row.import_batch_id = batch.id
+        session.commit()
+    bank_batch = _make_batch(
+        session,
+        user.id,
+        bank.id,
+        opening_balance_paise=None,
+        closing_balance_paise=None,
+        period_start=None,
+        period_end=None,
+        source_file_hash="bank",
+    )
+
+    statements: list[str] = []
+
+    def capture(conn: object, cursor: object, statement: str, *rest: object) -> None:
+        statements.append(statement)
+
+    def debit(when: date, amount_paise: int = -1) -> Transaction:
+        return Transaction(
+            account_id=bank.id,
+            date=when,
+            amount_paise=amount_paise,
+            transaction_type="spend",
+            merchant_normalized="axis card bill",
+        )
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        gate = card_bill_transfer_gate(session, user_id=user.id, batch=bank_batch)
+        assert len(statements) == 2
+        assert [gate(debit(date(2026, m, 15))) for m in (1, 2, 3)] == [True, True, True]
+        assert gate(debit(date(2026, 4, 15))) is False
+        assert gate(debit(date(2026, 1, 15), 1)) is False
+        assert len(statements) == 2
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+
+def test_card_bill_link_offered_reads_the_accounts_in_one_query(
+    engine: Engine,
+    session: Session,
+    user: User,
+) -> None:
+    """ADR-0002 rule 11b: the offered ids come from one accounts read per response, never one
+    per row, and from none when no row could be offered."""
+    bank, cc = _make_bank_and_cc(session, user.id)
+    payments = [
+        _make_cc_payment_row(session, user.id, cc, fingerprint=f"fp-offer-{i}") for i in range(3)
+    ]
+    debit = _make_bank_transfer_row(session, user.id, bank)
+    for row in (*payments, debit):
+        session.refresh(row)
+
+    statements: list[str] = []
+
+    def capture(conn: object, cursor: object, statement: str, *rest: object) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        offered = card_bill_link_offered_ids(session, user_id=user.id, txns=[*payments, debit])
+        assert offered == {p.id for p in payments}
+        assert len(statements) == 1
+        statements.clear()
+        assert card_bill_link_offered_ids(session, user_id=user.id, txns=[debit]) == set()
+        assert statements == []
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)

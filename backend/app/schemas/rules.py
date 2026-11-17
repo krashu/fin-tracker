@@ -22,8 +22,11 @@ every shape (narrow wire, clean single-user → multi-user v2 boundary — mirro
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
+
+from app.services.merchant import merchant_too_long
 
 
 class CategoryRuleRead(BaseModel):
@@ -42,7 +45,8 @@ class CategoryRuleRead(BaseModel):
     # tag_service.merchant_agg_winner_key) — NOT "this exact row has the
     # highest hit_count" (two raw rows can share the winning category and both
     # read True; there is no single "the" winning row anymore, only a winning
-    # category). Unaliased, this is byte-identical to the pre-A3 per-row pick.
+    # category). Unaliased, this is identical to the pre-A3 per-row pick, except keys
+    # that resolve to an unknown-via canonical, which are skipped (ADR-0011 rule 12).
     is_winner: bool
     # True when the user manually pinned this merchant→category rule (F3 authoring).
     # A pinned row wins regardless of hit_count; un-pinning reverts to learned.
@@ -87,15 +91,14 @@ class LabelRuleRead(BaseModel):
 class MerchantRuleRead(BaseModel):
     """All rules for one canonical merchant (union of both maps).
 
-    As of Phase A3 (ADR-0011 merchant-alias layer) the grouping key is the
-    CANONICAL merchant — ``AliasResolver.canonical()``'s output — not the raw
-    ``merchant_normalized`` string. An unaliased merchant resolves to itself
-    (decision 8), so this field keeps its name but its value now depends on
-    the user's alias table: two raw descriptors folded onto one canonical
-    surface as a single ``MerchantRuleRead`` entry, not two.
+    The grouping key is the CANONICAL merchant (ADR-0011 rule 8):
+    ``AliasResolver.canonical()``'s output, which is the merchant itself when
+    unaliased (decision 8). Two raw descriptors folded onto one canonical surface
+    as a single ``MerchantRuleRead`` entry, not two. Named like
+    ``TopMerchantRow.merchant_canonical``.
     """
 
-    merchant_normalized: str  # canonical key; identity when unaliased
+    merchant_canonical: str
     categories: list[CategoryRuleRead]
     labels: list[LabelRuleRead]
     # How many alias PATTERNS resolve to this canonical (AliasResolver.
@@ -115,18 +118,29 @@ class MerchantRuleRead(BaseModel):
     seeded: bool
 
 
-# ``merchant`` is the *raw* string; the route normalizes it (lowercase + whitespace
-# collapse today) before storing. min_length rejects a blank submission at the
+# ``merchant`` is the *raw* string; the route normalizes it (``normalize_merchant``) before
+# storing. min_length rejects a blank submission at the
 # boundary; the route additionally 422s if it normalizes to empty (e.g. all
-# whitespace). max_length matches the map tables' ``String(512)`` so an overlong
-# free-entry value fails with 422 here, not an opaque DB error on Postgres.
-_MerchantField = Field(min_length=1, max_length=512)
+# whitespace). max_length matches the map tables' ``String(512)``, and the validator refuses
+# a value that normalizes past it (ADR-0006 rule 3b), so an overlong free-entry value fails
+# with 422 here, not an opaque DB error on Postgres.
+
+
+def _fits_merchant_columns(v: str) -> str:
+    if merchant_too_long(v):
+        raise ValueError("merchant is longer than 512 characters once normalized")
+    return v
+
+
+MerchantInput = Annotated[
+    str, Field(min_length=1, max_length=512), AfterValidator(_fits_merchant_columns)
+]
 
 
 class CategoryRuleCreate(BaseModel):
     """Pin a merchant→category rule (create-new or re-point to a never-seen category)."""
 
-    merchant: str = _MerchantField
+    merchant: MerchantInput
     category_id: int
 
 
@@ -134,7 +148,7 @@ class LabelRuleCreate(BaseModel):
     """Pin a merchant→label rule. ``label_id`` must be an existing user label —
     the rules page does not create tags (no get-or-create side effect)."""
 
-    merchant: str = _MerchantField
+    merchant: MerchantInput
     label_id: int
 
 
@@ -175,12 +189,12 @@ class MerchantAliasCreate(BaseModel):
     false-merge hazard), on a duplicate ``pattern``, or on decision 7's
     no-chaining conflict in either direction."""
 
-    pattern: str = _MerchantField
-    canonical: str = _MerchantField
+    pattern: MerchantInput
+    canonical: MerchantInput
 
 
 class MerchantAliasUpdate(BaseModel):
     """PATCH: ``canonical`` only. ``pattern`` is the row's identity (part of its
     unique key) and is never edited -- delete and recreate instead."""
 
-    canonical: str = _MerchantField
+    canonical: MerchantInput

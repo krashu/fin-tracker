@@ -8,7 +8,8 @@
  * The date control has three states, each wider than the last: a month
  * stepper (◀ June 2026 ▶), defaulting to the current month (the board turns
  * the anchor into a `{date_from,date_to}` range via `monthRange`); "All
- * months" widens that to every month of the selected year (`yearRange`);
+ * months" widens that to every month of the selected calendar year, "2026"
+ * (`yearRange`, 1 Jan to 31 Dec, PRD §F8);
  * "All years" widens it again to every date in the data — both bounds
  * omitted, so the year selector no longer applies either. Picking a year, or
  * stepping the month, always drops back to a single bounded month/year — the
@@ -31,7 +32,6 @@ import { labelDisplay } from "@/lib/labels";
 import {
   buildCategoryTree,
   categoryLabel,
-  resolveCategoryColor,
 } from "@/lib/categories";
 import { CategoryDot } from "@/components/category-dot";
 import { cn } from "@/lib/utils";
@@ -204,7 +204,7 @@ export function FilterRow({
               >
                 <CategoryDot
                   categoryId={parent.id}
-                  color={resolveCategoryColor(parent, categories)}
+                  color={parent.display_color}
                 />
                 <span className="truncate">{parent.name}</span>
               </DropdownMenuItem>
@@ -216,7 +216,7 @@ export function FilterRow({
                 >
                   <CategoryDot
                     categoryId={sub.id}
-                    color={resolveCategoryColor(sub, categories)}
+                    color={sub.display_color}
                     className="size-1.5"
                   />
                   <span className="truncate">{sub.name}</span>

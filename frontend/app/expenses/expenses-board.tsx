@@ -38,10 +38,10 @@ import {
 import { accountLabel } from "@/lib/accounts";
 import { formatINR, formatDate } from "@/lib/format";
 import { thisMonthAnchor, monthKey, monthRange, yearRange } from "@/lib/dates";
+import { currentYear } from "@/lib/period";
 import {
   categoryLabel,
   isArchivedCategoryId,
-  resolveCategoryColor,
 } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
@@ -52,6 +52,7 @@ import { SummaryStrip } from "@/components/dashboard/summary-strip";
 import { TransactionDialog } from "./transaction-dialog";
 import { FilterRow, typeFilterToParam, type TypeFilter } from "./filter-row";
 import { SelectionBar } from "./selection-bar";
+import { PastRowsPrompt } from "./past-rows-prompt";
 
 const PAGE_SIZE = 50;
 
@@ -65,6 +66,10 @@ function parseIdParam(value: string | null): number | undefined {
 
 export function ExpensesBoard() {
   const [selectedTxn, setSelectedTxn] = useState<TransactionRead | null>(null);
+  // The row whose category was just corrected, for the "apply to past rows" offer.
+  // `seq` makes a second correction of the same row a fresh offer.
+  const [pastRows, setPastRows] = useState<{ sourceId: number; seq: number } | null>(null);
+  const correctionSeq = useRef(0);
 
   // The ⌘K palette deep-links here via ?account=<id> / ?category=<id>.
   const searchParams = useSearchParams();
@@ -91,10 +96,10 @@ export function ExpensesBoard() {
   const [allDates, setAllDates] = useState(false);
   const [allYears, setAllYears] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
-  // Derived, not its own state: onYearChange keeps monthAnchor's year in sync
-  // (below), so a separate `year` state was purely redundant — and updating it
-  // from inside onStepMonth's setMonthAnchor updater was an impure nested
-  // setState (React requires updaters to be pure).
+  // Derived, not its own state: it is the calendar year (PRD §F8) that
+  // `monthAnchor` falls in, so a separate `year` state was purely redundant —
+  // and updating it from inside onStepMonth's setMonthAnchor updater was an impure
+  // nested setState (React requires updaters to be pure).
   const year = monthAnchor.getFullYear();
 
   // Next.js doesn't remount /expenses on a query-string-only change, so a one-
@@ -131,7 +136,7 @@ export function ExpensesBoard() {
 
   // "Active" = any filter off its default view (Spending · all accounts · all
   // categories · current month · current year). Drives the Clear pill's visibility.
-  const currentYear = new Date().getFullYear();
+  const thisYear = currentYear();
   const hasActiveFilters =
     typeFilter !== "spending" ||
     accountId != null ||
@@ -139,7 +144,7 @@ export function ExpensesBoard() {
     labelId != null ||
     allDates ||
     allYears ||
-    year !== currentYear ||
+    year !== thisYear ||
     !atCurrentMonth;
 
   // Any filter change drops the selection (a selected row may not survive the
@@ -294,16 +299,13 @@ export function ExpensesBoard() {
           resetView();
         }}
         onYearChange={(y) => {
-          // Keep the monthAnchor's month index but move it to the new year —
-          // `year` (derived above) follows automatically on the next render.
-          // If the current month is in the future for the selected year,
-          // clamp to December. Picking a year is also the way back from
-          // "All years" to a single one.
-          const curMonth = monthAnchor.getMonth();
-          const now = new Date();
-          const maxMonth = y === now.getFullYear() ? now.getMonth() : 11;
-          const newMonth = Math.min(curMonth, maxMonth);
-          setMonthAnchor(new Date(y, newMonth, 1));
+          // Keep the monthAnchor's calendar month but move it into the picked
+          // year — `year` (derived above) follows automatically on the next render.
+          // If that month is in the future, clamp to the current month. Picking a
+          // year is also the way back from "All years" to a single one.
+          const moved = new Date(y, monthAnchor.getMonth(), 1);
+          const latest = thisMonthAnchor();
+          setMonthAnchor(moved > latest ? latest : moved);
           setAllDates(false);
           setAllYears(false);
           resetView();
@@ -437,7 +439,7 @@ export function ExpensesBoard() {
                       categoryName={
                         categoryArchived ? `${categoryName} (archived)` : categoryName
                       }
-                      categoryColor={resolveCategoryColor(category, categoriesById)}
+                      categoryColor={category?.display_color ?? null}
                       accountName={account?.name ?? "—"}
                       accountLast4={account?.last4 ?? null}
                       amountPaise={t.amount_paise}
@@ -482,6 +484,19 @@ export function ExpensesBoard() {
             accountsById.get(selectedTxn.account_id),
           )}
           onClose={() => setSelectedTxn(null)}
+          onCategoryCorrected={(id) =>
+            setPastRows({ sourceId: id, seq: ++correctionSeq.current })
+          }
+        />
+      ) : null}
+
+      {pastRows ? (
+        <PastRowsPrompt
+          key={`${pastRows.sourceId}-${pastRows.seq}`}
+          sourceId={pastRows.sourceId}
+          correctionSeq={pastRows.seq}
+          categories={categoriesQuery.data ?? []}
+          onDone={() => setPastRows(null)}
         />
       ) : null}
 

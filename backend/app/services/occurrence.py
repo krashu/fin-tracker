@@ -17,13 +17,29 @@ surplus is new. That is identical to a set-membership test whenever every count 
 0 and keeps 1 — and reusing an occupied slot would trip the uniqueness constraint. So the
 next ordinal is ``db_max_occ + (seen - db_count)``, not ``db_count``.
 
-What deliberately does **not** live here: each importer keeps its own prefetch ``SELECT``.
-The key tuple (``fingerprint`` / ``(account_id, fingerprint)`` /
-``(instrument_id, fingerprint)``), the scope window (``import_service`` narrows to the
-statement's date range; the other two do not) and investment's ``fingerprint IS NOT NULL``
-filter are genuinely per-source decisions, not parameters of this algorithm. Each importer
-also keeps its own skip counter, because they do not all mean the same thing —
-``import_service``'s ``skipped`` also counts zero-paise rows.
+What deliberately does **not** live here: each importer keeps its own prefetch ``SELECT``
+(ADR-0006 rule 7), because the key and the scope are per-source decisions, not parameters
+of this algorithm:
+
+* ``import_service`` and ``backup_import_service`` key on the bare fingerprint, with two
+  groupings: COUNT on ``COALESCE(origin_fingerprint, fingerprint)`` (the row's source line,
+  so an edited row still accounts for it) and MAX(``occurrence``) on the *current*
+  ``fingerprint`` (what the unique constraint holds). No ``account_id`` in the key — the
+  hash already encodes it, and a row moved to another account must still match its
+  origin. The statement importer scopes its prefetch to the file's fingerprint set, with
+  no date window and no account predicate; backup restore reads the user's whole history.
+* ``investment_import_service`` keys on ``(instrument_id, fingerprint)``, scoped to the
+  batch's instruments, with a ``fingerprint IS NOT NULL`` filter that keeps unhashed
+  manual rows out of the map.
+
+**The count key and the ordinal slot can differ.** ``allocate(key, slot=...)`` decides
+skip-or-insert on ``key`` but hands out ordinals from the ``slot`` key's ``(count, max)``:
+backup restore dedups an edited row on its *origin* hash, yet the ordinal must clear
+MAX(``occurrence``) on the row's *current* fingerprint, which is what the uniqueness constraint
+holds. With ``slot=None`` it is the same key and behaviour is unchanged.
+
+Each importer also keeps its own skip counter, because they do not all mean the same
+thing — each one's skip counter means duplicates in its own scope.
 
 **Postgres v2 cutover, one grep target.** None of the three call sites has a per-row
 SAVEPOINT to recover from the ``IntegrityError`` a concurrent upload would raise: two
@@ -56,8 +72,11 @@ class OccurrenceAllocator[K]:
         """
         self._existing_counts = existing_counts
         self._seen: dict[K, int] = {}
+        # Next free ordinal per slot key, advanced each time one is handed out (a handed-out
+        # ordinal the caller then discards stays consumed, as the module docstring requires).
+        self._next_slot: dict[K, int] = {}
 
-    def allocate(self, key: K) -> int | None:
+    def allocate(self, key: K, *, slot: K | None = None) -> int | None:
         """Next occurrence for ``key``, or ``None`` when it is an already-known duplicate.
 
         ``0`` is a VALID return — it is the first sighting of a key, and the most common
@@ -70,9 +89,17 @@ class OccurrenceAllocator[K]:
         ordinal the caller then discards. Callers that reject a row **after** allocating
         must not compensate for that — see ``investment_import_service``, where counting
         only persisted rows would let a re-upload duplicate a row the DB already holds.
+
+        ``slot`` (default ``key``) names the key whose MAX(occurrence) the ordinal must clear;
+        see the module docstring.
         """
-        db_count, db_max_occ = self._existing_counts.get(key, (0, -1))
+        db_count, _ = self._existing_counts.get(key, (0, -1))
         self._seen[key] = self._seen.get(key, 0) + 1
+        slot_key = key if slot is None else slot
+        if slot_key not in self._next_slot:
+            self._next_slot[slot_key] = self._existing_counts.get(slot_key, (0, -1))[1] + 1
         if self._seen[key] <= db_count:
             return None
-        return db_max_occ + (self._seen[key] - db_count)
+        ordinal = self._next_slot[slot_key]
+        self._next_slot[slot_key] = ordinal + 1
+        return ordinal

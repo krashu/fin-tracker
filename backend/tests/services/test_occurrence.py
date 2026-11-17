@@ -79,3 +79,13 @@ def test_allocate_counts_a_row_the_caller_then_discards() -> None:
     assert discarded == 0
 
     assert allocator.allocate("fp") == 1
+
+
+def test_slot_separates_the_dedup_count_from_the_ordinal() -> None:
+    """An edited backup row dedups on its origin key ``o`` but its ordinal must clear the
+    MAX on its current fingerprint ``f`` (what the unique constraint holds)."""
+    allocator = OccurrenceAllocator[str]({"o": (0, -1), "f": (1, 3)})
+
+    assert allocator.allocate("o", slot="f") == 4
+    assert allocator.allocate("f") is None  # f's one existing copy is absorbed
+    assert allocator.allocate("f") == 5  # not 4: the slot is shared

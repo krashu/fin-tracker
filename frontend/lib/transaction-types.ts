@@ -1,27 +1,27 @@
 import type { TransactionType } from "@/lib/api/client";
 
-/** The types a user may ASSIGN — on the manual-entry form (PRD §F2) or by
- * editing an existing row (ADR-0007 rule 1).
+/** The types the manual-entry form offers (PRD §F2) and an edit may assign (ADR-0007 rule 1).
  *
- * `transfer` is absent deliberately, not by oversight. A transfer is a *pair* of
- * rows born together via `POST /transactions/transfer` with server-derived signs
- * (ADR-0002 exactly-two-pairing); minting one here would leave a lone leg, so the
- * backend rejects `transaction_type: "transfer"` on PATCH with a 422. Rows that
- * already ARE transfers still render — see `TRANSACTION_TYPE_LABELS`.
+ * `transfer` is absent from this list on purpose: the add form stays spend/income. An
+ * existing unpaired row may be retyped to `transfer` in the edit dialog (ADR-0002 rule 7d),
+ * which offers it beside the four entry directions. Rows that already ARE transfers still
+ * render — see `TRANSACTION_TYPE_LABELS`.
  *
  * There is no `"refund"` here (ADR-0009): a refund is a `spend` row carrying a
  * positive `amount_paise`, not a stored type. The manual-entry/edit forms still
- * offer a three-way Spend/Refund/Income choice — see `EntryDirection` below.
+ * offer a four-way Spend/Refund/Income/Income-reversal choice — see
+ * `EntryDirection` below.
  */
 export const EDITABLE_TRANSACTION_TYPES = ["spend", "income"] as const;
 
 export type EditableTransactionType = (typeof EDITABLE_TRANSACTION_TYPES)[number];
 
-/** Display label for every type, including the one that can't be chosen.
+/** Display label for every type, including the one the add form does not offer.
  *
- * Covers all three because an existing `transfer` row must still show "Transfer" in
- * a picker it cannot select — unpaired transfers are legal (they survive a delete
- * or an unlink) and are otherwise fully editable.
+ * Covers all three because an existing `transfer` row must still show "Transfer" in the
+ * edit dialog's picker — unpaired transfers are legal (they survive a delete or an unlink,
+ * an unlinked card-bill debit commits as one, ADR-0002 rule 7b, and a user may write one,
+ * rule 7d) and are otherwise fully editable.
  */
 export const TRANSACTION_TYPE_LABELS: Record<TransactionType, string> = {
   spend: "Spend",
@@ -41,33 +41,39 @@ export function isRefund(t: {
 }
 
 /** UI-level entry direction for the manual-entry and edit forms — the
- * three-way choice PRD §F2 offers even though the backend stores only two
+ * four-way choice PRD §F2 offers even though the backend stores only two
  * editable types (ADR-0009). Maps to `{type, sign}`:
  *  - `spend`  → (`spend`, negative) — an outflow
- *  - `refund` → (`spend`, positive) — nets against spend in the same category
+ *  - `refund` → (`spend`, positive) — nets against spend in the same category.
+ *    Labelled "Refund / cashback": a purchase cashback is a rebate recorded
+ *    through this direction too (ADR-0013 rule 1)
  *  - `income` → (`income`, positive)
+ *  - `income_reversal` → (`income`, negative) — nets against income in the
+ *    same category (ADR-0009 rule 12)
  *
- * `transfer` has no direction — its legs' signs are server-derived, and
- * `EDITABLE_TRANSACTION_TYPES` already excludes it as a NEW selection.
+ * `transfer` has no direction — its legs' signs are server-derived. Only the edit dialog
+ * offers it (ADR-0002 rule 7d), as its own item that keeps the row's stored sign.
  */
-export const ENTRY_DIRECTIONS = ["spend", "refund", "income"] as const;
+export const ENTRY_DIRECTIONS = ["spend", "refund", "income", "income_reversal"] as const;
 
 export type EntryDirection = (typeof ENTRY_DIRECTIONS)[number];
 
 export const ENTRY_DIRECTION_LABELS: Record<EntryDirection, string> = {
   spend: "Spend",
-  refund: "Refund",
+  refund: "Refund / cashback",
   income: "Income",
+  income_reversal: "Income reversal",
 };
 
 const ENTRY_DIRECTION_TYPE: Record<EntryDirection, EditableTransactionType> = {
   spend: "spend",
   refund: "spend",
   income: "income",
+  income_reversal: "income",
 };
 
 /** The stored `transaction_type` for a given entry direction — `refund` folds
- * into `spend` (ADR-0009). */
+ * into `spend` and `income_reversal` into `income` (ADR-0009). */
 export function directionToType(direction: EntryDirection): EditableTransactionType {
   return ENTRY_DIRECTION_TYPE[direction];
 }
@@ -81,16 +87,20 @@ export function directionForTransaction(t: {
   transaction_type: TransactionType;
   amount_paise: number;
 }): EntryDirection {
-  if (t.transaction_type === "income") return "income";
+  if (t.transaction_type === "income") {
+    return t.amount_paise < 0 ? "income_reversal" : "income";
+  }
   return isRefund(t) ? "refund" : "spend";
 }
 
 /** Signed paise from a positive rupee magnitude, by entry direction — the
  * sign convention PRD §F4a pins and the backend re-validates via `sign_error`
- * (ADR-0007 rule 4, amended by ADR-0009): spend is negative, refund/income
- * positive.
+ * (ADR-0007 rule 4, amended by ADR-0009): spend and income reversal are
+ * negative, refund and income positive.
  *
  * `transfer` is not passed here: its legs' signs are server-derived. */
 export function signedPaise(direction: EntryDirection, magnitude: number): number {
-  return direction === "spend" ? -magnitude : magnitude;
+  return direction === "spend" || direction === "income_reversal"
+    ? -magnitude
+    : magnitude;
 }

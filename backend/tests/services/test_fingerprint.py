@@ -1,10 +1,11 @@
 """Tests for the PRD §F4 fingerprint formula.
 
-The formula itself is the spec; the hash output is not snapshotted (frozen
-hashes are fragile and unhelpful). What we pin is the *behavior*: the same
-inputs produce the same hash; flipping any one of the four fields produces
-a different hash; the refund sign flip (PRD §F4a) produces a different hash;
-the output shape is 64 lowercase hex chars.
+ADR-0006 rule 1 freezes the formula, so its output is pinned: ``test_golden_vector``
+holds one input tuple to a literal digest, which catches a field reorder, a changed
+separator or an extra field that every behavioural test below would pass. The rest pin
+the *behaviour*: the same inputs produce the same hash; flipping any one of the four
+fields produces a different hash; the refund sign flip (PRD §F4a) produces a different
+hash; the output shape is 64 lowercase hex chars.
 """
 
 from __future__ import annotations
@@ -20,6 +21,19 @@ _BASE = {
     "normalized_merchant": "swiggy bangalore",
     "account_id": 1,
 }
+
+
+def test_golden_vector() -> None:
+    """ADR-0006 rule 1: sha256 of ``2026-01-15␟-150000␟swiggy bangalore␟1`` (␟ = ``\\x1f``).
+
+    The literal was computed outside the app, with
+    ``printf '2026-01-15\\x1f-150000\\x1fswiggy bangalore\\x1f1' | sha256sum``. If this fails,
+    the formula changed: every stored fingerprint is now stale. That is a migration under
+    ADR-0006 rules 18-21, never an update to this literal.
+    """
+    assert transaction_fingerprint(**_BASE) == (
+        "98e3053ae4c4d69215dad3510b3d0492e1838bd347db2cdd79def1cbc3901fa2"
+    )
 
 
 def test_determinism() -> None:
@@ -119,3 +133,23 @@ def test_f1_f2_dedup_parity() -> None:
         account_id=1,
     )
     assert f1_fp == f2_fp
+
+
+def test_f1_f2_dedup_parity_across_unicode_spellings() -> None:
+    """A precomposed and a decomposed spelling of one merchant (a parser re-extraction versus
+    a typed entry) fingerprint alike, because ``normalize_merchant`` puts both in NFC."""
+    from app.services.merchant import normalize_merchant
+
+    precomposed = transaction_fingerprint(
+        txn_date=date(2026, 1, 15),
+        amount_paise=-150000,
+        normalized_merchant=normalize_merchant("CAF\u00c9 BANGALORE"),
+        account_id=1,
+    )
+    decomposed = transaction_fingerprint(
+        txn_date=date(2026, 1, 15),
+        amount_paise=-150000,
+        normalized_merchant=normalize_merchant("CAFE\u0301 BANGALORE"),
+        account_id=1,
+    )
+    assert precomposed == decomposed

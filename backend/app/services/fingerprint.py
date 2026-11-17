@@ -1,8 +1,8 @@
 """Transaction fingerprint — the dedup key from PRD §F4.
 
 Single source of truth for the formula. Pure function: no DB, no HTTP,
-no logging. Both the future ``import_service`` and any test asserting
-dedup behavior should import from here rather than re-typing the hash.
+no logging. ``import_service`` and any test asserting dedup behavior should import
+from here rather than re-typing the hash.
 
 The contract is locked in ``docs/adr/0006-f4-dedup-key.md``, which also carries the
 **recompute procedure** any future change must follow. Two rules from it matter here:
@@ -13,10 +13,9 @@ The contract is locked in ``docs/adr/0006-f4-dedup-key.md``, which also carries 
 * Callers pass an already-normalized merchant from the shared
   ``services/merchant.py:normalize_merchant``, whose output is ALSO the key for the
   F3 ``merchant_tag_map`` and F3a ``merchant_label_map`` tables. A change to its
-  rules (the planned Indian RRN / auth-code stripping) breaks dedup AND both
-  auto-tag stores at once, silently. Such a change is a recompute migration, not a
-  code edit — see ADR-0006 §Recompute procedure and ``normalize_merchant``'s
-  CHANGE HAZARD note.
+  rules (the planned Indian RRN / auth-code stripping) breaks dedup AND every
+  keyed store listed in ``normalize_merchant``'s CHANGE HAZARD, silently. Such a
+  change is a recompute migration, not a code edit — see ADR-0006 rules 18-21.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from datetime import date
 
 # ASCII Unit Separator. Provably absent from every field, so the join is
 # injection-proof: ``date.isoformat()`` is ``[0-9-]``, the two ints are ``[-0-9]``,
-# and ``normalize_merchant``'s ``" ".join(raw.lower().split())`` deletes it because
+# and ``normalize_merchant``'s whitespace collapse (its last step) deletes it because
 # ``'\x1f'.isspace()`` is True. Pinned by
 # ``tests/services/test_fingerprint.py::test_separator_cannot_appear_in_a_normalized_merchant``.
 _SEP = "\x1f"

@@ -36,10 +36,27 @@ describe("transaction-types ADR-0009 and F2 rules", () => {
     );
   });
 
-  it("maps 3-way UI entry directions to underlying stored types", () => {
+  it("maps 4-way UI entry directions to underlying stored types", () => {
     expect(directionToType("spend")).toBe("spend");
     expect(directionToType("refund")).toBe("spend");
     expect(directionToType("income")).toBe("income");
+    expect(directionToType("income_reversal")).toBe("income");
+  });
+
+  it("maps the income-reversal direction to (income, −) and recovers it from a negative income row", () => {
+    expect(ENTRY_DIRECTIONS).toEqual([
+      "spend",
+      "refund",
+      "income",
+      "income_reversal",
+    ]);
+    expect(signedPaise("income_reversal", 5000)).toBe(-5000);
+    expect(
+      directionForTransaction({
+        transaction_type: "income",
+        amount_paise: -5000,
+      }),
+    ).toBe("income_reversal");
   });
 
   it("recovers UI entry direction from stored transaction row", () => {
@@ -65,6 +82,12 @@ describe("transaction-types ADR-0009 and F2 rules", () => {
     ).toBe("income");
   });
 
+  it("labels the refund direction 'Refund / cashback' and maps it to (spend, +) (ADR-0013 rule 1)", () => {
+    expect(ENTRY_DIRECTION_LABELS.refund).toBe("Refund / cashback");
+    expect(directionToType("refund")).toBe("spend");
+    expect(signedPaise("refund", 1000)).toBe(1000);
+  });
+
   it("signs paise correctly based on entry direction", () => {
     const magnitude = 150000;
     // Outflow: negative
@@ -72,6 +95,8 @@ describe("transaction-types ADR-0009 and F2 rules", () => {
     // Refund / Inflow: positive
     expect(signedPaise("refund", magnitude)).toBe(150000);
     expect(signedPaise("income", magnitude)).toBe(150000);
+    // Income reversal: negative income (ADR-0009 rule 12)
+    expect(signedPaise("income_reversal", magnitude)).toBe(-150000);
   });
 
   it("has complete UI labels for all directions and transaction types", () => {
@@ -80,7 +105,8 @@ describe("transaction-types ADR-0009 and F2 rules", () => {
     expect(TRANSACTION_TYPE_LABELS.transfer).toBe("Transfer");
 
     expect(ENTRY_DIRECTION_LABELS.spend).toBe("Spend");
-    expect(ENTRY_DIRECTION_LABELS.refund).toBe("Refund");
+    expect(ENTRY_DIRECTION_LABELS.refund).toBe("Refund / cashback");
     expect(ENTRY_DIRECTION_LABELS.income).toBe("Income");
+    expect(ENTRY_DIRECTION_LABELS.income_reversal).toBe("Income reversal");
   });
 });

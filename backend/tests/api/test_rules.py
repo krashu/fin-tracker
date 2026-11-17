@@ -9,7 +9,7 @@ guards against a cross-tenant category-name leak.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from uuid import uuid4
 
 import pytest
@@ -18,14 +18,25 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Category, Label, MerchantAlias, MerchantLabelMap, MerchantTagMap, User
+from app.models import (
+    Account,
+    Category,
+    Label,
+    MerchantAlias,
+    MerchantLabelMap,
+    MerchantTagMap,
+    Transaction,
+    User,
+)
+from app.services.merchant import normalize_merchant
 from app.services.merchant_alias import EMPTY_RESOLVER, load_alias_resolver
 from app.services.merchant_labels import LABEL_PREFILL_MIN, prefetch_label_map
 from app.services.tag_service import prefetch_tag_map
+from tests.fk_bypass import foreign_keys_off
 
 
 def _cat(session: Session, user_id, name: str) -> Category:
-    cat = Category(user_id=user_id, name=name, is_seeded=False)
+    cat = Category(color="#2a78d6", user_id=user_id, name=name, is_seeded=False)
     session.add(cat)
     session.commit()
     session.refresh(cat)
@@ -41,7 +52,7 @@ def _label(session: Session, user_id, name: str) -> Label:
 
 
 def _merchant(body: list[dict], merchant: str) -> dict | None:
-    return next((r for r in body if r["merchant_normalized"] == merchant), None)
+    return next((r for r in body if r["merchant_canonical"] == merchant), None)
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +85,7 @@ def test_list_response_shape(
     assert len(body) == 1
     rule = body[0]
     assert set(rule.keys()) == {
-        "merchant_normalized",
+        "merchant_canonical",
         "categories",
         "labels",
         "alias_count",
@@ -129,7 +140,7 @@ def test_list_groups_and_sorts_by_merchant(
     session.commit()
 
     body = client.get("/api/v1/rules").json()
-    assert [r["merchant_normalized"] for r in body] == ["AMAZON", "ZOMATO"]
+    assert [r["merchant_canonical"] for r in body] == ["AMAZON", "ZOMATO"]
     assert _merchant(body, "AMAZON")["categories"] == []
     assert len(_merchant(body, "AMAZON")["labels"]) == 1
     assert len(_merchant(body, "ZOMATO")["categories"]) == 1
@@ -387,7 +398,7 @@ def test_list_omits_foreign_user(
     session.commit()
 
     body = client.get("/api/v1/rules").json()
-    assert [r["merchant_normalized"] for r in body] == ["MINE"]
+    assert [r["merchant_canonical"] for r in body] == ["MINE"]
 
 
 def test_list_does_not_leak_cross_tenant_category_name(
@@ -395,24 +406,26 @@ def test_list_does_not_leak_cross_tenant_category_name(
     seeded_user: User,
     session: Session,
 ) -> None:
-    """Regression guard for the stricter ``Category.user_id`` join.
+    """Regression guard for the stricter ``Category.user_id`` join (ADR-0003 rule 7).
 
-    A corrupt same-user map row pointing at ANOTHER user's category must never
-    surface that category's name (or the merchant) in this user's rules.
+    A same-user map row pointing at ANOTHER user's category must never surface that
+    category's name (or the merchant) in this user's rules. The composite same-user FK
+    (rule 10) refuses such a row, so it is stored with FKs off: the read must hold on
+    its own.
     """
     other = User(id=uuid4())
     session.add(other)
     session.flush()
     foreign_cat = _cat(session, other.id, "SecretBucket")
     # user_id is seeded_user (own row) but category_id belongs to `other`.
-    session.add(
-        MerchantTagMap(
-            user_id=seeded_user.id,
-            merchant_normalized="LEAKY",
-            category_id=foreign_cat.id,
+    with foreign_keys_off(session):
+        session.add(
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized="LEAKY",
+                category_id=foreign_cat.id,
+            )
         )
-    )
-    session.commit()
 
     resp = client.get("/api/v1/rules")
     assert _merchant(resp.json(), "LEAKY") is None
@@ -439,22 +452,18 @@ def test_list_label_rule_omits_foreign_user(
     session.commit()
 
     body = client.get("/api/v1/rules").json()
-    assert [r["merchant_normalized"] for r in body] == ["MINE"]
+    assert [r["merchant_canonical"] for r in body] == ["MINE"]
 
 
 def test_cross_tenant_label_rule_rejected_by_composite_fk(
     seeded_user: User,
     session: Session,
 ) -> None:
-    """The category-style cross-tenant leak is *unrepresentable* for labels.
+    """The cross-tenant label leak is *unrepresentable* (ADR-0003 rule 10).
 
-    Unlike ``merchant_tag_map`` (plain FK on ``category_id`` — a corrupt same-user
-    row pointing at another user's category CAN exist, hence the
-    ``Category.user_id`` join guard + its leak test), ``merchant_label_map`` has a
-    composite ``(label_id, user_id) → labels(id, user_id)`` FK. That rejects a
-    same-user map row pointing at another user's label at INSERT time, so the
-    corrupt row can never reach the join. This test documents why no join-filter
-    leak test is needed on the label side — the DB makes the leak impossible.
+    ``merchant_label_map`` has a composite ``(label_id, user_id) → labels(id, user_id)``
+    FK, so a same-user map row pointing at another user's label is rejected at INSERT
+    time — the same guarantee ``merchant_tag_map.category_id`` now has.
     """
     other = User(id=uuid4())
     session.add(other)
@@ -942,6 +951,47 @@ def test_delete_label_rule_foreign_user_404(
 # ---------------------------------------------------------------------------
 
 
+def test_create_category_rule_for_gateway_handle_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    cat = _cat(session, seeded_user.id, "Food")
+    resp = client.post(
+        "/api/v1/rules/categories",
+        json={"merchant": "UPI/9876543210@YBL", "category_id": cat.id},
+    )
+    assert resp.status_code == 422
+    assert "add an alias" in resp.json()["detail"]
+    # Counter-check: a VPA that names someone is a merchant.
+    ok = client.post(
+        "/api/v1/rules/categories",
+        json={"merchant": "upi/zomatoonline@paytm", "category_id": cat.id},
+    )
+    assert ok.status_code == 201
+
+
+def test_list_rules_hides_unknown_via_groups(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """A raw pin made while an alias covered the payee turns into an unknown-via group
+    when that alias goes; the group must not surface as a rule."""
+    cat = _cat(session, seeded_user.id, "Food")
+    alias = client.post(
+        "/api/v1/rules/aliases", json={"pattern": "9876543210", "canonical": "ramesh"}
+    )
+    assert alias.status_code == 201, alias.text
+    pin = client.post(
+        "/api/v1/rules/categories",
+        json={"merchant": "UPI/9876543210@YBL", "category_id": cat.id},
+    )
+    assert pin.status_code == 201, pin.text
+    map_id = pin.json()["id"]
+    assert client.delete(f"/api/v1/rules/aliases/{alias.json()['id']}").status_code == 204
+
+    body = client.get("/api/v1/rules").json()
+    assert _merchant(body, "unknown via phonepe") is None
+    assert all(c["id"] != map_id for rule in body for c in rule["categories"])
+
+
 def test_create_category_rule_pins_new_merchant(
     client: TestClient, seeded_user: User, session: Session
 ) -> None:
@@ -973,6 +1023,31 @@ def test_create_category_rule_normalizes_merchant(
     )
     assert resp.status_code == 201
     assert resp.json()["merchant_normalized"] == "blue tokai"
+
+
+def test_create_category_rule_stores_nfc_merchant(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    food = _cat(session, seeded_user.id, "Food")
+    other = _cat(session, seeded_user.id, "Dining")
+
+    resp = client.post(
+        "/api/v1/rules/categories", json={"merchant": "Cafe\u0301", "category_id": food.id}
+    )
+    assert resp.status_code == 201
+    assert resp.json()["merchant_normalized"] == "caf\u00e9"
+
+    again = client.post(
+        "/api/v1/rules/categories", json={"merchant": "Caf\u00e9", "category_id": other.id}
+    )
+    assert again.status_code == 201
+
+    group = _merchant(client.get("/api/v1/rules").json(), "caf\u00e9")
+    assert group is not None
+    # One group (both spellings are one merchant); the second pin re-pointed the first.
+    assert len(group["categories"]) == 2
+    pinned = [c["category_id"] for c in group["categories"] if c["pinned"]]
+    assert pinned == [other.id]
 
 
 def test_create_category_rule_pin_beats_higher_hit_count(
@@ -1042,6 +1117,53 @@ def test_create_category_rule_overlong_merchant_422(
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "target",
+    ["category_rule", "label_rule", "alias_pattern", "alias_canonical", "alias_update"],
+)
+def test_merchant_field_normalizing_past_512_chars_422(
+    client: TestClient, seeded_user: User, session: Session, target: str
+) -> None:
+    """ADR-0006 rule 3b: 171 x U+FB2C is 171 raw but 513 normalized, past the String(512)
+    merchant columns, so every rule and alias merchant field refuses it."""
+    long_merchant = "\ufb2c" * 171
+    cat = _cat(session, seeded_user.id, "Food")
+    label = _label(session, seeded_user.id, "Tag")
+
+    if target == "category_rule":
+        resp = client.post(
+            "/api/v1/rules/categories", json={"merchant": long_merchant, "category_id": cat.id}
+        )
+    elif target == "label_rule":
+        resp = client.post(
+            "/api/v1/rules/labels", json={"merchant": long_merchant, "label_id": label.id}
+        )
+    elif target == "alias_pattern":
+        resp = client.post(
+            "/api/v1/rules/aliases", json={"pattern": long_merchant, "canonical": "ramesh"}
+        )
+    elif target == "alias_canonical":
+        resp = client.post(
+            "/api/v1/rules/aliases", json={"pattern": "9876543210", "canonical": long_merchant}
+        )
+    else:
+        made = client.post(
+            "/api/v1/rules/aliases", json={"pattern": "9876543210", "canonical": "ramesh"}
+        )
+        assert made.status_code == 201, made.text
+        resp = client.patch(
+            f"/api/v1/rules/aliases/{made.json()['id']}", json={"canonical": long_merchant}
+        )
+
+    assert resp.status_code == 422
+    if target == "alias_update":
+        assert session.scalars(select(MerchantAlias.canonical)).all() == ["ramesh"]
+    else:
+        assert session.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
+        assert session.scalar(select(func.count()).select_from(MerchantLabelMap)) == 0
+        assert session.scalar(select(func.count()).select_from(MerchantAlias)) == 0
+
+
 def test_create_category_rule_unknown_category_422(client: TestClient, seeded_user: User) -> None:
     resp = client.post("/api/v1/rules/categories", json={"merchant": "swiggy", "category_id": 9999})
     assert resp.status_code == 422
@@ -1078,7 +1200,9 @@ def test_create_category_rule_income_category_422(
     """The merchant→category map is spend/refund-only, so pinning a merchant to
     an income category is rejected at the API (not just masked by the UI) — a
     durable pinned rule would otherwise re-pollute every future spend import."""
-    income_cat = Category(user_id=seeded_user.id, name="Salary", kind="income", is_seeded=False)
+    income_cat = Category(
+        color="#2a78d6", user_id=seeded_user.id, name="Salary", kind="income", is_seeded=False
+    )
     session.add(income_cat)
     session.commit()
     session.refresh(income_cat)
@@ -1206,6 +1330,21 @@ def test_create_label_rule_pins_below_threshold(
     assert labels[0]["prefills"] is True  # pinned → prefills despite hit_count=1
 
 
+def test_create_label_rule_for_gateway_handle_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    label = _label(session, seeded_user.id, "online")
+    resp = client.post(
+        "/api/v1/rules/labels", json={"merchant": "UPI/9876543210@YBL", "label_id": label.id}
+    )
+    assert resp.status_code == 422
+    assert "add an alias" in resp.json()["detail"]
+    ok = client.post(
+        "/api/v1/rules/labels", json={"merchant": "upi/zomatoonline@paytm", "label_id": label.id}
+    )
+    assert ok.status_code == 201
+
+
 def test_create_label_rule_unknown_label_422(client: TestClient, seeded_user: User) -> None:
     resp = client.post("/api/v1/rules/labels", json={"merchant": "amazon", "label_id": 9999})
     assert resp.status_code == 422
@@ -1304,6 +1443,53 @@ def test_list_rule_merchants_distinct_sorted_scoped(
     assert resp.json() == ["amazon", "zomato"]  # distinct, sorted, scoped, no blank
 
 
+def test_rule_merchants_lists_one_spelling(
+    client: TestClient, seeded_user: User, session: Session, axis_account: Account
+) -> None:
+    for n, raw in enumerate(("CAF\u00c9", "CAFE\u0301")):
+        session.add(
+            Transaction(
+                user_id=seeded_user.id,
+                account_id=axis_account.id,
+                date=date(2026, 5, 10 + n),
+                amount_paise=-10000,
+                transaction_type="spend",
+                merchant_raw=raw,
+                merchant_normalized=normalize_merchant(raw),
+                fingerprint=f"fp-nfc-{n}",
+                source="import",
+                confirmed_at=datetime.now(UTC),
+            )
+        )
+    session.commit()
+
+    merchants = client.get("/api/v1/rules/merchants").json()
+    assert merchants.count("caf\u00e9") == 1
+    assert "cafe\u0301" not in merchants
+
+
+def test_rule_merchants_omits_gateway_handles(
+    client: TestClient, seeded_user: User, session: Session, axis_account: Account
+) -> None:
+    for n, raw in enumerate(("UPI/9876543210@YBL", "Swiggy")):
+        session.add(
+            Transaction(
+                user_id=seeded_user.id,
+                account_id=axis_account.id,
+                date=date(2026, 5, 10),
+                amount_paise=-10000,
+                transaction_type="spend",
+                merchant_raw=raw,
+                merchant_normalized=normalize_merchant(raw),
+                fingerprint=f"fp-{n}",
+                source="import",
+                confirmed_at=datetime.now(UTC),
+            )
+        )
+    session.commit()
+    assert client.get("/api/v1/rules/merchants").json() == ["swiggy"]
+
+
 # ---------------------------------------------------------------------------
 # GET/POST/PATCH/DELETE /rules/aliases  (ADR-0011 merchant-alias layer, Phase A4)
 # ---------------------------------------------------------------------------
@@ -1375,11 +1561,37 @@ def test_create_alias_duplicate_pattern_422(
     assert resp.status_code == 422
 
 
+def test_create_alias_stores_nfc_pattern_and_canonical(
+    client: TestClient, seeded_user: User
+) -> None:
+    resp = client.post(
+        "/api/v1/rules/aliases",
+        json={"pattern": "Cafe\u0301 BLR", "canonical": "Cafe\u0301"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["pattern"] == "caf\u00e9 blr"
+    assert body["canonical"] == "caf\u00e9"
+
+    listed = client.get("/api/v1/rules/aliases").json()
+    assert [(a["pattern"], a["canonical"]) for a in listed] == [("caf\u00e9 blr", "caf\u00e9")]
+
+
+def test_create_alias_decomposed_duplicate_pattern_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    _alias(session, seeded_user.id, "caf\u00e9", "coffee chain")
+    resp = client.post("/api/v1/rules/aliases", json={"pattern": "cafe\u0301", "canonical": "x"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "an alias for this pattern already exists"
+
+
 def test_create_alias_canonical_matched_by_existing_pattern_422(
     client: TestClient, seeded_user: User, session: Session
 ) -> None:
-    """Decision 7, direction 1: the new canonical must not itself be caught by
-    an existing pattern (a false two-hop appearance)."""
+    """ADR-0011 rule 5: the new canonical must resolve to itself under the prospective
+    rule set. Here ``uber rides`` resolves to ``rideshare`` through the existing ``uber``
+    pattern, so it is not a fixed point."""
     _alias(session, seeded_user.id, "uber", "rideshare")
     resp = client.post("/api/v1/rules/aliases", json={"pattern": "ola", "canonical": "uber rides"})
     assert resp.status_code == 422
@@ -1388,7 +1600,7 @@ def test_create_alias_canonical_matched_by_existing_pattern_422(
 def test_create_alias_pattern_matches_existing_canonical_422(
     client: TestClient, seeded_user: User, session: Session
 ) -> None:
-    """Decision 7, direction 2: the new pattern must not catch an existing
+    """ADR-0011 rule 5, pattern side: the new pattern must not catch an existing
     alias's canonical."""
     _alias(session, seeded_user.id, "swiggy blr", "swiggy delivery")
     resp = client.post(
@@ -1444,6 +1656,31 @@ def test_create_alias_genuine_chain_still_422(
     resp = client.post("/api/v1/rules/aliases", json={"pattern": "foo", "canonical": "bar"})
     assert resp.status_code == 422
     assert resp.json()["detail"] == "canonical would be rewritten by another alias"
+
+
+def test_create_alias_reserved_unknown_via_canonical_422(
+    client: TestClient, seeded_user: User
+) -> None:
+    resp = client.post(
+        "/api/v1/rules/aliases", json={"pattern": "milkman", "canonical": "Unknown via PhonePe"}
+    )
+    assert resp.status_code == 422
+    ok = client.post("/api/v1/rules/aliases", json={"pattern": "milkman", "canonical": "milk"})
+    assert ok.status_code == 201
+    patched = client.patch(
+        f"/api/v1/rules/aliases/{ok.json()['id']}", json={"canonical": "Unknown via PhonePe"}
+    )
+    assert patched.status_code == 422
+
+
+def test_create_alias_gateway_canonical_422_names_the_cause(
+    client: TestClient, seeded_user: User
+) -> None:
+    resp = client.post(
+        "/api/v1/rules/aliases", json={"pattern": "milkman", "canonical": "9876543210@ybl"}
+    )
+    assert resp.status_code == 422
+    assert "payment-gateway handle" in resp.json()["detail"]
 
 
 def test_patch_alias_clears_is_seeded(

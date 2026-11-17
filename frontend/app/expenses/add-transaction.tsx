@@ -2,13 +2,16 @@
 
 /**
  * Manual transaction entry (PRD §F2) — the "Add" control in the /expenses
- * SubNav trailing slot plus its entry dialog. Spend/refund/income here (transfer
- * has its own dialog).
+ * SubNav trailing slot plus its entry dialog. Spend/refund/income/income reversal
+ * here (transfer has its own dialog).
  *
  * The amount is entered as a positive rupee magnitude; the sign is applied by
- * entry direction (spend negative, refund/income positive — PRD §F4a), mirroring
- * the accounts create form. A refund is not its own stored type (ADR-0009) — it's
- * a `spend` row with a positive amount, so `EntryDirection` is the local state and
+ * entry direction (spend and income reversal negative, refund/income positive — PRD §F4a), mirroring
+ * the accounts create form. The "Refund / cashback" direction also records a
+ * purchase cashback, a rebate (ADR-0013); picking the Cashback category under Spend
+ * shows a hint pointing there (Spend + Cashback stays legal: a clawback). A refund is not its own stored type (ADR-0009) — it's
+ * a `spend` row with a positive amount (and an income reversal a negative `income`,
+ * ADR-0009 rule 12), so `EntryDirection` is the local state and
  * `directionToType`/`signedPaise` derive the two fields the API actually wants. A
  * created row is auto-confirmed server-side, but the board only shows spend
  * (either sign) by default (and filters by account/category/month), so a new row
@@ -192,8 +195,8 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
         <DialogHeader>
           <DialogTitle>Add transaction</DialogTitle>
           <DialogDescription className="sr-only">
-            Record a spend, refund, or income entry against one of your
-            accounts.
+            Record a spend, refund or cashback, income, or income reversal
+            entry against one of your accounts.
           </DialogDescription>
         </DialogHeader>
 
@@ -269,6 +272,14 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
               />
             </Field>
           </div>
+
+          {direction === "spend" && selectedCategory?.role === "cashback" ? (
+            <p className="text-[12px] text-muted-foreground">
+              Cashback on a purchase is a rebate: choose{" "}
+              <strong>{ENTRY_DIRECTION_LABELS.refund}</strong>. Keep Spend only for a
+              cashback clawback.
+            </p>
+          ) : null}
 
           <Field
             label={

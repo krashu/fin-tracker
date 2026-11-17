@@ -2,10 +2,9 @@
 
 Flat shape: FK ids only, no denormalised joins. The field set is
 deliberately tight — ``fingerprint`` stays internal (PRD §F4 dedup key),
-and ``source`` / ``import_batch_id`` / ``transfer_pair_id`` have no UI
-consumer yet. ``transfer_pair_id`` will surface here when F4a CC-bill
-auto-link ships and the frontend wants to render a "paired" badge —
-the schema bump is non-breaking (additive nullable field).
+and ``source`` / ``import_batch_id`` have no UI consumer. ``transfer_pair_id``
+is on :class:`TransactionRead` for the F4a "Linked CC bill payment" banner
+(ADR-0002 pairing).
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.models.transaction import TransactionTypeStr
 from app.schemas.labels import LabelRead
+from app.services.bulk_categorise import BULK_MAX
+from app.services.merchant import merchant_too_long
 
 ConfidenceStr = Literal["confident", "uncertain", "seeded", "none"]
 
@@ -37,38 +38,36 @@ def _stripped_or_none(v: str | None) -> str | None:
     PATCH lands in the same state a blank one lands in on POST — which matters because
     the PRD §F4 fingerprint hashes ``normalize_merchant(raw) if raw else ""``, and a
     stored ``""`` would take a different branch than a stored NULL.
+
+    A merchant that normalizes past the 512-wide column is refused here (ADR-0006 rule 3b).
     """
     if v is None:
         return None
-    return v.strip() or None
+    v = v.strip() or None
+    if v is not None and merchant_too_long(v):
+        raise ValueError("merchant is longer than 512 characters once normalized")
+    return v
 
 
 def sign_error(transaction_type: TransactionTypeStr, amount_paise: int) -> str | None:
-    """The F2 sign rule, or ``None`` when the pair is valid.
+    """The sign rule (ADR-0009 rule 3), or ``None`` when the pair is valid.
 
-    ``income > 0``; ``spend`` and ``transfer`` take any non-zero sign; zero
-    rejected for all three. Wrong-sign rows would silently distort the F8
-    signed-sum aggregates.
-
-    ``spend`` is deliberately asymmetric with ``income``: a **positive spend is a
-    refund** (ADR-0009), so the old ``spend < 0`` guard had to go. ``income``
-    keeps ``> 0`` because an income reversal (a salary clawback) is out of scope
-    for v1. The accepted cost: a fat-fingered positive spend now reads as a
-    refund instead of 422-ing.
+    Every type accepts any non-zero sign; zero is rejected for all of them. The sign
+    carries meaning rather than validity: a **positive spend is a refund** and a
+    **negative income is an income reversal** (ADR-0009 rule 2), each netting its
+    category down in the signed-sum aggregates. The accepted cost: a fat-fingered
+    sign reads as a refund or a reversal instead of 422-ing. ``transaction_type`` is
+    still a parameter so the rule stays one helper with one call shape.
 
     Returns a message rather than raising so both callers can raise in their own
     idiom — :meth:`TransactionCreate._check_sign` as a ``ValueError`` pydantic turns
     into a 422 body, and ``PATCH /transactions`` as an ``HTTPException``. The route
-    needs it because ADR-0007 rule 4 validates the *merged* state: a PATCH may send
+    needs it because ADR-0006 rule 12 validates the *merged* state: a PATCH may send
     a new type, a new amount, or only one of the two, and a schema validator cannot
     see the stored row.
     """
     if amount_paise == 0:
         return "amount_paise must be non-zero"
-    if transaction_type == "income" and amount_paise <= 0:
-        return "income requires positive amount_paise"
-    # spend / transfer: any non-zero sign accepted (zero already rejected above).
-    # A positive spend IS the refund representation — see the docstring.
     return None
 
 
@@ -96,12 +95,22 @@ class TransactionRead(BaseModel):
     # ADR-0002 pairing, surfaced for the F4a "Linked CC bill payment" banner and its
     # break-link control (PRD §F4a-1) — the consumer the module docstring above
     # anticipated. Non-null also means the row's identity columns and type are frozen
-    # until it is unlinked (ADR-0007 rule 7), so the dialog needs it to explain that
+    # until it is unlinked (ADR-0006 rule 15), so the dialog needs it to explain that
     # on screen rather than letting the user discover it as a 422. Ships in the same
     # commit as that renderer: a wire field with no renderer is exactly the drift
-    # frontend/CLAUDE.md documents (tsc cannot see a backend field the TS type never
+    # frontend/AGENTS.md documents (tsc cannot see a backend field the TS type never
     # declares, which is how fx_unavailable_count was computed and discarded).
     transfer_pair_id: int | None
+    # ADR-0009 rule 13: the confirmed spend this refund reverses, or None. Informational,
+    # never summed; rendered by the dialog's refund picker and shipped with it, per the
+    # house rule above.
+    refund_of_id: int | None
+    # ADR-0002 rule 11b: server-computed placement of the manual card-bill link ("Paid your
+    # card bill elsewhere?"): a confirmed, unpaired, positive `income` or `transfer` row on a
+    # live card. Rendered by the transaction dialog and shipped with it, per the house rule
+    # above; the client never re-derives it. Required, so every response is built by
+    # `services.transaction_reads.transaction_reads`, never by validating an ORM row directly.
+    card_bill_link_offered: bool
     # F3a labels — the row's user tags. list[LabelRead] (not a scalar FK) is a
     # deliberate deviation from the flat-FK-ids rule: an M2M has no single id.
     # Read via the viewonly Transaction.labels relationship (selectinload in the
@@ -112,22 +121,21 @@ class TransactionRead(BaseModel):
 class TransactionCreate(BaseModel):
     """Create body for ``POST /api/v1/transactions`` (PRD §F2 manual entry).
 
-    Sign rule: ``income > 0``; ``spend`` and ``transfer`` accept any non-zero
-    amount. Zero rejected for all types. Wrong-sign rows would silently distort
-    dashboard signed-sum aggregates.
-
-    ``spend`` accepts both signs because a **positive spend is a refund**
-    (ADR-0009) — the UI still offers a three-way Spend/Refund/Income choice and
-    maps it to (type, sign) client-side. The consequence is that a mistyped
-    positive spend is now indistinguishable from a deliberate refund at this
-    boundary; that trade is recorded in ADR-0009.
+    Sign rule (:func:`sign_error`, ADR-0009 rule 3): every type accepts any
+    non-zero amount; zero is rejected for all types. A **positive spend is a
+    refund** and a **negative income is an income reversal** — the UI offers
+    four entry directions and maps each to (type, sign) client-side (ADR-0009
+    rule 12). The consequence is that a mistyped sign is indistinguishable from a
+    deliberate refund or reversal at this boundary; that trade is recorded in
+    ADR-0009.
 
     ``merchant_raw`` is optional (a manual row may legitimately have no
     merchant). It's stripped of leading/trailing whitespace; pure whitespace
     (``"   "``) and ``""`` both resolve to ``None`` so a blank input persists
-    SQL ``NULL``, not ``""``. The 256 cap matches
-    ``transactions.merchant_normalized String(256)`` so a long raw can't
-    silently overflow the normalized column on Postgres v2.
+    SQL ``NULL``, not ``""``. The 256 cap is the API's own: the
+    ``merchant_raw`` and ``merchant_normalized`` columns are ``String(512)``
+    (migration 0020), and normalizing can lengthen text, so a merchant that
+    normalizes past 512 is refused too (ADR-0006 rule 3b).
 
     No-merchant collision: two no-merchant rows with the same
     date+amount+account still collide → 409. The PRD §F4 fingerprint hashes
@@ -215,6 +223,31 @@ class TransferRead(BaseModel):
     dest: TransactionRead
 
 
+class RefundLinkSet(BaseModel):
+    """Body for ``PUT /api/v1/transactions/{id}/refund-link`` (ADR-0009 rule 13).
+
+    Points a refund (a positive ``spend``) at the confirmed negative ``spend`` it
+    reverses. Its own endpoint rather than a PATCH key: PATCH takes the seven
+    user-visible fields only (ADR-0006 rule 10).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    original_id: int = Field(gt=0)
+
+
+class TransactionLinkSet(BaseModel):
+    """Body for ``POST /api/v1/transactions/{id}/link`` (ADR-0002 rule 11b).
+
+    Names the other leg of the pair. Its own endpoint rather than a PATCH key: a link moves
+    the type, the category and the pair together, and PATCH writes no pair column.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    partner_id: int = Field(gt=0)
+
+
 class TransactionCandidate(TransactionRead):
     """Per-row payload for ``GET /imports/{batch_id}/candidates``.
 
@@ -233,8 +266,8 @@ class TransactionCandidate(TransactionRead):
       in the route module (≥3 confident, 1-2 uncertain), **except** when the
       resolved ``(canonical, category)`` pair is present in the merchant map
       at ``hit_count == 0`` — a dictionary entry this user has never
-      confirmed (ADR-0011 decision 4) — which reads ``"seeded"`` regardless
-      of the threshold. ``"none"`` means the pair is *absent* entirely (no
+      confirmed and has not pinned (ADR-0011 rule 11) — which reads ``"seeded"``
+      regardless of the threshold. ``"none"`` means the pair is *absent* entirely (no
       rule at all); collapsing that with a present-at-zero seed is exactly
       the distinction ``prefetch_tag_strength`` exists to preserve.
     * ``pinned`` — whether any ``merchant_tag_map`` row behind this
@@ -242,14 +275,20 @@ class TransactionCandidate(TransactionRead):
       path is pinned-aware, so a freshly-pinned rule prefills at ``hit_count=1``;
       surfacing ``pinned`` here lets the picker render an "authored" state that
       outranks the low ``prior_matches`` confidence tint. ``False`` when the pair
-      is absent. Note it can be ``True`` alongside ``confidence == "seeded"``:
-      pinning a seed row leaves ``hit_count`` at 0, because ``pin_tag`` never
-      bumps it on an existing row.
-    * ``cc_payment_candidate`` — the row is ``income`` and its merchant names
-      a card-bill payment, so F4a-1 may auto-link it to a bank debit at
-      commit. Does **not** assert the link will happen — the parent account
-      and a matching debit are checked at commit (``auto_link_cc_bill``
-      gates 4-6).
+      is absent. A pinned seed row (``hit_count`` stays 0, because ``pin_tag``
+      never bumps it) reads ``confidence == "none"`` with ``pinned == True`` —
+      never ``"seeded"``.
+    * ``cc_payment_candidate`` — the row names a card-bill payment, so F4a-1 may auto-link
+      it to its other leg at commit. On a card batch that is a positive ``income`` credit (the
+      leg links to a bank debit); on a bank batch it is a debit (the leg links to the card's
+      payment credit). Does **not** assert the link will happen — the parent account and a
+      matching row are checked at commit (``auto_link_cc_bill``).
+    * ``uncategorised_commits_as_transfer`` — this row, committed with no category, commits as
+      an unpaired ``transfer`` (ADR-0002 rules 7b, 7c): a flagged bank debit on a bank a live
+      card names "Paid from", dated inside a committed statement of that card, or a flagged
+      card payment credit, always. It ignores the row's current category (a categorised row
+      commits in its category's kind). ``False`` on every other row, so the review queue
+      never derives it.
 
     Why a separate schema rather than widening :class:`TransactionRead`:
     these fields are review-only. The board endpoint deliberately omits
@@ -261,6 +300,7 @@ class TransactionCandidate(TransactionRead):
     confidence: ConfidenceStr
     pinned: bool
     cc_payment_candidate: bool
+    uncategorised_commits_as_transfer: bool
 
 
 class TransactionUpdate(BaseModel):
@@ -287,17 +327,16 @@ class TransactionUpdate(BaseModel):
     collision surfaces as 409.
 
     Server-managed, never accepted here (rule 1): ``fingerprint``, ``occurrence``,
-    ``merchant_normalized``, ``origin_fingerprint``, ``source``,
+    ``merchant_normalized``, ``origin_fingerprint`` and its ``origin_*`` inputs, ``source``,
     ``import_batch_id``, ``confirmed_at``, ``auto_category_id`` and
     ``transfer_pair_id``. The line is a principle, not convenience: this body
     carries **what the user asserts about the money**, and stops at **what the
     system asserts about the row**.
 
     ``transaction_type`` accepts the full column vocabulary so the schema mirrors
-    the column, but the route rejects ``"transfer"`` as a *target* (rule 7 — pairs
-    are born via ``POST /transactions/transfer``, and a lone leg minted here would
-    violate ADR-0002's exactly-two-pairing invariant) and rejects identity/type
-    edits on a row that is currently paired.
+    the column, and the route accepts ``"transfer"`` as a target on an unpaired row
+    (ADR-0002 rule 7d; it writes no pair column) but rejects identity/type edits on a row
+    that is currently paired.
 
     ``category_id`` is pre-flighted against ``categories`` (same user, not archived,
     kind matching the **post-patch** ``transaction_type``) → 422 ``"category not
@@ -349,3 +388,33 @@ class TransactionUpdate(BaseModel):
             if name in self.model_fields_set and getattr(self, name) is None:
                 raise ValueError(f"{name} cannot be null")
         return self
+
+
+class BulkCategorise(BaseModel):
+    """``POST /transactions/bulk-categorise`` body (ADR-0004 rule 4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_ids: list[Annotated[int, Field(gt=0)]] = Field(min_length=1, max_length=BULK_MAX)
+    category_id: int = Field(gt=0)
+
+
+class BulkCategoriseResult(BaseModel):
+    updated: int  # rows whose category changed
+    taught: int  # distinct canonical merchants taught
+
+
+class BulkDelete(BaseModel):
+    """``POST /transactions/bulk-delete`` body: all-or-nothing, at most ``BULK_MAX`` ids."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_ids: list[Annotated[int, Field(gt=0)]] = Field(min_length=1, max_length=BULK_MAX)
+
+
+class PastRowsRead(BaseModel):
+    """``GET /transactions/{id}/past-rows``: the "apply to N recent <merchant> rows?" offer."""
+
+    merchant: str  # the canonical merchant, for the prompt text
+    category_id: int | None  # the source row's category, to send back to bulk-categorise
+    transaction_ids: list[int]

@@ -9,29 +9,33 @@ shape.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core import clock
 from app.models import (
     Account,
     Category,
     CategoryKindStr,
     Label,
+    MerchantAlias,
     MerchantTagMap,
     Transaction,
     TransactionLabel,
     User,
 )
 from app.schemas.transactions import MAX_LABELS_PER_TXN
+from app.services.bulk_categorise import BULK_MAX
 from app.services.fingerprint import transaction_fingerprint
 from app.services.merchant import normalize_merchant
+from app.services.reconciliation_service import auto_link_cc_bill, pair_existing_rows
 
 _WRONG_KIND_DETAIL = "category not found, archived, or wrong kind for this transaction"
 
@@ -426,7 +430,7 @@ def test_list_filter_by_category_cross_user_parent_returns_empty_not_other_users
     session.add(other_account)
     session.flush()
     other_parent = Category(
-        user_id=other_user.id, name="Foreign Parent", kind="spend", is_seeded=False
+        color="#2a78d6", user_id=other_user.id, name="Foreign Parent", kind="spend", is_seeded=False
     )
     session.add(other_parent)
     session.flush()
@@ -582,7 +586,9 @@ def test_list_flat_shape_omits_internal_fields(
         "category_name",
         "category_parent_name",
         "transfer_pair_id",
+        "refund_of_id",
         "labels",
+        "card_bill_link_offered",
     }
     # Belt-and-braces: PRD §F4 says fingerprint stays internal; user_id
     # never leaks single-user-v1 → multi-user-v2 boundary either.
@@ -1110,7 +1116,7 @@ def _seed_category(
     name: str = "Food",
     kind: CategoryKindStr = "spend",
 ) -> Category:
-    cat = Category(user_id=user_id, name=name, kind=kind, is_seeded=False)
+    cat = Category(color="#2a78d6", user_id=user_id, name=name, kind=kind, is_seeded=False)
     session.add(cat)
     session.commit()
     session.refresh(cat)
@@ -1187,7 +1193,7 @@ def test_patch_transaction_foreign_user_category_422(
     other = User(id=uuid4())
     session.add(other)
     session.flush()
-    foreign_cat = Category(user_id=other.id, name="ForeignFood", is_seeded=False)
+    foreign_cat = Category(color="#2a78d6", user_id=other.id, name="ForeignFood", is_seeded=False)
     session.add(foreign_cat)
     session.commit()
     session.refresh(foreign_cat)
@@ -1427,6 +1433,77 @@ def test_patch_labels_only_does_not_touch_tag_map(
 
 
 # ---------------------------------------------------------------------------
+# card_bill_link_offered — the server's placement of the manual card-bill link
+# ---------------------------------------------------------------------------
+
+
+def test_list_marks_only_unpaired_card_credits_card_bill_link_offered(
+    client: TestClient,
+    bank_account: Account,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """ADR-0002 rule 11b: the server marks the rows the dialog offers "Paid your card bill
+    elsewhere?" on: a confirmed, unpaired, positive ``income`` or ``transfer`` on a live card.
+    Everything else is false, so the client never re-derives the placement."""
+    user_id = axis_account.user_id
+    old_card = Account(user_id=user_id, name="Old CC", type="credit_card", issuer="axis")
+    session.add(old_card)
+    session.commit()
+
+    def seed(merchant: str, account: Account, amount: int, txn_type: str) -> None:
+        session.add(
+            _make_txn(
+                user_id=user_id,
+                account_id=account.id,
+                txn_date=date(2026, 4, 10),
+                amount_paise=amount,
+                fingerprint=f"fp-{merchant}",
+                transaction_type=txn_type,
+                merchant_raw=merchant,
+            )
+        )
+
+    seed("card income", axis_account, 50_000, "income")
+    seed("card transfer", axis_account, 50_000, "transfer")
+    seed("card refund", axis_account, 50_000, "spend")
+    seed("card transfer out", axis_account, -50_000, "transfer")
+    seed("bank income", bank_account, 50_000, "income")
+    seed("old card income", old_card, 50_000, "income")
+    session.commit()
+    old_card.archived_at = datetime(2026, 1, 1)
+    session.commit()
+    paired = client.post(
+        "/api/v1/transactions/transfer",
+        json=_transfer_body(source_account_id=bank_account.id, dest_account_id=axis_account.id),
+    )
+    assert paired.status_code == 201, paired.text
+
+    resp = client.get(
+        "/api/v1/transactions?transaction_type=spend&transaction_type=income"
+        "&transaction_type=transfer&limit=50"
+    )
+
+    assert resp.status_code == 200, resp.text
+    offered = {
+        (f"paired {r['account_id']}" if r["transfer_pair_id"] else r["merchant_raw"]): r.get(
+            "card_bill_link_offered"
+        )
+        for r in resp.json()
+    }
+    assert offered == {
+        "card income": True,
+        "card transfer": True,
+        "card refund": False,
+        "card transfer out": False,
+        "bank income": False,
+        "old card income": False,
+        f"paired {bank_account.id}": False,
+        f"paired {axis_account.id}": False,
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /transactions — F2 manual entry
 # ---------------------------------------------------------------------------
 
@@ -1477,7 +1554,9 @@ def test_post_spend_happy_path(
         "category_name",
         "category_parent_name",
         "transfer_pair_id",
+        "refund_of_id",
         "labels",
+        "card_bill_link_offered",
     }
     assert body["amount_paise"] == -8500
     assert body["transaction_type"] == "spend"
@@ -1597,16 +1676,19 @@ def test_post_spend_negative_amount_201(
     assert resp.json()["amount_paise"] == -5000
 
 
-def test_post_income_negative_amount_422(
+def test_post_negative_income_is_a_reversal(
     client: TestClient,
     axis_account: Account,
 ) -> None:
+    """A negative `income` IS the income-reversal representation (ADR-0009 rules 2-3)
+    — a salary clawback nets the income category down; no distinct type, no 422."""
     resp = client.post(
         "/api/v1/transactions",
         json=_post_body(account_id=axis_account.id, amount_paise=-5000, transaction_type="income"),
     )
-    assert resp.status_code == 422
-    assert "income requires positive" in resp.text
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["transaction_type"] == "income"
+    assert resp.json()["amount_paise"] == -5000
 
 
 @pytest.mark.parametrize("txn_type", ["spend", "income", "transfer"])
@@ -1786,7 +1868,7 @@ def test_post_foreign_user_category_422(
     other = User(id=uuid4())
     session.add(other)
     session.flush()
-    foreign_cat = Category(user_id=other.id, name="ForeignFood", is_seeded=False)
+    foreign_cat = Category(color="#2a78d6", user_id=other.id, name="ForeignFood", is_seeded=False)
     session.add(foreign_cat)
     session.commit()
     session.refresh(foreign_cat)
@@ -1858,6 +1940,78 @@ def test_post_duplicate_fingerprint_409(
     assert rows[0].hit_count == 1
 
 
+def test_post_decomposed_spelling_of_an_existing_merchant_409(
+    client: TestClient,
+    axis_account: Account,
+) -> None:
+    """ADR-0006 rule 3: ``Caf\u00e9`` and ``Cafe`` + a combining acute are one merchant, so the
+    second spelling collides on the fingerprint."""
+    first = client.post(
+        "/api/v1/transactions",
+        json=_post_body(account_id=axis_account.id, merchant_raw="Caf\u00e9"),
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/api/v1/transactions",
+        json=_post_body(account_id=axis_account.id, merchant_raw="Cafe\u0301"),
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"] == "transaction already exists"
+
+
+# U+FB2C normalizes (NFC) to three code points, so 171 of them are 171 raw and 513 normalized.
+_FB2C = "\ufb2c"
+
+
+def test_post_merchant_normalizing_past_512_chars_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """ADR-0006 rule 3b: a merchant that normalizes past the 512-wide column is refused, not
+    stored (SQLite ignores the width, Postgres would 500)."""
+    resp = client.post(
+        "/api/v1/transactions",
+        json=_post_body(account_id=axis_account.id, merchant_raw=_FB2C * 171),
+    )
+
+    assert resp.status_code == 422
+    assert session.scalar(select(func.count()).select_from(Transaction)) == 0
+
+
+def test_post_merchant_normalizing_to_exactly_512_chars_201(
+    client: TestClient,
+    axis_account: Account,
+) -> None:
+    """The cap is inclusive: 170 x 3 + 2 = 512 normalized characters fits."""
+    resp = client.post(
+        "/api/v1/transactions",
+        json=_post_body(account_id=axis_account.id, merchant_raw=_FB2C * 170 + "ab"),
+    )
+
+    assert resp.status_code == 201, resp.text
+
+
+def test_patch_merchant_normalizing_past_512_chars_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    created = client.post(
+        "/api/v1/transactions",
+        json=_post_body(account_id=axis_account.id, merchant_raw="Chai-wala"),
+    )
+    assert created.status_code == 201
+    txn_id = created.json()["id"]
+
+    resp = client.patch(f"/api/v1/transactions/{txn_id}", json={"merchant_raw": _FB2C * 171})
+
+    assert resp.status_code == 422
+    session.expire_all()
+    assert session.get(Transaction, txn_id).merchant_raw == "Chai-wala"
+
+
 def test_post_extra_field_422(
     client: TestClient,
     axis_account: Account,
@@ -1925,7 +2079,7 @@ def test_post_income_with_category_does_not_learn(
         "/api/v1/transactions",
         json=_post_body(
             account_id=axis_account.id,
-            amount_paise=50000,  # income requires positive amount_paise
+            amount_paise=50000,  # ordinary income (a negative one is a reversal)
             transaction_type="income",
             merchant_raw="ACME Payroll",
             category_id=cat.id,
@@ -2290,10 +2444,10 @@ def test_delete_transaction_paired_unlinks_partner(
     """DELETE on a paired row nulls the partner's transfer_pair_id atomically.
 
     Pre-flight added in the F4a-1 PR so deleting one half of an F4a auto-link
-    doesn't trip the composite FK from migration 0005. The partner's
-    transaction_type stays 'transfer' — PRD doesn't pin a restoration value
-    and no provenance column exists. Cosmetic anomaly, not data corruption;
-    user can manually relabel via a future widened PATCH.
+    doesn't trip the composite FK from migration 0005. These legs are born as
+    transfers (no ``pre_link_type``), so the partner stays 'transfer' (ADR-0002
+    rule 9); ``test_delete_paired_leg_restores_partner_pre_link_type`` covers a
+    linked existing row.
     """
     # Seed two cross-linked rows directly via ORM (no F4a service call —
     # this test is about the DELETE route, not the link path). Both rows
@@ -2338,8 +2492,237 @@ def test_delete_transaction_paired_unlinks_partner(
         partner = s.scalar(select(Transaction).where(Transaction.id == bank_id))
         assert partner is not None
         assert partner.transfer_pair_id is None
-        # Type stays 'transfer' — we don't restore.
+        # Born a transfer, so there is no pre-link type to restore.
         assert partner.transaction_type == "transfer"
+
+
+def _auto_linked_pair(
+    session: Session,
+    *,
+    axis_account: Account,
+    bank_account: Account,
+    cc_category_id: int | None = None,
+    bank_category_id: int | None = None,
+) -> tuple[int, int]:
+    """An F4a auto-link over two existing confirmed rows: a CC "PAYMENT RECEIVED"
+    ``income`` (+) and a bank ``spend`` (−), each optionally categorised before the link
+    (the link moves the category aside, ADR-0002 rule 9). Returns ``(cc_id, bank_id)``."""
+    axis_account.parent_account_id = bank_account.id
+    cc_row = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=date(2026, 5, 10),
+        amount_paise=500000,
+        fingerprint="fp-f4a-cc",
+        transaction_type="income",
+        merchant_raw="PAYMENT RECEIVED THANK YOU",
+        category_id=cc_category_id,
+    )
+    bank_row = _make_txn(
+        user_id=bank_account.user_id,
+        account_id=bank_account.id,
+        txn_date=date(2026, 5, 10),
+        amount_paise=-500000,
+        fingerprint="fp-f4a-bank",
+        transaction_type="spend",
+        merchant_raw="AXIS CARD BILL",
+        category_id=bank_category_id,
+    )
+    session.add_all([cc_row, bank_row])
+    session.commit()
+    auto_link_cc_bill(session, user_id=axis_account.user_id, txn=cc_row)
+    session.commit()
+    assert cc_row.transfer_pair_id == bank_row.id  # precondition: the link happened
+    return cc_row.id, bank_row.id
+
+
+def test_delete_paired_leg_restores_partner_pre_link_type(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 9: partner-delete restores the partner's pre-link type and clears it."""
+    cc_id, bank_id = _auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+
+    assert client.delete(f"/api/v1/transactions/{cc_id}").status_code == 204
+
+    with session_factory() as s:
+        bank_after = s.get(Transaction, bank_id)
+        assert bank_after is not None
+        assert bank_after.transfer_pair_id is None
+        assert bank_after.transaction_type == "spend"
+        assert bank_after.pre_link_type is None
+
+
+def test_unlink_restores_pre_link_type(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 9: unlinking an F4a auto-link puts each leg back to the type it had
+    before the link, and clears the stored pre-link type on both."""
+    cc_id, bank_id = _auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+
+    assert client.post(f"/api/v1/transactions/{cc_id}/unlink").status_code == 204
+
+    with session_factory() as s:
+        cc_after = s.get(Transaction, cc_id)
+        bank_after = s.get(Transaction, bank_id)
+        assert cc_after is not None and bank_after is not None
+        assert (cc_after.transaction_type, bank_after.transaction_type) == ("income", "spend")
+        assert cc_after.pre_link_type is None and bank_after.pre_link_type is None
+        assert cc_after.transfer_pair_id is None and bank_after.transfer_pair_id is None
+
+
+def _categorised_auto_linked_pair(
+    session: Session, *, axis_account: Account, bank_account: Account
+) -> tuple[int, int, int, int]:
+    """An auto-link over a categorised pair. Returns ``(cc_id, bank_id, salary_id, food_id)``."""
+    salary = _seed_category(session, axis_account.user_id, name="Salary", kind="income")
+    food = _seed_category(session, axis_account.user_id, name="Food")
+    cc_id, bank_id = _auto_linked_pair(
+        session,
+        axis_account=axis_account,
+        bank_account=bank_account,
+        cc_category_id=salary.id,
+        bank_category_id=food.id,
+    )
+    return cc_id, bank_id, salary.id, food.id
+
+
+def test_unlink_restores_pre_link_category(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 9: a link clears each leg's category into ``pre_link_category_id``;
+    unlink gives both back and clears the saved column."""
+    cc_id, bank_id, salary_id, food_id = _categorised_auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+    with session_factory() as s:
+        cc, bank = s.get(Transaction, cc_id), s.get(Transaction, bank_id)
+        assert cc is not None and bank is not None
+        assert (cc.category_id, bank.category_id) == (None, None)
+        assert (cc.pre_link_category_id, bank.pre_link_category_id) == (salary_id, food_id)
+
+    assert client.post(f"/api/v1/transactions/{cc_id}/unlink").status_code == 204
+
+    with session_factory() as s:
+        cc, bank = s.get(Transaction, cc_id), s.get(Transaction, bank_id)
+        assert cc is not None and bank is not None
+        assert (cc.category_id, bank.category_id) == (salary_id, food_id)
+        assert (cc.pre_link_category_id, bank.pre_link_category_id) == (None, None)
+
+
+def test_delete_paired_leg_restores_partner_pre_link_category(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    cc_id, bank_id, _, food_id = _categorised_auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+
+    assert client.delete(f"/api/v1/transactions/{cc_id}").status_code == 204
+
+    with session_factory() as s:
+        bank = s.get(Transaction, bank_id)
+        assert bank is not None
+        assert (bank.category_id, bank.pre_link_category_id) == (food_id, None)
+
+
+@pytest.mark.parametrize("then_clear", [False, True], ids=["set", "set_then_cleared"])
+def test_a_category_set_after_linking_survives_unlink(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+    then_clear: bool,
+) -> None:
+    """The newer choice wins (ADR-0002 rule 9): a category written on a linked leg discards
+    the saved one, even when the user then clears it again."""
+    cc_id, bank_id, _, food_id = _categorised_auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+    other = _seed_category(session, axis_account.user_id, name="Fuel")
+    resp = client.patch(f"/api/v1/transactions/{bank_id}", json={"category_id": other.id})
+    assert resp.status_code == 200, resp.text
+    if then_clear:
+        resp = client.patch(f"/api/v1/transactions/{bank_id}", json={"category_id": None})
+        assert resp.status_code == 200, resp.text
+
+    assert client.post(f"/api/v1/transactions/{cc_id}/unlink").status_code == 204
+
+    with session_factory() as s:
+        bank = s.get(Transaction, bank_id)
+        assert bank is not None
+        assert bank.transaction_type == "spend"
+        assert bank.category_id == (None if then_clear else other.id)
+        assert bank.category_id != food_id
+        assert bank.pre_link_category_id is None
+
+
+def test_patch_echoing_a_linked_legs_null_category_keeps_the_pre_link_category(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """An echo of the stored value is not a change (ADR-0006 rule 15)."""
+    cc_id, bank_id, _, food_id = _categorised_auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+
+    resp = client.patch(f"/api/v1/transactions/{bank_id}", json={"category_id": None})
+    assert resp.status_code == 200, resp.text
+    assert client.post(f"/api/v1/transactions/{cc_id}/unlink").status_code == 204
+
+    with session_factory() as s:
+        bank = s.get(Transaction, bank_id)
+        assert bank is not None
+        assert bank.category_id == food_id
+
+
+def test_bulk_categorise_on_a_linked_leg_discards_its_pre_link_category(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    cc_id, bank_id, _, food_id = _categorised_auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+    fuel = _seed_category(session, axis_account.user_id, name="Fuel")
+
+    resp = client.post(
+        "/api/v1/transactions/bulk-categorise",
+        json={"transaction_ids": [bank_id], "category_id": fuel.id},
+    )
+    assert resp.status_code == 200, resp.text
+    assert client.post(f"/api/v1/transactions/{cc_id}/unlink").status_code == 204
+
+    with session_factory() as s:
+        bank = s.get(Transaction, bank_id)
+        assert bank is not None
+        assert bank.category_id == fuel.id
+        assert bank.category_id != food_id
+        assert bank.pre_link_category_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -2389,7 +2772,9 @@ def test_transfer_happy_path(
         "category_name",
         "category_parent_name",
         "transfer_pair_id",
+        "refund_of_id",
         "labels",
+        "card_bill_link_offered",
     }
     assert set(body["source"].keys()) == leg_keys
     assert set(body["dest"].keys()) == leg_keys
@@ -2872,7 +3257,8 @@ def test_unlink_clears_both_legs(
     session: Session,
     session_factory: sessionmaker[Session],
 ) -> None:
-    """Unlinking one leg clears transfer_pair_id on BOTH; both survive as transfers."""
+    """Unlinking one leg clears transfer_pair_id on BOTH; legs born as transfers
+    (no pre-link type) survive as transfers."""
     cc_row = _make_txn(
         user_id=axis_account.user_id,
         account_id=axis_account.id,
@@ -2907,7 +3293,7 @@ def test_unlink_clears_both_legs(
         assert cc_after is not None and bank_after is not None
         assert cc_after.transfer_pair_id is None
         assert bank_after.transfer_pair_id is None
-        # Type stays 'transfer' — no provenance to restore.
+        # Born as transfers, so no pre-link type: both stay 'transfer' (ADR-0002 rule 9).
         assert cc_after.transaction_type == "transfer"
         assert bank_after.transaction_type == "transfer"
 
@@ -3393,28 +3779,34 @@ def test_patch_amount_sign_flip_to_a_refund_keeps_the_category(
 
 
 @pytest.mark.parametrize(
-    ("body", "expected"),
+    ("stored_amount", "body", "expected"),
     [
-        ({"transaction_type": "income"}, "income requires positive amount_paise"),
-        ({"amount_paise": 0}, "amount_paise must be non-zero"),
+        # A stored zero (only a direct DB write can make one) + a type-only body.
+        (0, {"transaction_type": "income"}, "amount_paise must be non-zero"),
+        (-12345, {"amount_paise": 0}, "amount_paise must be non-zero"),
     ],
+    ids=["type-only-onto-a-stored-zero", "amount-zero"],
 )
 def test_patch_sign_and_type_are_validated_as_a_merged_pair(
     client: TestClient,
     axis_account: Account,
     session: Session,
+    stored_amount: int,
     body: dict[str, object],
     expected: str,
 ) -> None:
-    """Rule 4 — the F2 sign rule applied to the MERGED state.
+    """ADR-0006 rule 12 — ``sign_error`` (ADR-0009 rule 3) applied to the MERGED state.
 
-    A schema validator cannot see the stored row, so each of these is legal in
-    isolation and wrong once merged with what is already there. A merged
-    ``{"amount_paise": 500}`` against a spend row is NOT in this table — since
-    ADR-0009 that pair is legal (it turns the row into a refund); see
-    ``test_patch_spend_positive_amount_becomes_a_refund`` below.
+    A schema validator cannot see the stored row, so a type-only body is legal in
+    isolation and wrong once merged with a stored zero amount. Since ADR-0009 every
+    type accepts any non-zero sign, so zero is the only invalid pair: a merged
+    ``{"amount_paise": 500}`` against a spend row is a refund (see
+    ``test_patch_spend_positive_amount_becomes_a_refund`` below), and
+    ``{"transaction_type": "income"}`` against a negative spend is an income reversal.
     """
     txn = _seed_one(session, axis_account=axis_account)  # spend, -12345
+    txn.amount_paise = stored_amount  # straight to the DB, past sign_error
+    session.commit()
 
     resp = client.patch(f"/api/v1/transactions/{txn.id}", json=body)
     assert resp.status_code == 422, resp.text
@@ -3452,21 +3844,48 @@ def test_patch_type_and_amount_together_can_flip_the_sign(
     assert resp.status_code == 200, resp.text
 
 
-def test_patch_transaction_type_to_transfer_422s(
+@pytest.mark.parametrize(
+    ("amount", "txn_type", "cat_kind", "body_category", "expect_kept"),
+    [
+        pytest.param(-12345, "spend", "spend", "absent", True, id="spend_keeps_its_category"),
+        pytest.param(5000, "income", "income", "null", False, id="income_clears_its_category"),
+    ],
+)
+def test_patch_an_unpaired_row_to_transfer(
     client: TestClient,
     axis_account: Account,
     session: Session,
+    amount: int,
+    txn_type: str,
+    cat_kind: CategoryKindStr,
+    body_category: str,
+    expect_kept: bool,
 ) -> None:
-    """Rule 7: transfer is not a valid PATCH TARGET.
+    """ADR-0002 rule 7d: a user may retype an unpaired row to ``transfer``. No pair column is
+    written. ``transfer`` shares the spend kind (rule 5), so a spend category rides along; an
+    income row crosses a kind and must send ``category_id: null`` (ADR-0006 rule 13)."""
+    cat = _seed_category(session, axis_account.user_id, name="Kept", kind=cat_kind)
+    txn = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=date(2026, 4, 10),
+        amount_paise=amount,
+        fingerprint="fp-to-transfer",
+        transaction_type=txn_type,
+        category_id=cat.id,
+    )
+    session.add(txn)
+    session.commit()
+    body: dict[str, object] = {"transaction_type": "transfer"}
+    if body_category == "null":
+        body["category_id"] = None
 
-    Pairs are born via ``POST /transactions/transfer``; a lone leg minted here would
-    have no second leg and would violate ADR-0002's exactly-two-pairing invariant.
-    """
-    txn = _seed_one(session, axis_account=axis_account)
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json=body)
 
-    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"transaction_type": "transfer"})
-    assert resp.status_code == 422, resp.text
-    assert "POST /transactions/transfer" in resp.json()["detail"]
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transaction_type"] == "transfer"
+    assert resp.json()["amount_paise"] == amount
+    assert resp.json()["category_id"] == (cat.id if expect_kept else None)
 
 
 def _live_pair(client: TestClient, *, source_id: int, dest_id: int) -> dict[str, object]:
@@ -3506,6 +3925,96 @@ def test_patch_a_live_transfer_leg_422s(
     assert "unlink" in resp.json()["detail"]
 
 
+def test_patch_resending_the_stored_transfer_type_is_a_no_op(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """ADR-0006 rule 15: re-sending the stored ``transfer`` on an unpaired transfer row
+    is not a change — a client that echoes the whole row back must not 422 on it."""
+    txn = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=date(2026, 4, 10),
+        amount_paise=-12345,
+        fingerprint="fp-unpaired-transfer",
+        transaction_type="transfer",
+    )
+    session.add(txn)
+    session.commit()
+    before = (txn.transaction_type, txn.amount_paise, txn.fingerprint, txn.occurrence)
+
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"transaction_type": "transfer"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transaction_type"] == "transfer"
+
+    session.refresh(txn)
+    assert (txn.transaction_type, txn.amount_paise, txn.fingerprint, txn.occurrence) == before
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"transaction_type": "transfer"},
+        {"amount_paise": -500000},
+        {"transaction_type": "transfer", "amount_paise": -500000, "date": "2026-05-24"},
+    ],
+    ids=["type", "amount", "type-amount-date"],
+)
+def test_patch_resending_a_live_legs_own_values_is_a_no_op(
+    client: TestClient,
+    bank_account: Account,
+    axis_account: Account,
+    body: dict[str, object],
+) -> None:
+    """ADR-0006 rule 15 locks a paired row's identity and type against CHANGES; a body
+    that re-sends the leg's own stored values changes nothing, so it is a 200."""
+    pair = _live_pair(client, source_id=bank_account.id, dest_id=axis_account.id)
+    leg = pair["source"]
+    assert leg["amount_paise"] == -500000  # what `body` re-sends
+
+    resp = client.patch(f"/api/v1/transactions/{leg['id']}", json=body)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == leg
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("fingerprint", "0" * 64),
+        ("origin_fingerprint", "0" * 64),
+        ("occurrence", 1),
+        ("source", "manual"),
+        ("merchant_normalized", "hacked"),
+        ("import_batch_id", 1),
+        ("confirmed_at", "2026-04-10T00:00:00"),
+        ("auto_category_id", 1),
+        ("transfer_pair_id", 1),
+        ("pre_link_type", "spend"),
+        ("pre_link_category_id", 1),
+        ("refund_of_id", 1),
+    ],
+)
+def test_patch_server_managed_key_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    key: str,
+    value: object,
+) -> None:
+    """ADR-0006 rule 10: PATCH accepts the seven user-visible fields only. A
+    server-managed key is a 422, and the row is left exactly as it was."""
+    txn = _seed_one(session, axis_account=axis_account)
+    before = session.execute(select(Transaction.__table__).where(Transaction.id == txn.id)).one()
+
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={key: value})
+    assert resp.status_code == 422, resp.text
+
+    session.expire_all()
+    after = session.execute(select(Transaction.__table__).where(Transaction.id == txn.id)).one()
+    assert after == before
+
+
 def test_patch_a_live_transfer_legs_category_and_labels_still_work(
     client: TestClient,
     bank_account: Account,
@@ -3535,9 +4044,10 @@ def test_patch_an_unlinked_transfer_leg_is_editable(
     bank_account: Account,
     axis_account: Account,
 ) -> None:
-    """Unpaired transfers are legal (survivors of delete/unlink) and fully editable.
+    """Unpaired transfers are legal (survivors of delete/unlink, or an unlinked card-bill debit,
+    ADR-0002 rule 7b) and fully editable.
 
-    Rule 7 forbids *creating* one via PATCH, not correcting one that already exists.
+    ADR-0002 rule 7d lets a user write one too.
     """
     pair = _live_pair(client, source_id=bank_account.id, dest_id=axis_account.id)
     leg_id = pair["source"]["id"]
@@ -3768,16 +4278,14 @@ def test_patch_labels_only_does_not_revalidate_an_untouched_sign(
     axis_account: Account,
     session: Session,
 ) -> None:
-    """Rule 4 fires only when the request puts the sign/type pair in play.
+    """ADR-0006 rule 12 fires only when the request puts the sign/type pair in play.
 
-    ``backup_csv`` validates the type vocabulary and that ``amount_paise`` parses,
-    but not the sign pairing — and a hand-edited zip is its declared threat model —
-    so a stored ``income`` carrying a negative amount is reachable (``spend`` no
-    longer offers this scenario post-ADR-0009, since it accepts either sign). A
+    Since ADR-0009 the only invalid pair is a zero amount, which no API path writes;
+    the row below is written straight to the DB to stand for one that slipped in. A
     labels-only PATCH must not 422 on state it never touched.
     """
     txn = _seed_one(session, axis_account=axis_account)
-    txn.transaction_type = "income"  # negative amount: violates the F2 rule
+    txn.amount_paise = 0  # violates sign_error: only a direct DB write gets here
     session.commit()
 
     resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"labels": ["disputed"]})
@@ -3785,6 +4293,1239 @@ def test_patch_labels_only_does_not_revalidate_an_untouched_sign(
     assert [lbl["name"] for lbl in resp.json()["labels"]] == ["disputed"]
 
     # But touching either half of the pair does re-validate it.
-    still_bad = client.patch(f"/api/v1/transactions/{txn.id}", json={"amount_paise": -20000})
+    still_bad = client.patch(f"/api/v1/transactions/{txn.id}", json={"transaction_type": "income"})
     assert still_bad.status_code == 422
-    assert "income requires positive amount_paise" in str(still_bad.json()["detail"])
+    assert "amount_paise must be non-zero" in str(still_bad.json()["detail"])
+
+
+# ---------------------------------------------------------------------------
+# Refund → original link (ADR-0009 rule 13)
+# ---------------------------------------------------------------------------
+
+
+def _refund_and_original(
+    session: Session,
+    account: Account,
+    *,
+    original_type: str = "spend",
+    original_amount: int = -50000,
+    original_confirmed: bool = True,
+    refund_type: str = "spend",
+    refund_amount: int = 20000,
+) -> tuple[int, int]:
+    """A refund row and the row it would point at. Returns ``(refund_id, original_id)``."""
+    original = _make_txn(
+        user_id=account.user_id,
+        account_id=account.id,
+        txn_date=date(2026, 5, 1),
+        amount_paise=original_amount,
+        fingerprint="fp-original",
+        transaction_type=original_type,
+        merchant_raw="SHOP",
+        confirmed_at=_DEFAULT_CONFIRMED if original_confirmed else None,
+    )
+    refund = _make_txn(
+        user_id=account.user_id,
+        account_id=account.id,
+        txn_date=date(2026, 5, 9),
+        amount_paise=refund_amount,
+        fingerprint="fp-refund",
+        transaction_type=refund_type,
+        merchant_raw="SHOP REFUND",
+    )
+    session.add_all([original, refund])
+    session.commit()
+    return refund.id, original.id
+
+
+def _refund_of_id(session_factory: sessionmaker[Session], txn_id: int) -> int | None:
+    with session_factory() as s:
+        txn = s.get(Transaction, txn_id)
+        assert txn is not None
+        return txn.refund_of_id
+
+
+def _link(client: TestClient, refund_id: int, original_id: int) -> Any:
+    return client.put(
+        f"/api/v1/transactions/{refund_id}/refund-link", json={"original_id": original_id}
+    )
+
+
+def test_refund_link_to_a_negative_spend_is_stored(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    refund_id, original_id = _refund_and_original(session, axis_account)
+
+    resp = _link(client, refund_id, original_id)
+    assert resp.status_code == 204, resp.text
+    assert _refund_of_id(session_factory, refund_id) == original_id
+    rows = {t["id"]: t for t in client.get("/api/v1/transactions").json()}
+    assert rows[refund_id]["refund_of_id"] == original_id
+    assert rows[original_id]["refund_of_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("original_type", "original_amount"),
+    [("income", 50000), ("spend", 50000), ("transfer", -50000)],
+    ids=["income", "positive_spend", "transfer"],
+)
+def test_refund_link_rejects_a_non_spend_target(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+    original_type: str,
+    original_amount: int,
+) -> None:
+    """ADR-0009 rule 13: the original must be a negative ``spend``."""
+    refund_id, original_id = _refund_and_original(
+        session, axis_account, original_type=original_type, original_amount=original_amount
+    )
+
+    resp = _link(client, refund_id, original_id)
+    assert resp.status_code == 422, resp.text
+    assert _refund_of_id(session_factory, refund_id) is None
+
+
+def test_refund_link_to_a_pending_original_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """The original must be confirmed: a review-queue discard deletes pending rows only, so
+    a confirmed target can never vanish under the link that way."""
+    refund_id, original_id = _refund_and_original(session, axis_account, original_confirmed=False)
+
+    assert _link(client, refund_id, original_id).status_code == 422
+    assert _refund_of_id(session_factory, refund_id) is None
+
+
+@pytest.mark.parametrize(
+    ("refund_type", "refund_amount"),
+    [("spend", -20000), ("income", 20000)],
+    ids=["negative_spend", "income"],
+)
+def test_refund_link_from_a_non_refund_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+    refund_type: str,
+    refund_amount: int,
+) -> None:
+    refund_id, original_id = _refund_and_original(
+        session, axis_account, refund_type=refund_type, refund_amount=refund_amount
+    )
+
+    resp = _link(client, refund_id, original_id)
+    assert resp.status_code == 422, resp.text
+    assert "only a refund" in resp.json()["detail"]
+    assert _refund_of_id(session_factory, refund_id) is None
+
+
+def _foreign_spend(session: Session, *, amount_paise: int) -> int:
+    other_user = User(id=uuid4())
+    session.add(other_user)
+    session.flush()
+    other_account = Account(
+        user_id=other_user.id, name="Foreign CC", type="credit_card", issuer="axis", last4="9995"
+    )
+    session.add(other_account)
+    session.flush()
+    row = _make_txn(
+        user_id=other_user.id,
+        account_id=other_account.id,
+        txn_date=date(2026, 5, 1),
+        amount_paise=amount_paise,
+        fingerprint="fp-foreign",
+    )
+    session.add(row)
+    session.commit()
+    return row.id
+
+
+def test_refund_link_to_another_users_row_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0003 rule 9: a body FK at another user's row is 422, never honoured."""
+    refund_id, _ = _refund_and_original(session, axis_account)
+    foreign_id = _foreign_spend(session, amount_paise=-50000)
+
+    assert _link(client, refund_id, foreign_id).status_code == 422
+    assert _refund_of_id(session_factory, refund_id) is None
+
+
+def test_refund_link_on_another_users_row_404(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0003 rule 8: another user's row is a 404 on both verbs, never a 403."""
+    _, original_id = _refund_and_original(session, axis_account)
+    foreign_id = _foreign_spend(session, amount_paise=20000)
+
+    assert _link(client, foreign_id, original_id).status_code == 404
+    assert client.delete(f"/api/v1/transactions/{foreign_id}/refund-link").status_code == 404
+    assert _refund_of_id(session_factory, foreign_id) is None
+
+
+def _candidate_ids(client: TestClient, refund_id: int) -> list[int]:
+    resp = client.get(f"/api/v1/transactions/{refund_id}/refund-candidates")
+    assert resp.status_code == 200, resp.text
+    return [t["id"] for t in resp.json()]
+
+
+def _add_txn(session: Session, account: Account, **kw: Any) -> int:
+    row = _make_txn(user_id=account.user_id, account_id=account.id, **kw)
+    session.add(row)
+    session.commit()
+    return row.id
+
+
+def test_refund_candidates_offer_only_linkable_originals(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    refund_id, original_id = _refund_and_original(session, axis_account)  # refund on 2026-05-09
+    pending = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 5, 2),
+        amount_paise=-100,
+        fingerprint="a",
+        confirmed_at=None,
+    )
+    positive = _add_txn(
+        session, axis_account, txn_date=date(2026, 5, 2), amount_paise=100, fingerprint="b"
+    )
+    income = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 5, 2),
+        amount_paise=-100,
+        fingerprint="c",
+        transaction_type="income",
+    )
+    transfer = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 5, 2),
+        amount_paise=-100,
+        fingerprint="d",
+        transaction_type="transfer",
+    )
+    too_old = _add_txn(
+        session, axis_account, txn_date=date(2025, 11, 1), amount_paise=-100, fingerprint="e"
+    )
+    after = _add_txn(
+        session, axis_account, txn_date=date(2026, 5, 10), amount_paise=-100, fingerprint="f"
+    )
+
+    ids = _candidate_ids(client, refund_id)
+
+    assert ids == [original_id]
+    assert not {pending, positive, income, transfer, too_old, after} & set(ids)
+
+
+def test_refund_candidates_rank_same_merchant_first(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    refund_id, original_id = _refund_and_original(session, axis_account)  # SHOP REFUND
+    other = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 5, 8),
+        amount_paise=-20000,
+        fingerprint="o",
+        merchant_raw="ELSEWHERE",
+    )
+    # A nearer, equal-amount row from another merchant does not outrank the same merchant.
+    same = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 4, 1),
+        amount_paise=-999,
+        fingerprint="s",
+        merchant_raw="SHOP REFUND",
+    )
+    assert _candidate_ids(client, refund_id)[0] == same
+    # Equal magnitude beats a nearer date among rows of one merchant.
+    equal = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 3, 1),
+        amount_paise=-20000,
+        fingerprint="q",
+        merchant_raw="SHOP REFUND",
+    )
+    ids = _candidate_ids(client, refund_id)
+    assert ids[:2] == [equal, same]
+    assert set(ids) == {equal, same, other, original_id}
+
+
+def test_refund_candidates_lead_with_the_current_original(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    refund_id, original_id = _refund_and_original(session, axis_account)
+    old = _add_txn(
+        session, axis_account, txn_date=date(2025, 1, 1), amount_paise=-5, fingerprint="old"
+    )
+    better = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 5, 8),
+        amount_paise=-20000,
+        fingerprint="bt",
+        merchant_raw="SHOP REFUND",
+    )
+    assert _candidate_ids(client, refund_id)[0] == better
+    assert _link(client, refund_id, old).status_code == 204
+
+    ids = _candidate_ids(client, refund_id)
+
+    assert ids[0] == old  # outside the window, still first
+    assert set(ids) == {old, better, original_id}
+
+
+def test_refund_candidates_of_a_non_refund_are_empty(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    _, original_id = _refund_and_original(session, axis_account)
+    # Another purchase that WOULD be a candidate for a refund on the same day.
+    _add_txn(session, axis_account, txn_date=date(2026, 5, 2), amount_paise=-700, fingerprint="p")
+    income_id = _add_txn(
+        session,
+        axis_account,
+        txn_date=date(2026, 5, 9),
+        amount_paise=900,
+        fingerprint="inc",
+        transaction_type="income",
+    )
+
+    assert _candidate_ids(client, original_id) == []  # a purchase is not a refund
+    assert _candidate_ids(client, income_id) == []  # nor is an income
+
+
+def test_delete_refund_link_is_idempotent(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    refund_id, original_id = _refund_and_original(session, axis_account)
+    assert _link(client, refund_id, original_id).status_code == 204
+
+    assert client.delete(f"/api/v1/transactions/{refund_id}/refund-link").status_code == 204
+    assert _refund_of_id(session_factory, refund_id) is None
+    assert client.delete(f"/api/v1/transactions/{refund_id}/refund-link").status_code == 204
+
+
+def test_deleting_the_original_clears_the_refund_link(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """The self-FK is ON DELETE NO ACTION, so DELETE nulls the refunds pointing at the
+    row first; the refund itself survives."""
+    refund_id, original_id = _refund_and_original(session, axis_account)
+    assert _link(client, refund_id, original_id).status_code == 204
+
+    assert client.delete(f"/api/v1/transactions/{original_id}").status_code == 204
+    assert _refund_of_id(session_factory, refund_id) is None
+
+
+def test_patch_a_linked_refund_to_a_negative_amount_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    refund_id, original_id = _refund_and_original(session, axis_account)
+    assert _link(client, refund_id, original_id).status_code == 204
+
+    for body in ({"amount_paise": -20000}, {"transaction_type": "income"}):
+        resp = client.patch(f"/api/v1/transactions/{refund_id}", json=body)
+        assert resp.status_code == 422, resp.text
+        assert "remove the refund link" in resp.json()["detail"]
+
+    # A change that keeps it a positive spend is fine.
+    ok = client.patch(f"/api/v1/transactions/{refund_id}", json={"amount_paise": 15000})
+    assert ok.status_code == 200, ok.text
+    assert _refund_of_id(session_factory, refund_id) == original_id
+
+
+def test_patch_the_original_to_a_refund_while_linked_422(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    refund_id, original_id = _refund_and_original(session, axis_account)
+    assert _link(client, refund_id, original_id).status_code == 204
+
+    for body in ({"amount_paise": 50000}, {"transaction_type": "income"}):
+        resp = client.patch(f"/api/v1/transactions/{original_id}", json=body)
+        assert resp.status_code == 422, resp.text
+        assert "refund" in resp.json()["detail"]
+
+    ok = client.patch(f"/api/v1/transactions/{original_id}", json={"amount_paise": -60000})
+    assert ok.status_code == 200, ok.text
+
+
+# ---------------------------------------------------------------------------
+# A36 — learning writes the canonical merchant (ADR-0004 rule 1)
+# ---------------------------------------------------------------------------
+
+
+def test_patch_board_row_teaches_the_canonical_merchant(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    session.add(MerchantAlias(user_id=axis_account.user_id, pattern="swiggy", canonical="swiggy"))
+    food = _seed_category(session, axis_account.user_id)
+    created = client.post(
+        "/api/v1/transactions",
+        json=_post_body(account_id=axis_account.id, merchant_raw="SWIGGY BLR 999"),
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.patch(
+        f"/api/v1/transactions/{created.json()['id']}", json={"category_id": food.id}
+    )
+    assert resp.status_code == 200, resp.text
+
+    rows = session.scalars(select(MerchantTagMap)).all()
+    assert [(r.merchant_normalized, r.category_id, r.hit_count) for r in rows] == [
+        ("swiggy", food.id, 1)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# A22 — POST /transactions/bulk-categorise (ADR-0004 rules 2b and 4)
+# ---------------------------------------------------------------------------
+
+
+def _post_rows(
+    client: TestClient,
+    account_id: int,
+    merchants: list[str],
+    *,
+    transaction_type: str = "spend",
+    txn_date: str = "2026-05-24",
+) -> list[int]:
+    """POST one uncategorised board row per merchant (distinct amounts keep fingerprints apart)."""
+    sign = 1 if transaction_type == "income" else -1
+    ids: list[int] = []
+    for i, merchant in enumerate(merchants):
+        resp = client.post(
+            "/api/v1/transactions",
+            json=_post_body(
+                account_id=account_id,
+                merchant_raw=merchant,
+                amount_paise=sign * (10_000 + i),
+                transaction_type=transaction_type,
+                txn_date=txn_date,
+            ),
+        )
+        assert resp.status_code == 201, resp.text
+        ids.append(resp.json()["id"])
+    return ids
+
+
+def _bulk(client: TestClient, ids: list[int], category_id: int) -> Any:
+    return client.post(
+        "/api/v1/transactions/bulk-categorise",
+        json={"transaction_ids": ids, "category_id": category_id},
+    )
+
+
+def _cat_of(session: Session, txn_id: int) -> int | None:
+    session.expire_all()
+    txn = session.get(Transaction, txn_id)
+    assert txn is not None
+    return txn.category_id
+
+
+def _tag_map(session: Session) -> dict[tuple[str, int], int]:
+    session.expire_all()
+    return {
+        (r.merchant_normalized, r.category_id): r.hit_count
+        for r in session.scalars(select(MerchantTagMap))
+    }
+
+
+def test_bulk_categorise_teaches_once_per_merchant(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    session.add(MerchantAlias(user_id=axis_account.user_id, pattern="swiggy", canonical="swiggy"))
+    session.commit()
+    food = _seed_category(session, axis_account.user_id)
+    ids = _post_rows(
+        client,
+        axis_account.id,
+        ["SWIGGY BLR 111", "SWIGGY HYD 222", "SWIGGY*333", "ZOMATO", "ZOMATO"],
+    )
+    assert _tag_map(session) == {}
+
+    resp = _bulk(client, ids, food.id)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"updated": 5, "taught": 2}
+    assert {_cat_of(session, i) for i in ids} == {food.id}
+    assert _tag_map(session) == {("swiggy", food.id): 1, ("zomato", food.id): 1}
+
+
+def test_bulk_categorise_unchanged_rows_do_not_teach(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    food = _seed_category(session, axis_account.user_id)
+    ids = _post_rows(client, axis_account.id, ["ZOMATO", "ZOMATO"])
+    assert _bulk(client, ids, food.id).json() == {"updated": 2, "taught": 1}
+
+    resp = _bulk(client, ids, food.id)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"updated": 0, "taught": 0}
+    assert _tag_map(session) == {("zomato", food.id): 1}
+
+
+def test_bulk_categorise_is_all_or_nothing(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    food = _seed_category(session, axis_account.user_id)
+    ids = _post_rows(client, axis_account.id, ["ZOMATO"])
+    pending = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=date(2026, 4, 10),
+        amount_paise=-500,
+        fingerprint="fp-pending",
+        confirmed_at=None,
+    )
+    session.add(pending)
+    session.commit()
+
+    resp = _bulk(client, [*ids, pending.id], food.id)
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["invalid_ids"] == [pending.id]
+    assert _cat_of(session, ids[0]) is None
+    assert _tag_map(session) == {}
+
+
+def test_bulk_categorise_kind_mismatch_422(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    food = _seed_category(session, axis_account.user_id)
+    [income_id] = _post_rows(client, axis_account.id, ["ACME PAYROLL"], transaction_type="income")
+
+    resp = _bulk(client, [income_id], food.id)
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["invalid_ids"] == [income_id]
+
+
+def test_bulk_categorise_income_rows_move_but_do_not_teach(
+    client: TestClient, axis_account: Account, session: Session
+) -> None:
+    salary = _seed_category(session, axis_account.user_id, name="Salary", kind="income")
+    ids = _post_rows(
+        client, axis_account.id, ["ACME PAYROLL", "ACME PAYROLL"], transaction_type="income"
+    )
+
+    resp = _bulk(client, ids, salary.id)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"updated": 2, "taught": 0}
+    assert {_cat_of(session, i) for i in ids} == {salary.id}
+    assert _tag_map(session) == {}
+
+
+# ---------------------------------------------------------------------------
+# A60 — POST /transactions/bulk-delete
+# ---------------------------------------------------------------------------
+
+
+def _bulk_delete(client: TestClient, ids: list[int]) -> Any:
+    return client.post("/api/v1/transactions/bulk-delete", json={"transaction_ids": ids})
+
+
+def _existing_ids(session_factory: sessionmaker[Session], ids: list[int]) -> set[int]:
+    with session_factory() as s:
+        return set(s.scalars(select(Transaction.id).where(Transaction.id.in_(ids))))
+
+
+def test_bulk_delete_is_all_or_nothing(
+    client: TestClient, axis_account: Account, session_factory: sessionmaker[Session]
+) -> None:
+    ids = _post_rows(client, axis_account.id, ["ZOMATO", "SWIGGY"])
+    missing = max(ids) + 1000
+
+    resp = _bulk_delete(client, [*ids, missing])
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == {
+        "message": "some transactions cannot be deleted",
+        "invalid_ids": [missing],
+    }
+    assert _existing_ids(session_factory, ids) == set(ids)
+
+
+def test_bulk_delete_releases_partners_outside_the_request(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rules 5 and 9, ADR-0009 rule 13: a partner outside the request gets its pre-link
+    type and category back; a refund whose original is deleted survives unlinked."""
+    cc_id, bank_id, _, food_id = _categorised_auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+    refund_id, original_id = _refund_and_original(session, axis_account)
+    assert _link(client, refund_id, original_id).status_code == 204
+
+    assert _bulk_delete(client, [cc_id, original_id]).status_code == 204
+
+    with session_factory() as s:
+        bank = s.get(Transaction, bank_id)
+        assert bank is not None
+        assert (
+            bank.transfer_pair_id,
+            bank.transaction_type,
+            bank.category_id,
+            bank.pre_link_type,
+            bank.pre_link_category_id,
+        ) == (None, "spend", food_id, None, None)
+        assert s.get(Transaction, refund_id) is not None
+    assert _refund_of_id(session_factory, refund_id) is None
+
+
+def test_bulk_delete_takes_both_legs_of_a_pair(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Both legs of a pair, or a refund with its original, go in one statement: neither is
+    released."""
+    cc_id, bank_id, _, _ = _categorised_auto_linked_pair(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+    refund_id, original_id = _refund_and_original(session, axis_account)
+    assert _link(client, refund_id, original_id).status_code == 204
+    ids = [cc_id, bank_id, refund_id, original_id]
+
+    assert _bulk_delete(client, ids).status_code == 204
+
+    assert _existing_ids(session_factory, ids) == set()
+
+
+def test_bulk_delete_accepts_pending_rows(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    (board_id,) = _post_rows(client, axis_account.id, ["ZOMATO"])
+    pending = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=date(2026, 5, 2),
+        amount_paise=-777,
+        fingerprint="fp-bulk-pending",
+        confirmed_at=None,
+    )
+    session.add(pending)
+    session.commit()
+
+    resp = _bulk_delete(client, [board_id, board_id, pending.id])
+
+    assert resp.status_code == 204, resp.text
+    assert _existing_ids(session_factory, [board_id, pending.id]) == set()
+
+
+def test_bulk_delete_is_capped_at_bulk_max(client: TestClient) -> None:
+    resp = _bulk_delete(client, list(range(1, BULK_MAX + 2)))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert isinstance(detail, list)
+    assert detail[0]["type"] == "too_long"
+
+
+# ---------------------------------------------------------------------------
+# A30 — GET /transactions/{id}/past-rows ("apply to past rows", ADR-0004 2b/4)
+# ---------------------------------------------------------------------------
+
+
+def _recent_date(days_ago: int = 1) -> str:
+    return (clock.today() - timedelta(days=days_ago)).isoformat()
+
+
+def _past_rows(client: TestClient, txn_id: int) -> Any:
+    return client.get(f"/api/v1/transactions/{txn_id}/past-rows")
+
+
+def test_apply_to_past_rows_teaches_once(
+    client: TestClient, axis_account: Account, session: Session, seeded_categories: list[Category]
+) -> None:
+    session.add(MerchantAlias(user_id=axis_account.user_id, pattern="swiggy", canonical="swiggy"))
+    session.commit()
+    food = _seed_category(session, axis_account.user_id, name="Eating Out")
+    row1, row2, row3, zomato = _post_rows(
+        client,
+        axis_account.id,
+        ["SWIGGY BLR 1", "SWIGGY HYD 2", "SWIGGY*3", "ZOMATO"],
+        txn_date=_recent_date(),
+    )
+    assert (
+        client.patch(f"/api/v1/transactions/{row1}", json={"category_id": food.id}).status_code
+        == 200
+    )
+    assert _tag_map(session) == {("swiggy", food.id): 1}
+
+    preview = _past_rows(client, row1)
+
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["merchant"] == "swiggy"
+    assert body["category_id"] == food.id
+    assert sorted(body["transaction_ids"]) == sorted([row2, row3])
+    assert zomato not in body["transaction_ids"]
+
+    applied = _bulk(client, body["transaction_ids"], food.id)
+
+    assert applied.json() == {"updated": 2, "taught": 1}
+    assert _tag_map(session) == {("swiggy", food.id): 2}
+    assert {_cat_of(session, i) for i in (row1, row2, row3)} == {food.id}
+    assert _cat_of(session, zomato) is None
+
+
+def test_past_rows_excludes_pending_and_other_types_and_old_rows(
+    client: TestClient, axis_account: Account, session: Session, seeded_categories: list[Category]
+) -> None:
+    food = _seed_category(session, axis_account.user_id, name="Eating Out")
+    [source, recent_match] = _post_rows(
+        client, axis_account.id, ["SWIGGY", "SWIGGY"], txn_date=_recent_date()
+    )
+    [old] = _post_rows(client, axis_account.id, ["SWIGGY"], txn_date=_recent_date(400))
+    [income] = _post_rows(
+        client, axis_account.id, ["SWIGGY"], transaction_type="income", txn_date=_recent_date()
+    )
+    pending = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=clock.today() - timedelta(days=2),
+        amount_paise=-777,
+        fingerprint="fp-pending-past",
+        merchant_raw="SWIGGY",
+        confirmed_at=None,
+    )
+    session.add(pending)
+    session.commit()
+    assert (
+        client.patch(f"/api/v1/transactions/{source}", json={"category_id": food.id}).status_code
+        == 200
+    )
+
+    ids = _past_rows(client, source).json()["transaction_ids"]
+
+    assert ids == [recent_match]
+    assert old not in ids and income not in ids and pending.id not in ids
+
+
+def test_past_rows_skip_hand_categorised_rows(
+    client: TestClient, axis_account: Account, session: Session, seeded_categories: list[Category]
+) -> None:
+    """Only rows still on a machine-assigned category are offered: uncategorised, the
+    fallback "Other", or the row's own auto suggestion. A row the user put somewhere
+    deliberately is never offered."""
+    uid = axis_account.user_id
+    food = _seed_category(session, uid, name="Eating Out")
+    dining = _seed_category(session, uid, name="Dining Out")
+    other = session.scalars(
+        select(Category).where(
+            Category.user_id == uid, Category.name == "Other", Category.kind == "spend"
+        )
+    ).one()
+    source, uncategorised, on_other, auto_hit, hand = _post_rows(
+        client, axis_account.id, ["SWIGGY"] * 5, txn_date=_recent_date()
+    )
+    assert (
+        client.patch(f"/api/v1/transactions/{source}", json={"category_id": food.id}).status_code
+        == 200
+    )
+    assert (
+        client.patch(f"/api/v1/transactions/{hand}", json={"category_id": dining.id}).status_code
+        == 200
+    )
+    on_other_row = session.get(Transaction, on_other)
+    auto_row = session.get(Transaction, auto_hit)
+    assert on_other_row is not None and auto_row is not None
+    on_other_row.category_id = other.id
+    auto_row.category_id = dining.id  # the machine put it here and the user left it
+    auto_row.auto_category_id = dining.id
+    session.commit()
+
+    ids = set(_past_rows(client, source).json()["transaction_ids"])
+
+    assert ids == {uncategorised, on_other, auto_hit}
+    assert hand not in ids
+
+
+def test_past_rows_for_pending_or_uncategorised_source_is_empty(
+    client: TestClient, axis_account: Account, session: Session, seeded_categories: list[Category]
+) -> None:
+    [source, _other] = _post_rows(
+        client, axis_account.id, ["SWIGGY", "SWIGGY"], txn_date=_recent_date()
+    )
+
+    resp = _past_rows(client, source)
+
+    assert resp.status_code == 200
+    assert resp.json()["transaction_ids"] == []
+
+
+def test_first_identity_edit_freezes_the_origin_inputs(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """ADR-0006 rule 17: the first identity edit of an imported row stores the pre-edit inputs
+    next to ``origin_fingerprint`` (which is untouched and still equals H(inputs)); a second
+    edit leaves them; a category-only edit and any edit of a manual row store nothing."""
+    txn = _seed_one(session, axis_account=axis_account)
+    txn.fingerprint = _fp_of(txn)
+    txn.origin_fingerprint = txn.fingerprint
+    manual = _seed_one(session, axis_account=axis_account, fingerprint="fp-manual")
+    manual.amount_paise = -777  # a distinct identity from the imported row
+    manual.fingerprint = _fp_of(manual)
+    session.commit()
+    before = (txn.date, txn.amount_paise, txn.merchant_normalized, txn.account_id)
+    stamped = txn.origin_fingerprint
+
+    category = _seed_category(session, axis_account.user_id, "Food", "spend")
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"category_id": category.id})
+    assert resp.status_code == 200, resp.text
+    session.refresh(txn)
+    assert txn.origin_date is None  # not an identity edit
+
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"amount_paise": -55555})
+    assert resp.status_code == 200, resp.text
+    session.refresh(txn)
+    assert (
+        txn.origin_date,
+        txn.origin_amount_paise,
+        txn.origin_merchant_normalized,
+        txn.origin_account_id,
+    ) == before
+    assert txn.origin_fingerprint == stamped
+    assert stamped == transaction_fingerprint(
+        txn_date=before[0],
+        amount_paise=before[1],
+        normalized_merchant=before[2],
+        account_id=before[3],
+    )
+
+    resp = client.patch(f"/api/v1/transactions/{txn.id}", json={"date": "2026-04-11"})
+    assert resp.status_code == 200, resp.text
+    session.refresh(txn)
+    assert txn.origin_date == before[0]  # the first edit's inputs, not the second's
+    assert txn.origin_amount_paise == before[1]
+
+    resp = client.patch(f"/api/v1/transactions/{manual.id}", json={"amount_paise": -99})
+    assert resp.status_code == 200, resp.text
+    session.refresh(manual)
+    assert manual.origin_date is None
+    assert manual.origin_fingerprint is None
+
+
+# ---------------------------------------------------------------------------
+# POST /transactions/{id}/link: the manual link (ADR-0002 rule 11b)
+# ---------------------------------------------------------------------------
+
+
+def _link_candidate_rows(
+    session: Session,
+    *,
+    axis_account: Account,
+    bank_account: Account,
+    bank_category_id: int | None = None,
+    amount_paise: int = 500000,
+) -> tuple[int, int]:
+    """A confirmed card ``income`` (+) and a confirmed bank ``spend`` (-) of the same amount,
+    ten days apart and unlinked. Returns ``(card_id, bank_id)``."""
+    card = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=date(2026, 5, 10),
+        amount_paise=amount_paise,
+        fingerprint="fp-ml-card",
+        transaction_type="income",
+        merchant_raw="PAYMENT RECEIVED",
+    )
+    bank = _make_txn(
+        user_id=bank_account.user_id,
+        account_id=bank_account.id,
+        txn_date=date(2026, 5, 20),
+        amount_paise=-500000,
+        fingerprint="fp-ml-bank",
+        category_id=bank_category_id,
+    )
+    session.add_all([card, bank])
+    session.commit()
+    return card.id, bank.id
+
+
+def _link_state(
+    session_factory: sessionmaker[Session], ids: list[int]
+) -> list[tuple[int | None, str, str | None, int | None]]:
+    with session_factory() as s:
+        rows = [s.get(Transaction, i) for i in ids]
+        return [
+            (r.transfer_pair_id, r.transaction_type, r.pre_link_type, r.pre_link_category_id)
+            for r in rows
+            if r is not None
+        ]
+
+
+def test_manual_link_pairs_equal_opposite_rows(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 11b: two equal-and-opposite confirmed rows on different accounts pair up
+    with no "Paid from" set and dates ten days apart; each stores its pre-link type and
+    category, and a link never teaches."""
+    food = _seed_category(session, axis_account.user_id)
+    card_id, bank_id = _link_candidate_rows(
+        session, axis_account=axis_account, bank_account=bank_account, bank_category_id=food.id
+    )
+
+    resp = client.post(f"/api/v1/transactions/{card_id}/link", json={"partner_id": bank_id})
+
+    assert resp.status_code == 204, resp.text
+    with session_factory() as s:
+        card, bank = s.get(Transaction, card_id), s.get(Transaction, bank_id)
+        assert card is not None and bank is not None
+        assert (card.transfer_pair_id, bank.transfer_pair_id) == (bank_id, card_id)
+        assert (card.transaction_type, bank.transaction_type) == ("transfer", "transfer")
+        assert (card.pre_link_type, bank.pre_link_type) == ("income", "spend")
+        assert (card.category_id, bank.category_id) == (None, None)
+        assert (card.pre_link_category_id, bank.pre_link_category_id) == (None, food.id)
+        assert s.scalars(select(MerchantTagMap)).all() == []
+
+
+def test_manual_link_amount_mismatch_422(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    card_id, bank_id = _link_candidate_rows(
+        session, axis_account=axis_account, bank_account=bank_account, amount_paise=500100
+    )
+    before = _link_state(session_factory, [card_id, bank_id])
+
+    resp = client.post(f"/api/v1/transactions/{card_id}/link", json={"partner_id": bank_id})
+
+    assert resp.status_code == 422
+    assert "equal and opposite" in resp.json()["detail"]
+    assert _link_state(session_factory, [card_id, bank_id]) == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "self",
+        "same_account",
+        "partner_pending",
+        "already_linked",
+        "archived_account",
+        "investment_account",
+        "non_inr_account",
+        "refund_original",
+        "linked_refund",
+    ],
+)
+def test_manual_link_refused_422(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+    case: str,
+) -> None:
+    """Every ineligible shape is a 422 that changes nothing (ADR-0002 rule 11b)."""
+    uid = axis_account.user_id
+    card_id, bank_id = _link_candidate_rows(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+    row_id, partner_id = card_id, bank_id
+    extra: list[int] = []
+    if case == "self":
+        partner_id = card_id
+    elif case == "same_account":
+        twin = _make_txn(
+            user_id=uid,
+            account_id=axis_account.id,
+            txn_date=date(2026, 5, 20),
+            amount_paise=-500000,
+            fingerprint="fp-ml-twin",
+        )
+        session.add(twin)
+        session.commit()
+        partner_id = twin.id
+    elif case == "partner_pending":
+        bank = session.get(Transaction, bank_id)
+        assert bank is not None
+        bank.confirmed_at = None
+        session.commit()
+    elif case == "already_linked":
+        pair = _live_pair(client, source_id=bank_account.id, dest_id=axis_account.id)
+        row_id = pair["dest"]["id"]
+        extra = [pair["source"]["id"]]  # type: ignore[index]
+    elif case in {"archived_account", "investment_account", "non_inr_account"}:
+        odd = Account(
+            user_id=uid,
+            name="Odd",
+            type="investment" if case == "investment_account" else "bank",
+            currency="USD" if case == "non_inr_account" else "INR",
+            archived_at=datetime(2026, 1, 1) if case == "archived_account" else None,
+        )
+        session.add(odd)
+        session.flush()
+        row = _make_txn(
+            user_id=uid,
+            account_id=odd.id,
+            txn_date=date(2026, 5, 20),
+            amount_paise=-500000,
+            fingerprint="fp-ml-odd",
+        )
+        session.add(row)
+        session.commit()
+        partner_id = row.id
+    elif case == "refund_original":
+        refund = _make_txn(
+            user_id=uid,
+            account_id=bank_account.id,
+            txn_date=date(2026, 5, 21),
+            amount_paise=1000,
+            fingerprint="fp-ml-refund",
+        )
+        refund.refund_of_id = bank_id
+        session.add(refund)
+        session.commit()
+        extra = [refund.id]
+    else:  # linked_refund: the partner is a refund that already points at an original
+        original = _make_txn(
+            user_id=uid,
+            account_id=bank_account.id,
+            txn_date=date(2026, 5, 1),
+            amount_paise=-1000,
+            fingerprint="fp-ml-original",
+        )
+        session.add(original)
+        session.flush()
+        refund = _make_txn(
+            user_id=uid,
+            account_id=axis_account.id,
+            txn_date=date(2026, 5, 20),
+            amount_paise=500000,
+            fingerprint="fp-ml-linked-refund",
+        )
+        refund.refund_of_id = original.id
+        session.add(refund)
+        session.commit()
+        row_id, partner_id = bank_id, refund.id
+        extra = [original.id]
+    ids = [row_id, partner_id, *extra]
+    before = _link_state(session_factory, ids)
+
+    resp = client.post(f"/api/v1/transactions/{row_id}/link", json={"partner_id": partner_id})
+
+    assert resp.status_code == 422, resp.text
+    assert _link_state(session_factory, ids) == before
+
+
+def test_manual_link_extra_field_422(
+    client: TestClient, axis_account: Account, bank_account: Account, session: Session
+) -> None:
+    card_id, bank_id = _link_candidate_rows(
+        session, axis_account=axis_account, bank_account=bank_account
+    )
+    resp = client.post(
+        f"/api/v1/transactions/{card_id}/link", json={"partner_id": bank_id, "amount_paise": 1}
+    )
+    assert resp.status_code == 422
+
+
+def test_manual_link_then_unlink_restores_types_and_categories(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """PRD §Verification 6: a manual link is undone by unlink, type and category both."""
+    food = _seed_category(session, axis_account.user_id)
+    card_id, bank_id = _link_candidate_rows(
+        session, axis_account=axis_account, bank_account=bank_account, bank_category_id=food.id
+    )
+    assert (
+        client.post(
+            f"/api/v1/transactions/{card_id}/link", json={"partner_id": bank_id}
+        ).status_code
+        == 204
+    )
+
+    assert client.post(f"/api/v1/transactions/{bank_id}/unlink").status_code == 204
+
+    with session_factory() as s:
+        card, bank = s.get(Transaction, card_id), s.get(Transaction, bank_id)
+        assert card is not None and bank is not None
+        assert (card.transaction_type, bank.transaction_type) == ("income", "spend")
+        assert (card.category_id, bank.category_id) == (None, food.id)
+        assert (card.transfer_pair_id, bank.transfer_pair_id) == (None, None)
+        assert (bank.pre_link_type, bank.pre_link_category_id) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# GET /transactions/{id}/link-candidates (ADR-0002 rule 11b)
+# ---------------------------------------------------------------------------
+
+
+def _candidate_row(
+    uid: object,
+    account_id: int,
+    fingerprint: str,
+    *,
+    amount_paise: int = -500000,
+    day: int = 11,
+    confirmed: bool = True,
+) -> Transaction:
+    return _make_txn(
+        user_id=uid,  # ty: ignore[invalid-argument-type]
+        account_id=account_id,
+        txn_date=date(2026, 5, day),
+        amount_paise=amount_paise,
+        fingerprint=fingerprint,
+        confirmed_at=_DEFAULT_CONFIRMED if confirmed else None,
+    )
+
+
+def test_link_candidates_lists_only_linkable_rows(
+    client: TestClient,
+    axis_account: Account,
+    bank_account: Account,
+    session: Session,
+) -> None:
+    """The list is the rows the POST would accept, nearest date first."""
+    uid = axis_account.user_id
+    card = _make_txn(
+        user_id=uid,
+        account_id=axis_account.id,
+        txn_date=date(2026, 5, 10),
+        amount_paise=500000,
+        fingerprint="fp-lc-card",
+        transaction_type="income",
+    )
+    far = _candidate_row(uid, bank_account.id, "fp-lc-far", day=18)
+    near = _candidate_row(uid, bank_account.id, "fp-lc-near", day=11)
+    original = _candidate_row(uid, bank_account.id, "fp-lc-original")
+    paired = _candidate_row(uid, bank_account.id, "fp-lc-paired")
+    other = User(email="other-lc@example.com")
+    session.add(other)
+    session.flush()
+    other_account = Account(user_id=other.id, name="Theirs", type="bank")
+    session.add_all([card, far, near, original, paired, other_account])
+    session.flush()
+    partner_of_paired = _candidate_row(uid, bank_account.id, "fp-lc-pp", amount_paise=500000)
+    session.add_all(
+        [
+            partner_of_paired,
+            _candidate_row(uid, bank_account.id, "fp-lc-amount", amount_paise=-500100),
+            _candidate_row(uid, bank_account.id, "fp-lc-pending", confirmed=False),
+            _candidate_row(uid, bank_account.id, "fp-lc-positive", amount_paise=500000),
+            _candidate_row(uid, axis_account.id, "fp-lc-same-account"),
+            _candidate_row(other.id, other_account.id, "fp-lc-foreign"),
+        ]
+    )
+    session.flush()
+    refund = _candidate_row(uid, bank_account.id, "fp-lc-refund", amount_paise=1000)
+    refund.refund_of_id = original.id
+    session.add(refund)
+    session.commit()
+    pair_existing_rows(session, paired, partner_of_paired)
+    session.commit()
+
+    resp = client.get(f"/api/v1/transactions/{card.id}/link-candidates")
+
+    assert resp.status_code == 200, resp.text
+    assert [r["id"] for r in resp.json()] == [near.id, far.id]
+
+
+def test_link_candidates_caps_at_20(
+    client: TestClient, axis_account: Account, bank_account: Account, session: Session
+) -> None:
+    uid = axis_account.user_id
+    card = _make_txn(
+        user_id=uid,
+        account_id=axis_account.id,
+        txn_date=date(2026, 5, 10),
+        amount_paise=500000,
+        fingerprint="fp-cap-card",
+        transaction_type="income",
+    )
+    session.add(card)
+    # Monthly autopays: 22 same-amount debits, each a month further from the card row.
+    rows = [
+        _make_txn(
+            user_id=uid,
+            account_id=bank_account.id,
+            txn_date=date(2024, 1, 1) + timedelta(days=30 * i),
+            amount_paise=-500000,
+            fingerprint=f"fp-cap-{i:02d}",
+        )
+        for i in range(22)
+    ]
+    session.add_all(rows)
+    session.commit()
+
+    resp = client.get(f"/api/v1/transactions/{card.id}/link-candidates")
+
+    assert resp.status_code == 200, resp.text
+    ids = [r["id"] for r in resp.json()]
+    assert len(ids) == 20
+    expected = sorted(rows, key=lambda r: (abs((r.date - card.date).days), r.id))[:20]
+    assert ids == [r.id for r in expected]
+
+
+def test_link_candidates_of_an_unlinkable_row_is_empty(
+    client: TestClient, axis_account: Account, bank_account: Account, session: Session
+) -> None:
+    uid = axis_account.user_id
+    pending = _candidate_row(
+        uid, axis_account.id, "fp-lc-self", amount_paise=500000, confirmed=False
+    )
+    session.add_all([pending, _candidate_row(uid, bank_account.id, "fp-lc-b")])
+    session.commit()
+
+    resp = client.get(f"/api/v1/transactions/{pending.id}/link-candidates")
+
+    assert resp.status_code == 200
+    assert resp.json() == []

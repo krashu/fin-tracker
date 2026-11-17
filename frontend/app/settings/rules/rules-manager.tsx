@@ -63,7 +63,7 @@ import {
   type MerchantRuleRead,
 } from "@/lib/api/client";
 import { invalidateRules } from "@/lib/queries/invalidate";
-import { categoryColorVar, resolveCategoryColor } from "@/lib/categories";
+import { categoryColorVar } from "@/lib/categories";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import { AliasManager } from "./alias-manager";
@@ -143,7 +143,7 @@ export function RulesManager() {
             ) : (
               learned.map((rule) => (
                 <RuleGroup
-                  key={rule.merchant_normalized}
+                  key={rule.merchant_canonical}
                   rule={rule}
                   categoryMap={categoryMap}
                   onForget={setDialog}
@@ -173,7 +173,7 @@ export function RulesManager() {
                 {showSeeded
                   ? seeded.map((rule) => (
                       <RuleGroup
-                        key={rule.merchant_normalized}
+                        key={rule.merchant_canonical}
                         rule={rule}
                         categoryMap={categoryMap}
                         onForget={setDialog}
@@ -212,7 +212,7 @@ function RuleGroup({
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <p className="min-w-0 truncate font-mono text-[12px] font-medium text-foreground">
-            {rule.merchant_normalized}
+            {rule.merchant_canonical}
           </p>
           {rule.alias_count > 1 ? (
             <AliasCountBadge count={rule.alias_count} />
@@ -220,7 +220,7 @@ function RuleGroup({
           {rule.seeded ? <SeededBadge /> : null}
         </div>
         <AddTagControl
-          merchant={rule.merchant_normalized}
+          merchant={rule.merchant_canonical}
           existingLabelIds={new Set(rule.labels.map((l) => l.label_id))}
         />
       </div>
@@ -230,13 +230,13 @@ function RuleGroup({
           {rule.categories.map((cat) => (
             <CategoryRuleLine
               key={`c-${cat.id}`}
-              merchant={rule.merchant_normalized}
+              merchant={rule.merchant_canonical}
               rule={cat}
               categoryMap={categoryMap}
               onForget={() =>
                 onForget({
                   kind: "category",
-                  merchant: rule.merchant_normalized,
+                  merchant: rule.merchant_canonical,
                   rule: cat,
                 })
               }
@@ -254,7 +254,7 @@ function RuleGroup({
               onForget={() =>
                 onForget({
                   kind: "label",
-                  merchant: rule.merchant_normalized,
+                  merchant: rule.merchant_canonical,
                   rule: lab,
                 })
               }
@@ -478,7 +478,7 @@ function CategoryRuleLine({
   const qc = useQueryClient();
   const [changeOpen, setChangeOpen] = useState(false);
   const cat = categoryMap.get(rule.category_id);
-  const color = resolveCategoryColor(cat, categoryMap);
+  const color = cat?.display_color ?? null;
 
   const pin = useMutation({
     mutationFn: (pinned: boolean) => patchCategoryRulePinned(rule.id, pinned),

@@ -16,8 +16,12 @@
  *   any other error; no client-side prediction of it.
  * - A row linked as one leg of a transfer pair freezes those fields plus the type
  *   until the link is broken (rule 7), because the two legs are one movement of
- *   money with server-derived signs. The banner says so and offers the unlink, so
- *   the user never meets that 422 blind.
+ *   money with server-derived signs. The banner says so and offers the unlink, which closes
+ *   the dialog (the restored type and category are server-side), so the user never
+ *   meets that 422 blind.
+ *
+ * A row the server marks `card_bill_link_offered` offers the manual card-bill link
+ * (ADR-0002 rule 11b); a link closes the dialog.
  *
  * Amount is entered as a positive rupee magnitude and signed by type, mirroring
  * add-transaction.tsx. It is deliberately NOT wrapped in `Sensitive`: you cannot
@@ -41,6 +45,8 @@ import {
 } from "@/components/ui/dialog";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { LabelInput } from "@/components/labels/label-input";
+import { CardBillLinkField } from "./card-bill-link-field";
+import { RefundOriginalField } from "./refund-original-field";
 import { Field, PickerButton, TextInput } from "@/components/form/fields";
 import { CategorySelector } from "@/components/categories/category-selector";
 import {
@@ -63,6 +69,7 @@ import {
   ENTRY_DIRECTION_LABELS,
   TRANSACTION_TYPE_LABELS,
   directionForTransaction,
+  isRefund,
   directionToType,
   signedPaise,
   type EntryDirection,
@@ -76,20 +83,25 @@ export function TransactionDialog({
   accounts,
   accountLabelText,
   onClose,
+  onCategoryCorrected,
 }: {
   txn: TransactionRead;
   categories: CategoryRead[];
   accounts: AccountRead[];
   accountLabelText: string;
   onClose: () => void;
+  /** Called after a save that changed the category, so the board can offer to apply
+   * the correction to past rows of the same merchant (ADR-0004 rule 4). */
+  onCategoryCorrected?: (txnId: number) => void;
 }) {
   const queryClient = useQueryClient();
 
-  // A transfer leg keeps "transfer" in state so the picker can render
-  // "Transfer", but that value is never selectable and the field is disabled
-  // while paired. Any other row seeds an EntryDirection (ADR-0009: a refund is
-  // not its own stored type, so the picker's three-way Spend/Refund/Income
-  // choice has to be recovered from {type, sign} via `directionForTransaction`).
+  // A transfer row keeps "transfer" in state: the picker offers it as a fifth
+  // choice after the four directions (ADR-0002 rule 7d), and the field is
+  // disabled while paired. Any other row seeds an EntryDirection (ADR-0009: a
+  // refund is not its own stored type, so the picker's four-way Spend/Refund/
+  // Income/Income reversal choice ("Refund / cashback" is the refund direction,
+  // ADR-0013) has to be recovered from {type, sign} via `directionForTransaction`).
   const [entry, setEntry] = useState<EntryDirection | "transfer">(() =>
     txn.transaction_type === "transfer"
       ? "transfer"
@@ -111,31 +123,34 @@ export function TransactionDialog({
 
   const mutation = useMutation({
     mutationFn: (body: TransactionUpdate) => patchTransaction(txn.id, body),
-    onSuccess: () => {
+    onSuccess: (_data, body) => {
       invalidateBoard();
       // A newly-typed tag is get-or-created server-side; refresh the catalog.
       queryClient.invalidateQueries({ queryKey: ["labels"] });
       // A board edit runs learn_merchant_memory (F3/F3a) server-side, so refresh
       // /settings/rules + tagging-health + candidate confidence.
       invalidateRules(queryClient);
+      if (body.category_id != null && body.category_id !== txn.category_id) {
+        onCategoryCorrected?.(txn.id);
+      }
       onClose();
     },
   });
 
-  // Unlink is its own mutation: it is a separate endpoint, it must not be
+  // Unlink is its own mutation: it is a separate endpoint, and it must not be
   // batched into the PATCH (the backend rejects an identity edit on a still-
-  // paired row), and the dialog stays open afterwards so the now-unfrozen fields
-  // become editable in place.
+  // paired row). Unlink restores each leg's pre-link type and category server-side,
+  // and neither is on the wire, so this dialog's state would be stale: it closes,
+  // and the board refetches the row.
   const unlink = useMutation({
     mutationFn: () => unlinkTransaction(txn.id),
-    onSuccess: invalidateBoard,
+    onSuccess: () => {
+      invalidateBoard();
+      onClose();
+    },
   });
 
-  // `txn` is the board's row snapshot, so it still reads as paired after a
-  // successful unlink — invalidating ["transactions"] refetches the list behind us
-  // but cannot rewrite this prop. Fold the mutation's own result in, so the fields
-  // unfreeze in place instead of making the user close and reopen the dialog.
-  const isPaired = txn.transfer_pair_id != null && !unlink.isSuccess;
+  const isPaired = txn.transfer_pair_id != null;
 
   const magnitude = rupeesToPaise(amount);
   const mergedType: TransactionType =
@@ -157,11 +172,12 @@ export function TransactionDialog({
   // backend 422s on a kind flip that keeps an incompatible category (ADR-0007
   // rule 5) — clearing here is what turns that into one round-trip instead of
   // an error. Spend → refund is a no-op here — both share the spend scope.
-  function handleDirectionChange(next: EntryDirection) {
+  function handleDirectionChange(next: EntryDirection | "transfer") {
     setEntry(next);
     if (
       selectedCategory &&
-      selectedCategory.kind !== categoryKindForType(directionToType(next))
+      selectedCategory.kind !==
+        categoryKindForType(next === "transfer" ? "transfer" : directionToType(next))
     ) {
       setCategoryId(null);
     }
@@ -173,8 +189,8 @@ export function TransactionDialog({
   // must never re-sign a leg. Preserving the sign and applying the typed magnitude
   // leaves a paired row's amount untouched (the input is disabled, so the magnitude
   // still equals the stored one) while keeping an UNPAIRED transfer — a legal
-  // survivor of a delete or an unlink — fully editable. `transfer` is never
-  // reachable as a NEW selection; it isn't in `ENTRY_DIRECTIONS`.
+  // survivor of a delete or an unlink, or an unlinked card-bill debit (ADR-0002 rule 7b) —
+  // fully editable, and a row retyped to Transfer here (rule 7d) keeps the sign it had.
   const nextAmount =
     entry === "transfer"
       ? (txn.amount_paise < 0 ? -magnitude : magnitude)
@@ -267,6 +283,9 @@ export function TransactionDialog({
                     {ENTRY_DIRECTION_LABELS[d]}
                   </DropdownMenuItem>
                 ))}
+                <DropdownMenuItem onSelect={() => handleDirectionChange("transfer")}>
+                  {TRANSACTION_TYPE_LABELS.transfer}
+                </DropdownMenuItem>
               </PickerButton>
             </Field>
             <Field label="Date">
@@ -279,6 +298,12 @@ export function TransactionDialog({
               />
             </Field>
           </div>
+
+          {mergedType === "transfer" && !isPaired ? (
+            <p className="text-[11px] text-muted-foreground">
+              Transfers count in neither spend nor income.
+            </p>
+          ) : null}
 
           <Field label="Account">
             <PickerButton label={accountText} disabled={isPaired}>
@@ -332,6 +357,11 @@ export function TransactionDialog({
           </Field>
 
           <LabelInput label="Tags" value={labels} onChange={setLabels} />
+
+          {isRefund(txn) ? <RefundOriginalField txn={txn} /> : null}
+          {txn.card_bill_link_offered ? (
+            <CardBillLinkField txn={txn} accounts={accounts} onLinked={onClose} />
+          ) : null}
         </div>
 
         {errored ? (
