@@ -7,7 +7,7 @@ Personal finance tracker — consolidates spending across Indian credit cards / 
 cash and tracks investments (Indian MFs, US stocks, manual entries) with XIRR and INR-rolled-up
 dashboards. Self-hostable, multi-user (households of 2–5).
 
-- `backend/` — Python 3.13 / FastAPI / SQLAlchemy 2.0 / Alembic on SQLite (Postgres in v2), managed by `uv`.
+- `backend/` — Python 3.14 / FastAPI / SQLAlchemy 2.0 / Alembic on SQLite (Postgres in v2), managed by `uv`.
 - `frontend/` — Next.js 16 App Router / React 19 / TypeScript / Tailwind 4 / TanStack Query v5, managed by `pnpm` (Node pinned in `.nvmrc`).
 
 Exact versions live in `backend/uv.lock` and `frontend/package.json` — **read them rather than
@@ -26,6 +26,7 @@ the underlying commands are authoritative.
 | Backend typecheck | `cd backend && uv run python -m ty check app` |
 | Frontend lint | `cd frontend && pnpm lint` |
 | Frontend typecheck | `cd frontend && pnpm typecheck` |
+| Frontend tests | `cd frontend && pnpm test` |
 | Migrations | `cd backend && uv run alembic upgrade head` |
 
 **Never start a long-running server yourself** (`pnpm dev`, `uvicorn --reload`, `docker compose up`).
@@ -34,22 +35,31 @@ mislead you. Verify backend behaviour with pytest, not by curling a live instanc
 
 The fast loop is not the definition of done: it drops coverage instrumentation (~25% of the wall
 clock), the real-PDF tests, and `slow`-marked tests. **Touching a migration means running the full
-suite** — the deselected `test_migrations_stairway` is the only thing proving every `downgrade()` in
-the chain reversible, and it is also where 0033's batch rebuild of `categories` gets exercised under
-real FK enforcement.
+suite** — the fast loop skips every migration test that runs upgrade/downgrade steps (only the
+model-drift and head-state checks stay in), including `test_migrations_stairway`, the only thing
+proving every `downgrade()` in the chain reversible and where 0033's batch rebuild of `categories`
+gets exercised under real FK enforcement.
 
 `-n auto` (pytest-xdist) is on both suite commands but deliberately **not** in `addopts`: worker
-startup costs ~17s, which pays for itself across 1400 tests and never on one file. So run a single
+startup costs ~17s, which pays for itself across the full suite and never on one file. So run a single
 test or file **without** it, and use `-n0` when you need `--pdb`, which xdist does not support.
+The dev container caps `-n auto` at 8 workers (`PYTEST_XDIST_AUTO_NUM_WORKERS` in
+`devcontainer.json`): on the 15W laptop it was tuned on, throughput drops past ~7 processes.
 Nothing needed making parallel-safe — every DB test builds its own `:memory:` engine — and coverage
 combines across workers to the same total. `addopts` does carry `--durations=15`: it is the regression
 radar that would have caught the 104ms fixture call this suite once hid.
 
-`pre-commit` is the real merge gate — 12 hooks, including **both** type-checkers (`ty check app`,
-`tsc --noEmit`), ruff, ruff-format, eslint, and a fixture-redaction test. A type error blocks the
-commit rather than surfacing in CI. It does **not** run the suite (only the redaction test), so the
-75% coverage floor is enforced solely by a bare `uv run pytest` / `make test`.
+`pre-commit` is the local gate — its hooks include **both** type-checkers (`ty check app`,
+`tsc --noEmit`), ruff, ruff-format, eslint, a `# type: ignore` ban over `backend/app/`, and a
+fixture-redaction test. A type error blocks the
+commit. It does **not** run either suite (only the redaction test), so locally the 75% coverage
+floor is enforced solely by a bare `uv run pytest` / `make test`, and vitest only by `pnpm test`.
 Install steps: `docs/LOCAL_SETUP.md`.
+
+The GitHub Actions in `.github/workflows/` re-run lint, both type-checkers, both suites (with the
+coverage floor) and pre-commit — but only after the source is published, so they catch nothing
+before it leaves this machine. They mirror the table above: when a command there changes, change
+the matching `run:` step in `test-backend.yml` / `test-frontend.yml` too.
 
 Behind a TLS-inspecting corporate proxy the investment price feeds fail with
 `CERTIFICATE_VERIFY_FAILED`; the git-ignored CA-bundle hook is documented in
@@ -57,7 +67,7 @@ Behind a TLS-inspecting corporate proxy the investment price feeds fail with
 
 ## Where the specs live
 
-- `PRD.md` is ~1,100 lines / ~20 K tokens. **Do not read it wholesale** — jump to the section you need.
+- `PRD.md` is long. **Do not read it wholesale** — jump to the section you need.
   - Features: `F1 Statement import`, `F2 Manual transaction entry`, `F3 Auto-tagging`,
     `F3a Transaction labels`, `F4 Duplicate detection`, `F4a Reconciliation rules`, `F5 Categories`,
     `F6 Accounts`, `F7 Investment tracking`, `F8 Dashboards`, `F9 Live / reactive updates`,
@@ -69,18 +79,22 @@ Behind a TLS-inspecting corporate proxy the investment price feeds fail with
 
 | ADR | Subject |
 |---|---|
-| [0001](docs/adr/0001-sqlite-postgres-portability.md) | SQLite→Postgres portability — 5 rules for every model and migration |
-| [0002](docs/adr/0002-transfer-pair-id-semantics.md) | `transfer_pair_id` is shared by F4a auto-reconciliation *and* F2 user transfers |
-| [0003](docs/adr/0003-multi-user-auth.md) | Cookie JWT + rotating refresh; the per-row tenant-isolation contract |
-| [0004](docs/adr/0004-f3-learning-lifecycle.md) | F3 auto-tag learning — one teach per decision |
-| [0005](docs/adr/0005-type-checker-ty.md) | `ty` replaces `mypy` |
-| [0006](docs/adr/0006-f4-dedup-key.md) | The F4 dedup key — the fingerprint formula is **frozen**; identity lives in the hash, multiplicity in `transactions.occurrence` |
-| [0007](docs/adr/0007-transaction-field-editability.md) | All six user-visible transaction columns are editable on PATCH; identity edits recompute the fingerprint at `occurrence = 0`, and `origin_fingerprint` keeps an edit from re-staging on re-import |
-| [0008](docs/adr/0008-f3-upi-merchant-normalisation-deferral.md) | *Superseded by 0011* — F3 UPI normalisation deferred past v1; don't touch `normalize_merchant` |
-| [0009](docs/adr/0009-refund-as-signed-spend.md) | A refund is a `spend` row with positive `amount_paise`, not its own `transaction_type` — `transaction_type` is `spend \| income \| transfer` |
-| [0010](docs/adr/0010-parsed-statement-return.md) | `StatementParser.parse()` returns `ParsedStatement` (rows + a `StatementSummary` of optional opening/closing balance + period), not a bare row list |
-| [0011](docs/adr/0011-merchant-alias-layer.md) | Merchant alias layer — token-boundary canonicalisation downstream of frozen `normalize_merchant`; per-user seed dictionary at `hit_count = 0` |
-| [0012](docs/adr/0012-category-hierarchy.md) | Categories are **two levels, capped** — one-hop rollup, one-hop colour inheritance, one-level *soft* archive cascade. No ORM `delete-orphan` on `subcategories` |
+| [0001](docs/adr/0001-sqlite-postgres-portability.md) | SQLite→Postgres portability — numbered rules for every model and migration; naive-UTC instants, IST business date |
+| [0002](docs/adr/0002-transfer-pair-id-semantics.md) | Paired rows (`transfer_pair_id`, investment `pair_id`) — exactly two same-user legs, linked both ways, written atomically; manual link needs equal and opposite amounts; unlink restores the pre-link type |
+| [0003](docs/adr/0003-multi-user-auth.md) | Cookie JWT + rotating refresh (30-min idle / 12h cap); per-row tenant isolation backed by composite same-user FKs; demo login never over HTTPS; self-service account deletion reuses guest teardown |
+| [0004](docs/adr/0004-f3-learning-lifecycle.md) | F3 learning — one teach per user decision, keyed on the canonical merchant; a bulk gesture teaches once per merchant |
+| [0005](docs/adr/0005-type-checker-ty.md) | `ty` (not mypy) gates `app/` only; suppress with `# ty: ignore[rule]`, `# type: ignore` banned |
+| [0006](docs/adr/0006-f4-dedup-key.md) | Transaction identity — the fingerprint formula is **frozen**; multiplicity in `occurrence`, provenance in `origin_fingerprint`; identity edits recompute the hash |
+| [0007](docs/adr/0007-transaction-field-editability.md) | *Merged into 0006* — stub |
+| [0008](docs/adr/0008-f3-upi-merchant-normalisation-deferral.md) | *Superseded by 0011* — stub |
+| [0009](docs/adr/0009-refund-as-signed-spend.md) | A refund is a positive `spend`, an income reversal a negative `income`, same category — `transaction_type` is `spend \| income \| transfer` |
+| [0010](docs/adr/0010-parsed-statement-return.md) | PDF statement parsers (card and bank) return `ParsedStatement` (rows + an always-present `StatementSummary`); bank rows checked against the running balance; uploads are never persisted |
+| [0011](docs/adr/0011-merchant-alias-layer.md) | Auto-tagging keys on the canonical merchant — single-pass token-boundary aliases after frozen `normalize_merchant`; per-user seed dictionary |
+| [0012](docs/adr/0012-category-hierarchy.md) | Categories are **two levels, capped** — one-hop rollup and colour inheritance, total *soft* archive cascade; "Other" is an unarchivable root |
+| [0013](docs/adr/0013-cashback-is-a-rebate.md) | Purchase cashback is a positive `spend` in a spend-kind Cashback category; referral and sign-up bonuses are income |
+| [0014](docs/adr/0014-tax-fx-rule-206.md) | *Proposed* — F11 foreign-asset gains convert at SBI's TT buying rate (Rule 206), never the stamped `fx_rate_to_inr`; cost side awaits a CA |
+| [0015](docs/adr/0015-fifo-lot-matching.md) | FIFO lot matching after same-day `indian_equity` trades net out as intraday; same-date order is date → source position → id |
+| [0016](docs/adr/0016-fx-stamped-at-transaction-date.md) | `fx_rate_to_inr` is server-stamped at the transaction date and never rewritten; a missing rate refuses the row |
 
 ## Working rules
 
@@ -92,14 +106,16 @@ Amounts are **`paise` / `cents` as int64, never `float`**. Field names end `_pai
 
 Two conventions that recur and are easy to get backwards:
 
-- **Refund sign** — a refund is not its own `transaction_type` (ADR-0009); it's a `spend` row
-  whose `amount_paise` is opposite the original spend's, same category, so signed sums reduce
-  category spend naturally. Don't invert without checking.
-- **FIFO tie-breaking** on a partial sell — the PRD pins ordering by purchase date but not the
-  tie-break. Ask rather than guess.
+- **Refund and reversal sign** — neither is its own `transaction_type` (ADR-0009). A refund is a
+  positive `spend` and an income reversal a negative `income`, each in the same category as the row
+  it reverses, so signed sums net naturally; zero is rejected on every write path. Purchase cashback
+  is a positive `spend` too (ADR-0013).
+- **FIFO** (ADR-0015) — sells consume the oldest lot first; same-date lots go by source-statement
+  position, then id, carried by insertion order. Insert imported rows in file order.
 
-Investment transactions are stored in native currency with `fx_rate_to_inr` stamped at the
-transaction date — **never re-derived at read time**. Spending is INR-only.
+Investment transactions are stored in native currency with `fx_rate_to_inr` server-stamped at the
+transaction date — **never re-derived or rewritten** (ADR-0016); tax uses SBI's TTBR instead
+(ADR-0014). Spending is INR-only.
 
 ### Think before coding
 
@@ -151,88 +167,30 @@ surface the proposed change first. Version policy is PRD §Maintenance posture: 
 
 ## Backend conventions (`backend/`)
 
-### Layout
-
-`app/api/v1/<domain>.py` — one flat module per domain, each exporting a `router`, all wired by a
-single `include_router` line in `app/api/v1/router.py` and mounted under `/api/v1`. Shared
-dependencies live in `app/api/deps.py`, deliberately outside `v1/`.
-
-A new endpoint means a new module **and** its line in `v1/router.py`. Forget the second and it
-**404s silently** — no error anywhere.
-
-**There is no `app/routers/`.** Adding one creates a second router location the wiring doesn't know
-about, with the same silent-404 result. Other packages: `core/`, `models/`, `parsers/`, `schemas/`,
-`services/`, plus `main.py` and `middleware.py`. Pydantic schemas live in `app/schemas/`.
+Layout, models & migrations (ADR-0001), timestamps and the `ty` type-checker live in
+[`backend/AGENTS.md`](backend/AGENTS.md), loaded when you work under `backend/`. Read it before adding
+an endpoint: one without its `include_router` line in `app/api/v1/router.py` 404s silently.
+The two rules below stay here because breaking them leaks data.
 
 ### Tenant isolation — ADR-0003
 
 Every owned table carries `user_id`. Three rules, and getting them wrong is a **data leak**:
 
 1. **Every read filters `user_id`.** No exceptions for "we derived these ids from the user anyway" —
-   restate the predicate.
+   restate the predicate. The only reads without it are the identity lookups: `sessions` by
+   `token_hash`, `users` by id or email.
 2. **Single-row fetch is `WHERE id = :id AND user_id = :uid`, and a miss returns 404** — not 403,
    not 200. A 403 is an existence oracle.
 3. **A body FK pointing at another user's row is 422**, never silently honoured. Applies to
-   `account_id`, `category_id`, `instrument_id`, and transfer legs.
+   `account_id`, `category_id`, `instrument_id`, category `parent_id`, labels, transfer legs and the
+   refund → original link. The DB backs it up: every owned→owned FK is a composite same-user FK
+   `(fk, user_id) → (id, user_id)`.
 
 Global-by-design (no `user_id`): `benchmarks`, `benchmark_nav`, `fx_rates`. Instrument NAVs are
 per-user, on `instruments.current_nav`.
 
 The contract is locked by `tests/api/test_auth_isolation.py`. A new owned table means a new row in
-that matrix.
-
-### Models & migrations — ADR-0001
-
-Five rules, applied to every new column, constraint, index, and Alembic revision. SQLite v1 →
-Postgres v2 is the reason.
-
-1. **Money is `BigInteger`**, named `_paise` / `_native_paise`.
-2. **String enums use `Enum(..., native_enum=False, create_constraint=True)`** — portable VARCHAR +
-   CHECK. Native PG enums can't be altered transactionally.
-3. **Constraint naming comes from `MetaData(naming_convention=...)`** on the declarative `Base`.
-   Never hand-name.
-4. **SQLite gets `PRAGMA foreign_keys=ON`** via the connect listener in `core/db.py`.
-5. **Time comes from `app/core/clock.py`; stored timestamps are naive UTC.**
-
-Every model carries `TimestampMixin`. `User` uses a UUID PK. `insert_skip_existing`
-(`core/db_errors.py`) holds the only runtime dialect fork in `app/` — a new external-source cache
-table calls it rather than cloning the branch.
-
-**Don't run `alembic upgrade` / `downgrade` against anything but the test SQLite DB without explicit
-confirmation.**
-
-### Timestamps — ADR-0001 rule 5
-
-**`app/core/clock.py` is the only answer to "what time is it."** Import the module —
-`from app.core import clock` — then `naive_utcnow()` (the portable one), `utcnow()` (aware), or
-`today()` (UTC date). No `date.today()`, no `datetime.now()`.
-
-- **Write `naive_utcnow()` to any column Python computes on**, and give every `DateTime` column a
-  Python-side `default=utcnow_default` (`models/base.py`) alongside its `server_default`. Aware is
-  not portable: Postgres assignment-casts it through the *server's* `TimeZone`, so the value comes
-  back shifted. That shipped as a real security break once (a 12h session cap firing at 17h30m).
-- **`server_default=func.now()` stays** on those columns as the raw-`INSERT` backstop, and
-  `tests/test_migration_parity.py` compares DB-side defaults — removing one is a schema change, not
-  a cleanup. Never `func.now()` as a column's *sole* writer.
-- **Don't compare stored datetimes at finer than day granularity.**
-- Some `.date()` calls (in `holdings_service.max_staleness_days` and `nav_snapshot_service`) are
-  mandatory `date`↔`datetime` conversions plus deliberate day-truncation, **not** naive/aware scars.
-  Deleting them is an instant `TypeError`. Don't "clean them up".
-- **Don't add a clock.** Call `clock`. If you need a shape it doesn't have, add it there with a
-  reason — not at the call site.
-- The type-checker cannot catch any of this — aware and naive are both `datetime`. The gate is
-  `tests/services/test_datetime_boundary.py`.
-
-### Types — ADR-0005
-
-- The type-checker is Astral's **`ty`, not mypy**. Invoke as `uv run python -m ty check app`; not
-  the bare `ty` shim, which goes missing from the Windows venv. Warnings fail the gate.
-- Suppress with **`# ty: ignore[rule-name]`**. **`# type: ignore` is not honoured** — `ty` errors
-  straight through it.
-- Don't widen the gate to `tests/`; that's its own decision. There is no `strict` bundle, so ruff's
-  `ANN` rules carry annotation completeness.
-- Before suppressing, check whether the diagnostic is a real bug. Four of seven were, on the dry run
-  that motivated the swap.
+that matrix, and the user teardown (`services/user_teardown.py`, shared by guest expiry and account deletion) must empty it.
 
 ### Logging & PII
 
@@ -243,78 +201,23 @@ Emit **structured events** — `logger.info("event_name", key=value)`, a stable 
 fields. **Never f-strings.** `configure_logging()` runs in the app lifespan and wires PII masking,
 the standard fields, `LOG_FORMAT=json` in prod and `LOG_LEVEL` globally. Call sites add nothing.
 
-**Never put PAN, account numbers, or card last-4 in logs, tracebacks, or error events.** Masking
+**Never put PAN, account numbers, card last-4 or Aadhaar numbers in logs, tracebacks, or error
+events.** Masking
 happens at the logger, never the call site.
 
 ## Frontend conventions (`frontend/`)
 
-shadcn/ui is **owned source** in `components/ui/`, not a package — include it when auditing
-CSS-utility dependents.
-
-### Server state is TanStack Query — and invalidation is manual
-
-**There are no `use*` query hooks.** Components call `useQuery` directly against a shared key
-convention. `["dashboards"]`-prefixed invalidation is what makes writes refresh reads.
-
-Defaults live in `components/providers.tsx`: `staleTime: 30_000`, `refetchOnWindowFocus: false`.
-Nothing refetches on its own — **if a mutation doesn't invalidate, the UI serves stale data until
-the stale window lapses.**
-
-`lib/queries/invalidate.ts` is a written contract, not a helper. Its docstring names every caller
-that must invoke it. Any mutation that learns or mutates a rule calls `invalidateRules` — otherwise
-`/settings/rules` and the tagging-health tiles serve a stale list and rule actions can 404 on a
-deleted id. **Read that docstring before adding a mutation.**
-
-### The tsc blind spot
-
-Pydantic schemas are **hand-mirrored** as TS types in `lib/api/client.ts`. Drift is only half-caught:
-
-- tsc **does** flag a TS field the backend dropped or renamed — a call site reads it.
-- tsc **cannot** see a backend field the TS type never declared. No diagnostic, nothing renders it,
-  suite stays green.
-
-So a response schema gaining a field must be **diffed by hand**. Two dashboard fields were computed
-and silently discarded this way.
-
-The gate is thinner than it looks: `tsc --noEmit` is the whole of it. `eslint.config.mjs` declares
-zero rules, so `pnpm lint` passes vacuously, and there are no frontend tests.
-
-### Components
-
-Dashboards and forms are **Client Components** (`"use client"`) — they need interactivity and
-TanStack Query. Pages that are pure layout stay Server Components.
-
-### Money display is masked by default
-
-`Sensitive` (from `components/balance-visibility.tsx`) hides every amount behind `••••` for
-over-the-shoulder privacy. That file's header docstring is the spec:
-
-- Client Context + localStorage, **not** a cookie + `router.refresh()` like the theme toggle. The
-  mask must be instant.
-- **Defaults to hidden**, so a reload never flashes real amounts.
-- `Sensitive` is a text swap and **can't wrap chart internals**. Charts mask via `useBalanceHidden()`
-  plus `pointer-events-none select-none blur-sm` — `pointer-events-none` is load-bearing, since
-  `ChartTooltipContent` renders raw values unless passed a `formatter`.
-
-Any new surface that renders a rupee amount goes through one of those two paths.
-
-### API client
-
-All calls go through `request()` in `lib/api/client.ts`. Tokens live in httpOnly cookies, so every
-call must send credentials, and **a 401 triggers one silent refresh + replay inside `request()`** —
-never at a call site. Bypassing it means an expired-but-refreshable session logs the user out
-instead of recovering.
-
-### Charts
-
-`lib/charts.ts` owns period → x-axis labelling and delegates money formatting to `lib/format.ts`
-(`compactINR`) and windows to `lib/dates.ts`. **Don't format money inline in a chart component.**
+In [`frontend/AGENTS.md`](frontend/AGENTS.md), loaded when you work under `frontend/`. Read it before
+adding a mutation (TanStack Query invalidation is manual), changing a response type (TS types
+hand-mirror the Pydantic schemas), or rendering a rupee amount (masked by default).
 
 ## Never
 
 - **Never commit `.env*`** (only `.env.example` is tracked), or **unredacted statement fixtures**.
   Real statements carry PAN, card last-4, account numbers, names and addresses —
-  `scripts/redact_fixture.py` and the `fixture-redaction` pre-commit hook exist for this.
+  `scripts/redact_fixture.py` and the `fixture-redaction` pre-commit hook exist for this. The
+  bundled sample statements (`backend/app/sample_statements/`) are synthetic and sit under the
+  same guard.
 - **Never bypass git hooks** (`--no-verify`), amend published commits, or force-push.
 - **Never log PII** — see §Logging & PII.
 - **Never start a long-running server** — see §Commands.

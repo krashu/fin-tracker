@@ -1,48 +1,48 @@
-# ADR-XXXX: [Short Descriptive Title]
+# ADR-NNNN: <the decision, stated as a rule>
 
-**Status**: [Proposed | Accepted | Superseded | Deprecated | Rejected]
-**Date**: YYYY-MM-DD
+**Status**: Proposed | Accepted | Superseded by ADR-XXXX | Deprecated | Rejected
+**Date**: YYYY-MM-DD (decided) · **Revised**: YYYY-MM-DD
+**Scope**: PRD §F… · `app/services/…`, `app/models/…`
+**Supersedes / Related**: ADR-XXXX
 
-## Problem
-
-[Describe the problem or issue that needs to be addressed. Be specific about what's broken, suboptimal, or unclear. Include concrete examples from the codebase if relevant.]
-
-**Example:** [Optional code snippet or specific scenario illustrating the problem]
-
-[Optional: List real examples from the codebase showing the issue]
+<!--
+Scope names files and symbols, never line numbers. Terms are defined in GLOSSARY.md, not here.
+The ADR states the target state: where code disagrees, the ADR wins and the code is the bug.
+Aim for 60–120 lines.
+-->
 
 ## Decision
 
-**[One-sentence summary of the decision]**
+One or two sentences an agent can act on without reading further.
 
-**[What to do / when to apply this]:**
-- Criterion or rule 1
-- Criterion or rule 2
-- Criterion or rule 3
+## Rules
 
-**[What not to do / when to avoid this]:**
-- Anti-pattern 1
-- Anti-pattern 2
+1. <rule, testable> — *Enforced by*: DB constraint | service | schema validation | tooling ·
+   *Locked by*: `tests/…::test_name`
 
-**Implementation approach:**
-- High-level guidance on how to apply this decision
-- Any specific thresholds or triggers
-- Where to find detailed examples or documentation
+<!--
+Enforced by: what actually stops a violation. Locked by: the test that fails if the rule breaks;
+"(planned)" after a test name marks one the code rewrite adds; "none (by choice)" says no gate is
+wanted, and why sits in Why.
+-->
 
----
+## Out of bounds
 
-## Trade-offs
+What this ADR deliberately does not allow or cover, stated as positive boundaries.
 
-**Benefits:** [List main benefits concisely]
+## Why
 
-**Drawbacks:** [List main challenges or trade-offs]
+Problem and forces, short. Link terms to [GLOSSARY.md](../../GLOSSARY.md) rather than redefining
+them.
 
-**Mitigation:** [How will drawbacks be addressed?]
+## Alternatives rejected
 
-## Alternatives Considered
+- **<name>** — one line.
 
-**Alternative 1 - [Name]**: [One-line summary of why this was rejected]
+## Consequences
 
-**Alternative 2 - [Name]**: [One-line summary of why this was rejected]
+What gets easier or harder, and the triggers that would reopen this decision.
 
-**Alternative 3 - [Name]**: [One-line summary of why this was rejected]
+## History
+
+- YYYY-MM-DD — one line per material change.

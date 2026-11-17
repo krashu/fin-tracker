@@ -1,82 +1,170 @@
-# ADR-0003: Multi-user auth — cookie JWT + rotating refresh, per-row tenant scoping
+# ADR-0003: Cookie-JWT auth with rotating refresh; every owned row is scoped to one user
 
 **Status**: Accepted
-**Date**: 2026-07-18
-
-## Problem
-
-The PRD's v1 access model is "single user, no login, `user_id` hardcoded" ([PRD §Users & access](../../PRD.md)). The v2 line — "real auth (email + password); every row already scoped by `user_id`" — needed to actually ship for the decided deployment topology: real users **self-host** a single-user or small household (2–5) instance; the hosted showcase is a **static, backend-less** build with no login at all. That reframes auth's job — it protects a *self-hosted* box, **not** a public multi-tenant SaaS. Several decisions are cross-cutting, hard to reverse, and re-litigation-prone (token transport, refresh semantics, the tenant-isolation contract, which tables are global, how the demo account is gated, what "sign out other devices" actually guarantees), and the conventions can't live in `CLAUDE.md` — it's gitignored in this environment. This ADR is their committed home.
+**Date**: 2026-07-18 (decided) · **Revised**: 2026-11-15
+**Scope**: PRD §Users & access, §Non-goals, §Data model · `app/api/deps.py` (`get_current_user_id`),
+`app/api/v1/auth.py`, `app/services/auth_service.py`, `app/services/guest_service.py`, `app/services/user_teardown.py`,
+`app/core/security.py`, `app/core/config.py` (`Settings`), `app/core/rate_limit.py`,
+`app/core/log_config.py`, `app/middleware.py` (`OriginCSRFMiddleware`), `app/models/session.py`
+**Supersedes / Related**: ADR-0001 (portability rules out RLS), ADR-0002 (composite same-user FK)
 
 ## Decision
 
-**Auth is httpOnly-cookie JWT access tokens + server-revocable rotating refresh tokens; every owned row carries `user_id` and every owned query filters it; a small set of reference tables is deliberately global.**
+A [user](../../GLOSSARY.md#users--tenancy) authenticates with a short-lived httpOnly-cookie access JWT
+plus a hashed, rotating, family-revocable refresh token. Every [owned table](../../GLOSSARY.md#users--tenancy)
+carries `user_id`; every read restates it, a single-row miss is 404, a cross-user reference is 422 at
+the boundary and unstorable in the DB. `benchmarks`, `benchmark_nav` and `fx_rates` are the only
+global tables.
 
-### Token model
-- **Access**: short-lived (15 min) HS256 JWT, delivered **only** as an httpOnly + `SameSite` cookie (never in a response body — JS can't read it, so XSS can't exfiltrate the session). Resolved on every request by the single dependency `get_current_user_id` ([api/deps.py](../../backend/app/api/deps.py)); 401 when missing / malformed / expired.
-- **Refresh**: opaque random token, stored **hashed** as a `sessions` row, path-scoped to `/api/v1/auth` so it never rides non-auth requests. Rotating with **reuse detection**: login/register mints a family; each refresh single-use-rotates within the family (atomic conditional `UPDATE` + rowcount guards the SPA double-submit race); presenting an already-revoked token = compromise → the **whole family** is revoked ([auth_service.py](../../backend/app/services/auth_service.py)).
-- **CSRF**: a fail-closed Origin check (`OriginCSRFMiddleware`) pairs with `SameSite`; credentialed CORS is an explicit allowlist (no wildcard).
+## Rules
 
-### Tenant model (the isolation contract)
-- **Every owned table carries `user_id`**: `accounts`, `categories`, `transactions`, `instruments`, `investment_transactions`, `import_batches`, `merchant_tag_map`, `labels`, `transaction_labels`, `merchant_label_map` (+ `sessions`, `users`). The last three shipped after this ADR (migrations 0021 / 0023); the two join-shaped ones (`transaction_labels`, `merchant_label_map`) carry the composite same-user FK pattern from [ADR-0002](0002-transfer-pair-id-semantics.md) rather than a plain FK, so cross-user references are rejected by the DB and not merely filtered on read. Every read filters it; every single-row fetch is scoped `WHERE id = :id AND user_id = :uid` and returns **404 (not 403/200)** on a miss — no existence oracle. Every body FK (an `account_id`, `category_id`, `instrument_id`, or transfer leg) is validated cross-user → **422**, never silently honoured.
-- **Global reference tables carry no `user_id` by design**: `benchmarks`, `benchmark_nav`, `fx_rates` — the same catalog / rate applies to every user. Instrument NAVs are *per-user* (they live on `instruments.current_nav`, not a shared snapshot table).
-- **Defense-in-depth (Phase 4)**: the two owned-table reads that previously trusted a user-derived id set instead of restating the predicate — the backup export's account/category re-fetch ([export_service.py](../../backend/app/services/export_service.py)) and the portfolio staleness helpers ([performance_service.py](../../backend/app/services/performance_service.py)) — now restate `user_id == uid`. A dangling FK then degrades to a blank cell (safe), not a cross-user read (leak). No fail-loud check is added: raising on a can't-happen-today path is speculative error handling (CLAUDE.md §2).
-  - **A second class, closed later (A1.3/A3.3)**: two reads that *joined* an owned table off a **plain** FK without restating the joined side's `user_id`. `GET /imports/pending` joins `Account` off `import_batches.account_id` and selects `name` + **`last4`** ([imports.py](../../backend/app/api/v1/imports.py)); `prefetch_tag_map` joins `Category` off `merchant_tag_map.category_id` and its result is written onto imported rows as `auto_category_id` ([tag_service.py](../../backend/app/services/tag_service.py)). Both FKs are plain, so the DB permits a cross-user value — unlike the join-shaped tables above, whose ADR-0002 composite FK makes it unstorable. **Four owned-table reads now restate the predicate.** On `/imports/pending` the clause belongs in the `outerjoin`'s ON, not the `WHERE`: `account_id` is nullable, and a `WHERE` would collapse the LEFT JOIN and drop account-less (backup-restore) batches. Neither was reachable through any write path — every one validates ownership first — so this is consistency, not an incident.
-- The contract is locked by an isolation test matrix ([tests/api/test_auth_isolation.py](../../backend/tests/api/test_auth_isolation.py), with the cross-tenant label / rule cases in [tests/api/test_rules.py](../../backend/tests/api/test_rules.py)): A cannot list / read / mutate B's rows across every owned table, cross-user body FKs 422, and read-models (holdings / portfolio / backup / tagging-stats) never surface another user's data.
+**Tokens and sessions**
 
-### Account lifecycle
-- **Registration** provisions the default category set (mirrors the seeded shape) inside the create transaction; duplicate email → 409 (see the enumeration note below). **Change-password** re-hashes, revokes every session, and issues a fresh one for the caller (sign-out-everywhere-else); the **demo account is refused** (403) since its credentials are source-published.
-- **Passwords** are argon2id; a dummy-verify equalizes timing on the user-not-found path (no timing oracle).
+1. **Access token** is an HS256 JWT (default 15 min) sent only as an httpOnly `SameSite` cookie, never
+   in a body; every route resolves it through `get_current_user_id`, and a missing, bad or expired
+   token is 401. — *Enforced by*: service · *Locked by*: `tests/api/test_auth.py::test_me_requires_auth`,
+   `::test_expired_access_token_401`
+2. **Refresh token** is opaque, stored only as a hash in `sessions`, cookie-scoped to `/api/v1/auth`.
+   Each refresh rotates single-use within its [refresh family](../../GLOSSARY.md#users--tenancy);
+   presenting a revoked token revokes the whole family. — *Enforced by*: service ·
+   *Locked by*: `tests/api/test_auth.py::test_refresh_rotates_token`, `::test_refresh_reuse_revokes_family`
+3. **A family dies after 30 minutes idle or 12 hours from login**, whichever is first
+   (`SESSION_IDLE_TIMEOUT_MINUTES`, `SESSION_ABSOLUTE_TTL_HOURS`). — *Enforced by*: service ·
+   *Locked by*: `tests/services/test_auth_service.py::test_rotate_rejects_past_absolute_cap`,
+   `::test_rotate_rejects_past_idle_timeout`, `::test_idle_timeout_measures_from_last_refresh_not_login`
+4. **A token for a user that no longer exists is 401**, never a 500 from a later FK failure. —
+   *Enforced by*: service (`get_current_user_id` confirms the row) ·
+   *Locked by*: `tests/api/test_auth_guest.py::test_pruned_guest_token_is_401`, `::test_expired_guest_token_is_401`
+5. **CSRF**: every unsafe request carries an `Origin` from the explicit allowlist (missing is 403);
+   credentialed CORS uses the same list, and a wildcard is refused at startup. `SameSite=none` needs
+   `Secure`; the default `JWT_SECRET` is refused when `COOKIE_SECURE`. — *Enforced by*: service +
+   config validation · *Locked by*: `tests/api/test_auth.py::test_csrf_missing_origin_rejected`,
+   `tests/test_config.py::test_cors_wildcard_rejected`, `::test_default_jwt_secret_rejected_when_secure`
+6. **Passwords are argon2id**; an unknown email, a password-less user and a gated demo login all run a
+   dummy verify. — *Enforced by*: service ·
+   *Locked by*: `tests/services/test_auth_service.py::test_failed_logins_all_run_a_dummy_verify`
 
-### Demo account gate
-The seeded demo user ships a **source-published** password. It authenticates only where the operator has **explicitly opted in** *and* the transport is plain http — `Settings.demo_login_permitted` (`demo_login_enabled and not cookie_secure`) is the single expression both the login path (`authenticate`) and the public `GET /auth/config` read, so the "Try the demo" button and the login 401 can never disagree. **Refused by default.**
+**Tenant isolation**
 
-**Amended 2026-08-02** — the original gate was `cookie_secure` alone, and it was open on every topology this project actually documents. `deploy/Caddyfile` serves `:80` plain http and browsers drop `Secure` cookies over http, so the LAN self-host stack (`make up-proxy`, whose own comments tell the operator to append a LAN origin "to allow login from another device") **structurally cannot set `cookie_secure`** — enabling it breaks login outright. A derived signal that the target topology can never assert is not a gate. The severity is also higher than "a demo account": the demo row is `v1_user_id`, the same row migration `0001` seeds and `_maybe_seed_demo` attaches data to, so on a dev-seeded or pre-auth-upgraded install that publicly-credentialed account owns the **real** data — and `POST /auth/change-password` refuses it, so it cannot be re-secured from the app.
+7. **Every read of an owned table restates `user_id = :uid`**, joined tables and re-fetches by
+   already-scoped ids included. The only exemptions are the identity lookups: `sessions` by
+   `token_hash`, `users` by id or email. — *Enforced by*: service ·
+   *Locked by*: `tests/api/test_imports_review.py::test_pending_never_labels_a_batch_with_another_users_account`
+8. **Single-row fetch is `WHERE id = :id AND user_id = :uid`; a miss is 404**, never 403 or 200. —
+   *Enforced by*: service · *Locked by*: `tests/api/test_auth_isolation.py::test_accounts_are_isolated_per_user`
+9. **A body FK naming another user's row is 422** (`account_id`, `category_id`, `instrument_id`,
+   `parent_account_id`, category `parent_id`, label, transfer leg). — *Enforced by*: service ·
+   *Locked by*: `tests/api/test_transactions.py::test_post_foreign_user_account_422`
+10. **Every owned→owned FK is a composite same-user FK** `(fk, user_id) → (id, user_id)` over an
+    `(id, user_id)` unique index, so a cross-user link cannot be stored even if rule 9 is skipped. —
+    *Enforced by*: DB · *Locked by*: `tests/api/test_rules.py::test_cross_tenant_label_rule_rejected_by_composite_fk`;
+    a metadata test over every owned FK (planned)
+11. **Every owned table has a row in the central matrix** `tests/api/test_auth_isolation.py`, and guest
+    teardown empties every owned table. — *Enforced by*: tooling · *Locked by*:
+    `tests/models/test_owned_tables.py::test_every_non_global_table_has_user_id`,
+    `::test_every_owned_table_is_torn_down`
 
-The fix adds `DEMO_LOGIN_ENABLED` (default off) as a **second necessary condition, not a second gate** — see Alternative 3. `cookie_secure` is retained in the expression because dropping it would let a hardened https deploy re-open the demo login, which the original gate correctly refused; ANDing is strictly safer than either signal alone. Consequence accepted: a TLS-fronted hosted demo is foreclosed. It is not a topology this project ships (PRD §Users & access makes the hosted showcase static and backend-less), and reopening it is a deliberate ADR revision, not a config change.
+**Accounts, registration and demo**
 
-### Session hardening for self-host (Phase 4)
-- **Rate-limit key (`RATE_LIMIT_TRUST_PROXY`, default off)**: the in-process auth limiter keys on the immediate peer, which collapses the whole LAN to one bucket behind the reverse-proxy overlay. When the flag is on it keys on the **rightmost** `X-Forwarded-For` entry — correct and spoof-resistant for **exactly one trusted hop** (Caddy appends the real peer, so a client-supplied value is never rightmost). **Enable only when the backend port is unreachable except through the trusted proxy** — a directly-reachable API lets a client spoof XFF to dodge throttling; the lifespan logs an advisory when the flag is on (can't detect port exposure in-process).
-- **Register 409 (enumeration oracle) — accepted, not softened.** Signup here is **self-host member onboarding** (a household admin who already knows the emails), not public SaaS growth, so the helpful 409 aids onboarding and softening it would cost UX + complexity for a non-threat. **Acceptability is scoped to trusted LAN / VPN self-host, not arbitrary WAN exposure** — and note it interacts with a *misconfigured* `RATE_LIMIT_TRUST_PROXY` (spoofed XFF → un-throttled enumeration), which is the real thing to get right.
+12. **The first user can always register; after that, registration is open only when
+    `REGISTRATION_ENABLED` (default false).** Registration provisions the default categories and the
+    [seed dictionary](../../GLOSSARY.md#transactions--import); a duplicate email is 409. — *Enforced by*:
+    service · *Locked by*: `tests/api/test_auth.py::test_register_refused_when_registration_disabled`,
+    `::test_first_user_registers_when_registration_disabled`, `::test_register_duplicate_email_409`,
+    `tests/test_config.py::test_registration_closed_by_default`
+13. **Change-password** re-hashes, revokes every family and issues a fresh one to the caller; the
+    demo account and guests get 403. — *Enforced by*: service ·
+    *Locked by*: `tests/api/test_auth.py::test_change_password_signs_out_other_sessions_keeps_current`,
+    `::test_change_password_refused_for_demo_account`
+13b. **Delete my account** (`POST /auth/delete-account`) erases the caller immediately: it requires the
+    current password and the typed confirmation phrase `delete my account`, then hard-deletes every
+    owned row through the same teardown as guest expiry (`teardown_user`), in one transaction, and
+    clears the auth cookies. A wrong password is 400 and deletes nothing: the session is valid, so it
+    is a body error, never a 401. There is no grace period and no undo; the UI offers a backup
+    download first. The demo account and guests get 403. The client reads
+    `UserRead.can_manage_credentials` (false for the demo account and guests) to show a notice instead
+    of the form. Deleting the last user reopens first-user registration (rule 12). — *Enforced by*:
+    service · *Locked by*:
+    `tests/api/test_auth.py::test_delete_account_erases_every_owned_row`,
+    `::test_delete_account_wrong_password_400`, `::test_delete_account_refused_for_demo_and_guest`,
+    `tests/api/test_auth.py::test_me_says_demo_and_guest_cannot_manage_credentials`,
+    `frontend/app/settings/security/delete-account-card.test.tsx` ("posts the password and the phrase,
+    then signs the session out")
+14. **The shared [demo account](../../GLOSSARY.md#users--tenancy) logs in only when `DEMO_LOGIN_ENABLED`
+    and not `COOKIE_SECURE`** — never over HTTPS. `Settings.demo_login_permitted` is the one expression
+    the login path and `GET /auth/config` read. — *Enforced by*: config + service ·
+    *Locked by*: `tests/api/test_auth.py::test_demo_login_refused_by_default_and_config_agrees`,
+    `::test_auth_config_demo_disabled_when_cookie_secure`, `::test_demo_login_refused_over_https_whatever_the_flags`
+15. **[Guest sandboxes](../../GLOSSARY.md#users--tenancy) have their own gate** (`GUEST_SANDBOX_ENABLED`,
+    default off) and may run over HTTPS. A guest is password-less, expires (default 2h), cannot upload
+    files (imports offer bundled redacted sample statements), and is pruned with every owned row.
+    `MAX_GUEST_ACCOUNTS` counts live guests only. — *Enforced by*: service ·
+    *Locked by*: `tests/services/test_guest_service.py::test_cleanup_expired_guests_prunes_only_expired`,
+    `::test_guest_cap_counts_live_guests_only`,
+    `tests/api/test_auth_guest.py::test_multiple_guest_sessions_are_isolated`,
+    `::test_demo_session_refused_when_guest_sandbox_disabled`, `::test_guest_sandbox_runs_over_https`,
+    `::test_guest_upload_is_refused`, `::test_guest_can_import_a_sample_statement`
+16. **Auth endpoints are rate-limited** per client key. With `RATE_LIMIT_TRUST_PROXY` the key is the
+    rightmost `X-Forwarded-For` entry (one trusted hop); enable it only when the API is reachable solely
+    through that proxy. — *Enforced by*: service ·
+    *Locked by*: `tests/test_rate_limit.py::test_trust_proxy_takes_rightmost_entry_on_multi_hop`
+17. **Logs never carry PAN, card numbers, account numbers or 12-digit Aadhaar numbers**; masking runs at
+    the logger. A card is stored as its last 4 digits only, never alongside its first 6. —
+    *Enforced by*: logger processor ·
+    *Locked by*: `tests/api/test_http_logging.py::test_pii_processor_scrubs_aadhaar_in_exception_string`
 
-**Amended 2026-08-08 — open self-service signup is in scope, so the 409 bullet's scoping condition is withdrawn.** The "public open signup" non-goal is reversed (PRD §Non-goals, §Users & access). `POST /auth/register` ([auth.py](../../backend/app/api/v1/auth.py)) and the `/register` page shipped with this ADR's original work and are **unchanged by this amendment** — what changed is the topology they are permitted to sit in. Registration is no longer only member onboarding by an admin who already knows the emails: a self-hosted instance may now be WAN-exposed and hold accounts for people the operator has never met, i.e. mutually-untrusted tenants on one box. §Tenant model already assumes exactly that and needs no change; its isolation test matrix is the reason this reversal is a scope decision and not a rewrite. What does **not** change: real data still lives only on a self-hosted instance, and the hosted showcase is still static / backend-less — it has no server, so it cannot take a registration — so PRD §Users & access's data-custody argument stands.
+## Out of bounds
 
-**Position on the register 409 — the acceptance lapses; softening is queued, not done.** The acceptance above was explicitly conditional (*"scoped to trusted LAN / VPN self-host, not arbitrary WAN exposure"*), and that condition is now gone, so the acceptance goes with it rather than surviving unexamined. This amendment does **not** soften the response: `register` still returns `409 "email already registered"`, which is now a **recorded, un-mitigated exposure** rather than an accepted trade-off. Alternative 4's revisit trigger has fired (see below); *what* replaces the 409 is decided in the signup phase, with the rest of the code below.
+- No Postgres row-level security: it is not portable to SQLite (ADR-0001).
+- No household grouping in v1. Joint accounts are imported by each user separately; rows are never
+  shared, so nothing double-counts. Design nothing that blocks an additive household view later.
+- No instant cross-device revocation: "sign out other devices" lags by up to the access TTL
+  (locked by `test_access_token_survives_password_change_until_expiry`).
+- No email verification and no non-enumerating register response: both need email delivery.
 
-**Deferred to the signup phase — recorded here, deliberately not built (verified at `be60f02`):**
-- **No operator kill switch.** There is no `REGISTRATION_ENABLED` anywhere in the tree, so a self-hoster cannot close signup. `DEMO_LOGIN_ENABLED` (§Demo account gate) is the pattern to mirror, **including its `GET /auth/config` exposure** so the frontend hides the affordance instead of 404-ing on it.
-- **Rate limiting exists, but the budget is per worker.** `Depends(RateLimit(bucket="register"))` guards the endpoint, gated by `RATE_LIMIT_ENABLED` / `AUTH_RATE_LIMIT_PER_MINUTE`. The store is in-process and single-node — [rate_limit.py](../../backend/app/core/rate_limit.py)'s module docstring says so and `_store` is a plain `dict` — and the shared-store swap is already deferred below. So N workers give N× the intended rate.
-- **A misconfigured `RATE_LIMIT_TRUST_PROXY` is the sharp edge**, as the bullet above already says: a directly-reachable API plus a spoofed `X-Forwarded-For` means un-throttled enumeration. That was accepted under the LAN/VPN scoping this amendment just withdrew.
-- **No email verification** — anyone can register any address. No position is taken here either way; it is the signup phase's call.
-- Softening the 409 (Alternative 4).
+## Why
 
-### Deferred to Postgres v2 / a shared store
-- **Instant cross-device revocation.** "Sign out other devices" is **~15-min lagged, by design, not a bug**: refresh families are revoked immediately, but access JWTs decode statelessly (no per-request revocation check), so other devices linger until their access token expires, then 401 on refresh. True-instant revocation needs a session-epoch check on the request path — deferred (pinned by a test so it isn't "fixed" accidentally).
-- Revoke-then-INSERT race on change-password (harmless on SQLite single-box; matters under Postgres `READ COMMITTED`).
-- DB-level email/password both-or-neither CHECK (app-enforced for now; SQLite can't rebuild the FK-referenced `users` table).
-- The rate limiter's O(n)-per-request stale-key sweep and single-node in-process store → a shared store (Redis) on any multi-worker deploy.
+Real data lives only on a self-hosted instance (one user or a [household](../../GLOSSARY.md#users--tenancy)),
+which may be WAN-exposed and hold mutually untrusted users. httpOnly cookies keep the session out of
+JavaScript; rotation with reuse detection makes a stolen refresh token self-limiting. OWASP requires
+both an idle and an absolute timeout. The shared demo account's password is in the source and, on a
+dev-seeded install, it owns real data — so it stays off HTTPS. A hosted demo serves only guests, and
+since the DPDP household exemption does not cover the project's own demo, guests see sample
+statements, never real ones. A user can erase their own data at any time (the DPDP Act's right to
+erasure, s.12(3)); erasure reuses guest teardown, so one tested path deletes every owned table.
+Composite FKs make isolation a DB fact rather than a code-review hope.
 
-**Do NOT** design anything that blocks an **additive household grouping + aggregate reach-across** (v2 — combined family net worth; visibility = aggregate-only leaning, pin before building). The per-row `user_id` scoping is the right foundation for it.
+## Alternatives rejected
 
----
+- **Tokens in the body or localStorage** — readable by JavaScript, so XSS exfiltrates the session.
+- **Stateless JWT only** — change-password and logout could not kill sessions.
+- **Plain FKs plus service checks** — one forgotten check (restore, bulk endpoint) stores a leak.
+- **Gate the demo on reachability** — under the proxy stack a LAN-reachable box reads as local.
+- **One gate for demo login and guests** — cannot offer hosted guests without exposing the shared login.
+- **Deletion with a grace period** — needs a scheduler and a pending-deletion state that no other
+  feature uses; the password, confirmation phrase and backup offer guard against accidents instead.
+- **Registration open by default** — any WAN instance becomes an enumeration oracle for member emails.
 
-## Trade-offs
+## Consequences
 
-**Benefits:** cookie-only tokens keep the session out of JS reach; rotating refresh with family-revoke turns a stolen refresh token into a detectable, self-limiting event; per-row `user_id` + a single resolver made the app multi-user without touching any router signature; the global/owned split keeps shared reference data unduplicated. The whole surface is justified for self-host without taking on SaaS breach-liability.
+- The isolation matrix grows with every owned table; that is the price of the guarantee.
+- **Reopen at a multi-worker or Postgres deploy**: per-worker rate-limit buckets need a shared store;
+  revoke-then-insert on change-password races under `READ COMMITTED`; instant revocation needs a
+  session-epoch check.
 
-**Drawbacks:** stateless access JWTs mean revocation is access-token-TTL-lagged; the in-process rate limiter is single-node and its key is proxy-topology-sensitive; the 409 is an enumeration oracle whose scoped acceptance lapsed with the 2026-08-08 signup reversal (§Session hardening, Amended 2026-08-08).
+## History
 
-**Mitigation:** short access TTL bounds the revocation lag; `RATE_LIMIT_TRUST_PROXY` + the advisory log address the proxy case; the Postgres-v2 items above list the exact upgrades and their triggers.
-
-## Alternatives Considered
-
-**Alternative 1 — Tokens in response body / localStorage.** Simpler SPA wiring, but readable by JS → XSS exfiltration. Rejected: httpOnly cookies are the point.
-
-**Alternative 2 — Stateless-only JWT (no refresh table).** No DB session state, but no server-side revocation at all and long-lived tokens. Rejected: change-password / logout must actually kill sessions.
-
-**Alternative 3 — Separate `DEMO_LOGIN_ENABLED` flag.** A second, driftable source of truth for the demo gate. Rejected: derive it from `cookie_secure` so the button and the 401 can't disagree. — **Narrowed 2026-08-02** (see §Demo account gate): the flag now exists, but the *invariant* this alternative was defending is intact. It is an input to `Settings.demo_login_permitted`, which remains the one expression both callers read; what was rejected — two independently-consulted signals that can drift apart — is still rejected. What changed is only that `cookie_secure` alone was shown to be unassertable on the LAN topology, so it can no longer be the sole input.
-
-**Alternative 3b — Gate on reachability instead of transport** (refuse the demo creds when `api_host` isn't loopback, or when `cors_allowed_origins` names a non-loopback origin). No new operator knob, and reachability is what the threat actually turns on. Rejected: it under-detects the exact target case — under `make up-proxy` the backend binds inside the container network and `CORS_ALLOWED_ORIGINS` defaults to both loopback spellings, so a LAN-reachable proxy stack reads as "local".
-
-**Alternative 4 — Soften the register 409 to a generic response.** Removes the enumeration oracle, but hurts self-host onboarding UX and adds complexity for a threat that doesn't apply to member-onboarding. Rejected for self-host; revisit if a public-signup topology ever returns. — **Trigger fired 2026-08-08** (see §Session hardening, Amended 2026-08-08): the public-signup topology returned, so this rejection no longer stands on its stated ground. It is **not** adopted here either — the 409 is unchanged in code and choosing its replacement is the signup phase's work.
-
-**Alternative 5 — Uvicorn `--proxy-headers` for the rate-limit key.** Would also fix request logging, but wires the trusted-hop config through the CLI / Docker layer (the parallel deployment WIP). Rejected for now in favour of a self-contained, opt-in app setting; revisit if logging needs the real client IP too.
+- 2026-07-18 — Accepted: cookie JWT, rotating refresh, per-row `user_id`, global reference tables.
+- 2026-08-02 — Demo login also requires `DEMO_LOGIN_ENABLED`; `cookie_secure` alone was unassertable
+  on the LAN proxy stack.
+- 2026-08-08 — Open self-service signup brought into scope; the 409's LAN-only acceptance lapsed.
+- 2026-11-15 — Rewritten to the rules-first template. Composite same-user FKs everywhere; read
+  exemptions closed to identity lookups; central matrix plus teardown test; first-user bootstrap then
+  registration closed by default; 401 for a deleted user; hosted guest sandboxes adopted behind their
+  own gate with sample statements only, while the shared demo login stays off HTTPS; 30-minute idle
+  timeout; Aadhaar masking; joint-account note.
+- 2026-11-15 — Added rule 13b: immediate self-service account deletion reusing guest teardown.
+- 2026-11-15 — Rule 13b: the confirmation phrase is named; a wrong password is 400 (a body error on a
+  valid session); teardown lives in services/user_teardown.py, shared with guest expiry.
+- 2026-11-16 — Rule 13b: the client renders from the server-computed
+  `UserRead.can_manage_credentials`, never from the email or a guest flag.

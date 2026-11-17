@@ -12,7 +12,7 @@ In this deployment configuration:
 - **SQLite Concurrency Hardening**: Configured with `PRAGMA journal_mode=WAL;`, `PRAGMA busy_timeout=5000;`, and `PRAGMA synchronous=NORMAL;` for non-blocking concurrent reads and write queueing.
 - **Automatic TTL Pruning**: A background async sweeper runs every 15 minutes in the FastAPI application lifespan to cleanly delete expired guest sandboxes (2-hour TTL) using a deterministic 6-phase topological teardown.
 - **Daily Automated Deployments**: GitHub Actions automatically rebuilds and redeploys the container daily at 03:17 UTC, anchoring rolling 90-day transaction windows to `clock.today()`.
-- **User Registration is Disabled** (`REGISTRATION_ENABLED=false`), preventing unauthorized permanent user accounts on the public showcase.
+- **User Registration is Closed** (`REGISTRATION_ENABLED=false`, the default) once the first user exists, preventing unauthorized permanent user accounts on the public showcase. The first user can always register, so **register the operator account right after the first deploy** (see §4 step 4): on a guest-only deploy any visitor could otherwise claim that first account.
 - **Zero CORS / Cookie Friction**: Because the UI and API reside on the same origin, auth cookies work natively without cross-origin configuration.
 
 ---
@@ -49,8 +49,7 @@ Configure environment variables via the [FastAPI Cloud Dashboard](https://dashbo
 fastapi cloud env set ENVIRONMENT "production"
 fastapi cloud env set COOKIE_SECURE "true"
 fastapi cloud env set COOKIE_SAMESITE "none"
-fastapi cloud env set DEMO_LOGIN_ENABLED "true"
-fastapi cloud env set ALLOW_DEMO_LOGIN_OVER_HTTPS "true"
+fastapi cloud env set GUEST_SANDBOX_ENABLED "true"
 fastapi cloud env set REGISTRATION_ENABLED "false"
 fastapi cloud env set SEED_DEMO_ON_STARTUP "true"
 fastapi cloud env set APPLY_MIGRATIONS_ON_STARTUP "true"
@@ -66,9 +65,8 @@ fastapi cloud env set --secret JWT_SECRET "<generate-random-64-char-string>"
 | `JWT_SECRET` | `<generate-random-64-char-string>` | Secret key for signing session tokens (set with `--secret`) |
 | `COOKIE_SECURE` | `true` | Enforces `Secure` flag on session cookies (required over HTTPS) |
 | `COOKIE_SAMESITE` | `none` | Allows auth cookies over HTTPS |
-| `DEMO_LOGIN_ENABLED` | `true` | Enables authentication with demo credentials and guest sessions |
-| `ALLOW_DEMO_LOGIN_OVER_HTTPS` | `true` | Authorizes demo authentication on HTTPS deployments |
-| `REGISTRATION_ENABLED` | `false` | Disables `/auth/register` and hides registration links |
+| `GUEST_SANDBOX_ENABLED` | `true` | Enables guest sandboxes at `POST /auth/demo-session` (allowed over HTTPS). Leave `DEMO_LOGIN_ENABLED` unset: the shared demo login never runs over HTTPS |
+| `REGISTRATION_ENABLED` | `false` | Closes `/auth/register` and hides registration links once the first user has registered (the default; set explicitly for clarity) |
 | `SEED_DEMO_ON_STARTUP` | `true` | Auto-populates 90-day demo transactions and investments on boot |
 | `APPLY_MIGRATIONS_ON_STARTUP` | `true` | Automatically brings SQLite schema to `head` on boot |
 | `RATE_LIMIT_TRUST_PROXY` | `true` | Keys rate-limiter on client IP via X-Forwarded-For behind cloud ingress |
@@ -105,6 +103,9 @@ fastapi deploy
 
 FastAPI Cloud will package the backend and pre-built frontend bundle, build the container, provision HTTPS (`https://fin-tracker-demo.fastapicloud.dev`), and launch the application.
 
+### 4. Register the Operator Account Immediately
+The first user can always register, whatever `REGISTRATION_ENABLED` says (ADR-0003 rule 12). Right after the first deploy, register your own account at `/register`; registration closes as soon as it exists. Until then any visitor to a guest-only deploy could claim that first account.
+
 ---
 
 ## 5. Automated CI/CD (GitHub Actions)
@@ -138,14 +139,14 @@ $token | gh secret set FASTAPI_CLOUD_TOKEN --repo krashu/fin-tracker
 
 ### 1. Ephemeral Guest Sandboxes (`guest_service.py`)
 - **Fast Sandbox Provisioning**: Bypasses Argon2 password hashing (`password_hash=None`) for guests, dropping sandbox creation latency to < 25ms and eliminating CPU-exhaustion denial of service risks.
-- **Deterministic 6-Phase Teardown**:
+- **Deterministic 6-Phase Teardown** (`user_teardown.teardown_user`, shared with account deletion):
   1. Nullify cyclic FKs (`transfer_pair_id`, `investment_transactions.pair_id`, `parent_account_id`).
   2. Delete join/mapping rows (`transaction_labels`, `merchant_label_maps`, `merchant_tag_maps`, `merchant_aliases`).
   3. Delete transactions (`transactions`, `investment_transactions`, `import_batches`).
   4. Delete entities (`labels`, `instruments`, `accounts`).
   5. Delete categories (subcategories with `parent_id IS NOT NULL` first, root categories second).
-  6. Delete sessions and guest user row.
-- **Safety Invariant**: Refuses to touch registered / permanent user accounts (`is_guest=False`).
+  6. Delete sessions and the user row.
+- **Safety Invariant** (in `delete_guest_sandbox`, not the shared teardown): Refuses to touch registered / permanent user accounts (`is_guest=False`).
 
 ### 2. SQLite WAL & Busy Timeout
 - Connect listeners automatically execute `PRAGMA journal_mode=WAL;`, `PRAGMA busy_timeout=5000;`, and `PRAGMA synchronous=NORMAL;` so reader queries never block writers, and concurrent writes queue gracefully up to 5,000ms.
@@ -161,7 +162,7 @@ $token | gh secret set FASTAPI_CLOUD_TOKEN --repo krashu/fin-tracker
    ```bash
    curl https://fin-tracker-demo.fastapicloud.dev/api/v1/auth/config
    ```
-   *Expected Response:* `{"demo_login_enabled": true, "registration_enabled": false}`
+   *Expected Response (after the operator account exists):* `{"demo_login_enabled": false, "guest_sandbox_enabled": true, "registration_enabled": false}`
 
 2. **Ephemeral Guest Session Creation**:
    ```bash
@@ -176,4 +177,4 @@ $token | gh secret set FASTAPI_CLOUD_TOKEN --repo krashu/fin-tracker
      -H "Content-Type: application/json" \
      -d '{"email": "test@example.com", "password": "password123"}'
    ```
-   *Expected Response:* `403 Forbidden` (`{"detail": "registration is disabled"}`)
+   *Expected Response (after the operator account exists):* `403 Forbidden` (`{"detail": "registration is disabled"}`)

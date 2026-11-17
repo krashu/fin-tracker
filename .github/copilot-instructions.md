@@ -1,15 +1,16 @@
 # Copilot instructions — fin-tracker
 
-**[`AGENTS.md`](../AGENTS.md) at the repo root is the full specification of this project's
-conventions. Read it before writing code here.** This file is only the always-on kernel: the rules
+**[`AGENTS.md`](../AGENTS.md) at the repo root, plus [`backend/AGENTS.md`](../backend/AGENTS.md) and
+[`frontend/AGENTS.md`](../frontend/AGENTS.md) for their areas, are the full specification of this
+project's conventions. Read them before writing code here.** This file is only the always-on kernel: the rules
 that are expensive enough to break that they must apply even if nothing else is loaded.
 
-Personal finance tracker. `backend/` = Python 3.13 / FastAPI / SQLAlchemy 2.0 / Alembic on SQLite,
+Personal finance tracker. `backend/` = Python 3.14 / FastAPI / SQLAlchemy 2.0 / Alembic on SQLite,
 managed by `uv`. `frontend/` = Next.js App Router / React 19 / TypeScript / Tailwind 4 /
 TanStack Query v5, managed by `pnpm`.
 
 Also read the relevant [`docs/adr/`](../docs/adr/) entry before changing an area it covers, and the
-named section of `PRD.md` — **never** read `PRD.md` wholesale, it is ~1,100 lines.
+named section of `PRD.md` — **never** read `PRD.md` wholesale, it is long.
 
 ## Non-negotiable
 
@@ -53,15 +54,17 @@ be diffed by hand.
 `make` may not be installed; these are authoritative.
 
 ```
-cd backend  && uv run pytest                      # tests (add --no-cov for a fast loop)
+cd backend  && uv run pytest -n auto              # tests (add --no-cov for a fast loop; drop -n auto for one file)
 cd backend  && uv run ruff check .                # lint
 cd backend  && uv run python -m ty check app      # typecheck
 cd frontend && pnpm lint                          # lint (declares zero rules — passes vacuously)
-cd frontend && pnpm typecheck                     # tsc --noEmit — the whole frontend gate
+cd frontend && pnpm typecheck                     # tsc --noEmit — the only check on the API-type mirror
+cd frontend && pnpm test                          # vitest
 ```
 
-`pre-commit` is the real merge gate: 12 hooks including both type-checkers. Coverage floor is 75%,
-landing effectively on `services/` and `parsers/`.
+`pre-commit` is the local gate, including both type-checkers; it runs neither test suite. Coverage floor
+is 75%, landing effectively on `services/` and `parsers/`. The `.github/workflows` re-run everything
+only after the source is published.
 
 ## How to work here
 

@@ -18,7 +18,7 @@ Pinning policy comes from [PRD.md § Maintenance posture](../PRD.md):
 
 ### Prerequisites
 
-- **Python 3.13** + **uv**
+- **Python 3.14** + **uv**
 - **Node 24** (pinned in [`.nvmrc`](../.nvmrc) → `24.18.0`) + **pnpm 11** (via Corepack, below)
 - *(Optional)* **make**
 
@@ -124,7 +124,7 @@ pnpm dev                                    # http://localhost:3000
 uv run pre-commit install    # from whichever directory holds the active .git
 ```
 
-After this the gate is automatic on every commit. `.pre-commit-config.yaml` runs 12 hooks:
+After this the gate is automatic on every commit. `.pre-commit-config.yaml` runs:
 file hygiene (trailing whitespace, EOF, YAML/TOML syntax, merge conflicts, line endings),
 `ruff check --fix`, `ruff format`, **`ty check app`**, `eslint`, **`tsc --noEmit`**, and the
 fixture-redaction test.

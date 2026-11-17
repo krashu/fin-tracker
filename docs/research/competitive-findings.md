@@ -144,8 +144,8 @@ the user never selects an issuer.
 
 **Why it matters here:** [`parsers/base.py:68`](../../backend/app/parsers/base.py#L68) is
 `parse(cls, pdf_bytes, password) -> list[RawTransaction]`. With no text seam, every
-fixture must be a redacted **PDF** — which is exactly why CLAUDE.md §Fixture redaction
-says `redact_fixture.py` covers text-based fixtures while PDFs still need an eyeball.
+fixture must be a redacted **PDF** — which is exactly why the old CLAUDE.md §Fixture redaction (its rule now lives in
+AGENTS.md §Never) said `redact_fixture.py` covers text-based fixtures while PDFs still need an eyeball.
 Splitting `pdf_bytes → list[str]` from `list[str] → list[RawTransaction]`:
 
 - makes the redaction script authoritative for parser fixtures,
@@ -212,7 +212,7 @@ Import batches already exist with ids. Recording each batch's covered date range
   doesn't discard them. The `CLOSE`/`INTRADAY` flag guards a concrete bug — a manual NAV
   refresh at 2pm IST overwriting a genuine close for the same date.
   *Do not* copy Ghostfolio's money handling: it stores `marketPrice`, `fee`, `unitPrice`,
-  `quantity` as `Float`, which CLAUDE.md §Working agreements forbids.
+  `quantity` as `Float`, which AGENTS.md §Money forbids.
 - **Percentage-of-amount tolerance** **[cited]** — Actual uses one named constant
   (`±7.5%` of the value, rounded to integer cents; `±2 days` for dates) shared by its rules
   engine *and* its recurrence detector. If amount tolerance is ever added (recurring
@@ -247,7 +247,7 @@ All three **[cited]** from Wealthfolio's `lots` / `lot_disposals` migrations.
    [PRD.md:411-413](../../PRD.md#L411-L413) defers a data change later rather than a
    migration. Keep FIFO as the only *offered* policy — Sharesight ships five (FIFO, LIFO,
    minimise gain, maximise gain, minimise CGT, plus an auto-optimise), which is precisely
-   the CLAUDE.md §2 abstraction-ahead-of-second-use we don't want.
+   the AGENTS.md §Simplicity first abstraction-ahead-of-second-use we don't want.
 
 Migration discipline **[cited]**: Wealthfolio shipped this transition additively —
 dual-write both representations, no read-path switchover in the same migration. Our move
@@ -411,7 +411,7 @@ top). Scope it as one deliverable.
 2025-07-24) background-synced facts into `balances` / `holdings` cache tables and concluded
 it "improved performance, but at the *cost* of data consistency" — *"Every view of the app
 touches nearly all the user's data. If any piece of data is wrong, every view in the app is
-wrong. There is nowhere to hide in a personal finance app."* CLAUDE.md §2's
+wrong. There is nowhere to hide in a personal finance app."* AGENTS.md §Simplicity first's
 no-portfolio-snapshot-cache rule now has a named casualty behind it. Expect the NAV-history
 work to generate cache pressure; don't yield.
 
@@ -423,7 +423,7 @@ work to generate cache pressure; don't yield.
 |---|---|
 | **Receipt OCR** | 2–5 issue mentions across Firefly + Actual vs 69–525 for recurring (~50×), and **zero** prior art in a 17-repo corpus. Weakest-supported item on the roadmap. |
 | **Google Drive sync** (deprioritised, not killed) | 3–5 mentions; no repo in the corpus syncs to consumer cloud storage. Self-hosters instead asked Wealthfolio for a **configurable database location** so they can point it at their own sync substrate — likely the cheaper answer to the same need. Drops below recurring detection. |
-| **Rules-engine expansion** (ordered rules, boolean logic, regex, amount conditions) | Firefly III maintains a written refusal: *"Most rule engines, even the filters in GMail, are very complex because of user demands and as a result, nobody uses them anymore."* Actual's 67- and 96-comment templating/formula threads are what the other road looks like. Actual's specificity scoring (`is`=10 … `contains`/`matches`=0) would be **inert** against exact-merchant-only rules. CLAUDE.md §2. |
+| **Rules-engine expansion** (ordered rules, boolean logic, regex, amount conditions) | Firefly III maintains a written refusal: *"Most rule engines, even the filters in GMail, are very complex because of user demands and as a result, nobody uses them anymore."* Actual's 67- and 96-comment templating/formula threads are what the other road looks like. Actual's specificity scoring (`is`=10 … `contains`/`matches`=0) would be **inert** against exact-merchant-only rules. AGENTS.md §Simplicity first. |
 | **Statistical / ML auto-categorisation** | **No benchmark showing it beats exact-match memory exists in any repo searched** — smart_importer's own accuracy notes are qualitative. Measure our exact-match miss rate first; if small, it's a §2 over-build. If ever justified, prefer Paisa's ~60-line TF-IDF (no scikit-learn, derivable from one SQL query, amount-as-token is a good trick for fixed recurring payments) over smart_importer's linear SVC. |
 | **Dividend forecasting** | Two passes independently said skip: no Indian ex-date/pay-date feed exists, so every row would be `Estimated` — a chart of our own past. Portfolio Performance's `DividendEvent` (ex-date + pay-date + per-unit amount as instrument reference data) is the right shape *if* a feed ever appears. |
 | **Schedule FA generation** | Needs a **daily** units × price series per US instrument across the calendar year plus **per-day** TTBR (the month-end table in §4.2 doesn't cover it), on a calendar-year axis that matches no other report. Weeks. INDmoney auto-fills Schedule FA for holdings on its platform, and US equity is held through exactly one broker. The ₹10 lakh penalty argues the disclosure must *happen*, not that we must compute it. **Contingent — see §8.2.** |

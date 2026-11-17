@@ -15,8 +15,8 @@ without rewrites.
 
 ## Goals
 
-1. Import credit-card and bank statements (CSV + PDF) for Axis / ICICI (HDFC dropped
-   from v1 — see §F1 Issuers), parse
+1. Import credit-card statements (PDF) for Axis / ICICI (the HDFC card parser was dropped
+   from v1 — see §F1 Issuers) and savings-account statements for HDFC / ICICI / SBI / Axis, parse
    transactions, dedupe against existing rows, and tag them by category.
 2. Learn your tagging habits — once you've categorised a merchant, future occurrences
    are auto-tagged.
@@ -44,8 +44,7 @@ without rewrites.
   `/register` ship it — but it opens on the self-hosted deployment, not on an operator-run
   one. Per-row multi-user scoping is **shipped** (email + password auth, every row scoped
   by `user_id` — see [ADR-0003](docs/adr/0003-multi-user-auth.md) and the auth row in
-  §Users & access below); the hardening the reversal implies is recorded in ADR-0003
-  §Session hardening, not built.
+  §Users & access below); registration is closed by default once the first user exists.
 - Shared households — a cross-user roll-up (one view over two members' data) is v2.
   ADR-0003 deliberately leaves room for an additive household grouping; nothing in v1
   reads across users.
@@ -128,10 +127,26 @@ which is where real data already lives — so it does not move custody to the op
 hosted demo is a static, backend-less site (above) with no server, so it cannot take a
 registration at all. Auth's justification widens with it: it protects a self-hosted instance
 that may be WAN-exposed and hold accounts for people the operator has never met, not only a
-single user or a household of 2–3. The hardening that implies — an operator kill switch, the
-register-409 enumeration oracle, email verification, and the per-worker rate limiter — is
-recorded in [ADR-0003](docs/adr/0003-multi-user-auth.md) §Session hardening (amended
-2026-08-08) and is **not built**.
+single user or a household of 2–3. The operator kill switch is `REGISTRATION_ENABLED`: the
+first user can always register (bootstrap), after which registration is **closed by default**
+until the operator opens it. Email verification and a non-enumerating register response need
+email delivery and are **not built**; the per-worker rate limiter is a multi-worker reopen
+trigger. All of it is in [ADR-0003](docs/adr/0003-multi-user-auth.md).
+
+**Delete my account** ([ADR-0003](docs/adr/0003-multi-user-auth.md) rule 13b). A user can erase
+their own data at any time — the DPDP Act's right to erasure (s.12(3)). Settings → Security →
+"Delete my account" first offers a backup download, then requires the current password and a
+typed confirmation phrase. Erasure is **immediate**: every owned row is hard-deleted through the
+same teardown as guest expiry, in one transaction, and the auth cookies are cleared. There is no
+grace period and no undo. The shared demo account and guests get 403 (guests expire on their
+own). Deleting the last user reopens first-user registration.
+
+**Guest sandboxes.** Separately from the static demo, an operator may enable short-lived,
+password-less guest sandboxes (`GUEST_SANDBOX_ENABLED`, off by default), which may run over
+HTTPS. A guest cannot upload files: imports offer **bundled redacted sample statements only**,
+so no real statement ever reaches an operator-run instance (the DPDP household exemption does
+not cover the project's own demo). The shared demo login, whose password is in the source, is
+never served over HTTPS. See [ADR-0003](docs/adr/0003-multi-user-auth.md) rules 14–15.
 
 **Household / family net worth (self-host, v2).** The concrete driver for multi-user beyond a
 single login: a family self-hosts one instance, each member logs in and tracks their own
@@ -150,27 +165,62 @@ model before building.) v2 — the auth foundation lands first; the roll-up ride
 | -------- | --------------------------------------------------------------------- |
 | v1       | Single user, no login. App runs on `localhost`. `user_id = 1` hardcoded. |
 | v1.5     | Add a single shared password / basic auth before any cloud deploy.    |
-| v2 ✅ **shipped** | Real auth — email + password, httpOnly-cookie JWT + rotating server-revocable refresh; every row scoped by `user_id`. Scoped to self-host (single user / household), per the topology above. See [ADR-0003](docs/adr/0003-multi-user-auth.md). |
+| v2 ✅ **shipped** | Real auth — email + password, httpOnly-cookie JWT + rotating server-revocable refresh (sessions end after 30 min idle or 12 h from login); every row scoped by `user_id`. Scoped to self-host (single user / household), per the topology above. See [ADR-0003](docs/adr/0003-multi-user-auth.md). |
 
 ## Functional requirements
 
 ### F1. Statement import
 
-Three families of import, each with its own parser registered in a
-`StatementParser` strategy table:
+Three families of import, each with its own parser. Only the PDF spending parsers implement
+the `StatementParser` protocol ([ADR-0010](docs/adr/0010-parsed-statement-return.md)); the
+investment CSV and INDmoney importers are standalone:
 
 **1. Spending statements (credit-card + bank)**
-- Formats: CSV and password-protected PDF.
-- Issuers (shipped): Axis (CC), ICICI (CC). HDFC was dropped from v1 — the card isn't
-  held, so no redacted fixture can exist for it, and the parser-discipline rule requires
-  one. Bank-statement parsers are unbuilt for every issuer; see §Verification step 6 for
-  how F4a is exercised without one.
+- Formats: password-protected PDF. (CSV and netbanking XLS exports have no parser; the first
+  one reopens ADR-0010's Protocol.)
+- Issuers (shipped): Axis (CC), ICICI (CC), **HDFC, ICICI, SBI and Axis savings accounts**. The HDFC *card* parser
+  was dropped from v1 — the card isn't held, so no redacted fixture can exist for it, and the
+  parser-discipline rule requires one.
+- HDFC savings reads all three known layouts: the 2024+ e-statement (a ruled table), netbanking
+  and the older e-statement, and the pre-2020 statement (the last two have no ruled table, so
+  their rows come from a positioned-word reader). Its fixtures are **synthetic** — invented
+  names, all-zero account numbers, example handles — one set per layout; the user's own
+  statement is checked locally with `pytest -m real_pdf`.
+- ICICI savings reads the "Statement of Transactions" layout, current and pre-2020, from the
+  positioned-word reader: particulars wrap above and below the date line, the in-table `B/F` row
+  is the opening balance, and the closing balance is the last printed running balance (ICICI
+  prints no closing figure). The netbanking "Detailed Statement" export is not read.
+- SBI savings reads netbanking, the e-account statement and YONO's "Statement of Account",
+  mapping columns by label (the e-account and YONO print Credit before Debit). Netbanking prints
+  no closing figure, so its closing balance is the last printed running balance. An e-account
+  PDF holding more than one account section (a loan beside the savings account) is refused, and
+  so is an e-account month with no transactions, which prints no ledger balance.
+- Axis savings reads its word-table layout (`Tran Date | Chq No | Particulars | Debit | Credit |
+  Balance | Init.(Br)`, current and legacy header wording); its in-table `OPENING BALANCE` row
+  seeds the running-balance check.
+- Every bank parser's fixtures are synthetic, one set per layout, and the user's own statements
+  are checked locally with `pytest -m real_pdf`. A PDF in which no transaction-table header is
+  found is refused; a header with no rows under it is a valid 0-row statement.
+- Every bank parser ([ADR-0010](docs/adr/0010-parsed-statement-return.md) rules 11–12):
+  - checks **every row against the printed running balance** (previous balance + the row's
+    signed amount = the balance printed on that row); a mismatch is an error naming the page
+    and row, never an import with a guessed sign;
+  - types rows by column — a debit is a negative `spend`, a credit a positive `income` — except
+    a credit it recognises as a reversal or refund (a failed UPI debit returned, a merchant
+    refund), which is a positive `spend` that nets the debit (ADR-0009), and a debit it
+    recognises as a card-bill payment, which is flagged `cc_payment_candidate` for F4a. Review
+    corrects the rest.
+  - Current accounts, overdraft limits and FD statements are out of scope.
 - Output: spending `transactions` rows in INR.
 - Parser contract ([ADR-0010](docs/adr/0010-parsed-statement-return.md)): `StatementParser`
   yields the parsed rows **plus** statement-level metadata — opening/closing balance and
-  billing period — read off the same file. The metadata is optional per layout: a statement
+  billing period — read off the same file. Balances use one sign convention for cards and banks:
+  the user's position, positive = money held, negative = owed, so `opening + Σ rows = closing`
+  holds for both. The metadata is optional per layout: a statement
   whose printed layout carries no balance block yields it all-`None`, which is a legitimate
-  result, never a parse failure. See §F4a case 5 for what it's used for.
+  result, never a parse failure. A statement with **zero rows** but a summary is valid and
+  imports. The period fields hold only what the statement printed; reconciliation computes a
+  fallback window from the rows and never stores it. See §F4a case 5 for what it's used for.
 
 **2. Investment transactions (canonical CSV)**
 - Format: a transaction-level CSV exported from a broker / AMC — seeded against the
@@ -199,8 +249,15 @@ Three families of import, each with its own parser registered in a
 4. Auto-tag step (F3) — only applies to spending transactions.
 5. Review screen → user confirms.
 
-**Upload limits (boundary validation).** Uploads are size-capped (configurable; default in
-the single-digit-MB range — well above any real statement) and refused with a **413** *before
+**Uploads are never persisted** ([ADR-0010](docs/adr/0010-parsed-statement-return.md) rule 13).
+The uploaded file, its extracted text and its PDF password live only in request memory. The
+database keeps the file's hash (`source_file_hash`), the parsed rows and the summary; nothing
+writes the bytes, text or password to disk, the database or a log, and a failed upload stores no
+batch. Statements carry names, addresses, account
+numbers and sometimes PAN or Aadhaar — keeping only the parsed rows is DPDP data minimisation.
+
+**Upload limits (boundary validation).** Uploads are size-capped (10 MiB statements, 25 MiB backups,
+well above any real statement) and refused with a **413** *before
 the body is buffered* — at the reverse proxy plus a streaming guard in the handler (don't gate
 on `Content-Length` alone: absent on chunked encoding, spoofable). Applies to every import
 path; a general boundary check that matters most on any internet-exposed instance (e.g. a
@@ -211,53 +268,70 @@ self-host on a public IP), where an unbounded upload is a trivial memory / disk 
 - Fields: `date`, `account`, `amount` (signed), `merchant` (free text), `category`, `notes`,
   `transaction_type` (spend / income / transfer).
 - Sign rule ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)): `spend` accepts either sign
-  — negative is an outflow, **positive is a refund** — `income` requires a positive amount,
-  `transfer` accepts either sign, and zero is rejected for all three. A refund is not its own
-  type; it is a `spend` row.
+  — negative is an outflow, **positive is a refund** — `income` accepts either sign —
+  positive is income, **negative is an income reversal** (a salary clawback) — `transfer` accepts
+  either sign, and zero is rejected for all three. Neither a refund nor a reversal is its own
+  type; each sits in the same category as the row it reverses. Purchase cashback is a refund-like
+  positive `spend` in a spend-kind Cashback category
+  ([ADR-0013](docs/adr/0013-cashback-is-a-rebate.md)); referral and sign-up bonuses are income.
+- **Refund link** (optional): a refund may name the spend it reverses — the target must be a
+  negative `spend` of the same user (ADR-0009). The link is informational; it never changes sums.
 - Transfers between user's own accounts use `transaction_type = transfer` and are
-  excluded from spend reports.
+  excluded from spend reports. An edit may change an unpaired row's type to or from `transfer`
+  ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md) rule 7d).
 
 ### F3. Auto-tagging (exact-match v1)
 
 - Maintain a `merchant_tag_map` table: `(normalized_merchant, category, hit_count, last_used)`.
-- Normalisation (shipped): **lowercase**, strip leading/trailing whitespace, collapse
+- Normalisation (shipped): **lowercase**, Unicode NFC (a precomposed and a decomposed `é` are one
+  merchant), strip leading/trailing whitespace, collapse
   multiple spaces. That's all of it — `services/merchant.py` is the single source of truth.
 - Future: stripping trailing transaction IDs / dates / reference numbers via regex
   (e.g. `swiggy*blr*12345 2026-04-12` → `swiggy`). This is **not** a code edit: the
   normalised string is the stored key for `transactions.fingerprint` and both merchant
   memory maps, so changing it requires the recompute migration in
-  [ADR-0006](docs/adr/0006-f4-dedup-key.md) §Recompute procedure. See the CHANGE HAZARD
+  [ADR-0006](docs/adr/0006-f4-dedup-key.md) rules 18–21. See the CHANGE HAZARD
   block in `services/merchant.py`.
   **Shipped, without touching this function** ([ADR-0011](docs/adr/0011-merchant-alias-layer.md)):
   a `merchant_alias` table resolves a canonical merchant *downstream* of normalisation, and the
   two memory maps re-key on it at read time, leaving the fingerprint on `merchant_normalized`.
-  Matching is **token-boundary contains** — both strings are split on runs of non-alphanumerics,
+  Matching is **token-boundary contains** — both strings are split on runs of non-alphanumerics
+  (Unicode-aware: a token is a run of letters, combining marks and digits in any script),
   and an alias fires when its token sequence is a contiguous subsequence of the merchant's tokens
   (so `upi/swiggy/9876@ybl` resolves to `swiggy`, but `ola` does not false-merge into
   `chocolate hut`). Conflicts resolve by longest-pattern-wins, a total order derived from the
   data — not a user-editable priority field. Authored on `/settings/rules`; every new user is
-  seeded at registration with ~96 Indian-merchant dictionary entries (`is_seeded=True`,
-  `hit_count=0`), fixing the cold start this measurement below describes. That route is what makes
-  the miss rate worth quoting in the first place: normalisation is lowercase + whitespace-collapse
+  seeded at registration with the seed dictionary of Indian-merchant aliases (`hit_count=0`;
+  "seeded" means `hit_count = 0 AND NOT pinned`), fixing the cold start this measurement below describes. That route is what makes
+  the miss rate worth quoting in the first place: normalisation is lowercase + NFC + whitespace-collapse
   only, so before aliasing, auto-tagging **could not fire at all** on a merchant whose descriptor
-  carries an order id, RRN or VPA — most Indian CC and UPI rows.
-- On import: for each new row, look up `normalized_merchant`; if found, prefill category
+  carries an order id, RRN or VPA — most Indian CC and UPI rows. A UPI descriptor whose VPA names
+  only a payment gateway or an anonymous payee (`razorpay@…`, `9876543210@ybl`) resolves to
+  **`unknown via <psp>`**, never to a merchant, and never learns, so a gateway is not mistaken for the
+  shop behind it (ADR-0011).
+  Auto-tagging, labels and the top-merchants dashboard all group by the canonical merchant.
+- On import: for each new row, look up its canonical merchant; if found, prefill category
   with highest-hit-count entry.
 - "User decision" fires `merchant_tag_map` upsert (insert or `hit_count++`) at these sites.
   A decision is taught **once, at one authoritative site per lifecycle** (see ADR-0004):
   - F2 manual POST with non-null category (immediate user-yes).
-  - PATCH `category_id` on a **board** row (`confirmed_at IS NOT NULL`) when the value
-    actually changed (post-board correction). PATCH on a **pending** review-queue row
+  - A categorisation of **board** rows (`confirmed_at IS NOT NULL`) whose category actually
+    changed (post-board correction) — a single PATCH, a bulk re-categorise, or **"apply to past
+    rows"** (after a correction, offer to re-categorise recent board rows of the same canonical
+    merchant). A bulk gesture is one atomic request and teaches **once per distinct merchant**,
+    however many rows it touches. PATCH on a **pending** review-queue row
     does *not* teach — pending edits learn only at commit (below), so discarding or
     cancelling a row leaves no orphaned map entry.
   - Bulk commit of an import batch (each row in the committed list = a user-yes,
     even if the category was prefilled by import auto-tag — passive accept counts
     as a positive signal), **except** rows defaulted to *Other* because their
     category was null or archived at commit (F4a reconciliation): those don't teach,
-    so an archived bucket is never re-learned.
+    so an archived bucket is never re-learned. Nor does a cashback credit committed still
+    in the Cashback category its merchant text pre-filled ([ADR-0013](docs/adr/0013-cashback-is-a-rebate.md)).
 - Acceptance metric (`GET /dashboards/tagging-stats`) uses **current-health**
   semantics: rows whose frozen suggestion points at a since-archived category are
-  excluded from both numerator and denominator (see ADR-0004).
+  excluded from both numerator and denominator, and `rules_count` counts live categories
+  only (see ADR-0004). Seeding writes rule rows directly and never counts as a teach.
 - **Manual pin (rule authoring — `/settings/rules`)**: the user can *pin* a
   merchant→category (and merchant→label, F3a) association so it always wins the
   prefill regardless of `hit_count`. Implemented as a `pinned` flag on the map row
@@ -324,14 +398,19 @@ avoid colliding with the F3 `merchant_tag_map` / `tag_service` "tag" namespace.
   and so still 409s on an identical row — the importer can prove distinctness by counting the
   file, a lone POST cannot.
 - A second stored hash, `origin_fingerprint`, records **which statement line produced a row**
-  ([ADR-0007](docs/adr/0007-transaction-field-editability.md)). The four identity columns are
+  ([ADR-0006](docs/adr/0006-f4-dedup-key.md)). The four identity columns are
   user-editable, so `fingerprint` is recomputed on an edit — and without a frozen copy of the
   original the importer would read that edit as a deletion and re-stage the pre-edit row,
   giving two rows for one transaction whose fingerprints differ by construction. The file-dedup
-  prefetches therefore key on `COALESCE(origin_fingerprint, fingerprint)`. It is stamped once,
-  at stage time, by the statement importer only: manual entry, transfer legs, F4a and backup
-  restore all leave it `NULL`, because a row with no external artifact is honestly keyed by its
-  own current values. Never unique, never indexed, never recomputed.
+  prefetches therefore key on `COALESCE(origin_fingerprint, fingerprint)`. It is stamped at
+  stage time by the statement importer only: manual entry, transfer legs and F4a leave it
+  `NULL`, because a row with no external artifact is honestly keyed by its own current values.
+  The first identity edit of a stamped row freezes the four inputs it was hashed from
+  (`origin_date`, `origin_amount_paise`, `origin_merchant_normalized`, `origin_account_id`), so
+  it is always recomputable. Backups carry those inputs, never a hash (a hash bakes in the
+  install-local account id), and restore recomputes both hashes on the target. Never unique,
+  never indexed; a change to the fingerprint formula recomputes it from the stored inputs, or
+  from the row's own where none are stored.
 
 ### F4a. Reconciliation rules
 
@@ -344,16 +423,44 @@ would produce wrong totals.
   side matches a CC-payment merchant regex (`CC PAYMENT|CREDIT CARD PMT|HDFC CC|
   ICICI CC|AXIS CC`) OR the CC side matches `PAYMENT RECEIVED|THANK YOU FOR PAYMENT`.
 - Action on detection: both rows auto-classified as `transaction_type = transfer`,
-  linked via a generated `transfer_pair_id` on both rows. Excluded from spend totals.
+  linked via a generated `transfer_pair_id` on both rows. Excluded from spend totals. Both
+  rows become uncategorised (a pair belongs to no category); each keeps its category aside
+  for unlink ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md) rule 9).
 - User sees a "Linked CC bill payment" banner on each row **on the board, once the
   batch is committed** — not in the review screen. The link is created *by* the
-  commit: `auto_link_cc_bill` runs after the pass that stamps `confirmed_at`, and
+  commit: `auto_link_cc_bill` runs after the pass that stamps `confirmed_at` — at the commit of
+  **either** the card batch or the bank batch, so whichever statement arrives second links to
+  the confirmed leg already on the board ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md)
+  rule 7) — and
   the review screen serves only unconfirmed rows, so a pending candidate provably
   never carries a `transfer_pair_id` yet. Breaking the link, if the auto-detection
   got it wrong, is likewise a board action on the committed row (§Verification 6).
 - This rule activates only when a CC account has been associated with a parent bank
   account (F6's optional relationship). No association → no auto-link, user resolves
   manually.
+- **An unlinked card-bill debit** ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md)
+  rule 7b): a bank debit flagged as a card-bill payment and committed as one (no category)
+  commits as an unpaired `transfer` when a live card names that bank as "Paid from" and a
+  committed statement of that card covers the debit's date (its printed period, or the first and
+  last dates of its rows when it prints none): out of spend, in no category, until a link pairs
+  it. Otherwise (no such card, or no committed statement of it for that date: history from before
+  the card was tracked, a month not yet imported) it commits as spend in Other, the only record of
+  that money until the card's statement arrives and links it. Giving it a category in review keeps
+  it spend either way.
+- **An unmatched card payment** ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md)
+  rule 7c): a card credit flagged as a bill payment and committed as one (no category) commits
+  as an unpaired `transfer`, whether or not the paying bank is tracked: paying a card is never
+  income. It links when the bank's debit arrives, or by hand. Giving it a category in review
+  commits it in that category's kind.
+- **Manual link** ("Paid your card bill elsewhere?", offered from an unpaired `income` or `transfer` credit on a card;
+  [ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md) rule 11b): when auto-link missed,
+  the user picks the bank row that paid the bill (`POST /transactions/{id}/link`). The two rows
+  must be the user's own, confirmed, live, INR, non-investment, on different accounts,
+  unpaired, **not in a refund link** (a refund's original or a linked refund), and **exactly
+  equal and opposite** in amount; dates may differ. Each keeps its pre-link type and category
+  for unlink, and both become `transfer`. Anything else — an amount mismatch included — is a 422.
+  `GET /transactions/{id}/link-candidates` offers the closest 20 rows the rule accepts. A partial payment or a payment plus a bank fee is not linked: a pair
+  always nets to zero. A link is not a categorisation and never teaches F3.
 
 **2. CSV import references an instrument already entered manually.**
 - Identity is the normalised `symbol` (broker ticker, upper-cased) — the model has a
@@ -378,16 +485,16 @@ would produce wrong totals.
   because a refund is a `spend` row by construction, it cannot drift into income's
   bucket the way a mistyped row once could.
 - A CC statement credit is still ambiguous on arrival: a merchant refund and a
-  cashback credit are indistinguishable from the statement text alone, and cashback
-  is legitimately *income* (§F5). The parser's classification is therefore a best
-  effort (positive amount → tentatively `spend`, i.e. a refund, unless the merchant
-  text names cashback, in which case `income`), and **the user corrects it** by
-  picking a category — a spend category keeps it a refund netting against that
-  category, an income category retypes it to `income`. This is now a *category-kind*
-  choice, not a type choice: every user-visible column, `transaction_type` included,
-  is editable on `PATCH /transactions`
-  ([ADR-0007](docs/adr/0007-transaction-field-editability.md)), but the review queue's
-  merged spend/income category picker is what most users act through.
+  cashback credit are indistinguishable from the statement text alone. Both are
+  `spend`, though: purchase cashback is a **rebate on spending**, a positive `spend` in
+  the spend-kind Cashback category ([ADR-0013](docs/adr/0013-cashback-is-a-rebate.md)),
+  not income. The parser's classification is therefore a best effort (positive amount →
+  `spend`; merchant text naming cashback → the Cashback category), and **the user
+  corrects the category**. A credit that is really income (a referral or sign-up bonus)
+  is retyped to `income` by picking an income category: every user-visible column,
+  `transaction_type` included, is editable on `PATCH /transactions`
+  ([ADR-0006](docs/adr/0006-f4-dedup-key.md)), but the review queue's merged
+  spend/income category picker is what most users act through.
 
 **4. Statement re-import after the issuer corrects a row.**
 - Fingerprint includes amount, so a corrected amount produces a *new* fingerprint
@@ -411,6 +518,9 @@ would produce wrong totals.
   Due" of ₹X stores as **−X paise** — a card's `opening_balance_paise`/`closing_balance_paise`
   use the same convention as the account's own balance. A `CR` (overpaid) closing balance stores
   positive.
+- Bank sign convention: the same rule — balances are the user's position, so a savings balance
+  stores **positive** unless overdrawn ([ADR-0010](docs/adr/0010-parsed-statement-return.md)
+  rule 7). One formula reconciles both account types.
 - Action on mismatch: **warn, never block** — the delta persists on the `ImportBatch` row and
   surfaces as a review-screen banner plus a pending-batches feed badge; the commit still succeeds
   regardless. No acknowledge flag, no blocked commit.
@@ -434,9 +544,7 @@ would produce wrong totals.
   create and immutable thereafter (there is no PATCH for `kind`). Spend categories serve
   `spend` transactions of either sign — a refund included
   ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)); income categories serve
-  `income`. Each row also carries a user-pickable `color` (`#rrggbb`, nullable — see the
-  inheritance rule below; `categoryColorVar` falls back to `--muted-foreground`, it does
-  **not** derive a hue from the id).
+  `income`. Each row also carries a user-pickable `color` (`#rrggbb`). A root always has one (CHECK `ck_categories_root_has_color`): omit it on create and the server assigns the least-used palette slot of that kind. A subcategory's is nullable (see the inheritance rule below). Reads carry the server-resolved `display_color`; the frontend never derives a colour.
 - **Two levels, and no more** ([ADR-0012](docs/adr/0012-category-hierarchy.md)). A
   category carries a nullable self-FK `parent_id`. `parent_id IS NULL` is a *parent*; a
   row pointing at one is a *subcategory*. A subcategory can never itself be a parent —
@@ -451,35 +559,35 @@ would produce wrong totals.
 - Registration provisions a 2-level default taxonomy. `services/provisioning.py`
   `_DEFAULT_SPEND_TAXONOMY` / `_DEFAULT_INCOME_TAXONOMY` are the live path **and the only
   place the subcategory names are written down** — read them rather than copying the list
-  into prose here or into a test.
-  - **spend — 9 parents**: Food & Dining, Household & Living, Bills & Utilities,
-    Commute & Transportation, Shopping & Lifestyle, Family & Social,
-    Savings & Investments, Loans & Settlements, Other.
-  - **income — 1 parent**: Income, holding Salary / Freelancing / Cashback /
-    Investment Returns / Rental Income / Other.
+  into prose here or into a test ([ADR-0012](docs/adr/0012-category-hierarchy.md)). Two
+  shape facts the rest of this PRD relies on: each `kind` has a root **"Other"** (the fallback
+  category, below), and **Cashback** is a *spend*-kind category, not income
+  ([ADR-0013](docs/adr/0013-cashback-is-a-rebate.md)).
   - An existing user is brought to the same shape by migration 0034, which **reparents**
     the old flat defaults under the new parents. It renames nothing and deletes nothing,
     so a transaction tagged "Groceries" keeps its category and merely gains an ancestor.
-- **`color` inherits one hop.** A subcategory with `color IS NULL` renders in its
-  parent's hue, so a family reads as one colour; siblings are separated by a derived
-  shade, never by an unrelated hue. Every seeded subcategory is `NULL` — a seeded
-  subcategory carrying its own hex is drift, and `tests/test_migration_parity.py` is what
-  pins that.
+- **`color` inherits one hop.** A subcategory with `color IS NULL` renders in its parent's hue (`display_color`) wherever categories are listed or compared, so a family reads as one colour. Only the stacked category-trend drilldown separates siblings, by rotating the palette from the parent's slot (ADR-0012 rule 7). Every seeded subcategory is `NULL` — a seeded subcategory carrying its own hex is drift, and `tests/test_migration_parity.py` is what pins that.
 - Note "Transfer" is **not** a category name — that moved to the `transaction_type`
-  dimension. **"Income" now is one**: it is the single income parent. And "Other" still
-  exists **twice**, once per `kind` — as a spend *parent* and as a subcategory under
-  Income. `kind` participates in the active-name unique index, so a name-only lookup for
-  the F3/F4a Other-default is ambiguous and must also filter `kind`.
+  dimension. "Other" exists **twice**, once per `kind`, and each is an **unarchivable root**:
+  archiving it, renaming it or giving it a parent is a 422, so the F3/F4a Other-default always
+  has a target. `kind` participates in the active-name unique index, so a name-only lookup for
+  the Other-default is ambiguous and must also filter `kind`.
 - User can add / rename / **reparent** / soft-delete. **Archiving cascades one level** —
-  archiving a parent archives its active subcategories in the same request. There is
-  still no hard delete: `transactions.category_id` is a plain FK, and the `archived_at`
-  contract is the only thing keeping it from breaking.
+  archiving a parent archives its active subcategories in the same request — and is
+  one-way. Archiving **offers to reassign** the category's transactions to another live
+  category of the same kind, as one bulk gesture. No user-facing path hard-deletes a
+  category; only whole-user teardown (guest expiry) does.
 
 ### F6. Accounts
 
 - Account types: `credit_card`, `bank`, `cash`, `investment`.
 - Per-account fields: `name`, `type`, `issuer` (nullable), `last4` (nullable for cash),
   `opening_balance`, `currency` ("INR" hardcoded).
+- **`issuer` is the statement-parser key.** A `credit_card` must carry one from the parsed set;
+  a `bank` carries none or one from it (a bank we cannot read statements for keeps its name in
+  the account name, not the issuer); `cash` and `investment` keep free text. The set, its
+  display labels and each account's `statement_import_supported` flag come from the server's
+  parser registry, so the account forms and the upload picker never mirror it.
 - **An `investment` account is a placeholder, and its `opening_balance` must be zero.**
   It exists to group and label a broker relationship; it holds no money. Holdings live
   in `instruments` / `investment_transactions` (§F7), transactions and transfers are
@@ -508,7 +616,10 @@ would produce wrong totals.
     fund.
   - `name`, `asset_class` (`indian_equity` / `indian_mf` / `us_equity` / `us_etf` /
     `fd` / `bond` / `nps` / `gold` / `other`).
-  - `currency` (`INR` or `USD` in v1).
+  - `currency` (`INR` or `USD` in v1). `us_equity` / `us_etf` must be USD and `indian_equity` /
+    `indian_mf` / `nps` must be INR, enforced by CHECKs on `instruments` and checked first at the
+    instrument API (422) and the investment CSV parser (row skipped); `fd`, `bond`, `gold` and
+    `other` take either.
   - `exchange` (`NSE` / `BSE` / `MFCentral` / `NASDAQ` / `NYSE` / `OTHER`).
   - `current_nav` (in native currency) + `nav_updated_at`. v1 auto-prices Indian MFs,
     Indian equities, US equities and US ETFs: Indian-MF NAVs from AMFI NAVAll (matched
@@ -519,7 +630,11 @@ would produce wrong totals.
 - **`investment_transactions`** — `date`, `instrument_id`, `transaction_type`
   (buy / sell / sip / dividend / bonus / split / switch_in / switch_out), `units`,
   `price_per_unit_native`, `amount_native`, `fees_native`, `fx_rate_to_inr`
-  (snapshot at transaction date — `1.0` for INR rows).
+  (server-stamped at the transaction date — `1.0` for INR rows — and never re-derived or
+  rewritten; [ADR-0016](docs/adr/0016-fx-stamped-at-transaction-date.md)). `amount_native` is the
+  **gross trade value** (units × price as reported, before charges) and `fees_native` the
+  **charges on that trade**, held separately: a buy's cost is `amount + fees`, a sell's net cash
+  is `amount − fees`.
 - **`fx_rates`** — daily INR↔USD rate snapshots, keyed by date. Used for:
   (a) stamping `fx_rate_to_inr` on new investment transactions, (b) converting
   `current_nav` to INR for portfolio rollups. Populated from `frankfurter.app` at
@@ -551,18 +666,30 @@ would produce wrong totals.
   and `amount_native` both required.
 - **`sell`** — removes units. Cost basis released using **FIFO** (first lot bought
   is the first sold). Realised gain/loss = `sale_proceeds_native − cost_basis_native`.
-  FIFO chosen because: (a) it's what Indian capital-gains rules use for equity / MF
-  taxation anyway, (b) it's the simplest to reason about without per-lot UI.
+  FIFO chosen because: (a) Indian tax law requires it for securities (the FIFO clause of the
+  Income-tax Act, 2025; s.45(2A) of the 1961 Act before it), (b) it's the simplest to reason
+  about without per-lot UI. Same-date lots are consumed in a fixed order — purchase date, then
+  position in the source statement (CAS / broker file), then insertion id
+  ([ADR-0015](docs/adr/0015-fifo-lot-matching.md)).
+  **Same-day `indian_equity` trades net first** (ADR-0015 rules 7–8): on each date, the lesser of
+  the day's bought and sold units of one instrument is **intraday** — the day's buys matched to
+  its sells in source order, opening no lot and consuming none. Only the residual buy opens a
+  lot, or the residual sell consumes FIFO. Netting is by date, not trade time, which is how
+  Indian brokers report it. Intraday results are speculative business income, never capital
+  gains, and an imported file's oversell check counts the day's buys before refusing a sell. MF
+  units, US shares and manual instruments are never netted.
   The FIFO match must be **persisted**, not just computed in passing: each sell (and
-  each `switch_out`) records which buy lot(s) it consumed — `(matched_buy_id,
-  matched_units, matched_cost_paise, buy_date)` per lot — so realised gain *and holding
-  period* are recoverable per sold lot (the input to the F11 capital-gains statement).
-  Today's in-memory FIFO (`holdings_service._consume_fifo`) pops lots only to compute the
-  *remaining* cost basis and discards the match, so this is net-new persistence, not a
-  re-use of existing output.
+  each `switch_out`) records which buy lot(s) it consumed — `(buy_txn_id, units,
+  cost_native_paise, proceeds_native_paise, sell_fees_native_paise, buy_date, sell_date,
+  kind)` per lot, `kind` being `fifo` or `intraday` — so realised gain, transfer expenses *and holding period* are recoverable per sold lot
+  (the input to the F11 capital-gains statement). The rows are rebuilt per instrument on every
+  investment write. No write may leave a sell without units at its own date (ADR-0015 rule 9);
+  a back-dated sell, or deleting a buy a later sell depends on, is refused.
 - **`sip`** — alias of `buy`, kept as a separate type only so reports can show
   "regular SIPs" distinct from one-off buys.
-- **`dividend`** — **cash payout, not a buy**. Records the dividend amount per
+- **`dividend`** — **cash payout, not a buy**. For a mutual fund this is an **IDCW** payout
+  (Income Distribution cum Capital Withdrawal, SEBI's name since April 2021); UI copy says
+  IDCW for MFs and keeps "dividend" for stocks. Records the payout amount per
   instrument; does *not* create new units. Dividends *do* count in XIRR cashflows
   (they are positive cashflows out of the holding back to you). Stored as a row with
   `units=0`, `amount_native > 0`, `transaction_type='dividend'`.
@@ -604,7 +731,11 @@ config module**, never inline literals. Three accounting subtleties must flow th
 lot-match or the statement diverges from the AMC's own CG report: `bonus` units carry **zero
 cost basis** and start their *own* holding period at the bonus date; `split` preserves the
 original lot's holding period (it adjusts prior buys in place, above); `switch_out` is itself
-a realised-gain event.
+a realised-gain event. **Foreign assets** (USD holdings) convert the gain for tax at SBI's TT
+buying rate on the last day of the month before the sale (Rule 206 of the Income-tax Rules,
+2026; Rule 115 for FY 2025-26 and earlier) — not the stamped `fx_rate_to_inr`, which stays the
+XIRR / portfolio rate ([ADR-0014](docs/adr/0014-tax-fx-rule-206.md), *Proposed* until a CA
+rules on converting cost of acquisition).
 
 **Out of scope v1**: per-lot manual override of FIFO selection (i.e. "I want to sell this
 specific lot for tax-loss harvesting" — the realised-gain statement is reporting-only, see F11;
@@ -613,14 +744,21 @@ actually needed.
 
 ### F8. Dashboards
 
-**v1 (5 views):**
+**v1 (6 views):**
 
 1. **Live portfolio summary tiles** (top of every page) — current portfolio value in
-   INR, today's change (₹ and %), this-month change, this-year change. Auto-refreshes
+   INR, today's change (₹ and %), this-month change, this-year change. **Investment
+   years are the Indian financial year** (1 Apr – 31 Mar, labelled "FY 2026-27"): this
+   tile's this-year change and every F11 tax report. **Spend years are the calendar year**
+   (1 Jan – 31 Dec, labelled "2026"): the spend summary strip, views 2, 3 and 6, every
+   spend year picker, and the credit-card YTD in view 4. Spending is read the way a
+   household budgets, by calendar year, and the FY applies only where tax does. "Today" is
+   the IST business date (ADR-0001). Auto-refreshes
    per F9. The spend-side summary strip alongside these shows the current month's
    spend total, a month-over-month delta against the same day-span last month, a
-   weekly spend sparkline, and the month's income. **No savings-rate tile ships**
-   — `net / income` would be a ratio over the existing `GET
+   weekly spend sparkline, and the month's income (signed, so income reversals net it
+   down; refunds and purchase cashback net spend down the same way, ADR-0009 / ADR-0013).
+   **No savings-rate tile ships** — `net / income` would be a ratio over the existing `GET
    /dashboards/period-totals`, but it is not built; earlier drafts of this
    document asserted it in three places.
 2. **Monthly spend by category** — stacked bar or pie, current month default with
@@ -634,8 +772,8 @@ actually needed.
    types are excluded outright**, for opposite reasons. **Credit cards** are not
    contributed as a clamped liability: no bill payment is ever recorded against a
    card, so its balance is accumulated *spend*, not debt, and folding it in would
-   subtract a full month's card spend from net worth. A card's calendar-YTD spend
-   rides along separately on `spend_ytd_paise`. **Investment accounts** are
+   subtract a full month's card spend from net worth. A card's calendar-year-to-date
+   spend rides along separately on `spend_ytd_paise`. **Investment accounts** are
    placeholders holding no money of their own (§F6 pins their opening balance to
    zero), and the value they would represent is already counted as the portfolio's
    current value — adding both double-counts it. The accounts list still reports
@@ -656,16 +794,23 @@ actually needed.
    a later milestone**: a time-series portfolio curve needs dense per-holding historical
    NAV (see §Roadmap), and the cheap money-weighted shortcut degenerates to a misleading
    flat line — so v1 delivers the one trustworthy number instead of a wrong picture.
+6. **Category trend** (`GET /dashboards/category-trend?months=12`) — monthly spend
+   per **parent** category over the last 12 months (the six largest parents in the window, the
+   rest folded into one series and Uncategorized its own), with a click-through to that parent's
+   subcategories month by month (click a parent to drill in). Sums are signed, so refunds and purchase cashback net their
+   month down (ADR-0009 / ADR-0013); archived subcategories roll into their parent, since
+   rollup follows `parent_id` (ADR-0012). Year boundaries (1 January) are marked on
+   the axis. It answers "is this category growing?", which view 2's single month cannot. The
+   net-worth-over-time trend stays unbuilt (view 4).
 
 **v1.1 (deferred, single weekend after v1 ships):**
 
-6. **Spend trend over time** — line chart, last 12 months, optional category filter.
 7. **Investment portfolio breakdown** — table of holdings (units, avg cost, current
    value, XIRR, % allocation) + donut by asset class.
 
 v1.1 features are split out because v1 delivers the core "what did I spend, what am I
-worth" loop; v1.1 adds drilldown and analytics. Both v1.1 dashboards depend on the
-same underlying APIs — splitting is purely scope discipline, not extra work.
+worth" loop; v1.1 adds drilldown and analytics. (The v1.1 spend-trend view became v1 view 6,
+the category trend.) The v1.1 dashboard depends on the same underlying APIs — splitting is purely scope discipline, not extra work.
 
 ### F9. Live / reactive updates
 
@@ -738,9 +883,12 @@ same underlying APIs — splitting is purely scope discipline, not extra work.
 - **Restore (shipped)**: `POST /backup/import` plus a "Load backup" control on
   Settings → Backup. **Additive and non-destructive** — rows already present are skipped
   by recomputed fingerprint, so re-importing after adding transactions tops up rather
-  than wiping. Accounts and categories are matched-or-created; transfers are relinked.
+  than wiping. Accounts and categories are matched-or-created; transfers are relinked when
+  both legs land (a lone leg is kept unpaired with a warning).
+  The zip carries `format_version` 3 in `metadata.json`, and every column is required; any
+  other version is refused with a 422.
   There is no CLI script (`scripts/` holds only `package_source.py`,
-  `redact_fixture.py`, `refresh_skills.py`), and none is wanted — a second CSV-load
+  `redact_fixture.py`), and none is wanted — a second CSV-load
   implementation would drift from `backup_import_service`'s fingerprint / occurrence
   handling. Restore *from Drive* remains v2.
 - **Caveat called out for the user**: CSVs cover portability (open in Excel) and
@@ -753,7 +901,8 @@ same underlying APIs — splitting is purely scope discipline, not extra work.
 Year-end reporting built on the F7 realised-gain lot-match + the dividend rows. Framing
 throughout: **a statement to reconcile against your AMC / broker CG report and your AIS /
 Form 26AS before filing — not tax advice, and not a return.** Two FY-scoped reports
-(financial year = 1 Apr – 31 Mar):
+(financial year = 1 Apr – 31 Mar). Under the Income-tax Act, 2025 the FY is also the **tax
+year**, labelled "Tax Year 2026-27"; "assessment year" applies only to FY 2025-26 and earlier:
 
 - **Capital-gains statement** — one row per sold lot: instrument, buy date, sell date, units,
   cost basis, proceeds, realised gain/loss, and a bucket tag (**STCG** / **LTCG** /
@@ -761,17 +910,23 @@ Form 26AS before filing — not tax advice, and not a return.** Two FY-scoped re
   **₹1.25 L exemption** surfaced as an explicit line (gross LTCG → exemption applied → net
   shown for *reconciliation*, not as a filing figure). Computed query-time from the persisted
   lot-match; no cache table.
-- **Dividend income summary** — rollup of `transaction_type='dividend'` rows per FY as *Income
-  from Other Sources* (slab-taxed since FY 2020-21), for AIS / Form 26AS TDS reconciliation. A
+- **Dividend income summary** — rollup of `transaction_type='dividend'` rows (stock dividends
+  and MF IDCW payouts) per FY as *Income from Other Sources* (slab-taxed since FY 2020-21), for AIS / Form 26AS TDS reconciliation. A
   group-by over data that already lands today; no schema change.
+- **Intraday trades** — listed apart from capital gains: one row per same-day match of an
+  Indian listed share (instrument, date, units, buy value, sell value, profit or loss), labelled
+  *speculative business income* and never added to a capital-gains bucket
+  ([ADR-0015](docs/adr/0015-fifo-lot-matching.md) rule 8). F11 reports it; it does not compute
+  the tax on it (slab rates and its own loss rules). Built: `GET /tax/intraday-trades?year=`,
+  `GET /tax/available-years` and the /tax page.
 
 **Out of scope v1**: net-taxable-position computation, capital-**loss** set-off
-(STCL → STCG+LTCG, LTCL → LTCG only), 8-AY loss carry-forward, and return-filing-date tracking
+(STCL → STCG+LTCG, LTCL → LTCG only), 8-tax-year loss carry-forward, and return-filing-date tracking
 — all v2 (§Roadmap). v1 reports gains to *reconcile*; it does not optimise tax.
 
 ## Data model (high level)
 
-Regenerated from `backend/app/models/` — 15 tables. Every table also carries
+Regenerated from `backend/app/models/` (read them for the current table list). Every table also carries
 `created_at` / `updated_at` via `TimestampMixin` (omitted below except where noted).
 
 ```
@@ -782,16 +937,30 @@ sessions (id, user_id, family_id, token_hash, expires_at, revoked_at)
 accounts (id, user_id, name, type, issuer, last4, opening_balance_paise, currency,
           parent_account_id, archived_at)
 categories (id, user_id, name, kind, is_seeded, archived_at, color, parent_id)
-  -- parent_id: nullable self-FK, NULL = a parent row. Depth is capped at 2 (ADR-0012),
-  -- enforced in the router. color NULL on a subcategory means "inherit the parent's".
+  -- parent_id: nullable composite same-user self-FK, ON DELETE NO ACTION; NULL = a parent
+  -- row. Depth is capped at 2 (ADR-0012), enforced in the router. color is never NULL on a root (CHECK ck_categories_root_has_color); NULL on a subcategory means "inherit the parent's".
 transactions (
   id, user_id, account_id, date, amount_paise, transaction_type, merchant_raw,
   merchant_normalized, category_id, auto_category_id, fingerprint, occurrence,
-  source ('import'|'manual'), import_batch_id, confirmed_at, transfer_pair_id
+  source ('import'|'manual'), import_batch_id, confirmed_at, transfer_pair_id,
+  pre_link_type, pre_link_category_id, refund_of_id, origin_fingerprint, origin_date, origin_amount_paise,
+  origin_merchant_normalized, origin_account_id
 )
   -- occurrence: the F4 multiset ordinal (ADR-0006) — identity lives in the hash,
   -- multiplicity in this column. confirmed_at: NULL = still in the review queue,
-  -- so the board and every dashboard filter on it. transfer_pair_id: the F4a link.
+  -- so the board and every dashboard filter on it. transfer_pair_id: the paired-rows
+  -- link (ADR-0002), written by F4a auto-link, the manual link, F2 user transfers and backup
+  -- restore; CHECK paired_is_transfer: a paired row is a transfer. pre_link_type: the type an
+  -- existing row had before F4a or the manual link made it a transfer (ADR-0002 rule 9);
+  -- unlink and partner-delete restore and clear it; NULL on F2-born legs; carried by
+  -- backup. pre_link_category_id: the category that link cleared (composite same-user FK to
+  -- categories); restored by unlink unless the user set a category on the leg since; CHECK
+  -- pre_link_category_while_linked allows it only on a paired, uncategorised row; carried by
+  -- backup. refund_of_id: optional refund → original link (ADR-0009 rule 13), composite
+  -- same-user self-FK, target a confirmed negative spend; informational, never read by sums.
+  -- origin_fingerprint: the statement line the row came from (ADR-0006 rule 17); the origin_*
+  -- inputs are set by the first identity edit (all four or none), origin_account_id a
+  -- composite same-user FK to accounts.
 merchant_tag_map (id, user_id, merchant_normalized, category_id, hit_count, last_used,
                   pinned)   -- pinned = user-authored, outranks a higher hit_count
 merchant_label_map (id, user_id, merchant_normalized, label_id, hit_count, last_used,
@@ -801,7 +970,7 @@ labels (id, user_id, name)   -- F3a user tags; name unique per user
 transaction_labels (transaction_id, label_id, user_id)  -- M2M; composite same-user FKs
                                                         -- + ON DELETE CASCADE
 import_batches (id, user_id, account_id, source_file_hash, parser_name, imported_count,
-                skipped_count, status, error_message)
+                skipped_count, status)
 instruments (id, user_id, symbol, name, asset_class, currency, exchange, current_nav,
              nav_updated_at, archived_at, isin, amfi_code)
 investment_transactions (id, user_id, instrument_id, date, transaction_type, units,
@@ -812,18 +981,22 @@ investment_transactions (id, user_id, instrument_id, date, transaction_type, uni
                          -- legs of one event (IDCW reinvestment dividend+buy; reserved
                          -- for switch_out/switch_in). fingerprint is NULLABLE here
                          -- (manual rows have none) unlike transactions.fingerprint.
+                         -- fx_rate_to_inr: server-stamped at the transaction date,
+                         -- no default (ADR-0016).
+realised_lots (id, user_id, sell_txn_id, buy_txn_id, units, cost_native_paise,
+               proceeds_native_paise, sell_fees_native_paise, buy_date, sell_date,
+               kind ('fifo' | 'intraday'))
+  -- the persisted lot match (ADR-0015 rules 5, 7): one row per lot a sell/switch_out consumed,
+  -- and one per same-day buy it netted (kind fifo | intraday), no default on kind;
+  -- rebuilt per instrument on every investment write; proceeds/sell_fees are the lot's shares
+  -- of the sell's gross amount_native_paise / fees_native_paise and sum exactly to them.
+  -- Composite same-user FKs to investment_transactions, ON DELETE CASCADE. Derived: not in the backup.
 fx_rates (id, date, from_currency, to_currency, rate, source)
 benchmarks (id, name, kind ('index_fund'), amfi_code, currency, inception_date,
             archived_at)
 benchmark_nav (id, benchmark_id, nav_date, nav)   -- column is nav_date, NOT date.
                                                  -- Price cache, backfilled at seed time
 ```
-
-**Not built yet** (listed here only so the F11 design has a target — do not write queries
-against it): `realised_lots (id, user_id, sell_txn_id, buy_txn_id, matched_units,
-matched_cost_paise, buy_date, sell_date)`, the FIFO match audit trail. No model, no
-migration; `holdings_service._consume_fifo` currently discards the consumed lots. See
-§Build sequencing v0.8.
 
 - All amounts stored as `paise` / `cents` (int64) to dodge float precision issues.
 - Soft-delete via `archived_at` on accounts / categories. Hard-delete on transactions
@@ -838,8 +1011,8 @@ migration; `holdings_service._consume_fifo` currently discards the consumed lots
   cold-XIRR in milliseconds for <100 holdings; net-worth is a query-time aggregate.
   Both tables would add complexity (invalidation logic, snapshot scheduling) for no
   observable win at personal scale. Revisit if XIRR computation ever exceeds 200ms.
-- **`realised_lots`** persists the FIFO match (F7): one row per buy lot a sell consumes, so
-  the F11 capital-gains statement recovers realised gain + holding period per sold lot. A
+- **`realised_lots`** persists the FIFO match (F7, ADR-0015 rule 5): one row per buy lot a sell
+  consumes or same-day buy it nets, marked fifo or intraday, so the F11 capital-gains statement recovers realised gain + holding period per sold lot. A
   table (not denormalized columns on `investment_transactions`) because one partial sell can
   consume N buy lots. `_paise` int64, SQLAlchemy 2.0 declarative — no SQLite-only idioms. No
   FY-report cache table: the statement is a query-time aggregate, consistent with the
@@ -849,7 +1022,7 @@ migration; `holdings_service._consume_fifo` currently discards the consumed lots
 
 | Layer       | Choice                                                 | Why                                                       |
 | ----------- | ------------------------------------------------------ | --------------------------------------------------------- |
-| Backend     | **Python 3.13 + FastAPI**                              | User pick. Pydantic v2 for schemas.                       |
+| Backend     | **Python 3.14 + FastAPI**                              | User pick. Pydantic v2 for schemas.                       |
 | ORM / migr. | **SQLAlchemy 2.0 + Alembic**                           | Type-safe sessions; trivial SQLite → Postgres swap later. |
 | Database    | **SQLite (v1)** → Postgres (v2 / hosted)               | Zero ops for personal use; Alembic migrations portable.   |
 | PDF parsing | **pdfplumber 0.11.9** (Jan 2026) + **pikepdf 10.6.0** (Mar 2026) | See "PDF parsing library choice" below for rationale.     |
@@ -940,11 +1113,11 @@ doubles as deliberate practice.
   - **bankstatementparser** — bundles parsers + local-LLM fallback but is tuned for
     Western banks; Indian formats aren't first-class. Worth re-evaluating in v2 if
     parser maintenance becomes painful.
-- **Python 3.13 support**: confirmed for both. pdfplumber's CI explicitly tests
+- **Python 3.14 support**: confirmed for both. pdfplumber's CI explicitly tests
   against 3.10–3.14 (per its README). pikepdf 10.6.0 ships binary wheels for cp310
-  through cp314. 3.13 was chosen over 3.14 (latest) to buy ~18 months of ecosystem
-  maturity in transitive deps at zero functional cost — matters given the
-  one-upgrade-weekend-per-year ceiling.
+  through cp314. The project runs on 3.14 only (`requires-python = ">=3.14,<3.15"`,
+  [ADR-0005](docs/adr/0005-type-checker-ty.md)); 3.13 was the original pick, for ecosystem
+  maturity, until every dependency shipped cp314 wheels.
 
 ## Production-grade essentials
 
@@ -973,8 +1146,9 @@ to see in a serious Python+TypeScript repo are committed scope, not "nice to hav
     eslint-config-next + a `prettier --check` step is scoped work with its own
     verification, not a doc edit — and there are no frontend tests to catch an
     autofix regression.
-- **CI** (`.github/workflows/ci.yml`): on push and PR — install, lint, type-check,
-  run tests, build the Next.js bundle. Matrix: Python 3.13 + Node 24 (matching `.nvmrc`).
+- **CI** (`.github/workflows/`: `test-backend.yml`, `test-frontend.yml`, `pre-commit.yml`,
+  plus security and Docker builds): on push and PR — install, lint, type-check, run tests,
+  build the Next.js bundle. Python 3.14 + Node from `.nvmrc`.
 - **Local dev**: `docker-compose.yml` at the repo root, brings up the FastAPI
   backend (SQLite mounted as a volume) + the Next.js dev server. `make dev` runs it.
 - **Cloud deploy recipe** (for v1.5): a `fly.toml` (or `railway.json`) that deploys
@@ -983,16 +1157,18 @@ to see in a serious Python+TypeScript repo are committed scope, not "nice to hav
 - **Structured logging**: `structlog` on the backend with JSON output in non-dev
   mode. Every request logs `request_id`, `user_id`, `route`, `duration_ms`,
   `status`. Import operations log `import_batch_id`, `parser`, `rows_in`,
-  `rows_imported`, `rows_skipped`. No PII (PAN, account numbers, card last-4) in
+  `rows_imported`, `rows_skipped`. No PII (PAN, account numbers, card last-4, Aadhaar) in
   logs — masking happens at the logger
   (`mask_pii`), never the call site. **Coverage is deliberately narrow, and the
-  shape matters**: only PAN and 16-digit cards have free-text regexes
-  (`core/pii_patterns.py` — `PAN_RE`, `CARD_RE`), so those are scrubbed wherever
+  shape matters**: only PAN, 16-digit cards and 12-digit Aadhaar numbers have free-text
+  regexes (`core/pii_patterns.py`), so those are scrubbed wherever
   they appear, including inside exception messages. Account numbers are masked
   **by field name only** — a value passed under a known key becomes `"***"`, but
   a bare account number interpolated into a message or an exception string is
   **not** scrubbed. Pass PII as a structured field; never build it into the event
-  string. 13-digit Visa and 15-digit Amex are out of scope, matching
+  string. Uploaded statements are a separate guarantee: the file, its extracted text and its
+  password are never persisted or logged at all (§F1, ADR-0010 rule 13), so masking is not
+  what protects them. 13-digit Visa and 15-digit Amex are out of scope, matching
   `scripts/redact_fixture.py`; the two pattern sets are pinned equal by
   `tests/test_fixture_redaction.py::test_redact_script_pattern_parity`.
 - **Error tracking** (v1.5): Sentry free tier, FastAPI middleware + Next.js SDK.
@@ -1004,8 +1180,9 @@ to see in a serious Python+TypeScript repo are committed scope, not "nice to hav
 
 - `backend/app/parsers/` — per-source statement parsers implementing a common
   `StatementParser` protocol:
-  - `axis_cc.py`, `icici_cc.py` — spending statements (the two shipped). No HDFC and no
-    bank-statement parser exists; see §F1 Issuers.
+  - `axis_cc.py`, `icici_cc.py` — credit-card spending statements. No HDFC card parser.
+  - `hdfc_bank.py`, `icici_bank.py`, `sbi_bank.py`, `axis_bank.py` (with the shared `bank.py`) —
+    savings-account statements; see §F1 Issuers.
   - `investment_csv.py` — canonical investment-transaction CSV parser (broker / AMC
     exports; `HEADER_ALIASES` column map; standalone, not a `StatementParser`)
   - `indmoney_us.py` — INDmoney US transaction export
@@ -1048,7 +1225,7 @@ this harder than HTMX would, but with discipline it's achievable. Rules:
     not `"^16.2.10"`), `pnpm-lock.yaml` committed. Use `pnpm` (not `npm`) for faster
     installs and stricter dependency resolution.
 - **Pick LTS, stay on LTS**: Next.js LTS, Node.js LTS (24.x as of Jul 2026),
-  Python 3.13. Don't chase. Skip every minor version that isn't security-relevant.
+  Python 3.14. Don't chase. Skip every minor version that isn't security-relevant.
 - **Cap the dep list aggressively**: every npm dependency added is a future
   upgrade-weekend tax. The minimal set: `next`, `react`, `react-dom`, `typescript`,
   `tailwindcss`, `@tanstack/react-query`, `zod` (for client-side validation),
@@ -1104,10 +1281,10 @@ next milestone never ships):**
   page. The "am I beating the market" number; the moving line chart stays deferred (Roadmap).
   (Promotes `httpx` to a prod dep here, ahead of its v0.5 FX use.)
 - **v0.7 — export + Drive sync.** CSV export, Drive OAuth, manual sync.
-- **v0.8 — tax statements & reporting (F11).** Persist the FIFO lot-match (extend
-  `holdings_service._consume_fifo` to *emit* the consumed lots into `realised_lots` — today it
-  discards them), add realised-gain classification (STCG / LTCG / debt-slab), and build the
-  capital-gains statement + dividend-income summary endpoints and pages. Depends on the F7
+- **v0.8 — tax statements & reporting (F11).** The FIFO lot-match is already persisted
+  (`realised_lots`, rebuilt by `holdings_service.rebuild_realised_lots` on every investment
+  write); add realised-gain classification (STCG / LTCG / debt-slab), and build the
+  capital-gains statement + dividend-income summary endpoints and sections of the /tax page. Depends on the F7
   investment lots (v0.4). *No loss set-off, no carry-forward* — that's the v2 optimiser
   (Roadmap). Goal: a statement you can reconcile against your AMC CG report + AIS at filing.
 - **v1.0 — production polish.** README screenshots, all tests passing, CI green,
@@ -1124,7 +1301,7 @@ next milestone never ships):**
 - **v1 (this PRD)** — everything above.
 - **v1.5** — basic auth, deployable to a cloud box.
 - **v2** — OCR for scanned bills; recurring-transaction detection; budgets & alerts;
-  capital-gains **loss set-off** (STCL → STCG+LTCG, LTCL → LTCG) + 8-AY carry-forward +
+  capital-gains **loss set-off** (STCL → STCG+LTCG, LTCL → LTCG) + 8-tax-year carry-forward +
   net-taxable computation (the F11 statement reports gains only in v1); a
   **tax-loss-harvesting** view (needs the per-lot override deferred in F7 + per-lot
   *unrealised* gain, currently aggregate-only);
@@ -1153,7 +1330,7 @@ next milestone never ships):**
     identity off the row and collides with [ADR-0006](docs/adr/0006-f4-dedup-key.md). It is
     also the only dedup-safe way to split: today's delete-and-re-enter workaround discards
     `origin_fingerprint`, so re-importing that statement re-stages the original line
-    ([ADR-0007](docs/adr/0007-transaction-field-editability.md) rule 9). The work is a
+    ([ADR-0006](docs/adr/0006-f4-dedup-key.md) rule 9). The work is a
     parent-exclusion predicate applied consistently across every §F8 aggregate — miss one and
     it double-counts (research §13.3).
   - **Per-category exclude-from-totals** — **not being built** (decided 2026-08-12). Lunch
@@ -1189,8 +1366,8 @@ End-to-end test once built:
      row surfaces it with `cc_payment_candidate = true`; choosing *Card bill payment* stages it
      with `category_id` still NULL, and committing it alongside an imported bank debit of equal
      magnitude within ±2 days flips both rows to `transfer` with a shared `transfer_pair_id`
-     (F4a-1). With no matching debit it commits as uncategorized `income` and **never** appears
-     in an income category total.
+     (F4a-1). With no matching debit it commits as an unpaired `transfer` in no category and
+     counts in neither spend nor income.
    - **Column detection on a serial-numbered table**: a statement whose rows carry a leading
      serial-number column (`1`, `2`, …) parses with the real amount, not `₹1` — the amount
      column is detected *after* the date column, never from index 0, since a bare digit string
@@ -1210,8 +1387,9 @@ End-to-end test once built:
      paths (statement, investment CSV, backup restore) share one allocator and must show
      this same behaviour — they had three copies of it, and the copies drifted once.
    - **The pending feed never labels a batch with another user's account**
-     ([ADR-0003](docs/adr/0003-multi-user-auth.md)): `import_batches.account_id` is a
-     plain FK, so store a batch of your own pointing at another user's account →
+     ([ADR-0003](docs/adr/0003-multi-user-auth.md) rule 7): the composite same-user FK
+     refuses it, so with FK checks off store a batch of your own pointing at another user's
+     account →
      `GET /imports/pending` shows the batch with a **null** name and last4, never theirs.
      A batch with no account at all (backup restore) still appears in the feed — the
      user predicate belongs in the join's ON clause, not the WHERE.
@@ -1223,8 +1401,9 @@ End-to-end test once built:
      interchangeable across the three** and the field set alone does not make them so:
      `rows_in` is parser output for statements, post-parse rows for the investment CSV, and
      `transactions.csv` rows only for a restore (accounts/categories are counted separately);
-     `rows_skipped` bundles zero-paise rows with duplicates for statements and means
-     duplicates only for the other two. What IS uniform, and is the thing to assert, is
+     `rows_skipped` means duplicates on all three paths. A statement's zero-amount lines
+     count as `rows_rejected` (ADR-0009 rule 3); a restore logs its zero-amount rows under
+     `rows_parse_skipped`, outside `rows_in`. What IS uniform, and is the thing to assert, is
      `rows_in == rows_imported + rows_skipped + rows_rejected` on every path — including a
      re-upload, where the investment importer's hash short-circuit reports every row skipped
      rather than reporting nothing at all.
@@ -1236,14 +1415,52 @@ End-to-end test once built:
      statement with no summary block (the Axis Flipkart layout) imports with the check simply
      not run — never a parse error. A credit-card "Total Amount Due" of ₹X stores as **−X
      paise**: owed is negative, matching `opening_balance_paise` for a card.
+   - **Zero-row statement** ([ADR-0010](docs/adr/0010-parsed-statement-return.md)): a
+     statement whose period has no transactions but prints a summary imports as an empty batch
+     carrying its balances, never an error. One with neither rows nor a summary is rejected.
+     A statement that prints no period stores none; the reconciliation window is computed and
+     never written back, and the review screen's header says "Statement period not printed". On
+     the upload screen, a statement with no transactions says so ("This statement has no
+     transactions.") rather than claiming they are already in expenses. A statement whose
+     only lines are zero-amount reads the same and says how many zero-amount lines it left
+     out; it is never refused, even with no summary.
+   - **Bank statement** ([ADR-0010](docs/adr/0010-parsed-statement-return.md)
+     rules 7, 11–12): import a redacted savings-account PDF from each shipped bank parser →
+     rows match the snapshot, and the batch reconciles with a **positive** closing balance
+     (money held). Alter one row's amount in the extracted table fixture → the parser fails
+     with an error naming that page and row, and nothing imports. A failed UPI debit and its
+     same-day reversal import as a negative and a positive `spend` that net to exactly zero,
+     and neither is dropped as a duplicate. A card-bill debit arrives flagged as a payment
+     candidate.
+   - **Uploads are not kept** ([ADR-0010](docs/adr/0010-parsed-statement-return.md) rule 13):
+     upload a password-protected statement, then a corrupt one → no file appears on disk, no
+     column holds the PDF bytes, its text or the password, the logs carry neither the password
+     nor statement text, and a failed upload stores no batch. An upload over the cap is refused
+     with 413 before its body is read in full.
 2. **Auto-tag**: Tag 5 transactions with categories → upload next month's statement →
    confirm same merchants are pre-categorised.
    - **Prefill never crosses users** ([ADR-0003](docs/adr/0003-multi-user-auth.md)):
-     `merchant_tag_map.category_id` is a plain FK, so store a map row of your own
-     pointing at another user's category → it is absent from the prefill map, and no
+     the composite same-user FK refuses it, so with FK checks off store a map row of your
+     own pointing at another user's category → it is absent from the prefill map, and no
      imported row is stamped with that `auto_category_id`. This is the one
      merchant-memory read whose result gets written back onto data.
+   - **One gesture, one teach** ([ADR-0004](docs/adr/0004-f3-learning-lifecycle.md)): bulk
+     re-categorise 10 board rows of one canonical merchant → that merchant's `hit_count` rises
+     by exactly 1, in one atomic request. Correct one row, accept **"apply to past rows"** → the
+     recent board rows of the same canonical merchant move, and `hit_count` again rises by 1.
+     Archive the category a rule points at → `rules_count` drops by one.
 3. **Manual entry**: Add a cash spend → verify it appears in monthly spend by category.
+   - **Signs** ([ADR-0009](docs/adr/0009-refund-as-signed-spend.md)): a positive `spend` in the
+     same category nets that category down (a refund); a negative `income` nets its income
+     category down (a reversal); zero is a 422 for every type. Link the refund to its original
+     spend → the totals do not move; link it to an `income` row or another user's spend → 422.
+   - **Cashback** ([ADR-0013](docs/adr/0013-cashback-is-a-rebate.md)): a card cashback credit
+     lands as a positive `spend` in the spend-kind Cashback category, lowers net spend, and
+     leaves income unchanged; a referral bonus entered as `income` raises income.
+   - **Unicode spelling** ([ADR-0006](docs/adr/0006-f4-dedup-key.md) rule 3): add a cash spend whose
+     merchant carries an accent, then post the same date, amount and account with the accent sent
+     as a separate combining mark (via the API, `e\u0301`) → 409 duplicate, and /settings/rules →
+     New rule offers the merchant once.
 4. **Investments**:
    - **Indian MFs / equities via CSV**: import a broker / AMC transaction CSV → confirm
      each `symbol` appears as an `instrument` and every buy / sip / dividend lands as an
@@ -1256,6 +1473,11 @@ End-to-end test once built:
    - **US stocks via INDmoney**: import an INDmoney transaction export → confirm
      tickers appear with `currency = USD`, transactions have `fx_rate_to_inr`
      stamped from the date's FX rate, and current INR-value rolls up correctly.
+   - **Asset-class currency is a database rule**: insert an `instruments` row by raw SQL with
+     `asset_class = 'indian_equity'` (or `nps`) and `currency = 'USD'`, or `us_etf` with `INR` →
+     the database refuses it (`ck_instruments_inr_only_asset_class` /
+     `ck_instruments_usd_only_asset_class`). The same body on `POST /instruments` is a 422 and in
+     an investment CSV a skipped line; a USD `fd` is accepted.
    - **XIRR**: pick one MF holding with ≥6 months of history → verify computed XIRR
      matches an external calculator (groww / kuvera / online XIRR tool) to within
      0.1%.
@@ -1266,6 +1488,14 @@ End-to-end test once built:
      it opened a real FIFO lot rather than blending into the original. XIRR stays within
      0.1% of an external calculator, since the pair nets to zero. Delete either leg →
      the survivor's `pair_id` is NULL and the other row is untouched.
+   - **Same-date FIFO order** ([ADR-0015](docs/adr/0015-fifo-lot-matching.md)): import a file
+     with two buys of one fund on the same date at different prices, then a partial sell → the
+     sell consumes the lot that appears first in the file, whatever its id or price.
+   - **Stamped FX never moves** ([ADR-0016](docs/adr/0016-fx-stamped-at-transaction-date.md)):
+     backfill or correct an `fx_rates` row for a past date → existing USD rows keep their
+     `fx_rate_to_inr` and invested INR. A USD row with no cached rate on or before its date
+     is refused, never stamped at 1, and an instrument the file would have created for it
+     alone is not left behind (a re-upload after `POST /fx/refresh` creates it).
    - **NAV / price snapshot**: trigger the snapshot (the sync icon on /portfolio or
      /holdings) →
      a held Indian MF's `current_nav` + `nav_updated_at` update from AMFI NAVAll (matched by
@@ -1301,20 +1531,63 @@ End-to-end test once built:
    check `GET /dashboards/overview` reports that amount exactly once — then confirm
    /dashboard's Assets · Investments · Owed line still sums to the headline. Not
    built, so not checked here: the net-worth-over-time trend and a savings-rate tile.
+   - **Calendar year on the spend side**: with data on 31 December and 1 January, the YTD
+     tiles on 15 January cover 1 January onward only and are labelled "2027" (for that year);
+     a year pick of "2026" totals 1 January – 31 December 2026. At 01:00 IST on 1 January,
+     "today" is already 1 January. The /tax year picker still offers FY start years.
+   - **Category trend** (view 6): for each of the last 12 months, every parent's
+     trend value equals that month's parent total in the monthly-by-category view (view 2),
+     to the paisa. A refund in March lowers March's bar; archiving a subcategory leaves its
+     history inside its parent's line; the 1 January boundary is marked.
 6. **Reconciliation rules** (F4a):
-   - **CC-bill double-count**: no bank-statement parser exists for any issuer, so this
-     is exercised via **manual entry** rather than a second import. **Order matters —
-     the bank leg must exist first.** `auto_link_cc_bill` runs from exactly one place,
-     the import batch-commit endpoint, and never on `POST /transactions`, so a bank-side
-     row added *after* the commit will not retro-link. Steps: in /settings/accounts
-     create a bank account and a CC, then edit the CC and set **"Paid from"** to that
-     bank (the F4a rule-1 link gate — without it the reconciler returns early and the
-     payment stays `income`) → add the matching bank-side debit by hand (F2) on that bank
-     for the bill amount, dated D, and confirm it → import a CC statement containing a
-     `PAYMENT RECEIVED` credit dated D → **commit the review queue** → confirm the two
-     rows are auto-linked as `transfer` (sharing `transfer_pair_id`), are excluded from
-     monthly spend, and that `GET /dashboards/overview` `income_paise` for that month no
-     longer includes the bill. Re-check when a bank parser lands.
+   - **CC-bill double-count, from two imports**: in /settings/accounts create a savings account
+     on a shipped bank parser (HDFC, ICICI, SBI or Axis) and a credit card, then edit the card and
+     set **"Paid from"** to that bank (the F4a rule-1 link gate — without it the reconciler
+     returns early and neither leg links). Import and commit the card statement whose period
+     covers date D and which carries a `PAYMENT RECEIVED` credit dated D → it is an unpaired
+     `transfer` for now, out of income. Import the bank statement carrying the bill debit of the same amount,
+     dated within ±2 days of D → the review queue offers *Card bill payment* on it → commit it as
+     one → the two rows are linked as `transfer` (sharing `transfer_pair_id`), are excluded from
+     monthly spend, and `GET /dashboards/overview` `income_paise` for that month never
+     includes the bill. Committing the bank statement first gives the same pair at the card's
+     commit ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md) rule 7); until then the debit
+     counts as spend in Other, because no statement of the card covers its date yet.
+     `auto_link_cc_bill` runs only at an import batch commit, never on `POST /transactions`. Use
+     real statements once that bank's and that card's parsers have been checked against a real
+     PDF; until then `tests/api/test_imports_review.py::test_commit_links_a_covered_card_bill_debit_to_a_card_payment_on_the_board`
+     (card first) and `::test_commit_links_a_card_payment_to_an_earlier_card_bill_debit_counted_as_spend`
+     (bank first) run both orders through the HDFC parser's table interpreter on a hand-built
+     table, with the card parser stubbed.
+   - **Unlinked card-bill debit** ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md)
+     rule 7b): with "Paid from" set, commit a card statement whose period covers date D but which
+     carries no matching payment → import the bank statement with a bill debit dated D → the
+     review copy says it stays out of spend → commit it as a *Card bill payment* → on the board
+     it is an unpaired `transfer` in no category: absent from spend, never in Other, while the
+     account balance still moves. Commit the card's next statement carrying the matching
+     `PAYMENT RECEIVED` within ±2 days → the two rows link, and unlinking leaves the bank debit a
+     `transfer`. A bill debit dated outside every committed statement of the card (history from
+     before you tracked it, a month not imported yet), or on a bank no card names as "Paid from",
+     reads "imports as Other" and commits as spend in Other. Choosing a category in review commits
+     it as spend in that category either way. In a guest session the bundled samples show both:
+     the "HDFC Bank savings account, June 2025" debit `CC 000000XXXXXX0000 AUTOPAY SI-TAD`
+     (15/06/2025, ₹12,345.67) reads "imports as Other" until the "Axis Bank credit card, June 2025"
+     sample is committed into the card that names that account "Paid from", then "stays out of
+     spend"; the two samples' amounts differ, so they never link.
+   - **Manual link** ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md) rule 11b): with
+     a card credit and a bank debit that auto-link missed (no "Paid from" set, or dates
+     far apart), choose "Paid your card bill elsewhere?" on the card row and pick the bank
+     row → both become `transfer` sharing `transfer_pair_id`, and unlink restores their
+     earlier types and categories. Picking a bank row whose amount differs by ₹1 is a 422, as is a row of
+     another user, an already-paired row, a row in a refund link, or a row on the same account;
+     no tag rule moves.
+   - **Unlink restores the pre-link type and category** ([ADR-0002](docs/adr/0002-transfer-pair-id-semantics.md)
+     rule 9): unlink an auto-linked pair → each leg returns to the type and category it had
+     before linking, unless you set a category on the linked leg. A card credit committed as a card
+     bill payment was already a `transfer` and stays out of income. A bank debit committed as a card bill payment while its card's
+     statement for that date was in was already a `transfer` and stays out of spend. A bank debit
+     that committed as spend (no covering card statement at its commit, categorised in review, or
+     entered by hand) is `spend` again in its category. A row carrying `transfer_pair_id` with a
+     non-`transfer` type is refused by the database.
    - **Symbol-keyed instrument identity**: create a manual `instruments` row for a
      symbol you already hold → import a CSV containing that symbol → confirm the rows
      attach to the existing instrument (no duplicate, no merge prompt).
@@ -1329,6 +1602,11 @@ End-to-end test once built:
      twin (Imported 0), the stored value is lowercase, and the merchant still auto-tags on the
      next import. A hand-edited file is this parser's declared threat model, so a capitalised
      cell must not fork the F4 identity.
+   - **Provenance survives** ([ADR-0006](docs/adr/0006-f4-dedup-key.md)): edit an imported
+     row's amount, back up, restore into a fresh database, re-import the original statement →
+     the edited row does not re-stage. A restored linked pair keeps its pre-link types, and a
+     lone leg restores with a warning. A hand-edited zero-amount row is skipped and counted in
+     `warnings`.
    - **Hand-edited UTC offset**: a `confirmed_at` cell carrying `+05:30` restores as the same
      instant as its UTC spelling, on both dialects — and a cell with **no** offset restores
      unshifted, since that is the shape the export itself writes. This is the one datetime
@@ -1347,6 +1625,25 @@ End-to-end test once built:
     each sale correctly (STCG / LTCG / debt-slab), surfaces the ₹1.25 L equity-LTCG exemption
     line, and per-bucket subtotals reconcile against a hand-computed FIFO calc. Re-running over
     the same data is stable (idempotent).
+    - **Foreign assets (provisional while [ADR-0014](docs/adr/0014-tax-fx-rule-206.md) is
+      Proposed)**: a US-stock sale on 10 June converts its gain at SBI's TT buying rate for
+      31 May, not at either row's stamped rate, and is marked provisional. With no TTBR loaded
+      for 31 May, the sale is flagged "rate missing" and no tax figure is shown.
+    - **Each sell's lot match is stored** ([ADR-0015](docs/adr/0015-fifo-lot-matching.md)):
+      the statement and `/holdings` agree on the units remaining in every lot.
+    - **No sell is left uncovered** (ADR-0015 rule 9): a sell dated before the buy that funds it
+      is refused, as is a sell that strips a later sell of its lots, and so is deleting a buy a
+      later sell depends on (422); deleting a buy that other lots cover succeeds and the sell
+      re-matches onto them. An investment CSV that would leave any sell of an instrument
+      uncovered imports none of that instrument's rows and lists every uncovered sell; the
+      file's other instruments import.
+    - **Intraday nets first** ([ADR-0015](docs/adr/0015-fifo-lot-matching.md) rules 7–8): hold
+      100 shares of an Indian stock bought last year; on one day buy 50 and sell 80 → 50 units
+      are intraday (listed apart, as speculative business income, never in a capital-gains
+      bucket) and only 30 units consume the old lot, whose remaining 70 units keep their cost
+      and date. A same-day sell listed before its buy in an imported file is not refused as an oversell
+      (entered by hand, the buy must come first). The same
+      trades in an MF or a US share are not netted.
 11. **Dividend FY summary (F11)**: dividend rows roll up per financial year; the total matches a
     raw `SELECT SUM(amount_native_paise) WHERE transaction_type='dividend'` over that FY's date
     range.
@@ -1357,7 +1654,7 @@ End-to-end test once built:
     and on a duplicate per-table CHECK name (two columns sharing one `Enum(name=...)`). All
     three are silent on SQLite and fatal on Postgres or on the user's real migrated DB, so a
     green suite is not evidence without them.
-13. **Absolute session cap, dialect-honestly** (ADR-0001 rule 5): back-date a refresh family's
+13. **Absolute session cap, dialect-honestly** (ADR-0001 rule 5b): back-date a refresh family's
     `sessions.created_at` via SQL past `session_absolute_ttl_hours` → the next refresh revokes
     the whole family and returns 401, **without patching any application symbol**. Separately,
     pinning the app clock to a fixed instant and inserting a row must make `created_at`,
@@ -1365,6 +1662,9 @@ End-to-end test once built:
     app clock wrote them, not the database server's. On SQLite the two clocks are
     indistinguishable in value, so this is the only check that fails before the fix rather than
     at the Postgres cutover, where a non-UTC server `TimeZone` moves the cap by its offset.
+    - **Idle timeout** ([ADR-0003](docs/adr/0003-multi-user-auth.md)): back-date a family's
+      last use past 30 minutes → the next refresh revokes the family and returns 401, even
+      though the 12-hour cap has not been reached.
     - **Same numbers on both deployments**: with the host TZ set to `Asia/Kolkata`, at 02:00
       local, `GET /portfolio/summary`, `GET /holdings` and `GET /dashboards/overview` report
       the same current value / net worth as the Docker UTC stack for the same data. The two
@@ -1382,6 +1682,16 @@ End-to-end test once built:
     because Caddy serves `:80` and the gate rode `cookie_secure` until 2026-08-02. (Note
     the login page caches this response with `staleTime: Infinity`, so an already-open tab
     keeps its button until reload.)
+    - **Guest sandboxes**: with `GUEST_SANDBOX_ENABLED=true` over HTTPS, a guest gets a
+      sandbox, its import screen offers only the bundled sample statements, and a file upload
+      is refused. The guest cap counts live guests only. After the sandbox is pruned, its
+      still-unexpired access token gets 401, never a 500.
+    - **Delete my account** ([ADR-0003](docs/adr/0003-multi-user-auth.md) rule 13b): as a user
+      with accounts, transactions, categories, rules, labels and investments, delete the account
+      with the right password and phrase → every owned table holds zero rows for that user, the
+      cookies are cleared, and the next request is 401; a second user's data is untouched. A
+      wrong password is 400 and deletes nothing; the demo account and a guest get 403. Delete
+      the only user → `POST /auth/register` accepts a new first user.
 15. **Merchant alias layer + seed dictionary** ([ADR-0011](docs/adr/0011-merchant-alias-layer.md)):
     register a fresh user → their `merchant_alias` / `merchant_tag_map` rows carry the seeded
     dictionary (`is_seeded=True`, `hit_count=0`) → import a statement containing a seeded merchant
@@ -1391,6 +1701,10 @@ End-to-end test once built:
     `coverage_rate` rises against the Phase A0 baseline, and every `transactions.fingerprint` is
     byte-identical to the value produced with the alias table empty (the
     [ADR-0006](docs/adr/0006-f4-dedup-key.md) guard).
+    - **Payment-gateway handles**: a UPI descriptor naming only a gateway handle (`razorpay@…`)
+      resolves to `unknown via razorpay`, never to a merchant, and does not prefill a category
+      learned from another gateway's merchant. The top-merchants dashboard groups by canonical
+      merchant, so two descriptors of one brand are one bar.
     - **Authoring leg**: the seed dictionary is a starting point, not the whole story, so the
       user must be able to correct it. Author a *narrowing* alias for a brand the dictionary
       already seeds — `uber eats -> uber eats` against the seeded `uber -> uber` — and confirm
@@ -1400,10 +1714,11 @@ End-to-end test once built:
       then learn independently: confirming a category on one must not change the other's
       suggestion.
 16. **Two-level categories** ([ADR-0012](docs/adr/0012-category-hierarchy.md)): register a
-    fresh user → `GET /categories?tree=true` returns 10 parents, every seeded subcategory
-    hangs off one of them with `color = null`, and no row is three deep. Create a
-    subcategory under a parent of the *other* `kind` → 422; under a subcategory → 422;
-    under another user's parent → 422 (not 404 — the parent is a body FK, ADR-0003 rule 3).
+    fresh user → `GET /categories?tree=true` returns every root of `_DEFAULT_*_TAXONOMY`
+    (each kind's "Other" among them), every seeded subcategory hangs off one of them with
+    `color = null`, and no row is three deep. Create a subcategory under a parent of the
+    *other* `kind` → 422; under a subcategory → 422;
+    under another user's parent → 422 (not 404 — the parent is a body FK, ADR-0003 rule 9).
     - **Reparent is not a delete.** PATCH a subcategory to `parent_id: null` → it becomes a
       root and **its transactions still resolve**. This is the path an ORM
       `delete-orphan` cascade silently turns into a row deletion, so assert the
@@ -1411,8 +1726,13 @@ End-to-end test once built:
     - **Archive cascades one level, and only forward.** Archive a parent → it and its
       active children carry the same `archived_at`, transactions keep resolving their
       (now archived) category, and the tree view omits the whole family. Archive a child →
-      the parent is untouched. Stored `archived_at` is **naive UTC** (ADR-0001 rule 5) on
+      the parent is untouched. Stored `archived_at` is **naive UTC** (ADR-0001 rule 5b) on
       every row the cascade writes, parent and children alike.
+    - **"Other" stays.** Archiving either kind's "Other", renaming it, or giving it a parent,
+      is a 422. Archiving a parent archives all its children, with no exception.
+    - **Archive with reassign.** Archive a category and choose another live category of the
+      same kind → its transactions move in one bulk gesture that teaches once per merchant;
+      reassigning to the other kind is a 422.
     - **Migration parity, both directions.** `alembic upgrade head` on a database seeded
       with the pre-0033 flat defaults produces the *same* `(name, kind, parent_id IS NOT
       NULL, color)` set as `provision_default_categories` does for a fresh registrant —
@@ -1432,6 +1752,21 @@ End-to-end test once built:
       database → the child's `parent_id` points at the restored parent. Hand-edit the zip
       so a child's `parent_name` names a category that isn't in the file → the restore
       still succeeds, but the flattened row is reported in `warnings`, never silently.
+    - **Colours.** `POST /categories` a spend root without `color` → it gets the palette slot held by the fewest active spend roots (on a fresh registrant, aqua `#1baf7a`). `color: null` on a root (create, PATCH, or a promotion) → 422. Promote an inheriting subcategory → it gets a palette colour. Restore a backup root with a blank colour → same. A database row of a root with `color IS NULL` is refused by `ck_categories_root_has_color`. On a fresh registrant, every seeded subcategory's `display_color` is its parent's colour, view 2 (drilldown included, archived subcategories too) draws each family in its hue, and the category-trend drilldown draws Shopping & Lifestyle's subcategories in the nine palette slots after magenta, none magenta, in light and dark mode.
+17. **Demo data looks lived-in**: on a fresh database, open the demo (or a guest sandbox).
+    It has two cards and a cash wallet alongside the bank, and both cards name the bank as
+    the account that pays them. Every full month in the window has salary, rent and an EMI
+    off the bank, everyday spends on the cards and in cash, and an ATM withdrawal from the
+    bank to the cash wallet as a linked transfer pair. Net cashflow is positive in every
+    month but one planned deficit month, and neither the bank nor the cash wallet dips
+    below zero. Each card's bill is paid from the bank every month for the previous
+    month's spend, as a linked transfer pair; the latest ICICI Amazon Pay bill is left
+    unlinked, and its card leg offers the manual link with the bank leg as its one
+    candidate. Each refund (but not cashback) links to the spend it reverses, and every
+    seeded card can be edited. Holdings show INR and USD positions (two funds whose
+    monthly SIPs run up to the past month, Indian and US equities, a US ETF, gold) and
+    realised gains from FIFO on both an INR and a USD sell. The seed adds no FX rate:
+    USD positions show in INR once FX has been refreshed.
 
 ## Open assumptions to confirm later
 

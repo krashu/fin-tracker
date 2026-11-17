@@ -1,3 +1,9 @@
+## Senior review (Claude Code)
+
+`/senior-review` is a project skill — [`.claude/skills/senior-review/`](../.claude/skills/senior-review/SKILL.md).
+It already carries the two passes and this repo's checklist; an invocation only needs the scope:
+
+```
 /senior-review
 
 Backend unstaged only. Two passes:
@@ -5,6 +11,7 @@ Backend unstaged only. Two passes:
 2. Test audit — classify each new test as keep / theater / redundant /
    wrong-assertion, then list missing tests by contract.
 Skip the diff summary.
+```
 
 ---
 

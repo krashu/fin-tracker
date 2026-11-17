@@ -1,125 +1,127 @@
-# ADR-0004: F3 auto-tag learning lifecycle — one teach per decision, current-health metric
+# ADR-0004: A tag rule is taught once per user decision, and only by a user decision
 
 **Status**: Accepted
-**Date**: 2026-07-19
-
-## Problem
-
-F3 auto-tagging ([PRD §F3](../../PRD.md)) maintains a `merchant_tag_map`
-(`user_id, merchant_normalized, category_id, hit_count, last_used`) that the import
-pipeline reads to prefill categories. The plumbing (savepoint recovery, frozen-suggestion
-metric, cross-user scoping) was sound, but *when and how often a decision gets taught* had
-several genuine bugs — and they're re-litigation-prone because "learn on every user
-touch" is the intuitive-but-wrong default. Concretely, on the pre-fix build:
-
-- **Double-teach.** One in-queue category edit taught the tag **twice** — the review-queue
-  PATCH bumped `hit_count`, then commit pass-3 bumped it again — so a corrected merchant
-  crossed the `CONFIDENT_MIN=3` threshold a full batch early.
-- **Orphan from discarded work.** A PATCH on a **pending** review-queue row wrote a map row
-  immediately; discarding the row (or cancelling the batch) left that map row behind →
-  future imports auto-tagged from a decision the user threw away.
-- **Zombie archived bucket.** Commit pass-3 re-taught a category the user **archived**
-  mid-review, resurrecting a live map row pointing at a dead bucket and inflating
-  `rules_count`.
-- **Self-vote.** The review-queue `confidence` / `prior_matches` chip counted the user's own
-  just-made PATCH as if it were prior history.
-- **Metric reads green for dead buckets.** `GET /dashboards/tagging-stats` counted a row
-  whose frozen `auto_category_id` pointed at a since-archived category as "kept" forever
-  (unchanged) — or, after the reconciliation fix below re-buckets it to *Other*, as a
-  spurious "not-kept" that dragged the rate *down*.
-
-`CLAUDE.md` is gitignored in this environment, so the contract can't live there; this ADR is
-its committed home.
+**Date**: 2026-07-19 (decided) · **Revised**: 2026-11-17
+**Scope**: PRD §F3, §Success metrics · `app/services/tag_service.py` (`should_learn_tag`,
+`AUTO_TAGGABLE_TYPES`, `record_tag`, `prefetch_tag_map`), `app/services/merchant_labels.py`
+(`learn_merchant_memory`), `app/api/v1/transactions.py`, `app/api/v1/imports.py`
+(`commit_import_batch`), `app/api/v1/dashboards.py` (`tagging_stats`), `app/services/demo_seed.py`
+**Supersedes / Related**: ADR-0011 (canonical merchant), ADR-0012 (fallback, archive), ADR-0009
 
 ## Decision
 
-**`record_tag` fires once per real user decision, at one authoritative site per lifecycle;
-data the user hasn't committed (or has discarded / archived) never teaches; the acceptance
-metric reflects current tagging health.**
+A [tag rule](../../GLOSSARY.md#auto-tagging) is keyed on the user's canonical merchant and is
+[taught](../../GLOSSARY.md#auto-tagging) exactly once per real user decision, at one site per row
+lifecycle. Staged, discarded, defaulted and non-spend data never teach. The acceptance metric and
+the rule count measure current health: rules and suggestions pointing at archived categories drop out.
 
-**Where a decision is taught (and only there):**
-- **F2 manual POST** with a non-null category — immediate user-yes.
-- **PATCH `category_id` on a *board* row** (`confirmed_at IS NOT NULL`) when the value
-  actually changed — the post-board correction. A PATCH on a **pending** review-queue row
-  does **not** teach.
-- **Bulk commit** of an import batch (pass-3) — each committed row is a user-yes (passive
-  accept counts), which is the **sole** learning site for pending rows.
+## Rules
 
-**What must not teach:**
-- Pending review-queue PATCHes (they learn at commit instead) — so discarding / cancelling
-  a staged row can't orphan a map entry, and the confidence chip can't count a self-vote.
-- Commit rows **defaulted to *Other*** because their category was null or pointed at an
-  archived/absent bucket at commit time (F4a reconciliation, tracked in `defaulted_ids`) —
-  so an archived bucket is never re-learned, and the board row lands on *Other* rather than a
-  dead bucket.
-- `income` / `transfer` rows (hand-classified in a separate taxonomy; `AUTO_TAGGABLE_TYPES`
-  gates every site).
+1. **Every teach goes through one gate**: `learn_merchant_memory` → `should_learn_tag` (a non-empty
+   canonical merchant and `transaction_type` in `AUTO_TAGGABLE_TYPES = {"spend"}`). The rule key is the
+   [canonical merchant](../../GLOSSARY.md#transactions--import) (ADR-0011), never the raw
+   `merchant_normalized`. — *Enforced by*: service ·
+   *Locked by*: `tests/services/test_tag_service.py::test_should_learn_tag`,
+   `::test_learn_writes_the_canonical_key`
+2. **There are exactly three teach sites, all user decisions:**
+   a. F2 manual POST with a non-null category;
+   b. a categorisation of [board](../../GLOSSARY.md#auto-tagging) rows (`confirmed_at IS NOT NULL`)
+      whose category actually changes — a single PATCH, a bulk gesture, or "apply to past rows";
+   c. import commit, the only teach site for staged rows, where a
+      [passive accept](../../GLOSSARY.md#auto-tagging) counts.
+   — *Enforced by*: service · *Locked by*: `tests/api/test_transactions.py::test_post_with_category_sets_tag_map`,
+   `::test_patch_category_records_new_tag`, `::test_patch_same_category_does_not_bump_hit_count`,
+   `tests/api/test_imports_review.py::test_patched_pending_row_learns_once_at_commit`,
+   `::test_e2e_learn_then_prefill_and_passive_accept`
+3. **A PATCH on a staged row never teaches**, so discarding or cancelling it cannot leave a rule
+   behind, and review-queue confidence never counts the user's own in-session edit. — *Enforced by*:
+   service · *Locked by*: `tests/api/test_imports_review.py::test_patch_pending_row_does_not_learn`,
+   `::test_e2e_discarded_pending_row_does_not_teach`, `::test_candidates_confidence_not_self_inflated_by_own_patch`
+4. **One gesture teaches once per distinct canonical merchant.** A bulk re-categorise of board rows, or
+   "apply to past rows", is one atomic request (all rows or none) and adds +1 per merchant, however
+   many rows it touches. "Apply to past rows" offers only recent rows still on a machine-assigned
+   category (uncategorised, the fallback "Other", or the row's own auto suggestion), never one the user
+   put elsewhere. — *Enforced by*: service (bulk endpoint) ·
+   *Locked by*: `tests/api/test_transactions.py::test_bulk_categorise_teaches_once_per_merchant`,
+   `::test_apply_to_past_rows_teaches_once`, `::test_past_rows_skip_hand_categorised_rows`,
+   `frontend/app/expenses/selection-bar.test.tsx`, `frontend/app/expenses/expenses-board.test.tsx`
+5. **A row the server defaulted at commit does not teach a category.** A spend row whose category is
+   null or archived at commit lands on the spend [fallback category](../../GLOSSARY.md#categories)
+   ("Other", ADR-0012, which always exists); its labels still teach. A cashback credit committed still
+   in the spend "Cashback" its merchant text pre-filled (ADR-0013) is a server default too. —
+   *Enforced by*: service ·
+   *Locked by*: `tests/api/test_imports_review.py::test_commit_defaults_archived_category_row_to_other`,
+   `::test_commit_keeps_the_cashback_prefill_and_does_not_teach_it`
+6. **Income and transfer rows never teach**, judged on the type after the F4a flip at commit and after
+   the update at PATCH. — *Enforced by*: service ·
+   *Locked by*: `tests/api/test_transactions.py::test_post_income_with_category_does_not_learn`,
+   `tests/api/test_imports_review.py::test_commit_f4a_does_not_learn_tag_for_flipped_row`
+7. **N teaches add exactly N to `hit_count`, never fewer**, including N same-rule teaches in one commit
+   and concurrent commits on Postgres. The increment is a single atomic SQL statement (upsert), portable
+   to both dialects (ADR-0001). — *Enforced by*: DB unique constraint + service ·
+   *Locked by*: `tests/api/test_imports_review.py::test_commit_same_merchant_twice_bumps_hit_count_per_row`,
+   `tests/services/test_tag_service.py::test_record_tag_repeated_bumps_accumulate`,
+   `::test_record_tag_handles_concurrent_insert_race`, `::test_record_tag_increment_is_a_single_statement`
+8. **Prefill never suggests an archived category, nor any category on a flagged card-bill debit**
+   (ADR-0002 rule 7b); the rule rows survive the archive. — *Enforced by*: service · *Locked by*:
+   `tests/services/test_tag_service.py::test_prefetch_skips_archived_category`,
+   `tests/api/test_imports_review.py::test_import_never_prefills_a_category_onto_a_card_bill_debit`
+9. **[Acceptance rate](../../GLOSSARY.md#auto-tagging) = kept / suggested over board rows whose frozen
+   `auto_category_id` inner-joins a live category of the same user.** The join key is the suggestion,
+   never the final `category_id`; a reject to a since-archived category stays counted. `None` at zero.
+   — *Enforced by*: query · *Locked by*: `tests/api/test_dashboards.py::test_tagging_stats_excludes_archived_suggestion_rows`,
+   `::test_tagging_stats_reject_to_since_archived_stays_counted`
+10. **`rules_count` counts taught rules (non-seeded, per ADR-0011 rule 11) on live categories only.** — *Enforced by*: query ·
+   *Locked by*: `tests/api/test_dashboards.py::test_tagging_stats_rules_count_excludes_zero_hit_rows`,
+   `::test_tagging_stats_rules_count_excludes_archived_categories`,
+   `::test_tagging_stats_rules_count_counts_pinned_seed_rows`
+11. **Spend-by-category keeps archived categories** (outer join). The asymmetry with rules 9–10 is
+   intended. — *Enforced by*: query ·
+   *Locked by*: `tests/api/test_dashboards.py::test_archived_category_surfaces_with_stored_name`
+12. **Seeding writes rule rows directly and never teaches.** The seed dictionary (ADR-0011) and the
+   demo seeder insert `merchant_tag_map` rows with chosen hit counts. — *Enforced by*: service ·
+   *Locked by*: `tests/services/test_demo_seed.py::test_seeder_never_calls_learn_merchant_memory`,
+   `::test_reseed_does_not_inflate_rule_hit_counts`
 
-**Acceptance metric — current-health semantics.** `tagging_stats`
-([dashboards.py](../../backend/app/api/v1/dashboards.py)) **inner-joins `Category` on
-`auto_category_id`** filtered to the user's live categories, so rows whose frozen suggestion
-points at a since-archived category leave **both** numerator and denominator. The join is
-keyed on `auto_category_id` (the suggestion), **never** the final `category_id` — a row the
-user changed to a since-archived bucket is a genuine reject and must stay counted as
-not-kept.
+## Out of bounds
 
-**Implementation approach:** the shared `should_learn_tag(...)` predicate
-([tag_service.py](../../backend/app/services/tag_service.py)) is the eligibility core at all
-sites; each site `and`s its extras (PATCH: confirmed + changed; commit: not-Other-defaulted).
-`record_tag` keeps its SELECT-then-INSERT-or-UPDATE with a `begin_nested()` savepoint for the
-concurrent-insert race, narrowing its `IntegrityError` catch to the
-`uq_merchant_tag_map_user_merchant_category` conflict.
+- Deleting a transaction never un-learns, and rules do not decay in v1.
+- Income and transfer rows are classified by hand; F3 does not suggest for them.
+- Which canonical merchant a descriptor resolves to: ADR-0011.
 
----
+## Why
 
-## Trade-offs
+"Learn on every touch" is the intuitive default, and it shipped five bugs. One in-queue edit taught
+twice and crossed `CONFIDENT_MIN` a batch early. A PATCH on a staged row left a rule behind after a
+discard. Commit re-taught a category archived mid-review. The confidence chip counted the user's own
+edit. The metric read green for dead categories. Each fix is one rule above.
 
-**Benefits:** one teach per decision makes `hit_count` mean "distinct user-yeses", so the
-`CONFIDENT_MIN` threshold behaves; discarded / archived data no longer corrupts future
-auto-tags; the metric tracks live health instead of accumulating stale green votes for dead
-buckets.
+`hit_count` drives [confident rules](../../GLOSSARY.md#auto-tagging), so it must count independent
+judgements. Five Swiggy rows re-categorised in one gesture are one judgement, not five. A rule that
+can never prefill again, because its category is archived, is not a rule the user has.
 
-**Drawbacks / accepted asymmetries:**
-- **`hit_count += 1` is a non-atomic read-modify-write** — correct on SQLite's single writer,
-  but lost-update-prone under Postgres concurrency. Deferred (below); the naive SQL-atomic
-  form (`hit_count = MerchantTagMap.hit_count + 1`) is **not** an acceptable stopgap: under
-  `autoflush=False` it's a deferred, idempotent expression, so several same-`(merchant,
-  category)` bumps in one commit pass collapse to `+1` instead of `+N`. Two tests lock the
-  `+N` behavior so the collapse can't be reintroduced.
-- **The metric deliberately filters `archived_at IS NULL`, whereas spend-by-category
-  deliberately keeps archived buckets** (outer join, no archived filter — see
-  [dashboards.py](../../backend/app/api/v1/dashboards.py)). This is intentional: they answer
-  different questions — "where did money go, ever" (keep the history) vs. "is auto-tagging
-  healthy *now*" (drop dead buckets). Do **not** "fix" one to match the other.
-- **Archived-category default-to-Other is spend/refund-only** (mirrors the null-category
-  fallback). An `income` / `transfer` row whose category is archived mid-review still commits
-  pointing at the archived bucket — cosmetic only, since those types never feed `record_tag`.
+## Alternatives rejected
 
-**Mitigation:** the atomic-`hit_count` upgrade has a defined home (below); the metric
-asymmetry and the spend/refund-only scope are documented here and in the route docstring so a
-future reader doesn't undo them.
+- **Teach on every PATCH, staged rows included** — double-teaches and orphans rules from discarded work.
+- **Final-state metric** — archiving never retracts a past accept, so stale green votes accumulate.
+- **Python `+= 1` read-modify-write** — loses bumps under Postgres concurrency.
+- **Bulk gesture = N teaches** — one click makes a rule confident.
+- **Seeder calls the teach function** — a fourth teach site that is not a user decision.
+- **422 on an archived category at commit** — hostile mid-review; default to "Other" instead.
 
-## Deferred to Postgres v2
+## Consequences
 
-- **Atomic `hit_count`** via native `INSERT … ON CONFLICT
-  (uq_merchant_tag_map_user_merchant_category) DO UPDATE SET hit_count =
-  merchant_tag_map.hit_count + 1` — atomic *and* correct per statement, which also retires
-  the savepoint dance in `record_tag`. Until then keep `+= 1`.
+- `hit_count` means "distinct user decisions", so `CONFIDENT_MIN` behaves.
+- The frontend sends one bulk request where it used to send N PATCHes.
+- Reopen if learning needs decay, or if income gets auto-tagging.
 
-## Alternatives Considered
+## History
 
-**Alternative 1 — Learn on every PATCH (including pending rows).** The intuitive default, but
-it double-teaches corrected rows and orphans map rows from discarded work. Rejected: teach at
-one authoritative site per lifecycle instead.
-
-**Alternative 2 — Final-state metric (archiving never retracts a past accept).** Simpler
-(no join), but leaves stale green votes for dead buckets and lets the F4a re-bucket-to-Other
-noise drag the rate down. Rejected in favour of current-health semantics.
-
-**Alternative 3 — Ship the SQL-atomic `hit_count` bump in v1.** Fixes the Postgres
-lost-update, but regresses v1 by collapsing same-triple bumps within one `autoflush=False`
-commit pass to `+1`. Rejected; deferred to the v2 `ON CONFLICT` rewrite.
-
-**Alternative 4 — Block the archived-bucket commit instead of defaulting to Other.** A 422
-mid-review is hostile UX for a self-host single user. Rejected: default to *Other* (mirrors
-the existing null-category fallback) and skip learning.
+- 2026-07-19 — Accepted after five learning bugs: one teach per decision, current-health metric.
+- 2026-11-15 — Rewritten to the rules-first template. Rules key on the canonical merchant. The atomic
+  increment is no longer deferred to v2. A bulk gesture or "apply to past rows" teaches once per
+  merchant. `rules_count` uses current-health semantics. The demo seeder writes rows instead of
+  teaching. The "no active Other → 422" path is gone, because the fallback is unarchivable (ADR-0012).
+- 2026-11-15 — Amended rule 5: a cashback credit committed still in its keyword-prefilled Cashback
+  category does not teach, since the server chose it, not the user (ADR-0013).
+- 2026-11-17 — Amended rule 8: prefill never puts a category on a flagged card-bill debit, so a rule learned from one bill never decides the next (ADR-0002 rule 7b, A76).

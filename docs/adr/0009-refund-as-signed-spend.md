@@ -1,224 +1,131 @@
 # ADR-0009: A refund is a signed spend, not a `transaction_type`
 
 **Status**: Accepted
-**Date**: 2026-08-12
-
-## Problem
-
-`transaction_type` carried four values — `spend | income | transfer | refund` — and an
-uncommitted, in-progress pass on this branch had gone further still, promoting refund a
-*second* time onto the category axis: a seeded spend-kind "Refund" category, with
-`imports.py` defaulting every untagged refund into it. That duplicated the concept on two
-axes at once and actively worked against the netting `PRD.md` §F4a already asks for — a
-Groceries refund parked in a generic "Refund" bucket leaves Groceries permanently inflated
-by the refunded amount, which is the opposite of what a refund is supposed to do to a
-category total.
-
-**The type was never earning its keep.** `sign_error()` (`app/schemas/transactions.py`)
-already required `refund > 0` and `spend < 0` — disjoint signs, same shape as `spend` and
-`income`. Nothing downstream used the *type* `refund` for anything a *sign check on
-`spend`* couldn't do instead: every F8 aggregate filtered `transaction_type IN
-('spend', 'refund')` as a single bucket (`app/api/v1/dashboards.py`, pre-ADR — 11 sites),
-`AUTO_TAGGABLE_TYPES` included both, and `_map_type` (`import_service.py`) only ever
-produced `refund` as a *fallback* when a credit couldn't be classified as cashback income.
-The type was a label for "spend row, positive sign" wearing a different name.
-
-**Five competitor apps agree, at schema level, that this is the wrong axis:**
-
-- **Firefly III** — types are structural (`Withdrawal` / `Deposit` / `Transfer`); "Refund" is
-  a seeded **`LinkType`** *between* journals (`database/seeders/LinkTypeSeeder.php`), not a
-  transaction type. Issue **#769** asked the maintainer for a `refund` type outright; it was
-  rejected, citing GnuCash's "negative expense" convention and naming the exact failure mode
-  this ADR is written to avoid — *"a huge expense and a huge income, skewing all charts."*
-- **Actual Budget** — a refund is a positive transaction in the **same category** as the
-  spend it reverses, documented explicitly as "isn't income."
-- **YNAB** — a refund is an inflow to the original spend category, same mechanism.
-- **Lunch Money** — has no `type` column on transactions at all; `is_income` lives on the
-  *category*, not the row.
-- **GnuCash** — books a refund as a negative expense (the double-entry equivalent of a
-  positive spend row here).
-
-None of the five gives refund a type slot of its own. `PRD.md` §F4a already documents the
-sign convention as policy ("refunds carry the opposite sign in the same category so signed
-sums net naturally") — this ADR makes that convention structural instead of advisory, and
-undoes the category-axis duplication in the same pass (see Alternatives, "the path not
-taken twice").
+**Date**: 2026-08-12 (decided) · **Revised**: 2026-11-15
+**Scope**: PRD §F2, §F4a, §F8, §Verification 1 · `app/models/transaction.py` (`TransactionTypeStr`),
+`app/schemas/transactions.py` (`sign_error`), `app/services/import_service.py` (`_map_type`),
+`app/services/reconciliation_service.py` (`auto_link_cc_bill`), `app/services/backup_import_service.py`,
+`app/services/transaction_delete.py` (`delete_owned_transactions`),
+`app/parsers/backup_csv.py`, `app/api/v1/dashboards.py`, `frontend/lib/transaction-types.ts`
+**Supersedes / Related**: cashback rule superseded by [ADR-0013](0013-cashback-is-a-rebate.md) ·
+[ADR-0006](0006-f4-dedup-key.md) (sign rule on PATCH) · [ADR-0002](0002-transfer-pair-id-semantics.md)
 
 ## Decision
 
-**`transaction_type` narrows to `spend | income | transfer`. A refund is derived, never
-stored: `transaction_type == "spend" AND amount_paise > 0`.**
+`transactions.transaction_type` is exactly `spend | income | transfer`. A
+[refund](../../GLOSSARY.md#transaction-types--signs) is a `spend` row with a positive amount and an
+[income reversal](../../GLOSSARY.md#transaction-types--signs) is an `income` row with a negative
+amount, each in the same category as the row it reverses. Both are derived from the sign and never
+stored as a type.
 
-- **Identity is untouched.** [ADR-0006](0006-f4-dedup-key.md)'s fingerprint is
-  `sha256("\x1f".join(date_iso, amount_paise, normalized_merchant, account_id))` — it never
-  hashed `transaction_type`. No fingerprint recompute, no `origin_fingerprint` change, no
-  `occurrence` change. Migration `0029_refund_as_signed_spend` is a pure `UPDATE …
-  SET transaction_type = 'spend' WHERE transaction_type = 'refund'` plus a narrowed CHECK
-  constraint — no identity column moves.
-- **`sign_error()` becomes asymmetric, deliberately** ([ADR-0007](0007-transaction-field-editability.md)
-  rule 4, amended): `spend` accepts any non-zero sign (negative = outflow, positive =
-  refund); `income` still requires `> 0`; `transfer` still accepts any non-zero sign; zero is
-  rejected for all three. Loosening `spend` is the point. `income` keeps `> 0` because an
-  income *reversal* (a salary clawback) is out of scope for v1 — there is no symmetric
-  "negative income" concept this ADR is trying to create. The accepted cost: a fat-fingered
-  positive spend now reads as a refund instead of 422ing. There is no server-side way to
-  distinguish "user meant to log an outflow and typed the wrong sign" from "user meant to
-  log a refund" — both are a positive `spend` row, and only the user knows which.
-- **Every F8 aggregate discriminates on sign, not on type.** The dashboards YTD block is the
-  one non-mechanical case: `gross_spend` becomes `spend AND amount_paise < 0`, `refund`
-  becomes `spend AND amount_paise > 0`, `cashback` (already `income`) is unchanged. The wire
-  fields `gross_spend_ytd_paise` / `refund_ytd_paise` / `spend_ytd_paise` keep their names
-  and meanings — `spend_ytd = gross + refund` still holds — only the discriminator moved from
-  type to sign.
-- **F4a auto-reconciliation needed an explicit sign guard, not just a comment rewrite.**
-  `reconciliation_service.py`'s CC-bill candidate query filtered `transaction_type IN
-  ('spend', 'transfer')` and derived "the target is negative" from the fact that the CC-side
-  row was `income` (`> 0` per `sign_error`) and equality pins the sign. That derivation holds
-  **only while `sign_error` holds** — but `POST /backup/import` persists `transaction_type`
-  and `amount_paise` verbatim, with no `sign_error` call (a **file-upload boundary**, which
-  `AGENTS.md` §Simplicity first explicitly scopes validation to). A hand-edited backup file
-  can therefore store a negative `income` row; before this ADR the type filter still excluded
-  a positive `refund` from matching it, but after the collapse a positive `spend` (a refund)
-  would satisfy `amount_paise == -txn.amount_paise` and could be mis-paired as a bill payment.
-  The fix is an explicit `Transaction.amount_paise < 0` clause in the candidate query — stated
-  rather than derived, because the invariant it depends on is no longer guaranteed at every
-  call site.
-- **Every other consumer collapses mechanically once the type does:**
-  - `_map_type` (`import_service.py`): the parser's own sign already carries refund-ness, so
-    the fallback for an unmatched credit is `income` for a cashback-named merchant, `spend`
-    otherwise — never a manufactured `refund`.
-  - `AUTO_TAGGABLE_TYPES` (`tag_service.py`): `frozenset({"spend"})`. Refunds still
-    auto-tag — they are spend rows now, by construction.
-  - `backup_csv.py`: `_TXN_TYPES` is `frozenset(get_args(TransactionTypeStr))` and narrows for
-    free. A **read-only legacy alias** — `refund` → `spend` on read — lets an already-exported
-    backup zip predating this ADR still import cleanly; nothing writes the value `refund`
-    again, so the alias is a one-way ramp, not a live vocabulary.
-  - Frontend: `EntryDirection` (`lib/transaction-types.ts`) is the UI-level three-way
-    Spend/Refund/Income choice PRD §F2's manual-entry form still needs, mapped to
-    `{type, sign}` — `spend → (spend, −)`, `refund → (spend, +)`, `income → (income, +)`. The
-    stored vocabulary narrows; the *form* does not, because the ambiguity `EntryDirection`
-    resolves (is this outflow or reversal?) is real and user-supplied, not derivable from the
-    amount alone until after the choice is made.
-  - Review queue: the flat "Refund" shortcut (PATCH `category_id: null`) is replaced by a
-    merged spend + income category dropdown on a credit row — picking a spend category makes
-    the row a positive `spend` (a refund, netting against that category); picking an income
-    category makes it `income`. This restores the "which spend category did this refund
-    reduce" precision an earlier pass had traded away for a flat default, and costs nothing
-    extra now that there is no separate type to toggle.
+## Rules
 
-**What not to do:**
+1. **`transaction_type ∈ {spend, income, transfer}`**, a CHECK driven by the model Literal. —
+   *Enforced by*: DB CHECK · *Locked by*: `tests/test_migration_parity.py::test_migration_matches_models`
+2. **Refund ≡ `spend AND amount_paise > 0`; income reversal ≡ `income AND amount_paise < 0`.** Both
+   are read-time derivations. — *Enforced by*: service ·
+   *Locked by*: `tests/api/test_transactions.py::test_list_positive_spend_serialises_as_a_refund`;
+   `::test_post_negative_income_is_a_reversal`
+3. **`sign_error`: every type accepts any non-zero sign; zero is rejected for all types.** One shared
+   helper for POST and PATCH (ADR-0006 governs which PATCH bodies run it). — *Enforced by*: schema
+   validation · *Locked by*: `tests/api/test_transactions.py::test_post_zero_amount_422`,
+   `::test_post_spend_positive_amount_is_a_refund`,
+   `::test_patch_sign_and_type_are_validated_as_a_merged_pair`
+4. **The sign rule binds every stored row.** Backup restore runs `sign_error`, and skips a violating
+   row with a counted warning (the same treatment as an unknown type). Consumers may rely on "no
+   zero amounts". — *Enforced by*: service ·
+   *Locked by*: `tests/services/test_backup.py::test_restore_skips_a_zero_amount_row_with_a_warning`
+5. **Aggregates discriminate on sign, never on a type.** Spend totals are the signed sum of `spend`
+   rows; [gross spend](../../GLOSSARY.md#transaction-types--signs) is the negative `spend` rows only;
+   `spend_ytd = gross + refund` (plus cashback, ADR-0013). Income totals are signed sums likewise, so reversals net them down.
+   — *Enforced by*: service ·
+   *Locked by*: `tests/api/test_dashboards.py::test_spend_plus_equal_refund_same_category_nets_to_exactly_zero`
+6. **The F4a CC-bill candidate query states `amount_paise < 0` explicitly**; it never derives a sign
+   from a type. — *Enforced by*: service ·
+   *Locked by*: `tests/services/test_reconciliation_service.py::test_no_op_on_no_or_bad_candidate`
+7. **`_map_type`**: parser `payment` → `income`; parser `deposit` (a bank credit) → `income`
+   unless its text names cashback, then `spend` (ADR-0013 rule 1); every other line → `spend`,
+   keeping the parser's sign (a purchase cashback is a positive `spend` per ADR-0013). It never
+   produces a `refund` type.
+   — *Enforced by*: service · *Locked by*: `tests/services/test_import_service.py::test_map_type`,
+   `tests/parsers/test_cc_classify.py::test_chargeback_credit_stores_as_a_positive_spend`
+8. **The parser vocabulary `TxnType` keeps `refund`** (`purchase | payment | refund | other |
+   withdrawal | deposit`), with `RawTransaction` checking its sign (`withdrawal` ≤ 0,
+   `deposit` ≥ 0, the bank column types); it is statement-side, upstream of `_map_type`. —
+   *Enforced by*: service · *Locked by*: `tests/parsers/test_base.py::test_refund_negative_paise_raises`,
+   `::test_withdrawal_positive_paise_raises`, `::test_deposit_negative_paise_raises`
+9. **Refunds auto-tag as spend rows**: `AUTO_TAGGABLE_TYPES == {"spend"}`. — *Enforced by*: service ·
+   *Locked by*: `tests/services/test_import_service.py::test_import_auto_tags_refund_row`
+10. *Retired 2026-11-15.* Backup restore no longer reads a legacy `refund` type: the backup format
+    is versioned (PRD §F10) and any other version is refused, so a `refund` cell is an unknown type
+    like any other.
+11. **`GET /transactions?transaction_type=…&amount_sign=…`** isolates refunds or reversals, scoped by
+    user. — *Enforced by*: service ·
+    *Locked by*: `tests/api/test_transactions.py::test_list_filter_by_transaction_type_and_amount_sign_isolates_refunds`
+12. **Manual entry offers four `EntryDirection`s**, each mapped to `(type, sign)`: spend → (spend, −),
+    refund → (spend, +), income → (income, +), income reversal → (income, −). — *Enforced by*:
+    frontend · *Locked by*: `frontend/lib/transaction-types.test.ts`
+13. **A refund may optionally link to the spend it reverses**: a nullable self-reference with a
+    composite same-user FK (ADR-0003). The target must be a negative `spend` of the same user. The link
+    is informational; netting never depends on it. Backup restore relinks a restored refund to its
+    original — a row inserted by the same restore, or the one pre-existing row its original deduped
+    against when that match is unambiguous — under the same checks as
+    `PUT /transactions/{id}/refund-link`; restore never mutates a pre-existing row, so a link it cannot
+    write is a restore warning counted in `links_not_restored`. `TransactionRead.refund_of_id` carries the
+    link, and `GET /transactions/{id}/refund-candidates` lists the originals the PUT would accept.
+    Deleting an original nulls the link on every refund pointing at it; the refund survives. A refund and its
+    original deleted together go in one statement. — *Enforced by*: DB FK + service ·
+    *Locked by*: `tests/api/test_transactions.py::test_refund_link_rejects_a_non_spend_target`,
+    `tests/api/test_transactions.py::test_refund_candidates_offer_only_linkable_originals`,
+    `frontend/app/expenses/transaction-dialog.test.tsx` ("links a refund to an original picked from its
+    candidates"),
+    `tests/services/test_backup.py::test_restore_links_a_new_refund_to_a_deduped_original`,
+    `tests/api/test_transactions.py::test_deleting_the_original_clears_the_refund_link`,
+    `::test_bulk_delete_releases_partners_outside_the_request`, `::test_bulk_delete_takes_both_legs_of_a_pair`,
+    `tests/services/test_demo_seed.py::test_reseed_clears_a_refund_link_into_the_wiped_rows`
 
-- Do not resurrect a seeded "Refund" category, on this axis or any other — that is the exact
-  duplication this ADR undoes (see Problem).
-- Do not touch `investment_transactions.transaction_type` (`buy | sell | dividend | ...`) —
-  disjoint vocabulary, a different table, no refund concept.
-- Do not touch `parsers/base.py`'s `TxnType` (`purchase | payment | refund | other`) — this is
-  statement-side classification vocabulary, upstream of `_map_type`, and `refund` stays a
-  valid `TxnType` value forever: `_classify` still needs to name "this credit's merchant text
-  matched a refund/reversal/chargeback keyword" before `_map_type` decides what stored type
-  and sign that becomes. T3, in the working notes for this change.
-- Do not widen `income`'s sign rule to match `spend`'s. Income reversal is a different,
-  unscoped problem; conflating the two erases the one piece of information `sign_error` still
-  enforces.
+## Out of bounds
 
-**Implementation approach:** narrow the model Literal
-(`app/models/transaction.py:TransactionTypeStr`) first — the column splats
-`*get_args(TransactionTypeStr)`, so this one edit drives the CHECK constraint DDL. Migration
-`0029_refund_as_signed_spend` updates data before narrowing the CHECK (so no row violates it
-mid-migration), and rebuilds `ix_transactions_user_confirmed_date` (`WHERE confirmed_at IS
-NOT NULL`) explicitly in both `upgrade()` and `downgrade()` — SQLite's `batch_alter_table`
-drops a partial index's predicate on reflection ([0008](0008-f3-upi-merchant-normalisation-deferral.md)
-hit the same hazard), and `test_migration_parity.py` does not check WHERE clauses, so nothing
-else would catch a silent loss. The downgrade is reconstructive, not byte-exact: it widens the
-CHECK back and flips every positive `spend` row to `refund`, which would also relabel a
-legitimately positive non-refund spend, had one existed — none do at the time of this
-migration, but a future downgrade against a database that has since gained one loses that
-distinction. Then the wide backend sweep (services, API, parsers, demo data), then the
-frontend (`EntryDirection`, the review-queue dropdown, comment sweep), then docs.
+- No seeded or system "Refund" category on any axis.
+- `investment_transactions.transaction_type` is a separate vocabulary with no refund concept.
+- Cashback classification belongs to ADR-0013.
 
-**Verification** (`PRD.md` §Verification step 1, rewritten by this ADR):
+## Why
 
-1. A `CHARGEBACK`-classified credit stores `transaction_type = "spend"` with a **positive**
-   `amount_paise`, for both the Axis and ICICI parsers (their refund keyword vocabularies
-   diverged historically) — composing `_classify` (still yields `TxnType == "refund"`, T3)
-   with `_map_type` (now folds that into `spend`), since the stored type only appears after
-   the second step.
-2. A positive `spend` nets a category to **exactly zero** against a matching negative `spend`
-   in the same category — the structural form of the §F4a netting convention.
-3. The F4a mis-pair guard: a negative `income` CC row (the state `POST /backup/import` can
-   persist without `sign_error`) plus a positive same-magnitude `spend` in the parent bank
-   account does **not** auto-link.
-4. Migration `0029` up and down against the test SQLite DB, with an explicit assertion that
-   `ix_transactions_user_confirmed_date` keeps its `WHERE confirmed_at IS NOT NULL` predicate
-   after each direction.
-5. A legacy backup CSV containing `transaction_type=refund` imports as `spend` (read-only
-   alias, T4).
-6. `GET /transactions?transaction_type=spend&amount_sign=positive` returns refunds only, and
-   stays tenant-isolated (ADR-0003).
+A fourth `refund` type was a label for "spend row, positive sign". Every consumer already bucketed
+`spend` and `refund` together, and a refund parked in its own category leaves the original category
+permanently inflated. Peers agree at schema level: Firefly III, Actual, YNAB, Lunch Money and GnuCash
+all model a refund as a same-category inflow (a negative expense), never as a type. Income reversal
+(a salary clawback) is the mirror case: double-entry debits the income account, so it is a negative
+`income` in the same income category.
 
----
+Backup restore is a file-upload boundary, so it validates. Without that, a hand-edited zip could store
+a zero or a wrong-sign row, which every aggregate and the F4a guard would have to tolerate.
 
-## Trade-offs
+## Alternatives rejected
 
-**Benefits:**
+- **Keep `refund` as a fourth type** — no information a sign check lacks, one more vocabulary to sync.
+- **A seeded "Refund" category** — guarantees the reversed category stays inflated.
+- **Record an income reversal as a negative-signed spend** — inflates spend and leaves income
+  overstated.
+- **Reuse `transfer_pair_id` to link a refund** — ADR-0002 pins it to one movement of money.
+- **Restore verbatim** — pushes bad-sign tolerance into every consumer.
 
-- Removes a distinction without a difference: nothing downstream ever needed the type
-  `refund` for anything a sign check on `spend` didn't already do, and five competitor apps
-  independently reach the same schema-level answer.
-- `PRD.md` §F4a's netting convention stops being advisory prose and becomes the only
-  representation there is — a refund literally cannot drift into its own bucket, because
-  there is no bucket left to drift into.
-- One fewer type to keep in lockstep across the model Literal, the schema sign rule, every
-  dashboard filter, the parser mapping, and the frontend picker — each of which was a second
-  place the same "is this a refund" decision had to agree with the first.
-- Restores review-queue precision (which spend category a refund nets against) that an
-  earlier pass had traded away specifically because the flat type made a precise choice
-  clunky to offer.
+## Consequences
 
-**Drawbacks:** `sign_error` is now asymmetric between `spend` and `income`, which is one more
-rule to remember; the F4a reconciliation guard depends on an invariant (`sign_error` runs) that
-one code path (`POST /backup/import`) doesn't actually provide, so the guard has to be stated
-rather than derived; and a fat-fingered positive spend is indistinguishable from a genuine
-refund at the API level — there is no server-side way to catch the former.
+- One representation for netting: a refund cannot drift into its own bucket.
+- Accepted cost: a fat-fingered positive spend reads as a refund, and a negative income as a
+  reversal. Only the user knows which was meant, and a type would not tell either.
+- Reopen if a feature needs refunds as first-class records (partial refunds against several spends).
 
-**Mitigation:** the sign asymmetry is documented at the single place it's enforced
-(`sign_error()`'s docstring) rather than left implicit; the reconciliation guard's comment
-names the exact backup-import path that makes it necessary, so a future reader doesn't "clean
-up" the supposedly-redundant clause; and the fat-finger ambiguity is inherent to a two-value
-sign, not something a third type could actually resolve either — Firefly III's issue #769
-rejection makes the same point about a `refund` type not preventing the analogous mistake in
-the other direction.
+## History
 
-## Alternatives Considered
-
-**Alternative 1 — keep `refund` as a fourth `transaction_type`** (the status quo before this
-ADR): rejected. Every downstream consumer already treated `spend` and `refund` as one bucket
-(11 dashboard filter sites alone), so the type carried no information a sign check didn't
-already have, at the cost of keeping four vocabularies in sync instead of three.
-
-**Alternative 2 — the path not taken twice: promote refund onto the category axis instead**
-(a seeded "Refund" category, tried and reverted in this same working-tree pass): rejected,
-and rejected specifically because it makes the netting problem *worse*, not neutral. A
-refund's whole job is to reduce the total in the category it reverses; parking it in a
-category of its own guarantees the original category stays inflated by exactly the refunded
-amount, forever.
-
-**Alternative 3 — link a refund to the spend it reverses**, the way Firefly III actually
-models it (a `LinkType` between journals): rejected for v1. `transfer_pair_id` exists and has
-the right shape (two rows, one relationship), but [ADR-0002](0002-transfer-pair-id-semantics.md)
-pins it specifically to F4a auto-reconciliation and F2 user transfers — repurposing it for
-refund-linking would be re-litigating a settled decision, not a freebie, and the sign
-convention already gets the netting math right without needing an explicit link. Worth
-revisiting only if a future feature needs to answer "which specific spend did this refund
-reverse" rather than "how much did this category net to."
-
-**Alternative 4 — widen `income`'s sign rule to match `spend`'s (accept negative income)**:
-rejected. It would make an income reversal representable, but that is a different, unscoped
-problem (salary clawback, not merchant refund), and accepting it here would erase the one
-piece of information `sign_error` still enforces for income rows.
-
-**Alternative 5 — derive the reconciliation guard's sign invariant instead of stating it**:
-rejected once `POST /backup/import`'s bypass of `sign_error` was traced through. Deriving
-"the target must be negative" from "the CC-side row is `income`" is correct only where
-`sign_error` ran, and there is at least one write path where it didn't — so the guard has to
-name the sign explicitly rather than assume it follows from the type.
+- 2026-08-12 — Accepted. `refund` type removed (migration `0029_refund_as_signed_spend`); dashboards
+  moved from type to sign; a seeded "Refund" category tried in the same pass was reverted.
+- 2026-11-15 — Rewritten to the rules-first template. Income reversal adopted (`sign_error` is
+  symmetric). Restore runs `sign_error`. Optional refund → original link added. Cashback moved to
+  ADR-0013.
+- 2026-11-16 — Rules 7–8: bank column types `withdrawal` / `deposit` added to `TxnType`; a deposit
+  imports as income unless it names cashback.
+- 2026-11-16 — Rule 13: deleting an original nulls its refunds' links; a refund deleted with its original
+  goes in one statement (the shared transaction delete).
