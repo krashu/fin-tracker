@@ -37,6 +37,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { listSpendByTag } from "@/lib/api/client";
 import { formatINR, formatMonthYear } from "@/lib/format";
+import { periodLabel as periodName } from "@/lib/period";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
@@ -80,7 +81,7 @@ export function SpendByTag({
 
   const displayPeriodLabel = month
     ? formatMonthYear(new Date(Number(month.split("-")[0]), Number(month.split("-")[1]) - 1, 1))
-    : `${year}`;
+    : periodName({ year });
 
   return (
     <Card>

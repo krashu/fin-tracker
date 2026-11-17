@@ -34,7 +34,7 @@ import {
 import { listSpendByPeriod } from "@/lib/api/client";
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel, type Grain } from "@/lib/charts";
-import { periodRange } from "@/lib/period";
+import { periodLabel as periodName, periodRange } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
 
@@ -94,7 +94,7 @@ export function SpendByPeriodBar({
           <CardTitle as="h2" className="text-[14px]">
             Spend over time
           </CardTitle>
-          <span className="text-[12.5px] text-muted-foreground">· {year}</span>
+          <span className="text-[12.5px] text-muted-foreground">· {periodName({ year })}</span>
         </div>
         <div className="flex items-center gap-1">
           {(["week", "month"] as const).map((g) => (

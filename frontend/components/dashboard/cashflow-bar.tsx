@@ -34,7 +34,7 @@ import {
 import { listCashflowByPeriod } from "@/lib/api/client";
 import { compactINR, formatINR } from "@/lib/format";
 import { periodLabel } from "@/lib/charts";
-import { periodRange } from "@/lib/period";
+import { periodLabel as periodName, periodRange } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
 
@@ -64,7 +64,7 @@ export function CashflowBar({ tagActive = false, year }: { tagActive?: boolean; 
 
   const data = (query.data?.buckets ?? []).map((b) => ({
     label: periodLabel(b.period, "month"),
-    income: b.income_paise, // ≥ 0
+    income: b.income_paise, // signed: a reversal nets it down
     spend: Math.max(0, -b.expense_paise),
     net: b.net_paise, // signed — dips below the y=0 reference on a deficit month
   }));
@@ -76,7 +76,7 @@ export function CashflowBar({ tagActive = false, year }: { tagActive?: boolean; 
           <CardTitle as="h2" className="text-[14px]">
             Income vs spend
           </CardTitle>
-          <span className="text-[12.5px] text-muted-foreground">· {year}</span>
+          <span className="text-[12.5px] text-muted-foreground">· {periodName({ year })}</span>
         </div>
         {/* Static caption independent of query state — this card ignores the
             tag filter on purpose (income can't be tagged). */}

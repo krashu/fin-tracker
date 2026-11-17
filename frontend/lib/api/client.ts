@@ -45,9 +45,17 @@ export type TransactionRead = {
   category_name: string | null;
   category_parent_name: string | null;
   /** Non-null = this row is one leg of a transfer pair (ADR-0002). Renders the
-   * F4a "Linked CC bill payment" banner, and freezes the row's identity fields
+   * "Linked CC bill payment" banner (F4a auto-link or the manual link, ADR-0002 rule 11b), and freezes the row's identity fields
    * and type until `unlinkTransaction` breaks the pair (ADR-0007 rule 7). */
   transfer_pair_id: number | null;
+  /** The spend this refund reverses (ADR-0009 rule 13), or null. Informational and
+   * never summed. Read by the dialog's refund picker; written only through
+   * `setRefundLink` / `deleteRefundLink`, never PATCH. */
+  refund_of_id: number | null;
+  /** Server-computed (ADR-0002 rule 11b placement): an unpaired, confirmed `income` or
+   * `transfer` credit on a live card. The dialog shows "Paid your card bill elsewhere?"
+   * from it; never re-derived here. */
+  card_bill_link_offered: boolean;
   labels: LabelRead[];
 };
 
@@ -87,11 +95,19 @@ export type TransactionCandidate = TransactionRead & {
   /** Winning rule for this (merchant, category) is user-authored (pinned) —
    * the picker renders an "authored" state that outranks the confidence tint. */
   pinned: boolean;
-  /** Row is `income` and its merchant names a card-bill payment (PRD §F4a-1) —
-   * the review queue can offer "Card bill payment" instead of a category.
-   * Does NOT assert the auto-link will fire at commit; that also needs a
-   * matching bank debit and an imported parent account. */
+  /** Row names a card-bill payment (PRD §F4a-1): a card `income` credit, or a
+   * bank debit (negative `spend`) — the review queue can offer "Card bill
+   * payment" instead of a category. Server-computed, never re-derived here.
+   * Does NOT assert the auto-link will fire at commit; that also needs the
+   * other leg (the bank debit, or the card's payment) and an imported parent
+   * account. */
   cc_payment_candidate: boolean;
+  /** This row, committed with no category, commits as an unpaired `transfer` (ADR-0002 rule
+   * 7b): a flagged bank debit on a bank a live card names "Paid from", dated inside a committed
+   * statement of that card, or a flagged card payment credit (rule 7c). Ignores the row's
+   * current category. False on every other row.
+   * Server-computed, never re-derived here. */
+  uncategorised_commits_as_transfer: boolean;
 };
 
 /** Response body of `POST /imports`. `already_imported` means the file hash was
@@ -102,6 +118,8 @@ export type TransactionCandidate = TransactionRead & {
  * imported into (the wrong-account mis-import the per-account dedup can't catch) —
  * an id, never a name; `duplicate_of_account_archived` flags that `GET /accounts`
  * won't return it, so it can't be resolved to a label.
+ * `skipped` = already in expenses (duplicates); `zero_amount_count` = zero-amount
+ * lines, not transactions.
  * `reconciliation_delta_paise` (PRD §F1/§F4a) is this import's statement-balance
  * check as of upload: `null` = not checked (no usable statement metadata),
  * `0` = reconciled, non-zero = mismatch, this many paise. */
@@ -109,6 +127,7 @@ export type ImportSummary = {
   batch_id: number;
   imported: number;
   skipped: number;
+  zero_amount_count: number;
   already_imported: boolean;
   pending_count: number;
   duplicate_of_account_id: number | null;
@@ -118,7 +137,8 @@ export type ImportSummary = {
 
 /** Response body of `POST /imports/investments` (PRD §F7). `warnings` are PII-safe
  * (line number + reason; never raw cells). `already_imported` flags an identical
- * re-upload (matched by source_file_hash) — nothing new was added. */
+ * re-upload (matched by source_file_hash) — nothing new was added. `rows_rejected`
+ * counts rows; `warnings` may be fewer (one per uncovered sell of a refused instrument). */
 export type InvestmentCsvImportSummary = {
   batch_id: number;
   instruments_new: number;
@@ -139,6 +159,19 @@ export type AccountRead = {
   currency: "INR" | "USD";
   parent_account_id: number | null;
   archived_at: string | null;
+  /** Whether an uploaded statement for this account has a parser. Server-derived
+   * from the parser registry (the lookup an upload dispatches on) — never
+   * re-derive it here by matching issuer names. */
+  statement_import_supported: boolean;
+};
+
+/** One `(account type, issuer)` a statement parser exists for, with its display
+ * label (`GET /accounts/statement-issuers`). The account forms render their issuer
+ * pickers from this rather than a hand-mirrored list. */
+export type StatementIssuer = {
+  account_type: "credit_card" | "bank";
+  issuer: string;
+  label: string;
 };
 
 /** Spend categories serve `spend`-typed transactions, of either sign (a refund
@@ -147,10 +180,16 @@ export type AccountRead = {
 export type CategoryKind = "spend" | "income";
 
 /** A user-picked `#rrggbb` hex color for a category's dot/bar (the backend
- * validates and lower-cases it). `null` = derive the color from the id — the
- * Auto fallback in `lib/categories.ts`. A plain string alias: the value is an
- * arbitrary hex, not a closed set. */
+ * validates and lower-cases it). `null` only on a subcategory, which inherits
+ * its parent's hue; a root always has one (ADR-0012 rule 7). A plain string
+ * alias: the value is an arbitrary hex, not a closed set. */
 export type CategoryColor = string;
+
+/** What a category is to the app, computed server-side (`category_roles`): the
+ * kind's fallback "Other" (never archived or renamed, ADR-0012 rule 8) or the
+ * spend-kind Cashback and its children (ADR-0013). The frontend branches on this
+ * and never matches category names. */
+export type CategoryRole = "fallback" | "cashback";
 
 export type CategoryRead = {
   id: number;
@@ -159,7 +198,10 @@ export type CategoryRead = {
   is_seeded: boolean;
   archived_at: string | null;
   color: CategoryColor | null;
+  /** Server-resolved: own colour or the parent's (ADR-0012 rule 7); never derive it. */
+  display_color: CategoryColor;
   parent_id: number | null;
+  role: CategoryRole | null;
 };
 
 /** Shape of a `GET /categories?tree=true` row — see `listCategoryTree`. Kept
@@ -347,7 +389,13 @@ export type AuthUser = {
   id: string;
   email: string | null;
   display_name: string | null;
-  is_guest?: boolean;
+  /** Always on the wire (`AuthUser.is_guest` defaults false server-side). A guest owns
+   * synthetic data only and cannot upload files (ADR-0003 rule 15). */
+  is_guest: boolean;
+  /** Server-computed (`auth_service.can_manage_credentials`): false for the shared demo
+   * login and for guests. The change-password and delete-account cards render a notice
+   * instead of their form when false; never re-derive it from `is_guest` or the email. */
+  can_manage_credentials: boolean;
 };
 
 /** Public demo credentials (backend `app/core/demo.py`) — the demo owns only
@@ -419,13 +467,29 @@ export function changePassword(
   });
 }
 
+/** The typed confirmation phrase `POST /auth/delete-account` requires (ADR-0003 rule 13b).
+ * Mirrors `DELETE_ACCOUNT_PHRASE` in `backend/app/schemas/auth.py`: exact, case-sensitive. */
+export const DELETE_ACCOUNT_PHRASE = "delete my account" as const;
+export type DeleteAccountRequest = { password: string; confirmation: typeof DELETE_ACCOUNT_PHRASE };
+
+/** Erase the signed-in account and everything it owns, immediately (ADR-0003 rule 13b).
+ * 204 clears the auth cookies. A wrong password is 400 (a body error, never 401, so it never
+ * triggers a refresh or a logout); 403 for the demo login and guests; 422 for a wrong phrase.
+ * Participates in refresh like `changePassword`. */
+export function deleteMyAccount(body: DeleteAccountRequest): Promise<void> {
+  return request<void>("/auth/delete-account", { method: "POST", body: JSON.stringify(body) });
+}
+
 /** Public, pre-auth client config. `demo_login_enabled` mirrors the backend's resolved
- * demo-login gate — so the login page can hide/show the "Try the demo" button.
- * `registration_enabled` reflects whether open user registration is allowed.
+ * shared-demo-login gate and `guest_sandbox_enabled` its separate guest-sandbox gate
+ * (`POST /auth/demo-session`); either one shows the "Try the demo" button, whose
+ * `loginDemo` tries a guest sandbox first and falls back to the shared demo login.
+ * `registration_enabled` reflects whether user registration is allowed.
  * `noRefresh`: this is read before any session exists, so a 401 must never trigger a
  * refresh attempt. */
 export type AuthConfig = {
   demo_login_enabled: boolean;
+  guest_sandbox_enabled: boolean;
   registration_enabled: boolean;
 };
 
@@ -477,11 +541,22 @@ export function listAccounts(): Promise<AccountRead[]> {
   return request<AccountRead[]>("/accounts");
 }
 
+export function listStatementIssuers(): Promise<StatementIssuer[]> {
+  return request<StatementIssuer[]>("/accounts/statement-issuers");
+}
+
 // Every call site today passes no params, so the shared `["categories"]`
 // TanStack key (used at all 11 call sites) is safe — a future caller that
 // passes `kind` (or calls `listCategoryTree`) must fold the params into its
 // own query key (e.g. `["categories", params]`) or it will collide with the
 // unfiltered cache entry.
+/** The palette the server hands out and the colour picker offers, in slot order. */
+export type CategoryPalette = { colors: CategoryColor[] };
+
+export function getCategoryPalette(): Promise<CategoryPalette> {
+  return request<CategoryPalette>("/categories/palette");
+}
+
 export function listCategories(params?: {
   kind?: CategoryKind;
 }): Promise<CategoryRead[]> {
@@ -559,13 +634,13 @@ export function deleteAccount(id: number): Promise<void> {
 }
 
 // --- Category mutations (PRD §F5) ---------------------------------------------
-// `color` is optional on create and nullable on update — an explicit `null`
-// PATCH clears a picked color and reverts to derive-from-id (unlike `name`,
-// which can't be nulled).
+// `color` is omitted on create to inherit (subcategory) or have the server assign
+// one (root); on update, `null` reverts a subcategory to inheriting and is a 422
+// on a root.
 export type CategoryCreate = {
   name: string;
   kind?: CategoryKind;
-  color?: CategoryColor | null;
+  color?: CategoryColor;
   parent_id?: number | null;
 };
 export type CategoryUpdate = {
@@ -591,10 +666,14 @@ export function patchCategory(
   });
 }
 
-/** Soft-delete a category (204). Also clears its merchant→category auto-tag
- * mappings server-side. Throws `ApiError(404)` if already archived. */
-export function deleteCategory(id: number): Promise<void> {
-  return request<void>(`/categories/${id}`, { method: "DELETE" });
+/** Soft-delete (archive) a category and its children (204). Its merchant→category rules
+ * are kept but stop applying while it is archived. With `reassignTo`, every board row on
+ * the archived categories moves to that live, same-kind category in the same commit
+ * (ADR-0012 rule 10); an invalid target is a 422 before anything is written. Throws
+ * `ApiError(404)` if already archived. */
+export function deleteCategory(id: number, opts?: { reassignTo?: number }): Promise<void> {
+  const query = opts?.reassignTo != null ? `?reassign_to=${opts.reassignTo}` : "";
+  return request<void>(`/categories/${id}${query}`, { method: "DELETE" });
 }
 
 // --- Label mutations (PRD §F3a — user "Tags") ---------------------------------
@@ -668,14 +747,13 @@ export type LabelRuleRead = {
   pinned: boolean; // user-authored: prefills even below the learned bar
 };
 
-// As of Phase A3 (ADR-0011) `merchant_normalized` is the CANONICAL merchant —
-// an unaliased merchant resolves to itself, so this keeps its name but its
-// value now depends on the user's alias table.
+// One rule group per CANONICAL merchant (ADR-0011 rule 8): the merchant itself
+// when unaliased. Named like `TopMerchantRow.merchant_canonical`.
 export type MerchantRuleRead = {
-  merchant_normalized: string;
+  merchant_canonical: string;
   categories: CategoryRuleRead[];
   labels: LabelRuleRead[];
-  alias_count: number; // distinct raw merchant_normalized keys folded in; always >=1
+  alias_count: number; // alias patterns resolving to this canonical; 1 when unaliased
   seeded: boolean; // every category row in the group is an unconfirmed seed (hit_count === 0)
 };
 
@@ -799,25 +877,116 @@ export function patchTransaction(
   });
 }
 
-/** Hard-delete a transaction (204). Throws `ApiError(404)` if already gone. */
-export function deleteTransaction(id: number): Promise<void> {
-  return request<void>(`/transactions/${id}`, { method: "DELETE" });
+/** The most ids one bulk call (bulk-categorise, bulk-delete) accepts. A hand-kept mirror of
+ * `services/bulk_categorise.py::BULK_MAX`; the server's 422 backstops any drift. */
+export const BULK_MAX = 500;
+
+export type BulkCategoriseResult = { updated: number; taught: number };
+
+/** Categorise many board rows at once (ADR-0004 rule 4): all-or-nothing, one teach per
+ * canonical merchant. Any bad id is a 422 whose body lists `invalid_ids` (see
+ * `invalidIdsFromError`) and nothing is written. */
+export function bulkCategorise(body: {
+  transaction_ids: number[];
+  category_id: number;
+}): Promise<BulkCategoriseResult> {
+  return request<BulkCategoriseResult>("/transactions/bulk-categorise", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Recent rows a category correction could also be applied to (ADR-0004 rules 2b and 4).
+ * `transaction_ids` is empty (and `category_id` null) when there is nothing to offer. */
+export type PastRowsRead = {
+  merchant: string;
+  category_id: number | null;
+  transaction_ids: number[];
+};
+
+export function getPastRows(id: number): Promise<PastRowsRead> {
+  return request<PastRowsRead>(`/transactions/${id}/past-rows`);
+}
+
+/** Pull `invalid_ids` from an all-or-nothing 422 body (bulk categorise, bulk delete, import commit);
+ * `[]` for any other error shape. */
+export function invalidIdsFromError(err: unknown): number[] {
+  if (!(err instanceof ApiError) || err.status !== 422) return [];
+  const detail = (err.body as { detail?: unknown } | undefined)?.detail;
+  const ids = (detail as { invalid_ids?: unknown } | undefined)?.invalid_ids;
+  return Array.isArray(ids)
+    ? ids.filter((x): x is number => typeof x === "number")
+    : [];
+}
+
+/** Hard-delete many rows in one all-or-nothing request (204). Each row goes through
+ * the shared server delete: a linked partner outside the request gets its pre-link
+ * type and category back (ADR-0002 rule 9), and refunds pointing at a deleted original
+ * lose the link (ADR-0009 rule 13). A missing id is a 422 listing `invalid_ids`
+ * (see `invalidIdsFromError`) and nothing is deleted. */
+export function bulkDeleteTransactions(body: { transaction_ids: number[] }): Promise<void> {
+  return request<void>("/transactions/bulk-delete", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 /** Break a transfer pair (PRD §F4a-1 "break the link if the auto-detection got it
- * wrong"). Clears `transfer_pair_id` on BOTH legs; idempotent 204 on an already
- * unpaired row. Both legs keep `transaction_type = "transfer"` — no provenance
- * column exists to restore the pre-link spend/income type — so the caller may want
- * to follow up with a PATCH. Unlinking is also the prerequisite for editing a
- * paired row's identity fields (ADR-0007 rule 7). */
+ * wrong", and the manual link of ADR-0002 rule 11b). Clears `transfer_pair_id` on BOTH
+ * legs and gives each leg back what the link took: its `pre_link_type` and its
+ * `pre_link_category_id` (ADR-0002 rule 9). A category set on the linked leg since then
+ * wins. A leg born as a transfer (F2) has neither and stays `transfer`. Neither column is
+ * on `TransactionRead`, so refetch the row to see the restored type and category.
+ * Idempotent 204 on an already unpaired row. Unlinking is also the prerequisite for
+ * editing a paired row's identity fields (ADR-0007 rule 7). */
 export function unlinkTransaction(id: number): Promise<void> {
   return request<void>(`/transactions/${id}/unlink`, { method: "POST" });
+}
+
+/** The originals a refund may link to (ADR-0009 rule 13): server-ranked, at most 20, and
+ * each one a row `setRefundLink` will accept. `[]` for a row that is not a refund. */
+export function listRefundCandidates(id: number): Promise<TransactionRead[]> {
+  return request<TransactionRead[]>(`/transactions/${id}/refund-candidates`);
+}
+
+/** Link a refund to the spend it reverses (204). Informational: nothing is re-summed. */
+export function setRefundLink(id: number, originalId: number): Promise<void> {
+  return request<void>(`/transactions/${id}/refund-link`, {
+    method: "PUT",
+    body: JSON.stringify({ original_id: originalId }),
+  });
+}
+
+/** Remove a refund's link (204, idempotent). */
+export function deleteRefundLink(id: number): Promise<void> {
+  return request<void>(`/transactions/${id}/refund-link`, { method: "DELETE" });
+}
+
+/** Body of `POST /transactions/{id}/link` (mirrors `schemas/transactions.py::TransactionLinkSet`). */
+export type TransactionLinkSet = { partner_id: number };
+
+/** The rows `linkTransaction` will accept for this one (ADR-0002 rule 11b). The server vets
+ * them with the same rule as the POST, puts the nearest date first and returns at most 20;
+ * `[]` for a row that cannot be linked. Render as returned: never filter or re-sort. */
+export function listLinkCandidates(id: number): Promise<TransactionRead[]> {
+  return request<TransactionRead[]>(`/transactions/${id}/link-candidates`);
+}
+
+/** Manually pair two confirmed rows as a transfer ("Paid your card bill elsewhere?",
+ * ADR-0002 rule 11b). 204. Both legs become `transfer`, keep their pre-link type and
+ * category aside for unlink, and lose their category. 422 with the reason in `detail`
+ * when the pair is refused; a missing or foreign partner is 422 too. Never teaches
+ * (ADR-0004), so no rule cache moves. */
+export function linkTransaction(id: number, partnerId: number): Promise<void> {
+  const body: TransactionLinkSet = { partner_id: partnerId };
+  return request<void>(`/transactions/${id}/link`, { method: "POST", body: JSON.stringify(body) });
 }
 
 /**
  * Manual transaction entry (PRD §F2). `amount_paise` is signed — the caller
  * applies the sign by entry direction (spend negative, income positive; a
- * refund is a `spend` with a positive amount — see `EntryDirection` in
+ * refund is a `spend` with a positive amount and an income reversal an `income`
+ * with a negative one — see `EntryDirection` in
  * `lib/transaction-types.ts`). Auto-confirmed server-side, so it lands on the
  * board immediately. 409 if it duplicates an existing fingerprint.
  */
@@ -907,6 +1076,31 @@ export async function createInvestmentCsvImport(args: {
   return (await res.json()) as InvestmentCsvImportSummary;
 }
 
+/** A bundled synthetic sample statement a guest can import (ADR-0003 rule 15).
+ * `account_ids` are the caller's live accounts it fits, decided server-side. */
+export type SampleStatementRead = {
+  id: string;
+  label: string;
+  issuer: string;
+  account_type: "credit_card" | "bank";
+  account_ids: number[];
+};
+
+export function listSampleStatements(): Promise<SampleStatementRead[]> {
+  return request<SampleStatementRead[]>("/imports/samples");
+}
+
+/** Stage a bundled sample into one of the caller's accounts; same summary as an upload. */
+export function importSampleStatement(body: {
+  sample_id: string;
+  account_id: number;
+}): Promise<ImportSummary> {
+  return request<ImportSummary>("/imports/samples", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 export function listCandidates(
   batchId: number,
 ): Promise<TransactionCandidate[]> {
@@ -979,6 +1173,7 @@ export type BackupImportSummary = {
   txns_imported: number;
   txns_skipped_dupe: number;
   rows_rejected: number;
+  links_not_restored: number;
   transfers_relinked: number;
   warnings: string[];
 };
@@ -1020,13 +1215,17 @@ export async function importBackup(file: File): Promise<BackupImportSummary> {
   return (await res.json()) as BackupImportSummary;
 }
 
+/** Commit `transaction_ids` and delete `discard_ids` in one atomic request (204;
+ * ADR-0002 rule 5). Either list may be empty, not both. A row that is not a pending row
+ * of this batch, or is named in both lists, is a 422 `{message, invalid_ids}`
+ * (see `invalidIdsFromError`) and nothing is committed or deleted. */
 export function commitImport(
   batchId: number,
-  transactionIds: number[],
+  body: { transaction_ids: number[]; discard_ids: number[] },
 ): Promise<void> {
   return request<void>(`/imports/${batchId}/commit`, {
     method: "POST",
-    body: JSON.stringify({ transaction_ids: transactionIds }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -1072,7 +1271,8 @@ export function listSpendByPeriod(params: {
 }
 
 /** One bar-group of the cashflow series (PRD §F8 view 3, the /spending
- * income-vs-spend chart). `period` is "YYYY-MM" or "YYYY-Www". `income_paise` ≥ 0;
+ * income-vs-spend chart). `period` is "YYYY-MM" or "YYYY-Www". `income_paise` is
+ * signed (an income reversal nets it down);
  * `expense_paise` is SIGNED (≤ 0 typically, matching SpendByPeriodBucket — but
  * legitimately > 0 in a refund-dominant bucket, never server-clamped); `net_paise`
  * = income + expense (server-computed, goes negative on a deficit bucket). */
@@ -1107,69 +1307,9 @@ export function listCashflowByPeriod(params: {
   );
 }
 
-/** One category in the spend-by-category-by-period echoed set (PRD §F8 view 3,
- * the /spending category-trend bar): its id + name, defining the stable stack
- * order and the color-join key. Both null for the uncategorized bucket; name is
- * additionally null for a row pointing at a foreign-user category (the guarded
- * JOIN drops the leaked name — cf. SpendByCategoryRow). */
-export type SpendCategoryRef = {
-  category_id: number | null;
-  category_name: string | null;
-};
-
-/** One cell of the category×period grid: a category's SIGNED total in a bucket
- * (spend negative, refund positive — nets like SpendByCategoryRow). Never
- * clamped on EITHER side of the wire: the sole consumer
- * (`category-trend-bar.tsx`) plots one category at a time against a `y=0`
- * reference line, so a net-credit bucket dips below the axis. Nothing floors. */
-export type SpendCategoryPeriodTotal = {
-  category_id: number | null;
-  total_paise: number;
-};
-
-/** One bucket of the category-trend series. `totals` is DENSE — one cell per
- * category in the response's `categories` set, zero-filled, in `categories`
- * order. */
-export type SpendByCategoryByPeriodBucket = {
-  period: string;
-  totals: SpendCategoryPeriodTotal[];
-};
-
-/** Response body of `GET /dashboards/spend-by-category-by-period`. `categories`
- * is echoed once (dropdown/series order + color join); `buckets` is chronological
- * ascending, zero-filled, never empty. Σ(a bucket's cell totals) reconciles to
- * the matching `SpendByPeriodBucket.total_paise` (both signed, both spend+refund),
- * and the identity holds on screen too — the chart is a single signed series, not
- * a stack, so nothing is floored away. */
-export type SpendByCategoryByPeriodResponse = {
-  bucket: "week" | "month";
-  start: string;
-  end: string;
-  categories: SpendCategoryRef[];
-  buckets: SpendByCategoryByPeriodBucket[];
-  label_id: number | null;
-};
-
-export function listSpendByCategoryByPeriod(params: {
-  bucket: "week" | "month";
-  start: string;
-  end: string;
-  label_id?: number;
-}): Promise<SpendByCategoryByPeriodResponse> {
-  const qs = new URLSearchParams({
-    bucket: params.bucket,
-    start: params.start,
-    end: params.end,
-  });
-  if (params.label_id != null) qs.set("label_id", String(params.label_id));
-  return request<SpendByCategoryByPeriodResponse>(
-    `/dashboards/spend-by-category-by-period?${qs}`,
-  );
-}
-
 /** One tag in the spend-by-tag-by-period echoed set (PRD §F3a labels, the
  * /spending tag-trend chart — arc Phase C): its id + name, defining the stable
- * line order and the palette-by-rank color join. Unlike SpendCategoryRef, id and
+ * line order and the palette-by-rank color join. Unlike CategoryTrendParent.parent_id, id and
  * name are NON-null: the route inner-joins labels (foreign/orphan labels drop the
  * row) and excludes the untagged residual, so every tag here is real. */
 export type TagRef = {
@@ -1225,17 +1365,31 @@ export function listSpendByTagByPeriod(params: {
 /** One row of the spend-by-category aggregate (PRD §F8 view 2). `total_paise`
  * is signed (spend negative, refund positive), so a category whose refunds
  * outweigh its in-window spend surfaces positive. Both ids are null for the
- * uncategorized bucket. */
+ * uncategorized bucket. `parent_id` / `parent_name` name the category's parent
+ * (one hop, ADR-0012 rule 6) whatever the archive state, so a rollup needs no
+ * category list; both are null for a root and for the uncategorized bucket.
+ * `display_color` / `parent_display_color` are the two rows' server-resolved colours
+ * (ADR-0012 rule 7), whatever the archive state, so view 2 needs no category list for
+ * colour; `display_color` is null only for the uncategorized bucket, and
+ * `parent_display_color` for a root and for uncategorized. */
 export type SpendByCategoryRow = {
   category_id: number | null;
   category_name: string | null;
+  parent_id: number | null;
+  parent_name: string | null;
+  display_color: CategoryColor | null;
+  parent_display_color: CategoryColor | null;
   total_paise: number;
 };
 
+/** Year numbers, newest first; the route defines the span (`listAvailableYears`
+ * returns calendar years, `listTaxYears` FY start years). */
 export type AvailableYearsResponse = {
   years: number[];
 };
 
+/** Calendar years for the spend pickers (PRD §F8): `2026` = 1 Jan - 31 Dec 2026, the
+ * span the dashboards' `?year=2026` covers. */
 export function listAvailableYears(): Promise<AvailableYearsResponse> {
   return request<AvailableYearsResponse>("/dashboards/available-years");
 }
@@ -1303,10 +1457,11 @@ export function listSpendByTag(params: {
 
 /** One row of the top-merchants list (PRD §F8 view 3). `total_paise` is SIGNED
  * (spend negative, refund positive — nets like SpendByCategoryRow), so a
- * refund-dominant merchant surfaces positive. `merchant_label` is a representative
- * raw display string; `merchant_normalized` is the grouping key. */
+ * refund-dominant merchant surfaces positive. `merchant_label` is the display string (a raw
+ * descriptor for an unaliased group, else the canonical); `merchant_canonical` is the
+ * grouping key, the per-user alias canonical (ADR-0011 rule 8). */
 export type TopMerchantRow = {
-  merchant_normalized: string;
+  merchant_canonical: string;
   merchant_label: string;
   total_paise: number;
 };
@@ -1342,7 +1497,8 @@ export function listTopMerchants(params: {
 
 /** Income vs spend over [start, end] (the /expenses summary strip's income
  * figure). `expense_paise` is signed (≤ 0 typically — refunds net against
- * spend, matching SpendByPeriodBucket); `income_paise` ≥ 0; `net_paise` =
+ * spend, matching SpendByPeriodBucket); `income_paise` is signed (an income
+ * reversal nets it down); `net_paise` =
  * income + expense (server-computed). Transfers excluded. */
 export type PeriodTotalsResponse = {
   start: string;
@@ -1395,7 +1551,7 @@ export function getTaggingStats(): Promise<TaggingStatsResponse> {
  * reports the raw signed balance for every type, excluded or not.
  * `spend_ytd_paise` is the signed net Σ(spend, signed) — spend rows of either
  * sign, refunds netting in as the positive ones — over the calendar
- * year-to-date window, populated only for `credit_card` rows
+ * year-to-date window (from 1 January), populated only for `credit_card` rows
  * (`null` otherwise, never `0`); it may be positive in a refund-dominant window,
  * so display floors it via `max(0, −value)`. Archived accounts are included
  * (flagged) so net worth doesn't change on archive. */
@@ -1492,11 +1648,18 @@ export type InstrumentRead = {
   archived_at: string | null;
 };
 
+/** One row of `GET /instruments/asset-classes`: the currencies a class may carry (one for a
+ * fixed class, both for the rest). The server is the only home of this rule. */
+export type AssetClassCurrencies = {
+  asset_class: AssetClass;
+  currencies: AccountRead["currency"][];
+};
+
 export type InstrumentCreate = {
   symbol: string;
   name: string;
   asset_class: AssetClass;
-  currency?: AccountRead["currency"]; // derived from asset class (US → USD); defaults INR
+  currency?: AccountRead["currency"]; // one of the class's currencies from `GET /instruments/asset-classes`
   exchange: Exchange;
   /** 12-char ISO 6166, normalised server-side (trimmed + upper-cased). Without one an
    * `indian_mf` can never be matched to AMFI NAVAll and stays hand-priced forever. */
@@ -1592,6 +1755,10 @@ export type HoldingsResponse = { holdings: HoldingRead[] };
 
 export function listInstruments(): Promise<InstrumentRead[]> {
   return request<InstrumentRead[]>("/instruments");
+}
+
+export function listAssetClassCurrencies(): Promise<AssetClassCurrencies[]> {
+  return request<AssetClassCurrencies[]>("/instruments/asset-classes");
 }
 
 export function createInstrument(
@@ -1790,111 +1957,81 @@ export function refreshBenchmarks(): Promise<BenchmarkRefreshSummary> {
   });
 }
 
-// --- Hierarchical Dashboards --------------------------------------------------
-
-export type HierarchicalSubcategorySpend = {
-  category_id: number | null;
-  category_name: string;
-  spend_paise: number;
-  total_paise: number;
-  percentage: number;
-  is_direct?: boolean;
-  color?: string | null;
+/** One drill row under a parent in the category trend (PRD §F8 view 6).
+ * `category_id` is the parent's own id on the direct row (`is_direct`).
+ * `category_name` is null only for a foreign-user category, which the composite
+ * same-user FK makes unreachable. `totals_paise` is signed, aligned to
+ * `CategoryTrendResponse.periods`, never clamped. */
+export type CategoryTrendSubcategory = {
+  category_id: number;
+  category_name: string | null;
+  /** The series colour the server chose: the palette rotation for an inheriting
+   * subcategory, the parent's own colour on the direct row (ADR-0012 rule 7). */
+  color: CategoryColor;
+  archived: boolean;
+  is_direct: boolean;
+  totals_paise: number[];
 };
 
-export type HierarchicalParentSpend = {
+/** One parent's monthly series; `parent_id` null is uncategorized (no subs).
+ * Archived children are already rolled in (ADR-0012 rule 6): Σ subs = parent. */
+export type CategoryTrendParent = {
   parent_id: number | null;
-  parent_name: string;
-  spend_paise: number;
-  direct_paise: number;
-  total_paise: number;
-  percentage: number;
-  color?: string | null;
-  subcategories: HierarchicalSubcategorySpend[];
+  parent_name: string | null;
+  /** The parent's `display_color`; null only for uncategorized. */
+  color: CategoryColor | null;
+  archived: boolean;
+  totals_paise: number[];
+  subcategories: CategoryTrendSubcategory[];
 };
 
-export type SubcategoryMover = {
-  category_id: number | null;
-  category_name: string;
-  parent_name?: string | null;
-  current_paise: number;
-  previous_paise: number;
-  delta_paise: number;
-  growth_rate: number | null;
+/** Response body of `GET /dashboards/category-trend`. `periods` is `YYYY-MM`,
+ * chronological. Every parent with an in-window row is returned; the chart
+ * folds the tail. */
+export type CategoryTrendResponse = {
+  periods: string[];
+  parents: CategoryTrendParent[];
+  label_id: number | null;
 };
 
-export type HierarchicalSpendResponse = {
-  period: string;
-  total_spend_paise: number;
-  parents: HierarchicalParentSpend[];
-  top_movers: SubcategoryMover[];
-  label_id?: number | null;
-};
-
-export function getHierarchicalSpend(params: {
-  month?: string;
-  year?: string;
+export function getCategoryTrend(params: {
+  months: number;
   label_id?: number;
-}): Promise<HierarchicalSpendResponse> {
-  const qs = new URLSearchParams();
-  if (params.month) qs.set("month", params.month);
-  if (params.year) qs.set("year", params.year);
+}): Promise<CategoryTrendResponse> {
+  const qs = new URLSearchParams({ months: String(params.months) });
   if (params.label_id != null) qs.set("label_id", String(params.label_id));
-  return request<HierarchicalSpendResponse>(
-    `/dashboards/hierarchical-spend?${qs.toString()}`,
-  );
+  return request<CategoryTrendResponse>(`/dashboards/category-trend?${qs}`);
 }
 
-export type HierarchicalSubcategoryRef = {
-  category_id: number | null;
-  category_name: string;
+// --- Tax statement (PRD §F11) ------------------------------------------------
+/** One intraday match (ADR-0015 rules 7-8), mirroring `schemas/tax.py`. INR paise
+ * (indian_* instruments are INR). `profit_paise` is server-computed; render as received. */
+export type IntradayTradeRead = {
+  sell_txn_id: number;
+  buy_txn_id: number;
+  instrument_id: number;
+  symbol: string;
+  name: string;
+  date: string;
+  units: string;
+  buy_value_paise: number;
+  sell_value_paise: number;
+  sell_charges_paise: number;
+  profit_paise: number;
 };
 
-export type HierarchicalParentRef = {
-  parent_id: number | null;
-  parent_name: string;
-  color?: string | null;
-  subcategories: HierarchicalSubcategoryRef[];
-};
-
-export type HierarchicalSubcategoryPeriodTotal = {
-  category_id: number | null;
-  total_paise: number;
-};
-
-export type HierarchicalParentPeriodTotal = {
-  parent_id: number | null;
-  total_paise: number;
-  subcategories: HierarchicalSubcategoryPeriodTotal[];
-};
-
-export type HierarchicalTrendBucket = {
+export type IntradayTradesResponse = {
   period: string;
-  totals: HierarchicalParentPeriodTotal[];
+  trades: IntradayTradeRead[];
+  total_profit_paise: number;
 };
 
-export type HierarchicalTrendResponse = {
-  bucket: "week" | "month";
-  start: string;
-  end: string;
-  parents: HierarchicalParentRef[];
-  buckets: HierarchicalTrendBucket[];
-  label_id?: number | null;
-};
+export function listIntradayTrades(year: number): Promise<IntradayTradesResponse> {
+  return request<IntradayTradesResponse>(`/tax/intraday-trades?year=${year}`);
+}
 
-export function getHierarchicalTrend(params: {
-  bucket: "week" | "month";
-  start: string;
-  end: string;
-  label_id?: number;
-}): Promise<HierarchicalTrendResponse> {
-  const qs = new URLSearchParams({
-    bucket: params.bucket,
-    start: params.start,
-    end: params.end,
-  });
-  if (params.label_id != null) qs.set("label_id", String(params.label_id));
-  return request<HierarchicalTrendResponse>(
-    `/dashboards/hierarchical-trend?${qs.toString()}`,
-  );
+/** Tax years worth offering (FY start years, newest first): every year with a realised
+ * sale, plus the current one. */
+export function listTaxYears(): Promise<AvailableYearsResponse> {
+  return request<AvailableYearsResponse>("/tax/available-years");
 }

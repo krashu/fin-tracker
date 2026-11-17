@@ -25,6 +25,7 @@ from app import main
 from app.core import clock
 from app.core.config import Settings, get_settings
 from app.core.db import make_engine
+from app.core.demo_data import ACCOUNTS
 from app.models import Account, Base, Transaction, User
 from app.services.provisioning import provision_default_categories
 
@@ -76,7 +77,7 @@ def _transaction_count(factory: sessionmaker[Session]) -> int:
 
 def test_enabled_empty_db_seeds(session_factory: sessionmaker[Session], seeded_user: None) -> None:
     main._maybe_seed_demo(Settings(SEED_DEMO_ON_STARTUP=True))
-    assert _account_count(session_factory) == 2
+    assert _account_count(session_factory) == len(ACCOUNTS)
 
 
 def test_enabled_populated_db_resyncs_without_duplicating(
@@ -91,7 +92,7 @@ def test_enabled_populated_db_resyncs_without_duplicating(
     # accounts' transactions rather than skipping — must land on the same
     # counts, not double them or raise on a duplicate fingerprint.
     main._maybe_seed_demo(settings)
-    assert _account_count(session_factory) == first_accounts == 2
+    assert _account_count(session_factory) == first_accounts == len(ACCOUNTS)
     assert _transaction_count(session_factory) == first_txns
 
 

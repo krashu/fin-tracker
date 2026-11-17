@@ -33,6 +33,7 @@ from app.core.security import ACCESS_COOKIE_NAME, create_access_token, hash_pass
 from app.main import app
 from app.models import Account, Category, Instrument, User
 from app.services.nav_snapshot_service import as_valuation_stamp
+from tests.aware_guard import install_aware_write_guard
 
 # Any allowed CORS origin — set as a default header on test clients so the
 # fail-closed CSRF Origin check (OriginCSRFMiddleware) lets mutations through.
@@ -83,8 +84,14 @@ def session_factory(engine: Engine) -> sessionmaker[Session]:
     Distinct from the ``session`` fixture so assertions in the test body
     have their own session that sees committed-by-the-route writes
     without contention.
+
+    Every route write passes the aware-datetime guard (ADR-0001 rule 5b,
+    ``tests/aware_guard.py``). Fixture writes through ``session`` are a separate
+    sessionmaker and are not checked — test setup may seed aware values.
     """
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_aware_write_guard(factory)
+    return factory
 
 
 @cache
@@ -145,9 +152,14 @@ def seeded_categories(session: Session, seeded_user: User) -> list[Category]:
         "Transfer",
     )
     cats = [
-        Category(user_id=seeded_user.id, name=n, kind="spend", is_seeded=True) for n in spend_names
+        Category(color="#2a78d6", user_id=seeded_user.id, name=n, kind="spend", is_seeded=True)
+        for n in spend_names
     ]
-    cats.append(Category(user_id=seeded_user.id, name="Income", kind="income", is_seeded=True))
+    cats.append(
+        Category(
+            color="#2a78d6", user_id=seeded_user.id, name="Income", kind="income", is_seeded=True
+        )
+    )
     session.add_all(cats)
     session.commit()
     for c in cats:

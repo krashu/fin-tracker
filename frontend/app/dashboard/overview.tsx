@@ -44,8 +44,7 @@ import {
   type TransactionRead,
 } from "@/lib/api/client";
 import { formatDate, formatINR } from "@/lib/format";
-import { resolveSiblingDisplayColor } from "@/lib/categories";
-import { periodParams, type Period } from "@/lib/period";
+import { currentYear, periodLabel, periodParams, type Period } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { CategoryDot } from "@/components/category-dot";
 import { Sensitive } from "@/components/balance-visibility";
@@ -58,7 +57,7 @@ import { useAvailableYears } from "@/components/dashboard/use-available-years";
 // Hand-mirror of the backend's NET_WORTH_EXCLUDED_TYPES
 // (app/schemas/dashboards.py), which is the source of truth. tsc cannot catch
 // drift here — see frontend/CLAUDE.md §"The tsc blind spot" — so keep it in sync
-// by hand, as accounts-manager.tsx already does for SUPPORTED_CC_ISSUERS. Credit
+// by hand. Credit
 // cards are spend channels, not liabilities; investment accounts are placeholders
 // whose value is already counted in portfolio_value_paise. The accounts panel
 // below still lists both — only the net-worth arithmetic skips them.
@@ -85,7 +84,7 @@ export function Overview() {
   // the backend already computes for the picker itself.
   const yearsQuery = useAvailableYears();
   const [pickedYear, setPickedYear] = useState<number | null>(null);
-  const year = pickedYear ?? yearsQuery.years[0] ?? new Date().getUTCFullYear();
+  const year = pickedYear ?? yearsQuery.years[0] ?? currentYear();
   const period: Period = { year };
 
   const overviewQuery = useQuery({
@@ -116,13 +115,11 @@ export function Overview() {
   const accountsById = new Map<number, string>(
     (data?.accounts ?? []).map((a) => [a.account_id, a.name]),
   );
-  // Resolved (not raw) color — an inheriting subcategory has `color: null`
-  // and `CategoryDot`/`categoryColorVar` can't inherit on their own, so a raw
-  // lookup rendered its dot grey (8.7, the last such caller after Phase 5's
-  // audit of the other 9).
+  // Colours come resolved from the server (`display_color`, ADR-0012 rule 7): an inheriting
+  // subcategory arrives in its parent's hue.
   const allCategories = categoriesQuery.data ?? [];
   const categoryColorById = new Map<number, CategoryColor | null>(
-    allCategories.map((c) => [c.id, resolveSiblingDisplayColor(c, allCategories)]),
+    allCategories.map((c) => [c.id, c.display_color]),
   );
   const holdings = holdingsQuery.data?.holdings ?? [];
   // "Unpriced" = no NAV at all. Kept separate from the FX case below, which DOES
@@ -302,7 +299,7 @@ function AccountsCard({
                   <GroupLabel>{g.label}</GroupLabel>
                   {g.type === "credit_card" ? (
                     <span className="text-[10px] text-muted-foreground/70">
-                      spent in {year} · not in net worth
+                      spent in {periodLabel({ year })} · not in net worth
                     </span>
                   ) : null}
                   {g.type === "investment" ? (

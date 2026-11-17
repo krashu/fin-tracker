@@ -7,7 +7,7 @@ rows, now I re-import the backup". Mirrors :mod:`app.services.investment_import_
 structurally (parse → upsert refs → dedup → persist, route owns the commit), but the
 money/identity details differ — see the two load-bearing rules below.
 
-* **Fingerprint is recomputed here, never trusted from the file.** The dedup key bakes in
+* **Fingerprints are recomputed here, never trusted from the file.** The dedup key bakes in
   ``account_id`` (:func:`app.services.fingerprint.transaction_fingerprint`), which is
   install-specific. Recomputing it from the *resolved* target ``account_id`` (over a re-normalized
   ``merchant_normalized``, never the file's cell as-is) reproduces exactly what a native row
@@ -18,6 +18,14 @@ money/identity details differ — see the two load-bearing rules below.
   occurrences ``{0, 5, 9}`` restores as ``{0, 1, 2}`` with the same rows and the same
   fingerprints. Dedup is therefore a multiset difference, so a backup carrying two
   genuinely-distinct identical rows restores both.
+* **Provenance is carried as inputs, then recomputed** (ADR-0006 rule 17). A row's
+  ``origin_*`` cells are the inputs of the statement line it came from; restore resolves the
+  origin account by name and recomputes ``origin_fingerprint`` on the target, storing the inputs
+  only when the origin differs from the row's own identity. The incoming dedup key is
+  ``COALESCE(origin, fingerprint)`` — the key the prefetch counts stored rows under — so an
+  edited imported row dedups against its statement line, and a restored one cannot re-stage on
+  the next statement upload. The ordinal is allocated against the *current* fingerprint
+  (``OccurrenceAllocator``'s ``slot``).
 * **Accounts/categories are match-or-create, never mutate.** Active account names are unique
   per user, so a name match with a *different* type/currency is rejected (a counted warning),
   never rebound; ``opening_balance_paise`` / ``type`` / ``currency`` on a matched account are
@@ -25,8 +33,13 @@ money/identity details differ — see the two load-bearing rules below.
   ``AccountUpdate`` locks them).
 
 Transfer pairs are re-linked in a second pass over a backup-local ``transfer_group`` token
-(NULL-then-update, the shape the self-referential composite FK requires) so restored transfers
-don't become ADR-0002-violating orphans.
+(NULL-then-update, the shape the self-referential composite FK requires). Both legs must be
+confirmed transfers this restore inserted, of equal and opposite amount on different accounts
+(ADR-0002 rules 7-8; a pending leg is deleted by import cancel, so it is never paired); a lone leg
+or an invalid group is kept unpaired with a warning and given back its pre-link type. Refund →
+original links (ADR-0009 rule 13) are restored the same way over ``row_ref`` /
+``refund_of_ref``, only between rows this restore inserted; one that cannot be restored is a
+warning counted in ``links_not_restored``, not a dropped row.
 
 Row-level dedup is the only idempotency backstop — there is **no** whole-zip hash short-circuit
 (the exporter stamps a timestamp, so byte-identical re-uploads are not a reliable signal). The
@@ -36,14 +49,17 @@ zip's ``source_file_hash`` is still recorded on the batch for the audit trail.
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import dataclass
+from datetime import date
+from typing import get_args
 from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.log_config import get_logger
-from app.models import Account, Category, ImportBatch, Transaction
+from app.models import Account, Category, CategoryKindStr, ImportBatch, Transaction
 from app.parsers.backup_csv import (
     ACCOUNTS_CSV,
     CATEGORIES_CSV,
@@ -54,9 +70,11 @@ from app.parsers.backup_csv import (
     ParsedBackupTransaction,
     parse_backup_zip,
 )
+from app.services.category_colors import active_root_colors, next_root_color
 from app.services.fingerprint import transaction_fingerprint
-from app.services.merchant import normalize_merchant
+from app.services.merchant import merchant_too_long, normalize_merchant
 from app.services.occurrence import OccurrenceAllocator
+from app.services.refund_link import refund_link_problem
 from app.services.transaction_labels import (
     link_labels,
     normalize_label_name,
@@ -78,6 +96,7 @@ class BackupImportResult:
     txns_imported: int
     txns_skipped_dupe: int
     rows_rejected: int
+    links_not_restored: int
     transfers_relinked: int
     warnings: list[str]
 
@@ -101,11 +120,14 @@ def persist_backup(
 ) -> BackupImportResult:
     """Persist already-parsed backup rows: upsert accounts/categories → dedup+insert txns → relink.
 
-    ``parsed.warnings`` (the parser's per-row skips) are merged into the returned warnings;
-    ``rows_rejected`` is the total dropped across parse + resolution — a user-facing total
-    spanning accounts, categories and transactions, deliberately NOT the ``rows_rejected`` in
-    the ``import_completed`` event below, which counts dropped TRANSACTIONS only so its counts
-    satisfy ``rows_in == imported + skipped + rejected``.
+    ``parsed.warnings`` (the parser's per-row skips) are merged into the returned warnings.
+    ``rows_rejected`` is the total rows dropped across parse + account/transaction resolution —
+    a user-facing total spanning accounts and transactions, deliberately NOT the
+    ``rows_rejected`` in the ``import_completed`` event below, which counts dropped
+    TRANSACTIONS only so its counts satisfy ``rows_in == imported + skipped + rejected``.
+    ``links_not_restored`` counts the transfer-pair and refund links that could not be restored
+    on rows that DID land; those warnings are not in ``rows_rejected``, and neither are
+    category-flatten warnings (the category landed). ``warnings`` holds every message.
     """
     batch = ImportBatch(
         user_id=user_id,
@@ -123,7 +145,7 @@ def persist_backup(
     categories_new, categories_matched, categories_by_key, category_warnings = _upsert_categories(
         session, user_id=user_id, rows=parsed.categories
     )
-    imported, skipped, relinked, txn_warnings = _persist_transactions(
+    imported, skipped, relinked, txn_warnings, link_warnings = _persist_transactions(
         session,
         user_id=user_id,
         batch_id=batch.id,
@@ -132,7 +154,17 @@ def persist_backup(
         categories_by_key=categories_by_key,
     )
 
-    warnings = [*parsed.warnings, *account_warnings, *category_warnings, *txn_warnings]
+    warnings = [
+        *parsed.warnings,
+        *account_warnings,
+        *category_warnings,
+        *txn_warnings,
+        *link_warnings,
+    ]
+    # A row dropped (parse, account, or resolution) vs a link not restored on a row that
+    # landed (transfer pair, refund) are counted apart; a flattened category landed too, so it
+    # is in neither.
+    rows_rejected = len(parsed.warnings) + len(account_warnings) + len(txn_warnings)
     batch.imported_count = imported
     batch.skipped_count = skipped
     # Informational only (no hash short-circuit reads it): "failed" carries the documented
@@ -162,6 +194,7 @@ def persist_backup(
         accounts_new=accounts_new,
         categories_new=categories_new,
         transfers_relinked=relinked,
+        links_not_restored=len(link_warnings),
         status=batch.status,
     )
 
@@ -173,7 +206,8 @@ def persist_backup(
         categories_matched=categories_matched,
         txns_imported=imported,
         txns_skipped_dupe=skipped,
-        rows_rejected=len(warnings),
+        rows_rejected=rows_rejected,
+        links_not_restored=len(link_warnings),
         transfers_relinked=relinked,
         warnings=warnings,
     )
@@ -240,7 +274,8 @@ def _upsert_categories(
     link to their parent category via ``parent_id`` when ``parent_name`` is present — but a
     ``parent_name`` that cannot be resolved to a ROOT category flattens the row to a root
     instead (ADR-0012 caps depth at 2), and that flattening is reported in the returned
-    warnings rather than silently counted as a success. Mirrors ``_upsert_accounts``' shape.
+    warnings rather than silently counted as a success. A restored root without a colour gets
+    the least-used palette slot of its kind (ADR-0012 rule 7). Mirrors ``_upsert_accounts``' shape.
     Returns ``(created, matched, {(name, kind): Category}, warnings)``.
     """
     existing_active: dict[tuple[str, str], Category] = {
@@ -256,6 +291,15 @@ def _upsert_categories(
 
     roots = [r for r in rows if not r.parent_name]
     subcats = [r for r in rows if r.parent_name]
+    used = {
+        k: active_root_colors(session, user_id=user_id, kind=k) for k in get_args(CategoryKindStr)
+    }
+
+    def _root_color(row: ParsedBackupCategory) -> str:
+        color = row.color or next_root_color(used[row.kind])
+        if row.archived_at is None:
+            used[row.kind].append(color)
+        return color
 
     for row in sorted(roots, key=lambda r: r.archived_at is not None):
         key = (row.name, row.kind)
@@ -270,7 +314,7 @@ def _upsert_categories(
             user_id=user_id,
             name=row.name,
             kind=row.kind,
-            color=row.color,
+            color=_root_color(row),
             archived_at=row.archived_at,
             parent_id=None,
         )
@@ -316,7 +360,7 @@ def _upsert_categories(
             user_id=user_id,
             name=row.name,
             kind=row.kind,
-            color=row.color,
+            color=row.color if parent_id is not None else _root_color(row),
             archived_at=row.archived_at,
             parent_id=parent_id,
         )
@@ -336,10 +380,12 @@ def _persist_transactions(
     rows: list[ParsedBackupTransaction],
     accounts_by_name: dict[str, Account],
     categories_by_key: dict[tuple[str, str], Category],
-) -> tuple[int, int, int, list[str]]:
-    """Recompute fingerprint → dedup → insert → relink transfer pairs.
+) -> tuple[int, int, int, list[str], list[str]]:
+    """Recompute fingerprint → dedup → insert → relink transfer pairs and refund links.
 
-    Returns ``(imported, skipped_dupe, transfers_relinked, warnings)``.
+    Returns ``(imported, skipped_dupe, transfers_relinked, warnings, link_warnings)``;
+    ``link_warnings`` are transfer-pair and refund links that could not be restored on rows
+    that DID land.
     """
     # How many rows already exist per dedup key, and the highest occurrence in use.
     # Dedup is a multiset difference, not set membership (ADR-0006): a backup holding two
@@ -386,15 +432,39 @@ def _persist_transactions(
     skipped_dupe = 0
     warnings: list[str] = []
     # transfer_group token → the rows inserted for it, for the second-pass re-link.
-    inserted_by_group: dict[str, list[Transaction]] = {}
+    inserted_by_group: dict[str, list[tuple[Transaction, ParsedBackupTransaction]]] = {}
     # (txn, raw label names) for rows carrying F3a labels — linked after the flush
     # below assigns ids.
     pending_labels: list[tuple[Transaction, tuple[str, ...]]] = []
+    # (txn, its source row) for every inserted row, for the refund-link pass.
+    inserted: list[tuple[Transaction, ParsedBackupTransaction]] = []
+    # Refund-link bookkeeping. `file_key_counts` tallies dedup keys over every row that reaches
+    # the allocator, so a key the file repeats is known to be ambiguous. `ref_targets` maps a
+    # backup-local row_ref to the Transaction this restore inserted for it, or to the dedup key
+    # of the pre-existing row it deduped against; None marks a ref shared by two rows.
+    # `deduped_refunds` are the deduped rows that carry a refund_of_ref.
+    file_key_counts: Counter[str] = Counter()
+    ref_targets: dict[str, Transaction | str | None] = {}
+    deduped_refunds: list[tuple[str, ParsedBackupTransaction]] = []
 
     for row in rows:
         account = accounts_by_name.get(row.account_name)
         if account is None:
             warnings.append(f"{TRANSACTIONS_CSV} row {row.line_no}: account not found — skipped")
+            continue
+
+        # ADR-0006 rule 3b: a merchant past the String(512) columns is skipped, never
+        # truncated (a truncated key is a different identity). The origin's merchant is a
+        # stored column too. `merchant_raw` is nullable here: a blank cell is not too long.
+        if (
+            merchant_too_long(row.merchant_normalized)
+            or (row.merchant_raw is not None and merchant_too_long(row.merchant_raw))
+            or (row.origin is not None and merchant_too_long(row.origin.merchant_normalized))
+        ):
+            warnings.append(
+                f"{TRANSACTIONS_CSV} row {row.line_no}: merchant longer than 512 characters"
+                " — skipped"
+            )
             continue
 
         category_id: int | None = None
@@ -417,10 +487,45 @@ def _persist_transactions(
             normalized_merchant=merchant_normalized,
             account_id=account.id,
         )
+        # ADR-0006 rule 17: recompute the origin on THIS install from the file's origin inputs
+        # (a hash is never carried: it bakes in the source install's account id).
+        origin_fingerprint: str | None = None
+        origin_inputs: tuple[date, int, str, int] | None = None
+        if row.origin is not None:
+            origin_account = accounts_by_name.get(row.origin.account_name)
+            if origin_account is None:
+                warnings.append(
+                    f"{TRANSACTIONS_CSV} row {row.line_no}: origin account not found — skipped"
+                )
+                continue
+            origin_merchant = normalize_merchant(row.origin.merchant_normalized)
+            origin_fingerprint = transaction_fingerprint(
+                txn_date=row.origin.date,
+                amount_paise=row.origin.amount_paise,
+                normalized_merchant=origin_merchant,
+                account_id=origin_account.id,
+            )
+            if origin_fingerprint == fingerprint:
+                origin_fingerprint = fingerprint  # unedited since import: no stored inputs
+            else:
+                origin_inputs = (
+                    row.origin.date,
+                    row.origin.amount_paise,
+                    origin_merchant,
+                    origin_account.id,
+                )
+        # The incoming dedup key is the same COALESCE the prefetch counts stored rows under;
+        # the ordinal still has to clear MAX(occurrence) on the row's CURRENT fingerprint.
+        dedup_key = origin_fingerprint or fingerprint
+        file_key_counts[dedup_key] += 1
         # `is None` — occurrence 0 is a valid first sighting (see the allocator).
-        occurrence = allocator.allocate(fingerprint)
+        occurrence = allocator.allocate(dedup_key, slot=fingerprint)
         if occurrence is None:
             skipped_dupe += 1
+            if row.row_ref is not None:
+                ref_targets[row.row_ref] = None if row.row_ref in ref_targets else dedup_key
+            if row.refund_of_ref is not None:
+                deduped_refunds.append((dedup_key, row))
             continue
 
         txn = Transaction(
@@ -434,24 +539,31 @@ def _persist_transactions(
             category_id=category_id,
             auto_category_id=None,  # the F3 acceptance-rate metric field is not restored
             fingerprint=fingerprint,
-            # origin_fingerprint stays NULL — deliberately, and even when `row.source`
-            # replays as "import" (ADR-0007 rule 9). A backup zip is a snapshot of our
-            # own data, not an immutable external artifact, so the honest dedup key for
-            # a restored row is its own current assertion, which is what COALESCE gives
-            # a NULL origin. Stamping it here would freeze a hash the file never
-            # promised and make a later edit un-matchable against a fresh statement.
+            # Provenance recomputed above (ADR-0006 rule 17); NULL for rows with none.
+            origin_fingerprint=origin_fingerprint,
+            origin_date=origin_inputs[0] if origin_inputs else None,
+            origin_amount_paise=origin_inputs[1] if origin_inputs else None,
+            origin_merchant_normalized=origin_inputs[2] if origin_inputs else None,
+            origin_account_id=origin_inputs[3] if origin_inputs else None,
             occurrence=occurrence,
             source=row.source,
             import_batch_id=batch_id,
             confirmed_at=row.confirmed_at,
             transfer_pair_id=None,  # linked in the second pass below
+            # ADR-0002 rule 9 provenance. Non-null implies a pair leg, so a row with no
+            # group (hand-edited) never carries one; _relink_transfers releases a leg that
+            # ends up unpaired.
+            pre_link_type=row.pre_link_type if row.transfer_group is not None else None,
         )
         session.add(txn)
         imported += 1
+        inserted.append((txn, row))
+        if row.row_ref is not None:
+            ref_targets[row.row_ref] = None if row.row_ref in ref_targets else txn
         if row.labels:
             pending_labels.append((txn, row.labels))
         if row.transfer_group is not None:
-            inserted_by_group.setdefault(row.transfer_group, []).append(txn)
+            inserted_by_group.setdefault(row.transfer_group, []).append((txn, row))
 
     session.flush()  # assign transaction ids before the re-link + label links
     # F3a labels — now that ids exist, link each row's labels. Resolve the union
@@ -473,24 +585,179 @@ def _persist_transactions(
                 if (norm := normalize_label_name(name)) in labels_by_name
             ]
             link_labels(session, txn_id=txn.id, user_id=user_id, label_ids=label_ids)
-    relinked = _relink_transfers(inserted_by_group)
+    # Transfers first: the refund checks below read the final (post-release) types.
+    relinked, transfer_warnings = _relink_transfers(inserted_by_group, categories_by_key)
+    refund_warnings = _relink_refunds(
+        session,
+        user_id=user_id,
+        inserted=inserted,
+        ref_targets=ref_targets,
+        deduped_refunds=deduped_refunds,
+        existing_counts=counts,
+        file_key_counts=file_key_counts,
+    )
     session.flush()
-    return imported, skipped_dupe, relinked, warnings
+    return imported, skipped_dupe, relinked, warnings, [*transfer_warnings, *refund_warnings]
 
 
-def _relink_transfers(groups: dict[str, list[Transaction]]) -> int:
-    """Second pass: point each transfer pair's two legs at each other by resolved id.
+def _relink_refunds(
+    session: Session,
+    *,
+    user_id: UUID,
+    inserted: list[tuple[Transaction, ParsedBackupTransaction]],
+    ref_targets: dict[str, Transaction | str | None],
+    deduped_refunds: list[tuple[str, ParsedBackupTransaction]],
+    existing_counts: dict[str, int],
+    file_key_counts: Counter[str],
+) -> list[str]:
+    """Restore each refund → original link (ADR-0009 rule 13) by backup-local ``row_ref``.
 
-    A group with anything other than two inserted legs (a lone leg because its partner deduped,
-    or malformed data) is left unlinked — ``transfer_pair_id`` stays NULL rather than forming a
-    half-pair. Returns the number of legs re-linked.
+    The link is written only onto a refund row this restore inserted, under the same checks as
+    ``PUT /transactions/{id}/refund-link`` (:func:`refund_link_problem`). The original may be a
+    row this restore inserted, or the one pre-existing row it deduped against — resolved only
+    when that match is unambiguous (:func:`_resolve_existing`). Restore never mutates a
+    pre-existing row, so a refund that itself deduped is warned about only when it has no link
+    yet; one that already carries its link needs nothing, which keeps an idempotent re-import
+    silent. A ref shared by two rows or pointing nowhere is unresolvable. Each failure leaves
+    ``refund_of_id`` as it was with a PII-safe warning (line number only), returned here.
+    """
+    inserted_ids = [txn.id for txn, _ in inserted]
+
+    def resolve(target: Transaction | str | None) -> Transaction | None:
+        if isinstance(target, str):
+            return _resolve_existing(
+                session,
+                user_id=user_id,
+                key=target,
+                inserted_ids=inserted_ids,
+                existing_counts=existing_counts,
+                file_key_counts=file_key_counts,
+            )
+        return target
+
+    warnings: list[str] = []
+    for txn, row in inserted:
+        if row.refund_of_ref is None:
+            continue
+        original = resolve(ref_targets.get(row.refund_of_ref))
+        if original is not None and refund_link_problem(txn, original) is None:
+            txn.refund_of_id = original.id
+        else:
+            warnings.append(f"{TRANSACTIONS_CSV} row {row.line_no}: refund link not restored")
+    for key, row in deduped_refunds:
+        existing = resolve(key)
+        if existing is None or existing.refund_of_id is None:
+            warnings.append(f"{TRANSACTIONS_CSV} row {row.line_no}: refund link not restored")
+    return warnings
+
+
+def _resolve_existing(
+    session: Session,
+    *,
+    user_id: UUID,
+    key: str,
+    inserted_ids: list[int],
+    existing_counts: dict[str, int],
+    file_key_counts: Counter[str],
+) -> Transaction | None:
+    """The one pre-existing row a deduped backup row matched, or ``None`` when it is a guess.
+
+    Unambiguous means one existing row under the coalesced dedup key AND one file row with that
+    key; with more of either, which existing row a given file row maps to is arbitrary. Rows
+    this restore inserted are excluded.
+    """
+    if existing_counts.get(key, 0) != 1 or file_key_counts[key] != 1:
+        return None
+    return session.scalars(
+        select(Transaction).where(
+            Transaction.user_id == user_id,
+            func.coalesce(Transaction.origin_fingerprint, Transaction.fingerprint) == key,
+            Transaction.id.not_in(inserted_ids),
+        )
+    ).one_or_none()
+
+
+def _saved_category_id(
+    row: ParsedBackupTransaction, categories_by_key: dict[tuple[str, str], Category]
+) -> int | None:
+    """The restoring user's category a row's pre-link category name and kind resolve to.
+
+    The same name-and-kind lookup as ``category_name``, so it only ever finds this user's own
+    categories; a name that does not resolve is dropped silently, like ``category_name``.
+    """
+    if row.pre_link_category_name is None or row.pre_link_category_kind is None:
+        return None
+    category = categories_by_key.get((row.pre_link_category_name, row.pre_link_category_kind))
+    return category.id if category is not None else None
+
+
+def _release_unpaired_leg(
+    txn: Transaction,
+    row: ParsedBackupTransaction,
+    categories_by_key: dict[tuple[str, str], Category],
+) -> None:
+    """Give a leg left unpaired what its link took, as if its partner were deleted.
+
+    The canonical rule is :func:`app.services.reconciliation_service.release_leg` (ADR-0002
+    rule 9); this variant works on rows that are not flushed yet and on the pre-link category
+    still held in the file. A link-born leg returns to its pre-link type; an F2-born one (no
+    pre-link type) stays a ``transfer``. A saved category goes back onto the leg only when the
+    leg has no category of its own (only a hand-edited zip carries both, and the row's own
+    category wins).
+    """
+    if txn.pre_link_type is not None:
+        if txn.transaction_type == "transfer":
+            txn.transaction_type = txn.pre_link_type
+        txn.pre_link_type = None
+    if txn.category_id is None:
+        txn.category_id = _saved_category_id(row, categories_by_key)
+
+
+def _relink_transfers(
+    groups: dict[str, list[tuple[Transaction, ParsedBackupTransaction]]],
+    categories_by_key: dict[tuple[str, str], Category],
+) -> tuple[int, list[str]]:
+    """Second pass: pair each valid transfer group's two legs by resolved id (ADR-0002 rules 7-8).
+
+    A group is paired only when exactly two legs were inserted by this restore, both are
+    confirmed transfers (a pending row is deleted by import cancel, ADR-0002 rule 5), and the
+    amounts are equal and opposite on different accounts. Restore never
+    mutates a pre-existing row, so a lone leg (its partner deduped, was rejected, or is not in
+    the file) and an invalid group are kept unpaired, released to their pre-link type, and
+    reported — one warning per leg, line number only. A paired leg regains its saved pre-link
+    category in the same pass as its pair (the row was inserted unpaired, because CHECK
+    ``pre_link_category_while_linked`` needs a pair), only when it has no category of its own.
+    Returns ``(legs paired, warnings)``.
     """
     relinked = 0
+    warnings: list[str] = []
     for legs in groups.values():
-        if len(legs) != 2:
-            continue
-        first, second = legs
-        first.transfer_pair_id = second.id
-        second.transfer_pair_id = first.id
-        relinked += 2
-    return relinked
+        if len(legs) == 2:
+            (first, first_row), (second, second_row) = legs
+            if (
+                first.transaction_type == "transfer"
+                and second.transaction_type == "transfer"
+                and first.confirmed_at is not None
+                and second.confirmed_at is not None
+                and first.amount_paise == -second.amount_paise
+                and first.account_id != second.account_id
+            ):
+                for leg, other, leg_row in (
+                    (first, second, first_row),
+                    (second, first, second_row),
+                ):
+                    leg.transfer_pair_id = other.id
+                    if leg.category_id is None:
+                        leg.pre_link_category_id = _saved_category_id(leg_row, categories_by_key)
+                relinked += 2
+                continue
+        message = (
+            "transfer pair not restored — legs must be two confirmed transfers of equal and "
+            "opposite amount on different accounts"
+            if len(legs) > 1
+            else "transfer partner not restored — left unpaired"
+        )
+        for txn, row in legs:
+            _release_unpaired_leg(txn, row, categories_by_key)
+            warnings.append(f"{TRANSACTIONS_CSV} row {row.line_no}: {message}")
+    return relinked, warnings

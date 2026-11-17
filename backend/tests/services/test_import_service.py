@@ -4,12 +4,14 @@ The e2e test in :mod:`tests.api.test_imports` exercises the happy path,
 batch short-circuit, row-level dedup, and multi-card scoping via the
 HTTP layer. These tests cover branches the StubParser fixture there
 does not naturally hit: the full ``_map_type`` table, ``LookupError``
-on missing account or unknown parser, and zero-paise row skipping.
+on missing account or unknown parser, and zero-paise row counting.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 import structlog
@@ -17,9 +19,18 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models import Account, Category, MerchantAlias, MerchantTagMap, Transaction, User
-from app.parsers import ParsedStatement, RawTransaction, StatementSummary
+from app.models import (
+    Account,
+    Category,
+    ImportBatch,
+    MerchantAlias,
+    MerchantTagMap,
+    Transaction,
+    User,
+)
+from app.parsers import HdfcBank, ParsedStatement, RawTransaction, StatementSummary
 from app.services import import_service
+from app.services.category_service import CASHBACK_CATEGORY_NAME
 from app.services.fingerprint import transaction_fingerprint
 from app.services.import_service import (
     AccountNotFoundError,
@@ -28,6 +39,10 @@ from app.services.import_service import (
     import_statement,
 )
 from app.services.merchant import normalize_merchant
+from app.services.provisioning import (
+    provision_default_categories,
+    provision_seed_merchant_dictionary,
+)
 
 
 @pytest.fixture
@@ -59,14 +74,19 @@ def seeded(session: Session) -> tuple[User, Account]:
         ("other", -25000, "X", "spend"),  # finance charge, fee — debit
         # An unmatched credit-card credit — vocabulary the parser's _REFUND_RE
         # missed — defaults to spend, not income (PRD §F5: its positive sign
-        # makes it a refund; the user corrects the rare genuine-cashback case;
-        # a wrong income default would inflate spend by the credit's full
-        # magnitude, per §F4a note 3).
+        # makes it a refund; a wrong income default would inflate spend by the
+        # credit's full magnitude, per §F4a note 3).
         ("other", 5000, "X", "spend"),
-        # ...unless the description names it cashback itself — then the keyword
-        # is trusted over the generic spend fallback (is_cashback_credit).
-        ("other", 5000, "ADDITIONAL CASHBACK FOR SWIGGY TRANSACTIONS", "income"),
-        ("other", 5000, "cashback credit", "income"),  # case-insensitive
+        # A credit naming cashback is a rebate on spending, so it is a positive
+        # spend too, never income (ADR-0013 rule 1); the keyword only picks its
+        # category (test_cashback_credit_lands_in_the_cashback_category).
+        ("other", 5000, "ADDITIONAL CASHBACK FOR SWIGGY TRANSACTIONS", "spend"),
+        ("other", 5000, "cashback credit", "spend"),  # case-insensitive
+        # Bank column types (ADR-0009 rule 7): a debit is a spend, a deposit is income unless
+        # its text names cashback, which is a rebate and so a positive spend (ADR-0013 rule 1).
+        ("withdrawal", -100, "X", "spend"),
+        ("deposit", 100, "X", "income"),
+        ("deposit", 2500, "DEBIT CARD CASHBACK", "spend"),
     ],
 )
 def test_map_type(txn_type: str, amount_paise: int, merchant_raw: str, expected: str) -> None:
@@ -77,6 +97,13 @@ def test_map_type(txn_type: str, amount_paise: int, merchant_raw: str, expected:
         txn_type=txn_type,  # type: ignore[arg-type]
     )
     assert _map_type(row) == expected
+
+
+def test_every_parser_issuer_has_a_label() -> None:
+    """The issuer pickers show these labels (from the server), so a parser without one would
+    fail at the first request rather than render a raw id."""
+    assert {issuer for issuer, _ in import_service.PARSERS} <= set(import_service.ISSUER_LABELS)
+    assert ("bank", "hdfc", "HDFC") in import_service.statement_issuers()
 
 
 def test_account_not_found_error_unknown_account(session: Session) -> None:
@@ -187,6 +214,52 @@ def test_two_identical_rows_in_one_statement_both_import(
     assert {t.occurrence for t in persisted} == {0, 1}
     # One fingerprint, two occurrences — identity is shared, multiplicity is not.
     assert len({t.fingerprint for t in persisted}) == 1
+
+
+def test_failed_upi_debit_and_reversal_both_import(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E12: a failed UPI debit and its same-day reversal are two rows netting to zero.
+
+    The fingerprint hashes the signed amount, so the -X debit and the +X
+    reversal can never dedupe into one row. Locks behaviour that was already
+    right. The bank parser is stubbed so no PDF is needed; the rows are hand-built
+    (ADR-0006).
+    """
+    user, _ = seeded
+    bank = Account(user_id=user.id, name="HDFC", type="bank", issuer="hdfc", last4="4321")
+    session.add(bank)
+    session.commit()
+    session.refresh(bank)
+    merchant = "UPI/412345678901/SWIGGY/swiggy@example"
+    rows = [
+        RawTransaction(
+            date=date(2026, 5, 4), amount_paise=-49900, merchant_raw=merchant, txn_type="purchase"
+        ),
+        RawTransaction(
+            date=date(2026, 5, 4), amount_paise=49900, merchant_raw=merchant, txn_type="refund"
+        ),
+    ]
+    monkeypatch.setitem(import_service.PARSERS, ("hdfc", "bank"), _stub_parser_with(rows))
+
+    result = import_statement(
+        user_id=user.id, account_id=bank.id, file_bytes=b"file", password=None, session=session
+    )
+    session.commit()
+
+    assert (result.imported, result.skipped) == (2, 0)
+    persisted = session.scalars(select(Transaction).where(Transaction.account_id == bank.id)).all()
+    assert {t.transaction_type for t in persisted} == {"spend"}
+    assert sum(t.amount_paise for t in persisted) == 0
+    assert len({t.fingerprint for t in persisted}) == 2
+    assert {t.occurrence for t in persisted} == {0}
+
+    again = import_statement(
+        user_id=user.id, account_id=bank.id, file_bytes=b"file", password=None, session=session
+    )
+    assert (again.imported, again.skipped) == (0, 2)
 
 
 def test_reupload_of_a_file_with_duplicates_stages_nothing(
@@ -380,12 +453,60 @@ def test_zero_paise_row_skipped(
     session.commit()
 
     assert result.imported == 1
-    assert result.skipped == 1
+    assert result.skipped == 0
+    assert result.zero_amount_count == 1
     assert result.already_imported is False
 
     persisted = session.scalars(select(Transaction)).all()
     assert len(persisted) == 1
     assert persisted[0].merchant_raw == "REAL TXN"
+
+
+def test_zero_amount_rows_are_not_counted_as_already_imported(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ADR-0010 rule 5: zero-amount rows are counted apart from duplicates, and a
+    # zero-only statement with an all-None summary is never refused.
+    user, account = seeded
+    monkeypatch.setitem(
+        import_service.PARSERS,
+        ("axis", "credit_card"),
+        _stub_parser_with(
+            [
+                RawTransaction(
+                    date=date(2026, 3, 6),
+                    amount_paise=0,
+                    merchant_raw="ZERO ONE",
+                    txn_type="other",
+                ),
+                RawTransaction(
+                    date=date(2026, 3, 7),
+                    amount_paise=0,
+                    merchant_raw="ZERO TWO",
+                    txn_type="other",
+                ),
+            ]
+        ),
+    )
+
+    result = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    assert (result.imported, result.skipped) == (0, 0)
+    assert result.zero_amount_count == 2
+    assert result.pending_count == 0
+    batch = session.get(ImportBatch, result.batch_id)
+    assert batch is not None
+    assert batch.skipped_count == 0
+    assert batch.status == "completed"
 
 
 def test_import_completed_telemetry(
@@ -434,9 +555,10 @@ def test_import_completed_telemetry(
     assert ev["import_batch_id"] == result.batch_id
     assert ev["rows_in"] == 2
     assert ev["rows_imported"] == result.imported == 1
-    assert ev["rows_skipped"] == result.skipped == 1
+    assert ev["rows_skipped"] == result.skipped == 0
+    assert ev["rows_rejected"] == result.zero_amount_count == 1
     # Invariant a reader sanity-checks against the numbers.
-    assert ev["rows_in"] == ev["rows_imported"] + ev["rows_skipped"]
+    assert ev["rows_in"] == ev["rows_imported"] + ev["rows_skipped"] + ev["rows_rejected"]
 
 
 # ---------- F3 auto-tag at import time ------------------------------------
@@ -448,7 +570,7 @@ def test_import_auto_tags_from_existing_map(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user, account = seeded
-    food = Category(user_id=user.id, name="Food")
+    food = Category(color="#2a78d6", user_id=user.id, name="Food")
     session.add(food)
     session.commit()
     session.add(
@@ -503,7 +625,7 @@ def test_import_prefills_via_alias(
     matches any merchant_tag_map row still prefills, because it tokenizes
     through an alias to a canonical the map WAS taught under."""
     user, account = seeded
-    food = Category(user_id=user.id, name="Food")
+    food = Category(color="#2a78d6", user_id=user.id, name="Food")
     session.add(food)
     session.commit()
     session.add(MerchantAlias(user_id=user.id, pattern="swiggy", canonical="food delivery"))
@@ -545,10 +667,69 @@ def test_import_prefills_via_alias(
     assert txn is not None
     assert txn.category_id == food.id
     assert txn.auto_category_id == food.id
-    # merchant_normalized still stores normalize_merchant's output (lowercase +
-    # whitespace collapse only -- normalize_merchant does not strip "*"), never
+    # merchant_normalized still stores normalize_merchant's output (lowercase,
+    # NFC and whitespace collapse only -- normalize_merchant does not strip "*"), never
     # the canonical: it is a read-time key only, never persisted on the row.
     assert txn.merchant_normalized == "swiggy*blr*99999"
+
+
+def test_cashback_credit_lands_in_the_cashback_category(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0013 rules 1-2: a credit naming cashback stages as a positive ``spend``
+    pre-filled into the seeded spend "Cashback", even when its descriptor resolves
+    to a merchant with a tag rule (here the seed ``swiggy`` alias). The prefill is a
+    keyword default, not an F3 suggestion, so ``auto_category_id`` stays NULL. The
+    ordinary purchase still auto-tags from the seed rule."""
+    user, account = seeded
+    provision_default_categories(session, user.id)
+    session.flush()
+    provision_seed_merchant_dictionary(session, user.id)
+    session.commit()
+    spend_ids = {
+        c.name: c.id
+        for c in session.scalars(
+            select(Category).where(Category.user_id == user.id, Category.kind == "spend")
+        )
+    }
+
+    monkeypatch.setitem(
+        import_service.PARSERS,
+        ("axis", "credit_card"),
+        _stub_parser_with(
+            [
+                RawTransaction(
+                    date=date(2026, 3, 9),
+                    amount_paise=17500,
+                    merchant_raw="ADDITIONAL CASHBACK FOR SWIGGY TRANSACTIONS",
+                    txn_type="other",
+                ),
+                RawTransaction(
+                    date=date(2026, 3, 5),
+                    amount_paise=-15000,
+                    merchant_raw="SWIGGY BLR",
+                    txn_type="purchase",
+                ),
+            ]
+        ),
+    )
+    import_statement(
+        user_id=user.id, account_id=account.id, file_bytes=b"file", password=None, session=session
+    )
+    session.commit()
+
+    rows = {t.merchant_raw: t for t in session.scalars(select(Transaction))}
+    cashback = rows["ADDITIONAL CASHBACK FOR SWIGGY TRANSACTIONS"]
+    assert cashback.transaction_type == "spend"
+    assert cashback.amount_paise == 17500
+    assert cashback.category_id == spend_ids[CASHBACK_CATEGORY_NAME]
+    assert cashback.auto_category_id is None
+
+    purchase = rows["SWIGGY BLR"]
+    assert purchase.category_id == spend_ids["Online Food Delivery"]
+    assert purchase.auto_category_id == spend_ids["Online Food Delivery"]
 
 
 def test_fingerprint_is_byte_identical_with_full_alias_table_loaded(
@@ -624,7 +805,7 @@ def test_import_skips_auto_tag_for_income_and_transfer(
     "spending transactions" — read as spend + refund only.
     """
     user, account = seeded
-    salary_cat = Category(user_id=user.id, name="Income")
+    salary_cat = Category(color="#2a78d6", user_id=user.id, name="Income")
     session.add(salary_cat)
     session.commit()
     session.add(
@@ -677,7 +858,7 @@ def test_import_auto_tags_refund_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user, account = seeded
-    food = Category(user_id=user.id, name="Food")
+    food = Category(color="#2a78d6", user_id=user.id, name="Food")
     session.add(food)
     session.commit()
     session.add(
@@ -763,8 +944,8 @@ def test_import_auto_tag_picks_highest_hit_count_per_merchant(
 ) -> None:
     """Two map rows for one merchant → prefetch reducer picks the winner."""
     user, account = seeded
-    food = Category(user_id=user.id, name="Food")
-    subs = Category(user_id=user.id, name="Subscriptions")
+    food = Category(color="#2a78d6", user_id=user.id, name="Food")
+    subs = Category(color="#2a78d6", user_id=user.id, name="Subscriptions")
     session.add_all([food, subs])
     session.commit()
     session.add_all(
@@ -825,7 +1006,7 @@ def test_reimport_does_not_resurface_tag_map_on_dedup_skipped_rows(
     silently re-fire the lookup on already-imported rows.
     """
     user, account = seeded
-    food = Category(user_id=user.id, name="Food")
+    food = Category(color="#2a78d6", user_id=user.id, name="Food")
     session.add(food)
     session.commit()
     session.add(
@@ -1476,6 +1657,79 @@ def test_no_summary_block_leaves_metadata_and_delta_null(
     assert result.reconciliation_delta_paise is None
 
 
+def test_zero_row_statement_with_summary_imports_and_checks_delta(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0010 rule 5: a statement period with no transactions but a printed
+    summary imports as a completed 0-row batch carrying its balances, and the
+    delta is still checked. Here the balances moved by −2000 with no rows to
+    account for it, so actual (0) − expected (−2000) = +2000."""
+    user, account = seeded
+    summary = StatementSummary(
+        opening_balance_paise=-5000,
+        closing_balance_paise=-7000,
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+    monkeypatch.setitem(
+        import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with_summary([], summary)
+    )
+
+    result = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    assert result.imported == 0
+    batch = session.get(import_service.ImportBatch, result.batch_id)
+    assert batch is not None
+    assert batch.status == "completed"
+    assert batch.imported_count == 0
+    assert batch.statement_opening_balance_paise == -5000
+    assert batch.statement_closing_balance_paise == -7000
+    assert batch.period_start == date(2026, 3, 1)
+    assert batch.period_end == date(2026, 3, 31)
+    assert batch.reconciliation_delta_paise == 2000
+    assert result.reconciliation_delta_paise == 2000
+
+
+def test_zero_row_statement_without_a_printed_period_is_not_checked(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S10-Q1: with no rows there is no min/max fallback window, so a zero-row
+    statement that prints balances but no period reconciles to "not checked"
+    (None) — never an error, and never a delta over an invented window."""
+    user, account = seeded
+    summary = StatementSummary(opening_balance_paise=-5000, closing_balance_paise=-7000)
+    monkeypatch.setitem(
+        import_service.PARSERS, ("axis", "credit_card"), _stub_parser_with_summary([], summary)
+    )
+
+    result = import_statement(
+        user_id=user.id,
+        account_id=account.id,
+        file_bytes=b"file",
+        password=None,
+        session=session,
+    )
+    session.commit()
+
+    batch = session.get(import_service.ImportBatch, result.batch_id)
+    assert batch is not None
+    assert batch.status == "completed"
+    assert batch.period_start is None
+    assert batch.period_end is None
+    assert result.reconciliation_delta_paise is None
+
+
 def test_reupload_restamps_metadata_and_recomputes_the_delta(
     session: Session,
     seeded: tuple[User, Account],
@@ -1530,3 +1784,60 @@ def test_reupload_restamps_metadata_and_recomputes_the_delta(
     assert batch.statement_opening_balance_paise == -500
     assert batch.statement_closing_balance_paise == -1500
     assert second.reconciliation_delta_paise == 0
+
+
+def test_hdfc_estatement_imports_and_reconciles(
+    session: Session,
+    seeded: tuple[User, Account],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synthetic HDFC e-statement through ``import_statement`` on a bank account: balances
+    reconcile, a deposit is income, and a reversal and a cashback credit are positive spend
+    (ADR-0009 rules 7-8, ADR-0013). ``parse`` is stubbed to the committed fixture, so no PDF
+    is needed; the fixture tests cover the table reading itself."""
+    user, _ = seeded
+    provision_default_categories(session, user.id)
+    bank = Account(user_id=user.id, name="HDFC Savings", type="bank", issuer="hdfc")
+    session.add(bank)
+    session.commit()
+    session.refresh(bank)
+    fixtures = Path(__file__).parents[1] / "fixtures" / "hdfc_bank"
+    tables = json.loads((fixtures / "tables_estatement.json").read_text(encoding="utf-8"))
+    lines = (fixtures / "summary_estatement.txt").read_text(encoding="utf-8").splitlines()
+
+    class _FixtureParser:
+        @classmethod
+        def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+            return ParsedStatement(
+                rows=HdfcBank.interpret_tables(tables), summary=HdfcBank.interpret_summary(lines)
+            )
+
+    monkeypatch.setitem(import_service.PARSERS, ("hdfc", "bank"), _FixtureParser)
+    result = import_statement(
+        user_id=user.id, account_id=bank.id, file_bytes=b"file", password=None, session=session
+    )
+    session.commit()
+
+    assert (result.imported, result.skipped) == (7, 0)
+    assert result.reconciliation_delta_paise == 0
+    by_merchant = {
+        t.merchant_raw: t
+        for t in session.scalars(select(Transaction).where(Transaction.account_id == bank.id))
+    }
+    employer = by_merchant[
+        "NEFT CR-EXAM0000002-SENTINEL EMPLOYER PVT LTD-TEST USER-EXAMN00000000001"
+    ]
+    assert (employer.transaction_type, employer.amount_paise) == ("income", 7500000)
+    reversal = by_merchant["REV-UPI-000000000003-SENTINEL FOOD-sentinelfood@example"]
+    assert (reversal.transaction_type, reversal.amount_paise) == ("spend", 49900)
+    cashback = by_merchant["DEBIT CARD CASHBACK"]
+    assert (cashback.transaction_type, cashback.amount_paise) == ("spend", 2500)
+    cashback_category = session.scalar(
+        select(Category).where(
+            Category.user_id == user.id,
+            Category.kind == "spend",
+            Category.name == CASHBACK_CATEGORY_NAME,
+        )
+    )
+    assert cashback_category is not None
+    assert cashback.category_id == cashback_category.id

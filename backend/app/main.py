@@ -71,30 +71,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             detail="keying the rate limiter on X-Forwarded-For; ensure the backend port is not "
             "directly reachable (only via the trusted reverse proxy)",
         )
-    if (
-        settings.demo_login_enabled
-        and settings.cookie_secure
-        and not settings.allow_demo_login_over_https
-    ):
-        # demo_login_permitted ANDs the two, so the flag is inert here unless explicitly
-        # permitted over HTTPS. Say so: the operator asked for the demo login and would
-        # otherwise get silence plus a "Try the demo" button that 401s.
+    if settings.demo_login_enabled and settings.cookie_secure:
+        # demo_login_permitted ANDs the two, so the flag is inert here. Say so: the
+        # operator asked for the demo login and would otherwise get silence plus a
+        # "Try the demo" button that 401s.
         logger.warning(
             "demo_login_enabled_but_inert",
-            detail="DEMO_LOGIN_ENABLED is set while COOKIE_SECURE=true; the demo login stays "
-            "refused (a source-published password must not ride a hardened deploy). "
-            "Set ALLOW_DEMO_LOGIN_OVER_HTTPS=true to enable demo login for a public showcase.",
+            detail="DEMO_LOGIN_ENABLED is set while COOKIE_SECURE=true; the shared demo login "
+            "stays refused (a source-published password must not ride a hardened deploy). "
+            "For a hosted demo set GUEST_SANDBOX_ENABLED=true instead.",
         )
-    elif settings.demo_login_enabled and settings.allow_demo_login_over_https:
+    if settings.guest_sandbox_enabled:
         logger.info(
-            "demo_login_allowed_over_https",
-            detail="demo login is permitted over HTTPS (ALLOW_DEMO_LOGIN_OVER_HTTPS=true)",
+            "guest_sandboxes_enabled",
+            detail="POST /auth/demo-session starts guest sandboxes (GUEST_SANDBOX_ENABLED=true)",
         )
-    if not settings.registration_enabled:
+    if settings.registration_enabled:
         logger.info(
-            "registration_disabled",
-            detail="open user registration is disabled on this instance "
-            "(REGISTRATION_ENABLED=false)",
+            "registration_open",
+            detail="user registration stays open after the first user (REGISTRATION_ENABLED=true)",
         )
     # Bring the DB to head before the guard below — migrations seed the v1
     # user row, so this must run first for a freshly created database.

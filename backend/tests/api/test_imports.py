@@ -9,17 +9,23 @@ will be exercised in the next-increment real-PDF parametrized test.
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import tempfile
 from datetime import date
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
+import structlog.testing
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Account, Category, ImportBatch, Transaction, User
+from app.main import app
+from app.models import Account, Base, Category, ImportBatch, Transaction, User
 from app.parsers import ParsedStatement, RawTransaction, StatementSummary
-from app.parsers.base import InvalidPasswordError, ParserError
+from app.parsers.base import InvalidPasswordError, ParserError, RunningBalanceMismatchError
 from app.services import import_service
 
 # Canned rows modelled on tests/fixtures/axis_cc/tables_sample.expected.json
@@ -93,13 +99,14 @@ _AXIS_ROWS_B: list[RawTransaction] = [
 
 
 class _StubAxisParser:
-    """Returns whatever rows are placed on its ``rows`` class attribute."""
+    """Returns whatever rows and summary are placed on its class attributes."""
 
     rows: ClassVar[list[RawTransaction]] = []
+    summary: ClassVar[StatementSummary] = StatementSummary()
 
     @classmethod
     def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
-        return ParsedStatement(rows=list(cls.rows), summary=StatementSummary())
+        return ParsedStatement(rows=list(cls.rows), summary=cls.summary)
 
 
 @pytest.fixture
@@ -107,6 +114,7 @@ def stub_axis_parser(monkeypatch: pytest.MonkeyPatch) -> type[_StubAxisParser]:
     """Register :class:`_StubAxisParser` for ``("axis", "credit_card")``."""
     monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _StubAxisParser)
     _StubAxisParser.rows = list(_AXIS_ROWS_A)
+    _StubAxisParser.summary = StatementSummary()
     return _StubAxisParser
 
 
@@ -171,6 +179,7 @@ def test_import_persists_transactions(
         "batch_id": 1,
         "imported": 7,
         "skipped": 0,
+        "zero_amount_count": 0,
         "already_imported": False,
         "pending_count": 7,
         "duplicate_of_account_id": None,
@@ -207,6 +216,7 @@ def test_reimport_same_file_reconciles_no_new_rows(
         "batch_id": 1,
         "imported": 7,
         "skipped": 0,
+        "zero_amount_count": 0,
         "already_imported": False,
         "pending_count": 7,
         "duplicate_of_account_id": None,
@@ -217,6 +227,7 @@ def test_reimport_same_file_reconciles_no_new_rows(
         "batch_id": 1,
         "imported": 0,
         "skipped": 7,
+        "zero_amount_count": 0,
         "already_imported": True,
         "pending_count": 7,
         "duplicate_of_account_id": None,
@@ -246,6 +257,7 @@ def test_reimport_different_bytes_row_level_dedupes(
         "batch_id": 1,
         "imported": 7,
         "skipped": 0,
+        "zero_amount_count": 0,
         "already_imported": False,
         "pending_count": 7,
         "duplicate_of_account_id": None,
@@ -259,6 +271,7 @@ def test_reimport_different_bytes_row_level_dedupes(
         "batch_id": 2,
         "imported": 2,
         "skipped": 5,
+        "zero_amount_count": 0,
         "already_imported": False,
         "pending_count": 2,
         "duplicate_of_account_id": None,
@@ -297,6 +310,7 @@ def test_reimport_resurfaces_rows_missing_from_the_db(
         "batch_id": batch_id,
         "imported": 2,  # the 2 discarded rows re-surface
         "skipped": 5,  # the 5 still-present rows are skipped
+        "zero_amount_count": 0,
         "already_imported": True,
         "pending_count": 7,  # 5 remaining + 2 resurfaced
         "duplicate_of_account_id": None,
@@ -439,20 +453,44 @@ def test_import_empty_statement_skips_dupcheck(
     """A parser yielding no rows must not crash the date-range dup-check.
 
     ``min()``/``max()`` over an empty list would raise, so the query is guarded
-    (skipped) when there are no rows.
+    (skipped) when there are no rows. A zero-row statement needs some summary
+    field to be valid (ADR-0010 rule 5); with no opening balance the delta
+    stays "not checked".
     """
     _StubAxisParser.rows = []
+    _StubAxisParser.summary = StatementSummary(closing_balance_paise=0)
     body = _post_import(client, account_id=axis_account.id, file_content=b"empty")
     assert body == {
         "batch_id": 1,
         "imported": 0,
         "skipped": 0,
+        "zero_amount_count": 0,
         "already_imported": False,
         "pending_count": 0,
         "duplicate_of_account_id": None,
         "duplicate_of_account_archived": False,
         "reconciliation_delta_paise": None,
     }
+
+
+def test_import_zero_rows_and_no_summary_is_422(
+    client: TestClient,
+    axis_account: Account,
+    stub_axis_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Neither rows nor any summary field: nothing to import (ADR-0010 rule 5).
+    The generic parse-failure 422, and no batch is left behind."""
+    _StubAxisParser.rows = []
+    resp = client.post(
+        "/api/v1/imports",
+        data={"account_id": str(axis_account.id)},
+        files={"file": ("statement.pdf", b"empty", "application/pdf")},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "could not parse statement file"
+    with session_factory() as s:
+        assert s.scalar(select(func.count()).select_from(ImportBatch)) == 0
 
 
 def test_two_axis_cards_dedup_independent(
@@ -589,7 +627,7 @@ class _RaisingParser:
         raise cls.exc
 
 
-def test_import_unknown_account_returns_404(
+def test_import_unknown_account_returns_422(
     client: TestClient,
     seeded_user: User,
 ) -> None:
@@ -598,8 +636,8 @@ def test_import_unknown_account_returns_404(
         data={"account_id": "9999"},
         files={"file": ("statement.pdf", b"x", "application/pdf")},
     )
-    assert resp.status_code == 404
-    assert resp.json()["detail"] == "account not found"
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "account not found or archived"
 
 
 def test_import_onto_archived_account_is_refused(
@@ -626,7 +664,7 @@ def test_import_onto_archived_account_is_refused(
         files={"file": ("statement.pdf", b"file-A", "application/pdf")},
     )
 
-    assert refused.status_code == 404
+    assert refused.status_code == 422
     with session_factory() as s:
         assert s.scalar(select(func.count()).select_from(Transaction)) == 0
         assert s.scalar(select(func.count()).select_from(ImportBatch)) == 0
@@ -657,7 +695,7 @@ def test_import_unknown_parser_returns_422(
         user_id=seeded_user.id,
         name="No-Parser Bank",
         type="bank",
-        issuer="sbi",
+        issuer="kotak",
     )
     session.add(bank)
     session.commit()
@@ -679,7 +717,7 @@ def test_import_usd_account_returns_422(
 ) -> None:
     """A USD account (reachable only via model/seed — AccountCreate blocks it)
     is rejected before parser dispatch: v1 import is INR-only, and this must be
-    a 422, not the 404 an AccountNotFoundError would give."""
+    its own 422, not the account-not-found one."""
     usd_cc = Account(
         user_id=seeded_user.id,
         name="US Card",
@@ -745,3 +783,237 @@ def test_import_parser_error_returns_422(
     assert resp.json()["detail"] == "could not parse statement file"
     # Internal parser-error messages must not bleed into the response.
     assert err_msg not in resp.text
+
+
+_TEXT = "SENTINEL-STATEMENT-TEXT-ABCDE1234F"
+_PWD = "SENTINEL-PWD-7Q3X"
+
+
+class _ScriptedParser:
+    """Call 1 parses, call 2 raises ParserError over the text, call 3 an InvalidPasswordError."""
+
+    calls: ClassVar[int] = 0
+    passwords: ClassVar[list[str | None]] = []
+
+    @classmethod
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+        cls.calls += 1
+        cls.passwords.append(password)
+        if cls.calls == 2:
+            raise ParserError(f"bad row: {_TEXT}")
+        if cls.calls == 3:
+            raise InvalidPasswordError(f"wrong password {_PWD}")
+        return ParsedStatement(rows=list(_AXIS_ROWS_A), summary=StatementSummary())
+
+
+def test_upload_persists_no_file_text_or_password(
+    client: TestClient,
+    axis_account: Account,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ADR-0010 rule 13: bytes, text and password live only in request memory."""
+    monkeypatch.setattr(_ScriptedParser, "calls", 0)
+    monkeypatch.setattr(_ScriptedParser, "passwords", [])
+    monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _ScriptedParser)
+    rollovers: list[object] = []
+    monkeypatch.setattr(
+        tempfile.SpooledTemporaryFile, "rollover", lambda self: rollovers.append(self)
+    )
+    monkeypatch.chdir(tmp_path)
+
+    # ~2 MiB: over Starlette's default 1 MB spool, under the 10 MiB cap.
+    file_bytes = b"%PDF-1.4 " + _TEXT.encode() + b"\0" * (2 * 1024 * 1024)
+    statuses: list[int] = []
+    bodies: list[str] = []
+    with structlog.testing.capture_logs() as logs, caplog.at_level(logging.DEBUG):
+        for payload in (file_bytes, file_bytes + b"corrupt", file_bytes + b"wrongpwd"):
+            resp = client.post(
+                "/api/v1/imports",
+                data={"account_id": str(axis_account.id), "password": _PWD},
+                files={"file": ("statement.pdf", payload, "application/pdf")},
+            )
+            statuses.append(resp.status_code)
+            bodies.append(resp.text)
+
+    assert statuses == [200, 422, 422]
+    assert _ScriptedParser.passwords == [_PWD, _PWD, _PWD]  # the absence checks mean something
+    for text in bodies:
+        assert _TEXT not in text and _PWD not in text
+
+    assert rollovers == []
+    assert list(tmp_path.iterdir()) == []
+    for sentinel in (_TEXT, _PWD):
+        assert sentinel not in repr(logs)
+        assert sentinel not in caplog.text
+
+    needles = [s.encode() for s in (_TEXT, _PWD)]
+    needles += [n.hex().encode() for n in needles]
+    with engine.connect() as conn:
+        for table in Base.metadata.sorted_tables:
+            for row in conn.execute(select(table)):
+                for value in row:
+                    blob = value if isinstance(value, bytes) else str(value).encode()
+                    assert not any(n in blob or n in blob.hex().encode() for n in needles), (
+                        f"{table.name} holds upload content"
+                    )
+        batches = conn.execute(select(ImportBatch.source_file_hash)).scalars().all()
+    # Failed uploads stored no batch; the one batch keeps only the file hash.
+    assert batches == [hashlib.sha256(file_bytes).hexdigest()]
+
+
+class _CrashingParser:
+    """``parse`` raises a non-``ParserError`` whose message carries statement text."""
+
+    @classmethod
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+        raise ValueError(f"bad row: {_TEXT}")
+
+
+def test_unexpected_parser_error_logs_no_statement_text(
+    client: TestClient,
+    axis_account: Account,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A52: any exception escaping a parser is a fixed 422, logged by type only."""
+    monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _CrashingParser)
+
+    with structlog.testing.capture_logs() as logs, caplog.at_level(logging.DEBUG):
+        resp = client.post(
+            "/api/v1/imports",
+            data={"account_id": str(axis_account.id)},
+            files={"file": ("statement.pdf", b"x", "application/pdf")},
+        )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "could not parse statement file"
+    assert _TEXT not in resp.text
+    assert _TEXT not in repr(logs)
+    assert _TEXT not in caplog.text
+    crashed = [e for e in logs if e["event"] == "statement_parser_crashed"]
+    assert len(crashed) == 1
+    assert crashed[0]["error_type"] == "ValueError"
+    assert not any("exc_info" in e for e in logs)
+    with session_factory() as s:
+        assert s.scalar(select(func.count()).select_from(ImportBatch)) == 0
+
+
+class _MismatchParser:
+    @classmethod
+    def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+        raise RunningBalanceMismatchError(page=2, row=3)
+
+
+def test_running_balance_mismatch_is_a_422_naming_page_and_row(
+    client: TestClient,
+    axis_account: Account,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0010 rule 11: the 422 names the position, the log carries it and nothing else."""
+    monkeypatch.setitem(import_service.PARSERS, ("axis", "credit_card"), _MismatchParser)
+
+    with structlog.testing.capture_logs() as logs:
+        resp = client.post(
+            "/api/v1/imports",
+            data={"account_id": str(axis_account.id)},
+            files={"file": ("statement.pdf", b"x", "application/pdf")},
+        )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "running balance does not match on page 2, row 3"
+    events = [e for e in logs if e["event"] == "statement_running_balance_mismatch"]
+    assert len(events) == 1
+    assert {k: v for k, v in events[0].items() if k not in {"event", "log_level"}} == {
+        "page": 2,
+        "row": 3,
+    }
+    with session_factory() as s:
+        assert s.scalar(select(func.count()).select_from(ImportBatch)) == 0
+
+
+@pytest.mark.parametrize(
+    "long_merchant",
+    ["a" * 513, "\ufb2c" * 171],
+    ids=["raw_over_512", "normalized_over_512"],
+)
+def test_import_refuses_a_statement_whose_merchant_is_too_long(
+    client: TestClient,
+    axis_account: Account,
+    session_factory: sessionmaker[Session],
+    stub_axis_parser: type[_StubAxisParser],
+    long_merchant: str,
+) -> None:
+    """ADR-0006 rule 3b: the whole file is refused with a 422 naming the row's position
+    (never the statement text), and nothing is staged."""
+    stub_axis_parser.rows = [
+        _AXIS_ROWS_A[0],
+        RawTransaction(
+            date=date(2026, 3, 9),
+            amount_paise=-12300,
+            merchant_raw=long_merchant,
+            txn_type="purchase",
+        ),
+    ]
+
+    resp = client.post(
+        "/api/v1/imports",
+        data={"account_id": str(axis_account.id)},
+        files={"file": ("statement.pdf", b"file-A", "application/pdf")},
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "merchant on statement row 2 is longer than 512 characters"
+    with session_factory() as s:
+        assert s.scalar(select(func.count()).select_from(Transaction)) == 0
+        assert s.scalar(select(func.count()).select_from(ImportBatch)) == 0
+
+
+def test_import_over_cap_is_413_and_stages_nothing(
+    client: TestClient,
+    axis_account: Account,
+    session_factory: sessionmaker[Session],
+    stub_axis_parser: type[_StubAxisParser],
+) -> None:
+    resp = client.post(
+        "/api/v1/imports",
+        data={"account_id": str(axis_account.id)},
+        files={"file": ("statement.pdf", b"\0" * (11 * 1024 * 1024), "application/pdf")},
+    )
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "file too large"
+    with session_factory() as s:
+        assert s.scalar(select(func.count()).select_from(ImportBatch)) == 0
+        assert s.scalar(select(func.count()).select_from(Transaction)) == 0
+
+
+def test_import_form_validation_422_never_echoes_input(
+    client: TestClient, axis_account: Account
+) -> None:
+    resp = client.post(
+        "/api/v1/imports",
+        data={"account_id": "abc", "password": _PWD},
+        files={"file": ("statement.pdf", b"x", "application/pdf")},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "account_id"]
+    assert _PWD not in resp.text and "abc" not in resp.text
+
+    no_file = client.post(
+        "/api/v1/imports",
+        data={"account_id": str(axis_account.id)},
+        files={"other": ("x.pdf", b"x", "application/pdf")},
+    )
+    assert no_file.status_code == 422
+    assert no_file.json()["detail"][0]["loc"] == ["body", "file"]
+
+
+def test_statement_upload_openapi_documents_the_multipart_body() -> None:
+    op = app.openapi()["paths"]["/api/v1/imports"]["post"]
+    schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+    assert schema["required"] == ["account_id", "file"]
+    assert "413" in op["responses"]

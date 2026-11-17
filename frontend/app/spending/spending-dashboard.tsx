@@ -8,7 +8,8 @@
  * the month anchor for the three MONTHLY cards (spend-by-category, spend-by-tag,
  * top-merchants) so their three steppers move as one. The trend cards keep their own
  * period state — a grain toggle is a different control from a month, and no finding
- * asks for them to follow along. Views 1 & 4 (live portfolio tiles, net worth over
+ * asks for them to follow along. CategoryTrendBar is a trailing 12-month window,
+ * independent of the picker and scoped only by the tag. Views 1 & 4 (live portfolio tiles, net worth over
  * time) land with F7 — this surface is the spending slice of F8.
  *
  * Card dispositions under the tag filter:
@@ -44,12 +45,12 @@ import { Pill } from "@/components/ui/pill";
 import { IconChevronDown } from "@/components/icons";
 import { listLabels } from "@/lib/api/client";
 import { labelDisplay } from "@/lib/labels";
-import { periodKey, type Period } from "@/lib/period";
+import { currentYear, periodKey, type Period } from "@/lib/period";
 
 export function SpendingDashboard() {
   const yearsQuery = useAvailableYears();
   const [period, setPeriod] = useState<Period>(() => ({
-    year: new Date().getFullYear(),
+    year: currentYear(),
   }));
   const [labelId, setLabelId] = useState<number | undefined>(undefined);
 
@@ -65,6 +66,7 @@ export function SpendingDashboard() {
   }, [labelId, labelsQuery.data]);
 
   const selectedTag = labels.find((l) => l.id === labelId);
+  // The calendar year the cards total over: a month's own year.
   const selectedYear = period.year;
   const monthParam = period.mon != null ? periodKey(period) : undefined;
 
@@ -110,7 +112,7 @@ export function SpendingDashboard() {
       <TopMerchants labelId={labelId} year={selectedYear} month={monthParam} />
       <CashflowBar tagActive={labelId != null} year={selectedYear} />
       <SpendByPeriodBar labelId={labelId} year={selectedYear} />
-      <CategoryTrendBar labelId={labelId} year={selectedYear} />
+      <CategoryTrendBar labelId={labelId} />
       {labels.length > 0 ? <SpendByTagHeatmap year={selectedYear} /> : null}
       <TaggingHealthCard />
     </div>

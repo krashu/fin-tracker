@@ -24,6 +24,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { listTopMerchants } from "@/lib/api/client";
 import { formatINR, formatMonthYear } from "@/lib/format";
+import { periodLabel as periodName } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
 
@@ -59,7 +60,7 @@ export function TopMerchants({
 
   const displayPeriodLabel = month
     ? formatMonthYear(new Date(Number(month.split("-")[0]), Number(month.split("-")[1]) - 1, 1))
-    : `${year}`;
+    : periodName({ year });
 
   return (
     <Card>
@@ -88,7 +89,7 @@ export function TopMerchants({
               // encodes exactly the % shown beside it.
               const sharePct = shownTotal > 0 ? (mag * 100) / shownTotal : 0;
               return (
-                <li key={r.merchant_normalized}>
+                <li key={r.merchant_canonical}>
                   <div className="mb-1 flex items-baseline justify-between gap-2">
                     <span
                       className="min-w-0 truncate text-[12.5px] text-foreground"
@@ -126,7 +127,7 @@ export function TopMerchants({
           <p className="mt-3 border-t border-border/60 pt-2.5 text-[11.5px] text-muted-foreground">
             Net credit in {displayPeriodLabel}:{" "}
             {creditRows.map((r, i) => (
-              <span key={r.merchant_normalized}>
+              <span key={r.merchant_canonical}>
                 {i > 0 ? ", " : ""}
                 {r.merchant_label}{" "}
                 <span className="tabular-nums text-pos">

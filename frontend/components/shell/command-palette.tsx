@@ -33,7 +33,7 @@ import { IconArrowRight, IconSearch } from "@/components/icons";
 import { CategoryDot } from "@/components/category-dot";
 import { listAccounts, listCategories } from "@/lib/api/client";
 import { accountLabel } from "@/lib/accounts";
-import { categoryDisplayName, resolveCategoryColor } from "@/lib/categories";
+import { categoryDisplayName } from "@/lib/categories";
 import { cn } from "@/lib/utils";
 
 import { NAV_GROUPS } from "./nav-config";
@@ -124,7 +124,7 @@ export function CommandPalette({
         label: categoryDisplayName(c, raw),
         href: `/expenses?category=${c.id}`,
         categoryId: c.id,
-        color: resolveCategoryColor(c, raw),
+        color: c.display_color,
       }));
   }, [categoriesQuery.data]);
 

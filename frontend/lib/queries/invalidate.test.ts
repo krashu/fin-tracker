@@ -13,7 +13,7 @@ describe("TanStack Query Invalidation Contract (lib/queries/invalidate.ts)", () 
     });
 
     // Seed queries in cache with data
-    qc.setQueryData(["rules"], [{ merchant_normalized: "swiggy" }]);
+    qc.setQueryData(["rules"], [{ merchant_canonical: "swiggy" }]);
     qc.setQueryData(["rules", "merchants"], ["swiggy", "zomato"]);
     qc.setQueryData(["rules", "aliases"], [{ pattern: "swiggy in", canonical: "swiggy" }]);
     qc.setQueryData(["dashboards", "tagging-stats"], { categorized_pct: 90 });

@@ -63,6 +63,8 @@ export const NAV_GROUPS: NavGroup[] = [
       { href: "/holdings", label: "Holdings", icon: IconStack },
       { href: "/investments", label: "Transactions", icon: IconExchange },
       { href: "/portfolio", label: "Portfolio", icon: IconTrend },
+      // F11 (PRD): the intraday listing; capital gains and dividends land in v0.8.
+      { href: "/tax", label: "Tax statement", icon: IconDoc },
     ],
   },
   {

@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { periodKey, periodParams, periodRange } from "@/lib/period";
+import {
+  currentYear,
+  fyOf,
+  periodKey,
+  periodLabel,
+  periodParams,
+  periodRange,
+  previousPeriod,
+  taxYearLabel,
+} from "@/lib/period";
 
 describe("periodKey", () => {
   it("renders a month period as YYYY-MM", () => {
@@ -16,7 +25,9 @@ describe("periodKey", () => {
 });
 
 describe("periodRange", () => {
-  it("returns Jan 1 - Dec 31 for a year period", () => {
+  // PRD §F8: a spend year is the calendar year, 1 Jan - 31 Dec — the same span the
+  // backend's dashboards `?year=` covers.
+  it("returns 1 Jan - 31 Dec for a year period (the calendar year)", () => {
     expect(periodRange({ year: 2026 })).toEqual({
       start: "2026-01-01",
       end: "2026-12-31",
@@ -53,6 +64,16 @@ describe("periodRange", () => {
   });
 });
 
+describe("periodLabel", () => {
+  it("labels a year period as the bare calendar year", () => {
+    expect(periodLabel({ year: 2026 })).toBe("2026");
+  });
+
+  it("labels a month period as the calendar month", () => {
+    expect(periodLabel({ year: 2026, mon: 6 })).toBe("June 2026");
+  });
+});
+
 describe("periodParams", () => {
   it("emits only {month} for a month period, never {year}", () => {
     const params = periodParams({ year: 2026, mon: 6 });
@@ -64,5 +85,47 @@ describe("periodParams", () => {
     const params = periodParams({ year: 2026 });
     expect(params).toEqual({ year: "2026" });
     expect(params.month).toBeUndefined();
+  });
+});
+
+describe("currentYear", () => {
+  it("is the calendar year of the local date, January included", () => {
+    expect(currentYear(new Date(2027, 0, 1))).toBe(2027);
+    expect(currentYear(new Date(2026, 11, 31))).toBe(2026);
+  });
+});
+
+// Tax only (PRD §F11): the tax pages still name the FY by its start year.
+describe("fyOf", () => {
+  it("puts January–March in the financial year that began the previous April", () => {
+    expect(fyOf({ year: 2027, mon: 2 })).toBe(2026);
+    expect(fyOf({ year: 2027, mon: 3 })).toBe(2026);
+    expect(fyOf({ year: 2026, mon: 4 })).toBe(2026);
+    expect(fyOf({ year: 2026, mon: 12 })).toBe(2026);
+    // A year period already names its FY.
+    expect(fyOf({ year: 2026 })).toBe(2026);
+  });
+});
+
+describe("previousPeriod", () => {
+  it("a year's previous period is the previous calendar year", () => {
+    expect(previousPeriod({ year: 2026 })).toEqual({ year: 2025 });
+    expect(periodRange(previousPeriod({ year: 2026 }))).toEqual({
+      start: "2025-01-01",
+      end: "2025-12-31",
+    });
+  });
+
+  it("January's previous period is the previous December", () => {
+    expect(previousPeriod({ year: 2027, mon: 1 })).toEqual({ year: 2026, mon: 12 });
+    expect(previousPeriod({ year: 2026, mon: 6 })).toEqual({ year: 2026, mon: 5 });
+  });
+});
+
+describe("taxYearLabel", () => {
+  it("labels tax years from 2026-27 on, and earlier years by FY and AY", () => {
+    expect(taxYearLabel(2026)).toBe("Tax year 2026-27");
+    expect(taxYearLabel(2027)).toBe("Tax year 2027-28");
+    expect(taxYearLabel(2025)).toBe("FY 2025-26 (AY 2026-27)");
   });
 });

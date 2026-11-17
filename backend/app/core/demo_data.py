@@ -27,11 +27,18 @@ the oldest of the 12-month narrative cycle. A window wider than 12 months (the
 default is :data:`DEMO_WINDOW_MONTHS`) just repeats the earliest slots — fine
 for a synthetic demo, nobody is comparing year-over-year.
 
-The merchant vocabulary is deliberately UNCHANGED from the old fixed dataset —
-only which relative month/day each row lands on moved. ``tests/test_migration_parity.py``
-hardcodes the 12 merchants this dataset teaches (F3 auto-tag learning) as
-colliding with the ADR-0011 seed dictionary; renaming or dropping one of those
-12 breaks that test. Add new merchants freely; don't rename the existing ones.
+On top of the slots, :data:`_RECURRING` lays down the steady monthly life of one
+salaried household across :data:`ACCOUNTS` (two cards, a bank account and a cash
+wallet): rent, an EMI and bills off the bank, everyday spends on the cards, small
+cash spends. Those repeat every month (or in named calendar months, like an annual
+premium or Diwali), with amounts jittered per calendar month. The bank pays each
+card's previous month in full (:func:`build_demo_card_bills`) and funds the cash
+wallet (:func:`build_demo_transfers`); refunds name the spend they reverse.
+
+``tests/test_migration_parity.py`` hardcodes 12 merchants this dataset teaches (F3
+auto-tag learning) as colliding with the ADR-0011 seed dictionary; renaming or
+dropping one of those 12 breaks that test. Add new merchants freely; don't rename
+the existing ones.
 
 The current (slot 0) month is truncated to ``day <= anchor.day`` so a demo
 session never shows a future-dated transaction.
@@ -40,7 +47,9 @@ session never shows a future-dated transaction.
 from __future__ import annotations
 
 import calendar
+import random
 from datetime import date as date_t
+from decimal import Decimal
 from typing import Any, Literal, NamedTuple
 
 # Trailing window the boot-time seeder keeps in place, in months (inclusive of
@@ -48,36 +57,91 @@ from typing import Any, Literal, NamedTuple
 # window always has full-year context, not just a bare 12.
 DEMO_WINDOW_MONTHS = 14
 
+# Which demo account a row posts to. "card" is the original Axis card and stays the
+# default so the one-off templates below read as before.
+AccountKey = Literal["card", "bank", "card2", "cash"]
+
+
+class AccountSpec(NamedTuple):
+    """One demo account. ``parent`` names the bank account that pays a card's bill
+    (``Account.parent_account_id``), on ``bill_day`` each month. A card's ``issuer``
+    must have a statement parser, or the accounts API refuses every edit of it."""
+
+    key: AccountKey
+    name: str
+    type: Literal["credit_card", "bank", "cash"]
+    issuer: str | None
+    # Placeholder last-4s: the demo account is a public "Try the demo" login.
+    # NEVER use a real card's last-4; the demo DB carries only synthetic ids.
+    last4: str | None
+    parent: AccountKey | None = None
+    bill_day: int | None = None
+
+
+ACCOUNTS: list[AccountSpec] = [
+    # Bills after the 1st's salary, apart so the two read as two payments.
+    AccountSpec("card", "Axis Flipkart", "credit_card", "axis", "4321", "bank", 18),
+    AccountSpec("bank", "HDFC Savings", "bank", "hdfc", None),
+    AccountSpec("card2", "ICICI Amazon Pay", "credit_card", "icici", "8765", "bank", 22),
+    AccountSpec("cash", "Cash wallet", "cash", None, None),
+]
+
 
 class SpendRow(NamedTuple):
     """A concrete, dated card spend / refund row. ``rupees`` is a positive
     magnitude; the writer signs it (spend negative, refund positive). ``labels``
-    are F3a user tags (get-or-created on seed)."""
+    are F3a user tags (get-or-created on seed). ``refund_of`` is the ``(date,
+    merchant)`` of the spend a refund reverses, on the same account (ADR-0009
+    rule 13); ``None`` on a spend and on cashback, which reverses nothing."""
 
     date: str
     merchant: str
     category: str
     rupees: int
     labels: tuple[str, ...] = ()
+    account: AccountKey = "card"
+    refund_of: tuple[str, str] | None = None
 
 
 class IncomeRow(NamedTuple):
     """A concrete, dated income row. ``rupees`` is positive. ``account`` picks
-    which demo account it posts to — almost everything is bank-credited salary,
-    but card cashback is credited to the CARD statement, not the linked bank
-    account (real Axis Flipkart behaviour)."""
+    which demo account it posts to — the bank, unless a row says otherwise.
+    (Card cashback is not income: it is a positive spend on the card, ADR-0013.)"""
 
     date: str
     source: str
     category: str
     rupees: int
     labels: tuple[str, ...] = ()
-    account: Literal["bank", "card"] = "bank"
+    account: AccountKey = "bank"
+
+
+class TransferRow(NamedTuple):
+    """A concrete, dated money movement between two demo accounts, written as a
+    linked pair of ``transfer`` rows (ADR-0002). ``rupees`` is positive."""
+
+    date: str
+    source: AccountKey
+    dest: AccountKey
+    rupees: int
+
+
+class CardBillRow(NamedTuple):
+    """One month's card bill, paid in full from the card's paying ``bank``: the bank's
+    "Credit Card Payment" debit and the card's "Payment Received" credit, both on
+    ``date``. ``linked`` is False for the one bill left for the user to link by hand."""
+
+    date: str
+    card: AccountKey
+    bank: AccountKey
+    rupees: int
+    linked: bool = True
 
 
 class _SpendTemplate(NamedTuple):
     """One recurring spend/refund slot. ``slot`` counts months back from the
-    anchor's month (0 = current month, 11 = oldest of the core cycle)."""
+    anchor's month (0 = current month, 11 = oldest of the core cycle). A refund's
+    ``refund_of`` is the ``(slot, day, merchant)`` of the spend template it reverses."""
 
     slot: int
     day: int
@@ -85,6 +149,8 @@ class _SpendTemplate(NamedTuple):
     category: str
     rupees: int
     labels: tuple[str, ...] = ()
+    account: AccountKey = "card"
+    refund_of: tuple[int, int, str] | None = None
 
 
 class _IncomeTemplate(NamedTuple):
@@ -94,33 +160,83 @@ class _IncomeTemplate(NamedTuple):
     category: str
     rupees: int
     labels: tuple[str, ...] = ()
-    account: Literal["bank", "card"] = "bank"
+    account: AccountKey = "bank"
 
 
-# Card spends across the 12-slot cycle. Merchants recur (Big Basket, Swiggy,
-# Uber, Netflix, …) so the top-merchants aggregate ranks meaningfully; slot 9
-# is a deliberate deficit slot (Travel + Shopping spike pushes spend above the
-# 50k salary) so the cashflow net line dips below 0 for that month.
+class _Recurring(NamedTuple):
+    """A spend that repeats on the same day of every month (or only in the calendar
+    ``months`` listed, 1-12). ``jitter_pct`` varies the amount by up to that percentage,
+    seeded from the calendar month, so a given month's amount never changes as the
+    window rolls forward."""
+
+    merchant: str
+    category: str
+    account: AccountKey
+    day: int
+    rupees: int
+    jitter_pct: int = 0
+    labels: tuple[str, ...] = ()
+    months: tuple[int, ...] = ()
+
+
+# The steady monthly life: bills and rent off the bank, day-to-day spends on the two
+# cards, small cash spends. Sized with the salary below so every month nets positive
+# except the deficit slot (see _SPEND_TEMPLATE), and neither the bank nor the cash
+# wallet goes below zero, card bills included; tests/test_demo_data.py locks both.
+_RECURRING: list[_Recurring] = [
+    # Bank: rent, loan, bills.
+    _Recurring("Rent - NoBroker", "Rent", "bank", 3, 28000),
+    _Recurring("Society Maintenance", "Rent & Maintenance", "bank", 5, 3500),
+    _Recurring("HDFC Car Loan EMI", "Loan EMIs & Repayments", "bank", 5, 14500),
+    _Recurring("ACT Fibernet", "Mobile & Broadband", "bank", 8, 1179),
+    _Recurring("BESCOM Electricity", "Electricity", "bank", 12, 1800, 25),
+    _Recurring("Indane Gas", "Cooking Gas & LPG", "bank", 16, 1100, 5, months=(1, 3, 5, 7, 9, 11)),
+    _Recurring("LIC Premium", "Health & Life Insurance", "bank", 10, 24000, months=(3,)),
+    # Cash wallet.
+    _Recurring("Maid salary", "Household Help & Domestic Staff", "cash", 1, 4000),
+    _Recurring("Chai stall", "Coffee & Tea", "cash", 6, 60, 30),
+    _Recurring("Sabzi vendor", "Groceries", "cash", 9, 450, 30),
+    _Recurring("Auto rickshaw", "Ride-Hailing & Taxis", "cash", 14, 120, 30),
+    # Axis card: groceries, food, rides, subscriptions. (Coffee and extra orders come
+    # from _SPEND_TEMPLATE.)
+    _Recurring("Big Basket", "Groceries", "card", 7, 1800, 20),
+    _Recurring("Swiggy", "Online Food Delivery", "card", 6, 600, 35, ("online",)),
+    _Recurring("Zomato", "Online Food Delivery", "card", 13, 750, 30, ("online",)),
+    _Recurring("Swiggy Instamart", "Instant Grocery Delivery", "card", 27, 900, 30, ("online",)),
+    _Recurring("Uber", "Ride-Hailing & Taxis", "card", 11, 380, 30),
+    _Recurring("Netflix", "Digital Subscriptions & Streaming", "card", 20, 649),
+    _Recurring("Spotify", "Digital Subscriptions & Streaming", "card", 21, 149),
+    # ICICI Amazon Pay: fuel, phone, transit, pharmacy, outings, Diwali.
+    _Recurring("Indian Oil", "Fuel & Petrol", "card2", 9, 2500, 15),
+    _Recurring("Airtel", "Mobile & Broadband", "card2", 27, 1199),
+    _Recurring("Metro", "Metro & Public Transit", "card2", 15, 500),
+    _Recurring("Apollo Pharmacy", "Health", "card2", 26, 600, 30, months=(1, 3, 5, 7, 9, 11)),
+    _Recurring(
+        "BookMyShow", "Entertainment", "card2", 23, 900, 25, ("weekend",), (2, 4, 6, 8, 10, 12)
+    ),
+    _Recurring("Tanishq", "Gifts & Celebrations", "card2", 20, 18000, 0, ("festive",), (10,)),
+]
+
+# One-off and extra card spends across the 12-slot cycle, on top of _RECURRING.
+# Merchants recur (Big Basket, Swiggy, Uber, …) so the top-merchants aggregate ranks
+# meaningfully; slot 9 is a deliberate deficit slot (a Travel + Shopping spike pushes
+# spend above the salary) so the cashflow net line dips below 0 for that month.
 _SPEND_TEMPLATE: list[_SpendTemplate] = [
     # slot 11 (oldest)
     _SpendTemplate(11, 5, "Big Basket", "Groceries", 2800),
     _SpendTemplate(11, 10, "Swiggy", "Online Food Delivery", 650, ("online",)),
     _SpendTemplate(11, 14, "Uber", "Ride-Hailing & Taxis", 380),
-    _SpendTemplate(11, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
     _SpendTemplate(11, 24, "Amazon", "Shopping", 1500, ("online",)),
     # slot 10
     _SpendTemplate(10, 6, "Big Basket", "Groceries", 3100),
     _SpendTemplate(10, 11, "Zomato", "Online Food Delivery", 720, ("online",)),
     _SpendTemplate(10, 15, "Metro", "Metro & Public Transit", 250),
-    _SpendTemplate(10, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
-    _SpendTemplate(10, 21, "Spotify", "Digital Subscriptions & Streaming", 149),
     _SpendTemplate(10, 26, "Apollo Pharmacy", "Health", 540),
-    # slot 9 — deficit slot (spend > 50k salary → net < 0)
+    # slot 9 — deficit slot (spend > salary → net < 0)
     _SpendTemplate(9, 4, "Big Basket", "Groceries", 3600),
     _SpendTemplate(9, 9, "Swiggy", "Online Food Delivery", 980, ("online",)),
     _SpendTemplate(9, 12, "MakeMyTrip", "Travel", 32000, ("travel", "goa")),
     _SpendTemplate(9, 18, "Croma", "Electronics & Gadgets", 18500, ("festive",)),
-    _SpendTemplate(9, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
     _SpendTemplate(9, 22, "Myntra", "Clothing & Apparel", 6200, ("festive",)),
     _SpendTemplate(9, 25, "Uber", "Ride-Hailing & Taxis", 720, ("travel",)),
     # slot 8
@@ -128,35 +244,28 @@ _SPEND_TEMPLATE: list[_SpendTemplate] = [
     _SpendTemplate(8, 9, "Blue Tokai", "Coffee & Tea", 480, ("restaurant",)),
     _SpendTemplate(8, 14, "Swiggy", "Online Food Delivery", 610, ("online",)),
     _SpendTemplate(8, 16, "Metro", "Metro & Public Transit", 300),
-    _SpendTemplate(8, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
     _SpendTemplate(8, 23, "BookMyShow", "Entertainment", 900, ("weekend",)),
     # slot 7
     _SpendTemplate(7, 6, "Big Basket", "Groceries", 3400),
     _SpendTemplate(7, 11, "Zomato", "Online Food Delivery", 850, ("online",)),
     _SpendTemplate(7, 15, "Uber", "Ride-Hailing & Taxis", 560),
     _SpendTemplate(7, 19, "Amazon", "Shopping", 3200, ("online", "gifts")),
-    _SpendTemplate(7, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
-    _SpendTemplate(7, 27, "Airtel", "Mobile & Broadband", 1200),
     # slot 6
     _SpendTemplate(6, 5, "Big Basket", "Groceries", 3000),
     _SpendTemplate(6, 10, "Swiggy", "Online Food Delivery", 700, ("online",)),
     _SpendTemplate(6, 14, "Metro", "Metro & Public Transit", 280),
-    _SpendTemplate(6, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
-    _SpendTemplate(6, 21, "Spotify", "Digital Subscriptions & Streaming", 149),
     _SpendTemplate(6, 25, "Apollo Pharmacy", "Health", 620),
     # slot 5
     _SpendTemplate(5, 6, "Big Basket", "Groceries", 3300),
     _SpendTemplate(5, 11, "Blue Tokai", "Coffee & Tea", 520, ("restaurant",)),
     _SpendTemplate(5, 15, "Uber", "Ride-Hailing & Taxis", 410),
     _SpendTemplate(5, 19, "Amazon", "Shopping", 2100, ("online",)),
-    _SpendTemplate(5, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
+    _SpendTemplate(5, 8, "Manipal Hospitals", "Health", 9500, (), "card2"),
     # slot 4
     _SpendTemplate(4, 5, "Big Basket", "Groceries", 3500),
     _SpendTemplate(4, 10, "Zomato", "Online Food Delivery", 890, ("online",)),
     _SpendTemplate(4, 14, "Metro", "Metro & Public Transit", 320),
     _SpendTemplate(4, 18, "Myntra", "Clothing & Apparel", 4200),
-    _SpendTemplate(4, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
-    _SpendTemplate(4, 26, "Airtel", "Mobile & Broadband", 1150),
     # slot 3
     _SpendTemplate(3, 4, "Big Basket", "Groceries", 3200),
     _SpendTemplate(3, 9, "Swiggy", "Online Food Delivery", 890, ("online",)),
@@ -167,7 +276,6 @@ _SPEND_TEMPLATE: list[_SpendTemplate] = [
     _SpendTemplate(2, 3, "Blue Tokai", "Coffee & Tea", 520, ("restaurant",)),
     _SpendTemplate(2, 8, "Metro", "Metro & Public Transit", 300),
     _SpendTemplate(2, 14, "Big Basket", "Groceries", 4100),
-    _SpendTemplate(2, 20, "Netflix", "Digital Subscriptions & Streaming", 649),
     _SpendTemplate(2, 25, "Croma", "Electronics & Gadgets", 1200),
     # slot 1
     _SpendTemplate(1, 3, "Blue Tokai", "Coffee & Tea", 450, ("restaurant",)),
@@ -178,42 +286,61 @@ _SPEND_TEMPLATE: list[_SpendTemplate] = [
     _SpendTemplate(0, 4, "Big Basket", "Groceries", 2600),
     _SpendTemplate(0, 9, "Swiggy", "Online Food Delivery", 740, ("online",)),
     _SpendTemplate(0, 14, "Uber", "Ride-Hailing & Taxis", 390),
-    _SpendTemplate(0, 16, "Netflix", "Digital Subscriptions & Streaming", 649),
 ]
 
-# Card refunds: `spend`-typed with a POSITIVE amount (ADR-0009 — a refund is not
-# its own type), same category as the spend they offset so the §F4a signed sum
-# nets. Slot 9's refund partially returns that slot's deficit-driving shopping
-# spike (still leaves slot 9 in deficit); slot 2's returns an Amazon order.
+# Card credits: `spend`-typed with a POSITIVE amount. A refund is not its own type
+# (ADR-0009) and sits in the same category as the spend it offsets, so the §F4a
+# signed sum nets, and links to that spend through ``refund_of``. Slot 9's refund
+# partially returns that slot's deficit-driving shopping spike (still leaves slot 9
+# in deficit); slot 2's returns the previous month's Amazon order.
+# Card cashback is a rebate on spending, a positive spend in "Cashback" (ADR-0013),
+# credited on the card statement itself (real Axis Flipkart behaviour).
 _REFUND_TEMPLATE: list[_SpendTemplate] = [
-    _SpendTemplate(9, 28, "Myntra refund", "Clothing & Apparel", 2000, ("festive",)),
-    _SpendTemplate(2, 18, "Amazon refund", "Shopping", 600, ("online",)),
+    _SpendTemplate(
+        9,
+        28,
+        "Myntra refund",
+        "Clothing & Apparel",
+        2000,
+        ("festive",),
+        refund_of=(9, 22, "Myntra"),
+    ),
+    _SpendTemplate(8, 28, "Card Cashback", "Cashback", 350),
+    _SpendTemplate(7, 17, "Uber refund", "Ride-Hailing & Taxis", 180, refund_of=(7, 15, "Uber")),
+    _SpendTemplate(6, 30, "Card Cashback", "Cashback", 420),
+    _SpendTemplate(
+        2, 18, "Amazon refund", "Shopping", 600, ("online",), refund_of=(3, 22, "Amazon")
+    ),
+    _SpendTemplate(
+        2, 29, "Croma refund", "Electronics & Gadgets", 1200, refund_of=(2, 25, "Croma")
+    ),
 ]
 
-# Bank/card income: salary every slot + a year-end and an appraisal bonus
-# (Salary), two freelancing payouts, and card cashback so income-vs-spend isn't
-# a flat band. Cashback posts to the CARD (real Axis Flipkart behaviour — it's
-# credited on the card statement, not the linked bank account).
+# Bank income: salary every slot + a year-end and an appraisal bonus (Salary) and
+# two freelancing payouts, so income-vs-spend isn't a flat band.
 _INCOME_TEMPLATE: list[_IncomeTemplate] = [
-    _IncomeTemplate(11, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(10, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(11, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(10, 1, "Acme Payroll", "Salary", 110000),
     _IncomeTemplate(10, 18, "Upwork", "Freelancing", 12000),
-    _IncomeTemplate(9, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(8, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(8, 28, "Card Cashback", "Cashback", 350, (), "card"),
-    _IncomeTemplate(7, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(7, 15, "Acme Year-End Bonus", "Salary", 45000),
-    _IncomeTemplate(6, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(6, 30, "Card Cashback", "Cashback", 420, (), "card"),
-    _IncomeTemplate(5, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(9, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(8, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(7, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(7, 15, "Acme Year-End Bonus", "Salary", 90000),
+    _IncomeTemplate(6, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(5, 1, "Acme Payroll", "Salary", 110000),
     _IncomeTemplate(5, 22, "Consulting", "Freelancing", 15000),
-    _IncomeTemplate(4, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(4, 20, "Acme Appraisal Bonus", "Salary", 35000),
-    _IncomeTemplate(3, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(2, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(1, 1, "Acme Payroll", "Salary", 50000),
-    _IncomeTemplate(0, 1, "Acme Payroll", "Salary", 50000),
+    _IncomeTemplate(4, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(4, 20, "Acme Appraisal Bonus", "Salary", 60000),
+    _IncomeTemplate(3, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(2, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(1, 1, "Acme Payroll", "Salary", 110000),
+    _IncomeTemplate(0, 1, "Acme Payroll", "Salary", 110000),
 ]
+
+
+# The cash wallet's only inflow: an ATM withdrawal on the 1st, the same day as the
+# maid's salary it mostly pays for.
+_ATM_DAY, _ATM_RUPEES = 1, 6000
 
 
 def _add_months(anchor: date_t, months_back: int) -> date_t:
@@ -229,6 +356,31 @@ def _day_in_month(year: int, month: int, day: int) -> date_t:
     row lands on Feb 28/29, not a ``ValueError``)."""
     last_day = calendar.monthrange(year, month)[1]
     return date_t(year, month, min(day, last_day))
+
+
+def _jittered(rec: _Recurring, year: int, month: int) -> int:
+    """``rec.rupees`` varied by up to ``rec.jitter_pct``, the same for a given calendar
+    month on every run (``random.Random`` seeded from a string is deterministic)."""
+    if not rec.jitter_pct:
+        return rec.rupees
+    rng = random.Random(f"{year}-{month}-{rec.merchant}-{rec.day}")
+    return round(rec.rupees * (1 + rng.uniform(-rec.jitter_pct, rec.jitter_pct) / 100))
+
+
+def _original(
+    tmpl: _SpendTemplate, anchor: date_t, months_back: int, window_months: int
+) -> tuple[str, str] | None:
+    """The ``(date, merchant)`` of the spend a refund template reverses, or ``None``
+    when it reverses nothing or that spend's month is outside the window. The
+    original is always earlier, so a refund on or before the anchor has its original."""
+    if tmpl.refund_of is None:
+        return None
+    slot, day, merchant = tmpl.refund_of
+    original_back = months_back + slot - tmpl.slot
+    if original_back >= window_months:
+        return None
+    month_start = _add_months(anchor, original_back)
+    return _day_in_month(month_start.year, month_start.month, day).isoformat(), merchant
 
 
 def build_demo_dataset(
@@ -250,6 +402,22 @@ def build_demo_dataset(
     for months_back in range(window_months - 1, -1, -1):
         month_start = _add_months(anchor, months_back)
         slot = months_back % 12
+        for rec in _RECURRING:
+            if rec.months and month_start.month not in rec.months:
+                continue
+            on = _day_in_month(month_start.year, month_start.month, rec.day)
+            if on > anchor:
+                continue
+            spends.append(
+                SpendRow(
+                    on.isoformat(),
+                    rec.merchant,
+                    rec.category,
+                    _jittered(rec, on.year, on.month),
+                    rec.labels,
+                    rec.account,
+                )
+            )
         for tmpl in _SPEND_TEMPLATE:
             if tmpl.slot != slot:
                 continue
@@ -257,7 +425,14 @@ def build_demo_dataset(
             if on > anchor:
                 continue
             spends.append(
-                SpendRow(on.isoformat(), tmpl.merchant, tmpl.category, tmpl.rupees, tmpl.labels)
+                SpendRow(
+                    on.isoformat(),
+                    tmpl.merchant,
+                    tmpl.category,
+                    tmpl.rupees,
+                    tmpl.labels,
+                    tmpl.account,
+                )
             )
         for tmpl in _REFUND_TEMPLATE:
             if tmpl.slot != slot:
@@ -266,7 +441,15 @@ def build_demo_dataset(
             if on > anchor:
                 continue
             refunds.append(
-                SpendRow(on.isoformat(), tmpl.merchant, tmpl.category, tmpl.rupees, tmpl.labels)
+                SpendRow(
+                    on.isoformat(),
+                    tmpl.merchant,
+                    tmpl.category,
+                    tmpl.rupees,
+                    tmpl.labels,
+                    tmpl.account,
+                    _original(tmpl, anchor, months_back, window_months),
+                )
             )
         for tmpl in _INCOME_TEMPLATE:
             if tmpl.slot != slot:
@@ -287,21 +470,101 @@ def build_demo_dataset(
     return spends, refunds, income
 
 
-# Instruments + their transaction history. Unaffected by the rolling window —
-# holdings/XIRR need the full purchase history since inception, not a recent
-# slice, so these stay fixed find-or-create rows (app.services.demo_seed
-# ._seed_investments), seeded once and never wiped.
+def build_demo_transfers(
+    anchor: date_t, *, window_months: int = DEMO_WINDOW_MONTHS
+) -> list[TransferRow]:
+    """The monthly bank → cash ATM withdrawals for the same window as
+    :func:`build_demo_dataset`, minus any dated after ``anchor``. Both legs share one
+    date, so the future-date filter can never keep one leg and drop the other."""
+    transfers: list[TransferRow] = []
+    for months_back in range(window_months - 1, -1, -1):
+        month_start = _add_months(anchor, months_back)
+        on = _day_in_month(month_start.year, month_start.month, _ATM_DAY)
+        if on <= anchor:
+            transfers.append(TransferRow(on.isoformat(), "bank", "cash", _ATM_RUPEES))
+    return transfers
+
+
+def build_demo_card_bills(
+    anchor: date_t, *, window_months: int = DEMO_WINDOW_MONTHS
+) -> list[CardBillRow]:
+    """Each card's monthly bill for the window of :func:`build_demo_dataset`: paid from
+    its ``parent`` on its ``bill_day`` for exactly the previous calendar month's net
+    spend on it (purchases less refunds and cashback), minus any dated after ``anchor``.
+    The window's oldest month has no bill: the month it would pay for is outside the
+    window. Both legs share one date, so the future-date filter never splits a bill. The
+    second card's latest bill is ``linked=False``: the one the demo leaves to link by hand.
+    """
+    spends, refunds, _income = build_demo_dataset(anchor, window_months=window_months)
+    owed: dict[tuple[AccountKey, str], int] = {}
+    for row in spends:
+        owed[(row.account, row.date[:7])] = owed.get((row.account, row.date[:7]), 0) + row.rupees
+    for row in refunds:
+        owed[(row.account, row.date[:7])] = owed.get((row.account, row.date[:7]), 0) - row.rupees
+    bills: list[CardBillRow] = []
+    for months_back in range(window_months - 2, -1, -1):
+        month_start = _add_months(anchor, months_back)
+        billed_month = _add_months(anchor, months_back + 1).isoformat()[:7]
+        for spec in ACCOUNTS:
+            if spec.parent is None or spec.bill_day is None:
+                continue
+            on = _day_in_month(month_start.year, month_start.month, spec.bill_day)
+            rupees = owed.get((spec.key, billed_month), 0)
+            if on <= anchor and rupees > 0:
+                bills.append(CardBillRow(on.isoformat(), spec.key, spec.parent, rupees))
+    second = [i for i, bill in enumerate(bills) if bill.card == "card2"]
+    if second:
+        bills[second[-1]] = bills[second[-1]]._replace(linked=False)
+    return bills
+
+
+# Instruments + their transaction history: find-or-create rows
+# (app.services.demo_seed._seed_investments), seeded once and never wiped, since
+# holdings/XIRR need the full history since inception, not a recent slice. The dates
+# below are a template: :func:`build_demo_instruments` moves them all by the same whole
+# number of months so the newest lands as late as it can on or before the anchor, so
+# an instrument created today (every guest sandbox) shows SIPs running up to now.
 #
-# ``amount``/``fee`` are native paise; ``units``/``price`` are exact-decimal
-# strings (parsed losslessly to Decimal). ``current_nav`` is set so holdings
-# show value/P&L and the donut has slices. A couple of txns carry a ``note``
+# ``amount``/``fee`` are native paise (cents for a USD instrument); ``units``/``price``
+# are exact-decimal strings (parsed losslessly to Decimal). ``current_nav`` is set so
+# holdings show value/P&L and the donut has slices. A couple of txns carry a ``note``
 # (InvestmentTransaction also has the column).
+#
+# ``currency`` defaults to INR. A USD instrument's txns each carry ``fx``, the
+# ``fx_rate_to_inr`` stamped on the row: a plausible rate for that date, written as a
+# literal because the seeder is the server-side writer and fx_rates may be empty on a
+# fresh box (ADR-0016 only forbids rewriting a stamp). The seed writes no ``fx_rates``
+# row: that table is global, and a made-up rate there would stamp real users' rows. So
+# until someone refreshes FX, the USD holdings show as FX-unavailable.
+#
+# The equities trade in more than one lot and sell part of a position, so FIFO
+# (ADR-0015) books realised lots on both an INR and a USD instrument.
 #
 # ``isin`` is optional and only present where a price source needs it: it is the ONLY
 # key AMFI NAVAll is matched on, so an ``indian_mf`` without one is a permanent
 # refresh-navs dead-end ("no ISIN — cannot match AMFI NAVAll"). Equities need none —
 # they price off symbol + exchange via Yahoo — and the hand-priced classes
 # (fd / bond / nps / gold / other) have no auto source at all, by design.
+def _monthly_sips(first: date_t, rupees: int, navs: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Monthly SIPs of ``rupees`` from ``first``, one per NAV in ``navs``. Units are
+    the fund's allotment rounded to 3 decimals, as AMCs do, so ``amount`` is what was
+    paid, not ``units * price``."""
+    sips: list[dict[str, Any]] = []
+    for i, nav in enumerate(navs):
+        year, month0 = divmod(first.year * 12 + first.month - 1 + i, 12)
+        units = (Decimal(rupees) / Decimal(nav)).quantize(Decimal("0.001"))
+        sips.append(
+            {
+                "date": date_t(year, month0 + 1, first.day).isoformat(),
+                "type": "sip",
+                "units": str(units),
+                "price": nav,
+                "amount": rupees * 100,
+            }
+        )
+    return sips
+
+
 INSTRUMENTS: list[dict[str, Any]] = [
     {
         "symbol": "INFY",
@@ -341,11 +604,193 @@ INSTRUMENTS: list[dict[str, Any]] = [
         # default. AMFI lists both plans' IDCW variants under their own ISINs, so this pins
         # plan + option, not just the fund.
         "isin": "INF879O01027",
-        "current_nav": "78",
+        "current_nav": "94.2",
+        "txns": _monthly_sips(
+            date_t(2025, 9, 5),
+            5000,
+            (
+                "84.1",
+                "85.3",
+                "83.9",
+                "86.2",
+                "87.5",
+                "86.8",
+                "88.4",
+                "89.9",
+                "88.7",
+                "90.6",
+                "91.8",
+                "90.9",
+                "92.7",
+                "93.5",
+            ),
+        ),
+    },
+    {
+        "symbol": "UTINIFTY",
+        "name": "UTI Nifty 50 Index Fund",
+        "asset_class": "indian_mf",
+        "exchange": "MFCentral",
+        # Direct-Plan-Growth, checked against AMFI NAVAll (scheme code 120716).
+        "isin": "INF789F01XA0",
+        "current_nav": "178.19",
+        "txns": _monthly_sips(
+            date_t(2025, 9, 10),
+            10000,
+            (
+                "158.4",
+                "161.2",
+                "163.9",
+                "162.5",
+                "160.8",
+                "164.7",
+                "166.3",
+                "165.1",
+                "168.9",
+                "171.4",
+                "170.2",
+                "173.6",
+                "175.8",
+                "176.9",
+            ),
+        ),
+    },
+    {
+        "symbol": "HDFCBANK",
+        "name": "HDFC Bank Ltd",
+        "asset_class": "indian_equity",
+        "exchange": "NSE",
+        "current_nav": "1005",
         "txns": [
-            {"date": "2025-09-01", "type": "sip", "units": "100", "price": "65", "amount": 650000},
-            {"date": "2025-12-01", "type": "sip", "units": "100", "price": "70", "amount": 700000},
-            {"date": "2026-03-01", "type": "sip", "units": "100", "price": "72", "amount": 720000},
+            {
+                "date": "2025-10-14",
+                "type": "buy",
+                "units": "40",
+                "price": "960",
+                "amount": 3840000,
+                "fee": 2000,
+            },
+            {
+                "date": "2026-01-20",
+                "type": "buy",
+                "units": "30",
+                "price": "985",
+                "amount": 2955000,
+                "fee": 1500,
+            },
+            {
+                "date": "2026-05-12",
+                "type": "buy",
+                "units": "30",
+                "price": "1010",
+                "amount": 3030000,
+                "fee": 1500,
+            },
+            {"date": "2026-06-24", "type": "dividend", "amount": 220000},
+            # FIFO: all of the first lot and 10 units of the second.
+            {
+                "date": "2026-08-18",
+                "type": "sell",
+                "units": "50",
+                "price": "1045",
+                "amount": 5225000,
+                "fee": 2500,
+                "note": "Trimmed after the results rally",
+            },
+        ],
+    },
+    {
+        "symbol": "AAPL",
+        "name": "Apple Inc",
+        "asset_class": "us_equity",
+        "exchange": "NASDAQ",
+        "currency": "USD",
+        "current_nav": "272.40",
+        "txns": [
+            {
+                "date": "2025-10-06",
+                "type": "buy",
+                "units": "3",
+                "price": "256.40",
+                "amount": 76920,
+                "fx": "88.72",
+            },
+            {
+                "date": "2026-01-12",
+                "type": "buy",
+                "units": "3",
+                "price": "261.10",
+                "amount": 78330,
+                "fx": "89.95",
+            },
+            {
+                "date": "2026-04-13",
+                "type": "buy",
+                "units": "2",
+                "price": "248.75",
+                "amount": 49750,
+                "fx": "88.40",
+            },
+            {
+                "date": "2026-07-13",
+                "type": "buy",
+                "units": "2",
+                "price": "268.30",
+                "amount": 53660,
+                "fx": "89.10",
+            },
+            {"date": "2026-08-14", "type": "dividend", "amount": 260, "fx": "89.30"},
+            {
+                "date": "2026-09-21",
+                "type": "sell",
+                "units": "4",
+                "price": "275.00",
+                "amount": 110000,
+                "fx": "89.60",
+            },
+        ],
+    },
+    {
+        "symbol": "VOO",
+        "name": "Vanguard S&P 500 ETF",
+        "asset_class": "us_etf",
+        "exchange": "NYSE",
+        "currency": "USD",
+        "current_nav": "668.10",
+        "txns": [
+            {
+                "date": "2025-11-10",
+                "type": "buy",
+                "units": "1",
+                "price": "618.20",
+                "amount": 61820,
+                "fx": "88.65",
+            },
+            {
+                "date": "2026-02-09",
+                "type": "buy",
+                "units": "1",
+                "price": "630.50",
+                "amount": 63050,
+                "fx": "90.40",
+            },
+            {
+                "date": "2026-05-11",
+                "type": "buy",
+                "units": "1",
+                "price": "640.00",
+                "amount": 64000,
+                "fx": "89.00",
+            },
+            {
+                "date": "2026-08-10",
+                "type": "buy",
+                "units": "1",
+                "price": "655.40",
+                "amount": 65540,
+                "fx": "89.20",
+            },
+            {"date": "2026-09-29", "type": "dividend", "amount": 720, "fx": "89.50"},
         ],
     },
     {
@@ -366,3 +811,29 @@ INSTRUMENTS: list[dict[str, Any]] = [
         ],
     },
 ]
+
+
+def _shift_months(on: date_t, months: int) -> date_t:
+    year, month0 = divmod(on.year * 12 + on.month - 1 + months, 12)
+    return _day_in_month(year, month0 + 1, on.day)
+
+
+def build_demo_instruments(anchor: date_t) -> list[dict[str, Any]]:
+    """:data:`INSTRUMENTS` with every txn date moved by one whole number of months, the
+    most that keeps every date on or before ``anchor``. One shift for all keeps each
+    instrument's order of trades, so FIFO (ADR-0015) books the same lots."""
+    dates = [date_t.fromisoformat(t["date"]) for spec in INSTRUMENTS for t in spec["txns"]]
+    newest = max(dates)
+    months = (anchor.year * 12 + anchor.month) - (newest.year * 12 + newest.month)
+    while any(_shift_months(d, months) > anchor for d in dates):
+        months -= 1
+    return [
+        {
+            **spec,
+            "txns": [
+                {**t, "date": _shift_months(date_t.fromisoformat(t["date"]), months).isoformat()}
+                for t in spec["txns"]
+            ],
+        }
+        for spec in INSTRUMENTS
+    ]

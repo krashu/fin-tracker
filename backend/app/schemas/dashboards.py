@@ -31,15 +31,34 @@ class SpendByCategoryRow(BaseModel):
 
     ``category_id`` / ``category_name`` are both null for the uncategorized
     bucket — rows where ``transactions.category_id IS NULL``.
+
+    ``parent_id`` / ``parent_name`` name the category's parent (one hop, ADR-0012
+    rule 6), whatever the archive state of either row, so the frontend rolls a
+    subcategory up from the row alone. Both are null for a root and for the
+    uncategorized bucket.
+
+    ``display_color`` / ``parent_display_color`` are the category's and its parent's
+    server-resolved colours, built from ``category_colors`` whatever the archive state, so
+    view 2 needs no category list for colour (ADR-0012 rule 7). ``display_color`` is null only
+    for the uncategorized bucket; ``parent_display_color`` for a root and for uncategorized.
     """
 
     category_id: int | None
     category_name: str | None
+    parent_id: int | None
+    parent_name: str | None
+    display_color: str | None
+    parent_display_color: str | None
     total_paise: int
 
 
 class AvailableYearsResponse(BaseModel):
-    """Envelope for GET /api/v1/dashboards/available-years."""
+    """Envelope for the year pickers: GET /api/v1/dashboards/available-years and
+    GET /api/v1/tax/available-years.
+
+    ``years`` are year numbers, newest first; the route defines the span. The
+    dashboards return calendar years (PRD §F8), the tax route FY start years (§F11).
+    """
 
     years: list[int]
 
@@ -182,7 +201,8 @@ class CashflowByPeriodBucket(BaseModel):
     week), both the x-axis label and the chronological sort key — same shape as
     ``SpendByPeriodBucket.period``.
 
-    * ``income_paise`` — Σ of ``income`` (≥ 0).
+    * ``income_paise`` — **signed** Σ of ``income``: an income reversal (a negative
+      ``income`` row) nets it down (ADR-0009 rule 5).
     * ``expense_paise`` — **signed** Σ of ``spend`` + ``refund``, exactly like
       ``PeriodTotalsResponse.expense_paise`` / ``SpendByPeriodBucket.total_paise``:
       ≤ 0 in the common case, but **legitimately > 0** in a refund-dominant
@@ -219,107 +239,12 @@ class CashflowByPeriodResponse(BaseModel):
     buckets: list[CashflowByPeriodBucket]
 
 
-class SpendCategoryRef(BaseModel):
-    """One category in the spend-by-category-by-period **echoed set** — its id +
-    name, defining the stable stack order and the color-join key for the
-    /spending category-trend bar (PRD §F8 view 3).
-
-    ``category_id`` / ``category_name`` are both ``None`` for the uncategorized
-    bucket (rows where ``transactions.category_id IS NULL``). ``category_name``
-    is *additionally* ``None`` for a row whose ``category_id`` points at another
-    user's Category — the LEFT JOIN's ``Category.user_id == user_id`` predicate
-    drops the foreign name (cf. ``SpendByCategoryRow``), an unreachable-via-API
-    defense-in-depth case.
-    """
-
-    category_id: int | None
-    category_name: str | None
-
-
-class SpendCategoryPeriodTotal(BaseModel):
-    """One cell of the category×period grid — a category's signed total in a
-    bucket.
-
-    ``total_paise`` is **signed** (spend negative, refund positive; nets refunds
-    against spend exactly like ``SpendByCategoryRow.total_paise``). It is **never
-    clamped** server-side: a category whose refunds outweigh its in-bucket spend
-    surfaces positive. Nor is it clamped client-side — the sole consumer
-    (``category-trend-bar.tsx``) is a one-category-at-a-time **signed** bar chart, so a
-    net-credit month dips below the y=0 reference line the chart deliberately draws.
-    There is no stacked bar here and nothing floors. Do **not** clamp server-side "for
-    consistency": that would break the reconciliation identity below and read as ₹0 for
-    a refund-dominant month. ``Σ`` of all cells in a bucket reconciles exactly to that
-    bucket's ``SpendByPeriodBucket.total_paise``.
-    """
-
-    category_id: int | None
-    total_paise: int
-
-
-class SpendByCategoryByPeriodBucket(BaseModel):
-    """One bucket of the category-trend series — a bucket's per-category totals.
-
-    ``period`` is the bucket label (``"YYYY-MM"`` month | ``"YYYY-Www"`` ISO
-    week), both the x-axis label and the chronological sort key — same shape as
-    ``SpendByPeriodBucket.period``.
-
-    ``totals`` is **dense**: it carries a cell for **every** category in the
-    response's ``categories`` set, zero-filled — no gaps in either the period or
-    the category dimension (same no-gaps contract as the period zero-fill). A
-    fully zero-filled bucket (no in-window activity) still lists a 0 cell per
-    category. Cell order follows ``categories`` order.
-    """
-
-    period: str
-    totals: list[SpendCategoryPeriodTotal]
-
-
-class SpendByCategoryByPeriodResponse(BaseModel):
-    """Envelope for ``GET /api/v1/dashboards/spend-by-category-by-period`` — the
-    /spending category-trend bar (PRD §F8 view 3: "how is my category mix
-    shifting?"). The consumer renders ONE category at a time, chosen from a
-    dropdown; the single fetch carries every category's series so switching is
-    instant. It is not a stack — see ``SpendCategoryPeriodTotal`` below.
-
-    ``bucket`` echoes the requested grain; ``start`` / ``end`` echo the requested
-    window (stale-cache verification, cf. ``SpendByPeriodResponse``).
-
-    ``categories`` is the category set appearing anywhere in the window, echoed
-    once so the frontend has a stable series order + color join. Order:
-    categorized first, most-negative **grand** total (Σ across all buckets)
-    first → biggest overall spender at the top of the dropdown,
-    ``category_id`` ascending as a stable tiebreak, uncategorized
-    (``category_id is None``) pinned last — mirrors ``spend_by_category``'s
-    portable sort.
-
-    ``buckets`` is chronological ascending, zero-filled, and never empty. Each
-    bucket's ``totals`` is signed and dense (one cell per ``categories`` entry).
-
-    ``label_id`` echoes the optional F3a tag filter (``None`` = unfiltered),
-    same stale-cache-verification rationale as ``bucket`` / ``start`` / ``end``.
-
-    **Reconciliation:** ``Σ(bucket.totals[*].total_paise)`` equals the matching
-    ``SpendByPeriodBucket.total_paise`` for the same window/grain (both filter
-    ``spend`` + ``refund``, both signed). The identity holds on screen too: the
-    consumer plots the signed magnitude against a ``y=0`` reference line, so a
-    net-credit bucket dips below the axis rather than being floored — nothing is
-    clamped on either side of the wire.
-    """
-
-    bucket: Literal["week", "month"]
-    start: date
-    end: date
-    categories: list[SpendCategoryRef]
-    buckets: list[SpendByCategoryByPeriodBucket]
-    label_id: int | None = None
-
-
 class TagRef(BaseModel):
     """One tag in the spend-by-tag-by-period **echoed set** — its id + name,
     defining the stable line order and the color-join key for the /spending
     tag-trend chart (PRD §F3a labels; tag-analysis arc Phase C).
 
-    Unlike ``SpendCategoryRef``, ``label_id`` / ``label_name`` are **non-null**:
+    Unlike ``CategoryTrendParent.parent_id``, ``label_id`` / ``label_name`` are **non-null**:
     the route uses an INNER JOIN over ``transaction_labels`` with
     ``Label.user_id == user_id`` (mirroring ``spend_by_tag``), so an orphan /
     foreign-user label drops the row entirely rather than surfacing a null name,
@@ -368,7 +293,7 @@ class SpendByTagByPeriodResponse(BaseModel):
     Phase C: "is spend under a tag growing over time?").
 
     The tag×time generalization of ``spend_by_tag``, and the tag analog of
-    ``spend_by_category_by_period``. ``bucket`` echoes the requested grain;
+    ``category_trend``. ``bucket`` echoes the requested grain;
     ``start`` / ``end`` echo the requested window (stale-cache verification, cf.
     ``SpendByPeriodResponse``).
 
@@ -387,7 +312,7 @@ class SpendByTagByPeriodResponse(BaseModel):
     come from the group-by-tag shape (arc decision #7), so a multi-tagged txn
     **double-counts** across its tags' lines. Combined with the untagged
     exclusion, ``Σ`` of a bucket's cells does **not** equal that bucket's
-    ``SpendByPeriodBucket.total_paise`` — unlike ``spend_by_category_by_period``,
+    ``SpendByPeriodBucket.total_paise`` — unlike ``category_trend``,
     which has that identity. The only valid reconciliation is per-tag: a tag's
     cells over the window sum to that tag's ``spend_by_tag`` grouped total for the
     same window. Never "fix" the non-identity by clamping or de-duping.
@@ -404,11 +329,12 @@ class TopMerchantRow(BaseModel):
     """One row of the top-merchants list — a merchant's signed spend for a month
     (PRD §F8 view 3, "where is the money actually going?").
 
-    ``merchant_normalized`` is the GROUP BY key (``Transaction.merchant_normalized``
-    — the normalized string every raw variant collapses to). ``merchant_label`` is a
-    representative display string (``COALESCE(MAX(merchant_raw), merchant_normalized)``
-    — deterministic within a SQL dialect; a lexicographic pick, not a "prettiest
-    name" one).
+    ``merchant_canonical`` is the grouping key: the user's alias canonical the
+    normalized merchant resolves to (ADR-0011 rule 8), or the normalized string itself
+    when no alias matches. ``merchant_label`` is the display string: an unaliased group
+    shows a representative raw descriptor (``MAX(merchant_raw)``, a lexicographic pick,
+    not a "prettiest name" one), while an aliased group, or an ``unknown via <psp>``
+    gateway handle, shows its canonical.
 
     ``total_paise`` is **signed**: spends are negative, refunds positive, so a
     merchant whose refunds outweigh in-window spend surfaces with a positive total
@@ -417,7 +343,7 @@ class TopMerchantRow(BaseModel):
     (positive) rows apart, never as a spend bar.
     """
 
-    merchant_normalized: str
+    merchant_canonical: str
     merchant_label: str
     total_paise: int
 
@@ -428,11 +354,11 @@ class TopMerchantsResponse(BaseModel):
 
     ``period`` echoes the requested month or year (stale-cache verification, cf.
     ``SpendByCategoryResponse``). ``rows`` are ordered most-negative first (biggest
-    spender first, ``merchant_normalized`` ascending as a stable tiebreak) and capped
+    spender first, ``merchant_canonical`` ascending as a stable tiebreak) and capped
     at the requested ``limit``; the no-merchant bucket (``merchant_normalized == ""``)
     is excluded so a blank manual row can't top the list.
 
-    ``total_merchants`` is the count of distinct non-empty merchants with in-window
+    ``total_merchants`` is the count of distinct non-empty canonical merchants with in-window
     spend activity (**before** the LIMIT), so the UI can honestly say "top 5
     of 23"; ``truncated`` is ``total_merchants > limit``. ``total_merchants`` counts
     every such merchant regardless of sign, so it can exceed the number of *spend*
@@ -462,7 +388,8 @@ class PeriodTotalsResponse(BaseModel):
       common case; refunds net against spend, same rule as the spend
       aggregates). NOT a positive magnitude — the frontend negates for display,
       matching ``SpendByPeriodBucket.total_paise``.
-    * ``income_paise`` — Σ of ``income`` (≥ 0).
+    * ``income_paise`` — **signed** Σ of ``income``: an income reversal (a negative
+      ``income`` row) nets it down (ADR-0009 rule 5).
     * ``net_paise`` — ``income_paise + expense_paise`` (server-computed so the
       client can't drift on the sign). ``transfer`` is excluded entirely (it
       moves money between the user's own accounts — not income or spend).
@@ -553,12 +480,13 @@ class AccountBalanceRow(BaseModel):
     balance for every type, excluded or not.
 
     ``spend_ytd_paise`` is the **signed net** Σ(spend) over the
-    calendar year-to-date window (Jan 1 of the requested month's year → end of
-    that month). It is **populated only for ``credit_card`` rows**; ``None`` for
-    every other type (``None`` pins "not applicable" vs a genuine ₹0 spend). It
-    is **not** guaranteed ≤ 0 — a refund-dominant window is legitimately
-    positive and is never clamped server-side (same rule as
-    ``expense_paise`` / ``SpendCategoryPeriodTotal``); the /dashboard accounts
+    calendar-year-to-date window (1 January of the year the requested period starts
+    in → end of that period; PRD §F8). It is **populated only for
+    ``credit_card`` rows**; ``None`` for every other type (``None`` pins "not
+    applicable" vs a genuine ₹0 spend). It is **not** guaranteed ≤ 0 — a
+    refund-dominant window is legitimately positive and is never clamped
+    server-side (same rule as
+    ``expense_paise`` / ``CategoryTrendParent.totals_paise``); the /dashboard accounts
     panel floors it to a non-negative "spent this year" magnitude for display.
 
     ``archived`` flags soft-deleted accounts. They are **included** in the
@@ -617,97 +545,53 @@ class OverviewResponse(BaseModel):
     accounts: list[AccountBalanceRow]
 
 
-class HierarchicalSubcategorySpend(BaseModel):
-    """One subcategory row in a parent's hierarchical spend breakdown."""
+class CategoryTrendSubcategory(BaseModel):
+    """One drill row under a parent in the category trend (PRD §F8 view 6).
 
-    category_id: int | None
-    category_name: str
-    spend_paise: int
-    total_paise: int
-    percentage: float
-    is_direct: bool = False
-    color: str | None = None
+    ``category_id`` is the parent's own id on the direct row (``is_direct``):
+    spend booked straight to the parent. ``totals_paise`` is signed (ADR-0009 /
+    ADR-0013: refunds and cashback net against spend) and never clamped.
+    """
 
-
-class HierarchicalParentSpend(BaseModel):
-    """One parent category in the hierarchical spend breakdown."""
-
-    parent_id: int | None
-    parent_name: str
-    spend_paise: int
-    direct_paise: int
-    total_paise: int
-    percentage: float
-    color: str | None = None
-    subcategories: list[HierarchicalSubcategorySpend]
+    category_id: int
+    # None only for a foreign-user category, which the composite same-user FK
+    # (models/transaction.py) makes unreachable; the join still filters on user_id.
+    category_name: str | None
+    # The series colour: the palette rotation for an inheriting subcategory, the parent's
+    # own colour on the direct row (ADR-0012 rule 7).
+    color: str
+    archived: bool
+    is_direct: bool
+    totals_paise: list[int]
 
 
-class SubcategoryMover(BaseModel):
-    """One subcategory spend shift between previous and current period."""
+class CategoryTrendParent(BaseModel):
+    """One parent category's monthly series (PRD §F8 view 6).
 
-    category_id: int | None = None
-    category_name: str
-    parent_name: str | None = None
-    current_paise: int
-    previous_paise: int
-    delta_paise: int
-    growth_rate: float | None = None
-
-
-class HierarchicalSpendResponse(BaseModel):
-    """Envelope for GET /api/v1/dashboards/hierarchical-spend."""
-
-    period: str
-    total_spend_paise: int
-    parents: list[HierarchicalParentSpend]
-    top_movers: list[SubcategoryMover]
-    label_id: int | None = None
-
-
-class HierarchicalSubcategoryRef(BaseModel):
-    """One subcategory in the hierarchical trend echoed parent set."""
-
-    category_id: int | None
-    category_name: str
-
-
-class HierarchicalParentRef(BaseModel):
-    """One parent category in the hierarchical trend echoed set."""
+    ``parent_id`` is ``None`` for uncategorized spend, which has no
+    subcategories. Archived children roll up into their parent (ADR-0012
+    rule 6), so ``totals_paise[i]`` is the sum of ``subcategories[*].totals_paise[i]``.
+    """
 
     parent_id: int | None
-    parent_name: str
+    parent_name: str | None
+    # The parent's ``display_color``; None only for uncategorized.
     color: str | None = None
-    subcategories: list[HierarchicalSubcategoryRef] = []
+    archived: bool
+    totals_paise: list[int]
+    subcategories: list[CategoryTrendSubcategory] = []
 
 
-class HierarchicalSubcategoryPeriodTotal(BaseModel):
-    """One subcategory's signed total in a trend bucket."""
+class CategoryTrendResponse(BaseModel):
+    """Envelope for GET /api/v1/dashboards/category-trend.
 
-    category_id: int | None
-    total_paise: int
+    ``periods`` is ``YYYY-MM``, chronological, one per requested month ending
+    in the IST business month. Every parent with an in-window row is returned
+    (the frontend folds the tail); values are signed and never clamped. For
+    each month, the sum over ``parents`` equals that month's
+    ``spend-by-period`` total.
+    """
 
-
-class HierarchicalParentPeriodTotal(BaseModel):
-    """One parent category's signed total in a trend bucket."""
-
-    parent_id: int | None = None
-    total_paise: int
-    subcategories: list[HierarchicalSubcategoryPeriodTotal] = []
-
-
-class HierarchicalTrendBucket(BaseModel):
-    """One bucket of the hierarchical trend timeline."""
-
-    period: str
-    totals: list[HierarchicalParentPeriodTotal]
-
-
-class HierarchicalTrendResponse(BaseModel):
-    """Envelope for GET /api/v1/dashboards/hierarchical-trend."""
-
-    bucket: Literal["week", "month"]
-    start: date
-    end: date
-    parents: list[HierarchicalParentRef]
-    buckets: list[HierarchicalTrendBucket]
+    periods: list[str]
+    parents: list[CategoryTrendParent]
     label_id: int | None = None

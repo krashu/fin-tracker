@@ -40,12 +40,16 @@ from app.models import (
     Instrument,
     InvestmentTransaction,
     Label,
+    MerchantAlias,
     MerchantTagMap,
     Transaction,
     TransactionLabel,
     User,
 )
+from app.services.category_service import CASHBACK_CATEGORY_NAME
 from app.services.merchant import normalize_merchant
+from app.services.reconciliation_service import pair_existing_rows
+from tests.fk_bypass import foreign_keys_off
 
 # Sentinel for the "use now()" default — distinct from caller-supplied None
 # (None = pending row in the review queue, intentionally).
@@ -131,7 +135,15 @@ def test_single_spend_returns_one_negative_row(
     body = resp.json()
     assert body["period"] == "2026-05"
     assert body["rows"] == [
-        {"category_id": food.id, "category_name": "Food", "total_paise": -15000},
+        {
+            "category_id": food.id,
+            "category_name": "Food",
+            "parent_id": None,
+            "parent_name": None,
+            "display_color": "#2a78d6",
+            "parent_display_color": None,
+            "total_paise": -15000,
+        },
     ]
 
 
@@ -295,7 +307,60 @@ def test_uncategorized_row_pinned_last(
     resp = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
     rows = resp.json()["rows"]
     assert len(rows) == 2
-    assert rows[-1] == {"category_id": None, "category_name": None, "total_paise": -99999}
+    assert rows[-1] == {
+        "category_id": None,
+        "category_name": None,
+        "parent_id": None,
+        "parent_name": None,
+        "display_color": None,
+        "parent_display_color": None,
+        "total_paise": -99999,
+    }
+
+
+def test_spend_by_category_rows_carry_their_parent_even_when_archived(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """ADR-0012 rule 6: the rollup follows ``parent_id`` whatever the archive state.
+
+    Each row names its parent so the frontend rolls a subcategory up without
+    consulting the (active-only) category list. An archived child still carries its
+    parent; a root and the uncategorized bucket carry ``None``.
+    """
+    uid = axis_account.user_id
+    parent = Category(color="#2a78d6", user_id=uid, name="P", kind="spend")
+    session.add(parent)
+    session.flush()
+    active = Category(user_id=uid, name="A", kind="spend", parent_id=parent.id)
+    archived = Category(
+        user_id=uid, name="B", kind="spend", parent_id=parent.id, archived_at=datetime.now(UTC)
+    )
+    session.add_all([active, archived])
+    session.flush()
+    for i, cat_id in enumerate([active.id, archived.id, parent.id, None]):
+        session.add(
+            _make_txn(
+                user_id=uid,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 10),
+                amount_paise=-1000 * (i + 1),
+                fingerprint=f"fp-parent-{i}",
+                category_id=cat_id,
+            )
+        )
+    session.commit()
+
+    rows = client.get("/api/v1/dashboards/spend-by-category?month=2026-05").json()["rows"]
+    by_id = {r["category_id"]: r for r in rows}
+    for child in (active, archived):
+        assert by_id[child.id]["parent_id"] == parent.id
+        assert by_id[child.id]["parent_name"] == "P"
+    assert by_id[parent.id]["parent_id"] is None
+    assert by_id[parent.id]["parent_name"] is None
+    assert by_id[None]["parent_id"] is None
+    assert by_id[None]["parent_name"] is None
 
 
 def test_refund_only_category_sorts_between_spends_and_uncategorized(
@@ -632,14 +697,13 @@ def test_cross_user_rows_and_category_name_isolated(
 
     1. A transaction owned by another user must not appear in v1's dashboard.
     2. A transaction owned by v1 but whose ``category_id`` points at another
-       user's Category (the FK-permissive scenario the JOIN's
-       ``Category.user_id == user_id`` guards) must surface with
-       ``category_name=null``, not the foreign user's category name.
+       user's Category (the scenario the JOIN's ``Category.user_id == user_id``
+       guards, ADR-0003 rule 7) must surface with ``category_name=null``, not
+       the foreign user's category name.
 
-    Prong 2 is seeded by raw ``session.add`` to bypass the API's
-    ``_assert_category_id_or_422`` write-time gate — we're explicitly
-    testing what happens when that gate is bypassed (e.g. a future code
-    path forgets it).
+    Prong 2 bypasses both the API's ``_assert_category_id_or_422`` write-time
+    gate and the composite same-user FK (rule 10) — stored with FKs off — to
+    prove the read holds on its own.
     """
     other_user = User(id=uuid.UUID("00000000-0000-0000-0000-000000000099"))
     session.add(other_user)
@@ -653,6 +717,7 @@ def test_cross_user_rows_and_category_name_isolated(
         last4="9999",
     )
     leaky_category = Category(
+        color="#2a78d6",
         user_id=other_user.id,
         name="STOLEN-PROTECTED-NAME",
         is_seeded=False,
@@ -664,35 +729,36 @@ def test_cross_user_rows_and_category_name_isolated(
 
     food = next(c for c in seeded_categories if c.name == "Food")
 
-    # Prong 1: another user's row in the same window.
-    other_users_txn = _make_txn(
-        user_id=other_user.id,
-        account_id=other_account.id,
-        txn_date=date(2026, 5, 10),
-        amount_paise=-99999,
-        fingerprint="fp-other-user",
-        category_id=leaky_category.id,
-    )
-    # Prong 2: v1 user's row pointing at the OTHER user's category id.
-    v1_txn_pointing_at_other = _make_txn(
-        user_id=axis_account.user_id,
-        account_id=axis_account.id,
-        txn_date=date(2026, 5, 11),
-        amount_paise=-5000,
-        fingerprint="fp-v1-leak",
-        category_id=leaky_category.id,
-    )
-    # Control: a normal v1 row so we can assert the dashboard isn't empty.
-    v1_normal = _make_txn(
-        user_id=axis_account.user_id,
-        account_id=axis_account.id,
-        txn_date=date(2026, 5, 12),
-        amount_paise=-2000,
-        fingerprint="fp-v1-normal",
-        category_id=food.id,
-    )
-    session.add_all([other_users_txn, v1_txn_pointing_at_other, v1_normal])
-    session.commit()
+    with foreign_keys_off(session):
+        # Prong 1: another user's row in the same window.
+        other_users_txn = _make_txn(
+            user_id=other_user.id,
+            account_id=other_account.id,
+            txn_date=date(2026, 5, 10),
+            amount_paise=-99999,
+            fingerprint="fp-other-user",
+            category_id=leaky_category.id,
+        )
+        # Prong 2: v1 user's row pointing at the OTHER user's category id.
+        v1_txn_pointing_at_other = _make_txn(
+            user_id=axis_account.user_id,
+            account_id=axis_account.id,
+            txn_date=date(2026, 5, 11),
+            amount_paise=-5000,
+            fingerprint="fp-v1-leak",
+            category_id=leaky_category.id,
+        )
+        # Control: a normal v1 row so we can assert the dashboard isn't empty.
+        v1_normal = _make_txn(
+            user_id=axis_account.user_id,
+            account_id=axis_account.id,
+            txn_date=date(2026, 5, 12),
+            amount_paise=-2000,
+            fingerprint="fp-v1-normal",
+            category_id=food.id,
+        )
+        session.add_all([other_users_txn, v1_txn_pointing_at_other, v1_normal])
+        session.commit()
 
     resp = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
     assert resp.status_code == 200
@@ -1624,6 +1690,32 @@ def test_period_totals_empty_window_all_zero(
     }
 
 
+def test_income_reversal_nets_income_down(
+    client: TestClient,
+    axis_account: Account,
+) -> None:
+    """ADR-0009 rule 5: income totals are signed sums, so an income reversal (a
+    negative ``income`` row, written through the ordinary POST) nets income down
+    rather than being dropped or counted as positive."""
+    for amount, merchant in ((100000, "ACME Payroll"), (-30000, "ACME Payroll clawback")):
+        resp = client.post(
+            "/api/v1/transactions",
+            json={
+                "date": "2026-05-10",
+                "account_id": axis_account.id,
+                "amount_paise": amount,
+                "transaction_type": "income",
+                "merchant_raw": merchant,
+            },
+        )
+        assert resp.status_code == 201, resp.text
+
+    body = client.get(f"{_TOTALS_URL}?start=2026-05-01&end=2026-05-31").json()
+    assert body["income_paise"] == 70000
+    assert body["expense_paise"] == 0
+    assert body["net_paise"] == 70000
+
+
 def test_period_totals_income_spend_refund_net_and_transfer_excluded(
     client: TestClient,
     axis_account: Account,
@@ -1913,6 +2005,49 @@ def test_tagging_stats_kept_changed_cleared_and_manual(
     assert body["coverage_rate"] == pytest.approx(3 / 4)
 
 
+def test_tagging_stats_linking_an_auto_tagged_row_keeps_it_kept(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """A link clears ``category_id`` into ``pre_link_category_id`` (ADR-0002 rule 9); the
+    acceptance metric must read the saved category, or every link would count an
+    accepted auto-tag as rejected (PRD §Success-metrics)."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    bank = Account(
+        user_id=axis_account.user_id, name="HDFC", type="bank", issuer="hdfc", last4=None
+    )
+    session.add(bank)
+    session.flush()
+    tagged = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=axis_account.id,
+        txn_date=date(2026, 5, 1),
+        amount_paise=-1000,
+        fingerprint="fp-linked-kept",
+        category_id=food.id,
+        auto_category_id=food.id,
+    )
+    partner = _make_txn(
+        user_id=axis_account.user_id,
+        account_id=bank.id,
+        txn_date=date(2026, 5, 1),
+        amount_paise=1000,
+        fingerprint="fp-linked-partner",
+    )
+    session.add_all([tagged, partner])
+    session.commit()
+    before = client.get(_TAGGING_URL).json()
+    assert (before["total_auto_tagged"], before["kept"]) == (1, 1)
+
+    pair_existing_rows(session, tagged, partner)
+    session.commit()
+
+    after = client.get(_TAGGING_URL).json()
+    assert (after["total_auto_tagged"], after["kept"]) == (1, 1)
+
+
 def test_tagging_stats_excludes_pending_rows(
     client: TestClient,
     axis_account: Account,
@@ -2045,14 +2180,16 @@ def test_tagging_stats_excludes_foreign_category_suggestion(
     session: Session,
 ) -> None:
     """A v1 row whose ``auto_category_id`` points at ANOTHER user's category (the
-    FK-permissive leak the join's ``Category.user_id == user_id`` guards) must be
+    leak the join's ``Category.user_id == user_id`` guards, ADR-0003 rule 7) must be
     excluded. Pins the cross-user predicate: dropping it would count the foreign
-    suggestion. Seeded via raw ``session.add`` to bypass the write-time gate.
+    suggestion. The composite same-user FK refuses such a row (rule 10), so it is
+    stored with FKs off: the read must hold on its own.
     """
     other_user = User(id=uuid.UUID("00000000-0000-0000-0000-000000000099"))
     session.add(other_user)
     session.commit()
     leaky_category = Category(
+        color="#2a78d6",
         user_id=other_user.id,
         name="STOLEN-PROTECTED-NAME",
         is_seeded=False,
@@ -2062,29 +2199,30 @@ def test_tagging_stats_excludes_foreign_category_suggestion(
     session.refresh(leaky_category)
 
     food = next(c for c in seeded_categories if c.name == "Food")
-    session.add_all(
-        [
-            _make_txn(  # legit v1 auto-tag → the only row that should count
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 1),
-                amount_paise=-1000,
-                fingerprint="fp-v1-legit",
-                category_id=food.id,
-                auto_category_id=food.id,
-            ),
-            _make_txn(  # v1 row whose suggestion points at the other user's category
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 2),
-                amount_paise=-2000,
-                fingerprint="fp-v1-foreign-suggestion",
-                category_id=food.id,
-                auto_category_id=leaky_category.id,
-            ),
-        ]
-    )
-    session.commit()
+    with foreign_keys_off(session):
+        session.add_all(
+            [
+                _make_txn(  # legit v1 auto-tag → the only row that should count
+                    user_id=axis_account.user_id,
+                    account_id=axis_account.id,
+                    txn_date=date(2026, 5, 1),
+                    amount_paise=-1000,
+                    fingerprint="fp-v1-legit",
+                    category_id=food.id,
+                    auto_category_id=food.id,
+                ),
+                _make_txn(  # v1 row whose suggestion points at the other user's category
+                    user_id=axis_account.user_id,
+                    account_id=axis_account.id,
+                    txn_date=date(2026, 5, 2),
+                    amount_paise=-2000,
+                    fingerprint="fp-v1-foreign-suggestion",
+                    category_id=food.id,
+                    auto_category_id=leaky_category.id,
+                ),
+            ]
+        )
+        session.commit()
 
     resp = client.get(_TAGGING_URL)
     body = resp.json()
@@ -2220,6 +2358,101 @@ def test_tagging_stats_rules_count_excludes_zero_hit_rows(
     resp = client.get(_TAGGING_URL)
     body = resp.json()
     assert body["rules_count"] == 1
+
+
+def test_tagging_stats_rules_count_skips_unknown_via_rows(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """ADR-0011 rule 12: a map row whose key resolves to an unknown-via canonical is not
+    a rule, so it is not counted."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="upi/9876543210@ybl",
+                category_id=food.id,
+                hit_count=2,
+            ),
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="swiggy",
+                category_id=food.id,
+                hit_count=1,
+            ),
+        ]
+    )
+    session.commit()
+    assert client.get(_TAGGING_URL).json()["rules_count"] == 1
+
+
+def test_tagging_stats_rules_count_excludes_archived_categories(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """ADR-0004 rule 10: ``rules_count`` counts live rules — a rule whose category
+    was archived drops out, like it does from the rules list and the prefill."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    shopping = next(c for c in seeded_categories if c.name == "Shopping")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="a",
+                category_id=food.id,
+                hit_count=2,
+            ),
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="b",
+                category_id=shopping.id,
+                hit_count=2,
+            ),
+        ]
+    )
+    session.commit()
+    assert client.get(_TAGGING_URL).json()["rules_count"] == 2
+
+    assert client.delete(f"/api/v1/categories/{shopping.id}").status_code == 204
+
+    assert client.get(_TAGGING_URL).json()["rules_count"] == 1
+
+
+def test_tagging_stats_rules_count_counts_pinned_seed_rows(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """A pinned ``hit_count = 0`` row is user-authored, not seeded (ADR-0011 rule 11),
+    so it counts; an unpinned one at zero is a never-confirmed seed and does not."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    shopping = next(c for c in seeded_categories if c.name == "Shopping")
+    session.add_all(
+        [
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="pinned-seed",
+                category_id=food.id,
+                hit_count=0,
+                pinned=True,
+            ),
+            MerchantTagMap(
+                user_id=axis_account.user_id,
+                merchant_normalized="plain-seed",
+                category_id=shopping.id,
+                hit_count=0,
+            ),
+        ]
+    )
+    session.commit()
+
+    assert client.get(_TAGGING_URL).json()["rules_count"] == 1
 
 
 # =============================================================================
@@ -2447,6 +2680,7 @@ def test_overview_net_worth_includes_portfolio(
                 price_per_unit_native=Decimal("140"),
                 amount_native_paise=140000,
                 fees_native_paise=0,
+                fx_rate_to_inr=Decimal("1"),
             ),
         ]
     )
@@ -2525,7 +2759,7 @@ def test_overview_uses_newest_rate_even_if_dated_ahead_of_utc_today(
     seeded_user: User,
     session: Session,
 ) -> None:
-    """A cache whose only rate is dated AFTER UTC-today still values the USD holding.
+    """A cache whose only rate is dated AFTER ``clock.today()`` still values the USD holding.
 
     This is the 00:00–05:30 IST window, made deterministic. ``rate_on`` is
     ``date <= on`` carry-forward, so under the old ``rate_on(on=date.today())`` read this
@@ -2597,6 +2831,7 @@ def test_overview_null_nav_holding_contributes_zero(
             price_per_unit_native=Decimal("100"),
             amount_native_paise=100000,
             fees_native_paise=0,
+            fx_rate_to_inr=Decimal("1"),
         )
     )
     session.commit()
@@ -2765,6 +3000,7 @@ def test_overview_investment_account_excluded_from_net_worth(
             price_per_unit_native=Decimal("150"),
             amount_native_paise=3_000_000_00,
             fees_native_paise=0,
+            fx_rate_to_inr=Decimal("1"),
         )
     )
     session.commit()
@@ -2786,8 +3022,9 @@ def test_overview_cc_spend_ytd_is_signed_net_within_year(
     axis_account: Account,
     session: Session,
 ) -> None:
-    """spend_ytd_paise is the signed net Σ(spend, refund) over the year-to-date:
-    a refund nets against spends, and a prior-year spend is excluded from the YTD
+    """spend_ytd_paise is the signed net Σ(spend, refund) over the calendar
+    year-to-date (from 1 January, PRD §F8): a refund nets against spends, and a
+    prior-year spend — December of the previous year — is excluded from the YTD
     figure while still counting in the all-time balance."""
     session.add_all(
         [
@@ -2826,46 +3063,97 @@ def test_overview_cc_spend_ytd_is_signed_net_within_year(
     session.commit()
 
     row = client.get(f"{_OVERVIEW_URL}?month=2026-05").json()["accounts"][0]
-    # YTD (2026): -30000 - 20000 + 8000 = -42000 (refund nets).
+    # 2026 YTD [2026-01-01, 2026-05-31]: -30000 - 20000 + 8000 = -42000 (refund
+    # nets; the Dec 2025 spend belongs to 2025).
     assert row["spend_ytd_paise"] == -42000
-    # All-time balance also carries the 2025 spend: -42000 - 50000 = -92000.
+    # All-time balance carries every row: -30000 - 20000 + 8000 - 50000 = -92000.
     assert row["balance_paise"] == -92000
 
 
-def test_overview_cc_spend_ytd_year_from_month_param_not_today(
+def test_ytd_starts_on_1_january(
     client: TestClient,
     axis_account: Account,
     session: Session,
 ) -> None:
-    """The YTD window's year derives strictly from the ?month= param, not the
-    server clock: the same seeded data yields different spend_ytd_paise for
-    month=2025-12 vs month=2026-01, and each boundary is inclusive."""
+    """PRD §F8: on the spend side, "year" and every YTD figure mean the calendar
+    year, 1 January – 31 December (only tax stays on the financial year). The
+    window derives strictly from the ?month= / ?year= param, never the server
+    clock, and each boundary is inclusive. ``?year=2026`` is echoed verbatim."""
     session.add_all(
         [
             _make_txn(
                 user_id=axis_account.user_id,
                 account_id=axis_account.id,
+                txn_date=date(2025, 1, 1),  # first day of 2025
+                amount_paise=-5000,
+                fingerprint="fp-cy25-first",
+            ),
+            _make_txn(
+                user_id=axis_account.user_id,
+                account_id=axis_account.id,
                 txn_date=date(2025, 12, 31),  # last day of 2025
                 amount_paise=-11000,
-                fingerprint="fp-boundary-2025",
+                fingerprint="fp-cy25-last",
             ),
             _make_txn(
                 user_id=axis_account.user_id,
                 account_id=axis_account.id,
                 txn_date=date(2026, 1, 1),  # first day of 2026
                 amount_paise=-22000,
-                fingerprint="fp-boundary-2026",
+                fingerprint="fp-cy26-first",
             ),
         ]
     )
     session.commit()
 
-    dec = client.get(f"{_OVERVIEW_URL}?month=2025-12").json()["accounts"][0]
     jan = client.get(f"{_OVERVIEW_URL}?month=2026-01").json()["accounts"][0]
-    # 2025 YTD [2025-01-01, 2025-12-31] catches only the Dec 31 spend.
-    assert dec["spend_ytd_paise"] == -11000
-    # 2026 YTD [2026-01-01, 2026-01-31] catches only the Jan 1 spend.
+    dec = client.get(f"{_OVERVIEW_URL}?month=2025-12").json()["accounts"][0]
+    apr = client.get(f"{_OVERVIEW_URL}?month=2026-04").json()["accounts"][0]
+    # 2026 YTD [2026-01-01, 2026-01-31] catches only the 1 January spend.
     assert jan["spend_ytd_paise"] == -22000
+    # 2025 YTD [2025-01-01, 2025-12-31] catches both of that year's ends.
+    assert dec["spend_ytd_paise"] == -16000
+    # April is NOT a new year: 2026 YTD [2026-01-01, 2026-04-30] still holds 1 January.
+    assert apr["spend_ytd_paise"] == -22000
+
+    y26 = client.get(f"{_OVERVIEW_URL}?year=2026").json()
+    assert y26["period"] == "2026"
+    assert y26["expense_paise"] == -22000  # 2026-01-01 .. 2026-12-31
+    assert y26["accounts"][0]["spend_ytd_paise"] == -22000
+    y25 = client.get(f"{_OVERVIEW_URL}?year=2025").json()
+    assert y25["expense_paise"] == -16000  # 2025-01-01 .. 2025-12-31
+    by_cat = client.get("/api/v1/dashboards/spend-by-category?year=2026").json()
+    assert sum(r["total_paise"] for r in by_cat["rows"]) == -22000
+    # A year's previous period is the previous calendar year: view 2's delta for
+    # ?year=2026 asks spend-by-category for ?year=2025 (lib/period.ts previousPeriod).
+    prev = client.get("/api/v1/dashboards/spend-by-category?year=2025").json()
+    assert prev["period"] == "2025"
+    assert sum(r["total_paise"] for r in prev["rows"]) == -16000
+
+
+@pytest.mark.parametrize(
+    ("instant", "year"),
+    [
+        # 23:30 IST on 31 December 2026: still 2026.
+        (datetime(2026, 12, 31, 18, 0, tzinfo=UTC), 2026),
+        # 01:00 IST on 1 January 2027: the business date (ADR-0001 rule 5c) is in
+        # 2027, though the UTC date is still 31 December 2026.
+        (datetime(2026, 12, 31, 19, 30, tzinfo=UTC), 2027),
+    ],
+    ids=["2330-ist-31-dec", "0100-ist-1-jan"],
+)
+def test_available_years_offers_the_current_year_of_the_business_date(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    instant: datetime,
+    year: int,
+) -> None:
+    """With no data, the only year offered is the calendar year of today's IST date."""
+    monkeypatch.setattr(clock, "utcnow", lambda: instant)
+
+    resp = client.get("/api/v1/dashboards/available-years")
+    assert resp.status_code == 200
+    assert resp.json()["years"] == [year]
 
 
 def test_overview_spend_ytd_is_per_credit_card(
@@ -2914,7 +3202,8 @@ def test_overview_spend_ytd_is_per_credit_card(
     )
     session.commit()
 
-    body = client.get(f"{_OVERVIEW_URL}?month=2026-05").json()
+    # March 2026: the 2026 YTD these rows are in.
+    body = client.get(f"{_OVERVIEW_URL}?month=2026-03").json()
     by_name = {a["name"]: a for a in body["accounts"]}
     assert by_name["Axis CC"]["spend_ytd_paise"] == -13000
     assert by_name["ICICI CC"]["spend_ytd_paise"] == -70000  # -77000 + 7000
@@ -3393,544 +3682,6 @@ def test_cashflow_reconciles_with_period_totals_and_spend_by_period(
 
 
 # =============================================================================
-# spend-by-category-by-period (the /spending category-trend bar,
-# PRD §F8 view 3 — "how is my category mix shifting?")
-#
-# The category×time generalization of spend-by-category: same LEFT JOIN Category
-# (with the cross-user-safe join predicate), same `transaction_type == "spend"` filter,
-# board-only, signed sums. Reuses spend_by_period's _bucket_of / _iter_periods /
-# window-filter / zero-fill. Headline behaviours: the DENSE category×period grid
-# (a cell per echoed category per bucket, zero-filled), the stable series order
-# (most-negative grand total first, uncategorized pinned last), the signed-sum
-# reconciliation to spend-by-period, and net-credit cells NOT clamped server-side.
-# The consumer renders one category at a time against a y=0 reference line — not
-# a stack, and nothing floors on either side of the wire.
-# =============================================================================
-
-_SBCBP_URL = "/api/v1/dashboards/spend-by-category-by-period"
-
-
-def test_spend_by_category_by_period_empty_window_zero_filled(
-    client: TestClient,
-    seeded_user: User,
-) -> None:
-    """No activity → categories is empty and every bucket carries an empty
-    (dense-over-nothing) totals list; the envelope echoes grain + window."""
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-01-01&end=2026-02-28")
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "bucket": "month",
-        "start": "2026-01-01",
-        "end": "2026-02-28",
-        "categories": [],
-        "buckets": [
-            {"period": "2026-01", "totals": []},
-            {"period": "2026-02", "totals": []},
-        ],
-        "label_id": None,
-    }
-
-
-def test_spend_by_category_by_period_single_category_single_month(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    food = next(c for c in seeded_categories if c.name == "Food")
-    session.add(
-        _make_txn(
-            user_id=axis_account.user_id,
-            account_id=axis_account.id,
-            txn_date=date(2026, 5, 10),
-            amount_paise=-15000,
-            fingerprint="fp-food",
-            category_id=food.id,
-        )
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31")
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "bucket": "month",
-        "start": "2026-05-01",
-        "end": "2026-05-31",
-        "categories": [{"category_id": food.id, "category_name": "Food"}],
-        "buckets": [
-            {
-                "period": "2026-05",
-                "totals": [{"category_id": food.id, "total_paise": -15000}],
-            }
-        ],
-        "label_id": None,
-    }
-
-
-def test_spend_by_category_by_period_dense_grid_and_stack_order(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """Two categories in two different months: the grid is DENSE (each bucket
-    lists a cell for BOTH categories, zero-filled where absent) and the echoed
-    category order is the stack order — most-negative grand total first."""
-    food = next(c for c in seeded_categories if c.name == "Food")
-    shopping = next(c for c in seeded_categories if c.name == "Shopping")
-    session.add_all(
-        [
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 1, 15),
-                amount_paise=-10000,
-                fingerprint="fp-food-jan",
-                category_id=food.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 2, 15),
-                amount_paise=-50000,
-                fingerprint="fp-shop-feb",
-                category_id=shopping.id,
-            ),
-        ]
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-01-01&end=2026-02-28")
-    body = resp.json()
-    # Shopping (grand -50000) sorts before Food (grand -10000).
-    assert body["categories"] == [
-        {"category_id": shopping.id, "category_name": "Shopping"},
-        {"category_id": food.id, "category_name": "Food"},
-    ]
-    # Dense: Jan has a 0 cell for Shopping, Feb a 0 cell for Food. Cell order
-    # matches the categories order.
-    assert body["buckets"] == [
-        {
-            "period": "2026-01",
-            "totals": [
-                {"category_id": shopping.id, "total_paise": 0},
-                {"category_id": food.id, "total_paise": -10000},
-            ],
-        },
-        {
-            "period": "2026-02",
-            "totals": [
-                {"category_id": shopping.id, "total_paise": -50000},
-                {"category_id": food.id, "total_paise": 0},
-            ],
-        },
-    ]
-
-
-def test_spend_by_category_by_period_uncategorized_pinned_last(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """The uncategorized bucket (category_id=null) surfaces as its own series and
-    sorts last regardless of magnitude (mirrors spend_by_category)."""
-    food = next(c for c in seeded_categories if c.name == "Food")
-    session.add_all(
-        [
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 10),
-                amount_paise=-10000,
-                fingerprint="fp-food",
-                category_id=food.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 11),
-                amount_paise=-99999,  # bigger magnitude, still pinned last
-                fingerprint="fp-uncat",
-                category_id=None,
-            ),
-        ]
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31")
-    body = resp.json()
-    assert body["categories"] == [
-        {"category_id": food.id, "category_name": "Food"},
-        {"category_id": None, "category_name": None},
-    ]
-    assert body["buckets"] == [
-        {
-            "period": "2026-05",
-            "totals": [
-                {"category_id": food.id, "total_paise": -10000},
-                {"category_id": None, "total_paise": -99999},
-            ],
-        }
-    ]
-
-
-def test_spend_by_category_by_period_refund_nets_within_category_and_bucket(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """PRD §F4a rule 3: a refund preserves the category and the signed sum nets
-    it against spend within the same cell."""
-    food = next(c for c in seeded_categories if c.name == "Food")
-    session.add_all(
-        [
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 10),
-                amount_paise=-15000,
-                fingerprint="fp-spend",
-                category_id=food.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 12),
-                amount_paise=5000,
-                fingerprint="fp-refund",
-                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
-                category_id=food.id,
-            ),
-        ]
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31")
-    assert resp.json()["buckets"] == [
-        {
-            "period": "2026-05",
-            "totals": [{"category_id": food.id, "total_paise": -10000}],
-        }
-    ]
-
-
-def test_spend_by_category_by_period_net_credit_category_not_clamped(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """A category whose refunds outweigh its in-window spend surfaces a POSITIVE
-    total_paise — the server does not clamp (the display floor is frontend-only,
-    or the signed-sum reconciliation below would break)."""
-    shopping = next(c for c in seeded_categories if c.name == "Shopping")
-    food = next(c for c in seeded_categories if c.name == "Food")
-    session.add_all(
-        [
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 10),
-                amount_paise=-10000,
-                fingerprint="fp-shop-spend",
-                category_id=shopping.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 12),
-                amount_paise=5000,
-                fingerprint="fp-food-refund",
-                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
-                category_id=food.id,
-            ),
-        ]
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31")
-    body = resp.json()
-    # Shopping (-10000) sorts before Food (+5000, net-credit) — both categorized.
-    assert body["categories"] == [
-        {"category_id": shopping.id, "category_name": "Shopping"},
-        {"category_id": food.id, "category_name": "Food"},
-    ]
-    food_cell = next(t for t in body["buckets"][0]["totals"] if t["category_id"] == food.id)
-    assert food_cell["total_paise"] == 5000  # positive, NOT clamped to 0
-
-
-def test_spend_by_category_by_period_reconciles_with_spend_by_period(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """The authoritative identity: Σ(per-category cell totals) per bucket ==
-    the spend-by-period bucket total (both filter spend+refund, both signed).
-    Income + transfer excluded from both."""
-    food = next(c for c in seeded_categories if c.name == "Food")
-    income_cat = next(c for c in seeded_categories if c.name == "Income")
-    transfer_cat = next(c for c in seeded_categories if c.name == "Transfer")
-    session.add_all(
-        [
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 3),
-                amount_paise=-15000,
-                fingerprint="fp-food",
-                category_id=food.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 9),
-                amount_paise=3000,
-                fingerprint="fp-food-refund",
-                transaction_type="spend",  # refund: spend row, positive amount (ADR-0009)
-                category_id=food.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 11),
-                amount_paise=-2000,
-                fingerprint="fp-uncat",
-                category_id=None,
-            ),
-            # Income + transfer — excluded from both aggregates.
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 13),
-                amount_paise=80000,
-                fingerprint="fp-income",
-                transaction_type="income",
-                category_id=income_cat.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 20),
-                amount_paise=-50000,
-                fingerprint="fp-transfer",
-                transaction_type="transfer",
-                category_id=transfer_cat.id,
-            ),
-        ]
-    )
-    session.commit()
-
-    sbcbp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31").json()
-    period = client.get(f"{_PERIOD_URL}?bucket=month&start=2026-05-01&end=2026-05-31").json()
-
-    # Per-bucket signed identity: Σ cells == spend-by-period bucket total.
-    period_by_key = {b["period"]: b["total_paise"] for b in period["buckets"]}
-    for b in sbcbp["buckets"]:
-        cell_sum = sum(t["total_paise"] for t in b["totals"])
-        assert cell_sum == period_by_key[b["period"]]
-
-    # Concretely: -15000 + 3000 (food) + -2000 (uncat) = -14000; income/transfer out.
-    assert sum(t["total_paise"] for t in sbcbp["buckets"][0]["totals"]) == -14000
-
-
-def test_spend_by_category_by_period_excludes_income_transfer_and_pending(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    food = next(c for c in seeded_categories if c.name == "Food")
-    income_cat = next(c for c in seeded_categories if c.name == "Income")
-    transfer_cat = next(c for c in seeded_categories if c.name == "Transfer")
-    session.add_all(
-        [
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 3),
-                amount_paise=-15000,
-                fingerprint="fp-spend",
-                category_id=food.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 4),
-                amount_paise=100000,
-                fingerprint="fp-income",
-                transaction_type="income",
-                category_id=income_cat.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 5),
-                amount_paise=-50000,
-                fingerprint="fp-transfer",
-                transaction_type="transfer",
-                category_id=transfer_cat.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 6),
-                amount_paise=-99999,
-                fingerprint="fp-pending",
-                category_id=food.id,
-                confirmed_at=None,
-            ),
-        ]
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31")
-    body = resp.json()
-    # Only the confirmed Food spend survives; income/transfer/pending are gone.
-    assert body["categories"] == [{"category_id": food.id, "category_name": "Food"}]
-    assert body["buckets"] == [
-        {
-            "period": "2026-05",
-            "totals": [{"category_id": food.id, "total_paise": -15000}],
-        }
-    ]
-
-
-def test_spend_by_category_by_period_cross_user_and_category_name_isolated(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """Two-pronged isolation (mirrors the spend-by-category test):
-
-    1. Another user's row must not appear.
-    2. A v1 row whose category_id points at another user's Category surfaces with
-       category_name=null (the JOIN's user predicate drops the foreign name), but
-       keeps its own category_id as a distinct series.
-    """
-    other_user = User(id=uuid.UUID("00000000-0000-0000-0000-000000000099"))
-    session.add(other_user)
-    session.commit()
-
-    other_account = Account(
-        user_id=other_user.id,
-        name="Other CC",
-        type="credit_card",
-        issuer="axis",
-        last4="9999",
-    )
-    leaky_category = Category(
-        user_id=other_user.id,
-        name="STOLEN-PROTECTED-NAME",
-        is_seeded=False,
-    )
-    session.add_all([other_account, leaky_category])
-    session.commit()
-    session.refresh(other_account)
-    session.refresh(leaky_category)
-
-    food = next(c for c in seeded_categories if c.name == "Food")
-    session.add_all(
-        [
-            # Prong 1: another user's row.
-            _make_txn(
-                user_id=other_user.id,
-                account_id=other_account.id,
-                txn_date=date(2026, 5, 10),
-                amount_paise=-99999,
-                fingerprint="fp-other-user",
-                category_id=leaky_category.id,
-            ),
-            # Prong 2: v1 row pointing at the OTHER user's category id.
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 11),
-                amount_paise=-5000,
-                fingerprint="fp-v1-leak",
-                category_id=leaky_category.id,
-            ),
-            # Control: a normal v1 row.
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 5, 12),
-                amount_paise=-2000,
-                fingerprint="fp-v1-normal",
-                category_id=food.id,
-            ),
-        ]
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31")
-    body = resp.json()
-
-    # Prong 1: the other user's -99999 never appears in any cell.
-    all_cell_totals = [t["total_paise"] for b in body["buckets"] for t in b["totals"]]
-    assert -99999 not in all_cell_totals
-
-    # Prong 2: the foreign category surfaces with its id but a null name.
-    leaky_ref = next(c for c in body["categories"] if c["category_id"] == leaky_category.id)
-    assert leaky_ref["category_name"] is None
-    # Sanity: the normal v1 category keeps its name.
-    food_ref = next(c for c in body["categories"] if c["category_id"] == food.id)
-    assert food_ref["category_name"] == "Food"
-
-
-def test_spend_by_category_by_period_week_bucket_zero_fill(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """Week-grain zero-fill (per-route wiring): spend in 2026-W01 and 2026-W03,
-    none in W02 → W02 is a dense zero cell. Window Mon 2025-12-29 .. Sun
-    2026-01-18 = W01..W03."""
-    food = next(c for c in seeded_categories if c.name == "Food")
-    session.add_all(
-        [
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2025, 12, 30),  # 2026-W01
-                amount_paise=-10000,
-                fingerprint="fp-w01",
-                category_id=food.id,
-            ),
-            _make_txn(
-                user_id=axis_account.user_id,
-                account_id=axis_account.id,
-                txn_date=date(2026, 1, 13),  # 2026-W03
-                amount_paise=-30000,
-                fingerprint="fp-w03",
-                category_id=food.id,
-            ),
-        ]
-    )
-    session.commit()
-
-    resp = client.get(f"{_SBCBP_URL}?bucket=week&start=2025-12-29&end=2026-01-18")
-    assert resp.json()["buckets"] == [
-        {"period": "2026-W01", "totals": [{"category_id": food.id, "total_paise": -10000}]},
-        {"period": "2026-W02", "totals": [{"category_id": food.id, "total_paise": 0}]},
-        {"period": "2026-W03", "totals": [{"category_id": food.id, "total_paise": -30000}]},
-    ]
-
-
-def test_spend_by_category_by_period_start_after_end_returns_422(
-    client: TestClient,
-    seeded_user: User,
-) -> None:
-    resp = client.get(f"{_SBCBP_URL}?bucket=month&start=2026-06-30&end=2026-06-01")
-    assert resp.status_code == 422
-    assert resp.json()["detail"] == "start must be on or before end"
-
-
-# =============================================================================
 # top-merchants (PRD §F8 view 3 — "where is the money actually going?")
 #
 # Month-scoped GROUP BY merchant_normalized: signed-sum per merchant, ordered
@@ -3987,7 +3738,7 @@ def test_top_merchants_single_merchant(
     assert body["truncated"] is False
     assert body["rows"] == [
         {
-            "merchant_normalized": normalize_merchant("Swiggy"),
+            "merchant_canonical": normalize_merchant("Swiggy"),
             "merchant_label": "Swiggy",
             "total_paise": -15000,
         }
@@ -4033,12 +3784,63 @@ def test_top_merchants_ranked_most_negative_first_with_tiebreak(
 
     resp = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05")
     rows = resp.json()["rows"]
-    assert [r["merchant_normalized"] for r in rows] == [
+    assert [r["merchant_canonical"] for r in rows] == [
         normalize_merchant("Amazon"),
         normalize_merchant("Big Basket"),
         normalize_merchant("Swiggy"),
     ]
     assert [r["total_paise"] for r in rows] == [-50000, -10000, -10000]
+
+
+def test_top_merchants_groups_by_canonical(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """ADR-0011 rule 8: descriptors folded by the user's aliases are one bar, keyed on the
+    canonical. A second user's alias must not leak in."""
+    uid = axis_account.user_id
+    other = User(id=uuid.uuid4())
+    session.add(other)
+    session.flush()
+    session.add_all(
+        [
+            MerchantAlias(user_id=uid, pattern="swiggy", canonical="swiggy"),
+            MerchantAlias(user_id=uid, pattern="bigbasket", canonical="big basket"),
+            MerchantAlias(user_id=other.id, pattern="zomato", canonical="swiggy"),
+        ]
+    )
+    for n, (raw, paise) in enumerate(
+        [
+            ("UPI/SWIGGY/1111@YBL", -10000),
+            ("SWIGGY*BLR*2222", -20000),
+            ("Swiggy", -5000),
+            ("BIGBASKET ONLINE", -7000),
+            ("Zomato", -1000),
+        ]
+    ):
+        session.add(
+            _make_txn(
+                user_id=uid,
+                account_id=axis_account.id,
+                txn_date=date(2026, 5, 3 + n),
+                amount_paise=paise,
+                fingerprint=f"fp-canon-{n}",
+                merchant_raw=raw,
+            )
+        )
+    session.commit()
+
+    body = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05").json()
+    assert body["rows"] == [
+        {"merchant_canonical": "swiggy", "merchant_label": "Swiggy", "total_paise": -35000},
+        {"merchant_canonical": "big basket", "merchant_label": "big basket", "total_paise": -7000},
+        {"merchant_canonical": "zomato", "merchant_label": "Zomato", "total_paise": -1000},
+    ]
+    assert body["total_merchants"] == 3
+    capped = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05&limit=1").json()
+    assert capped["truncated"] is True
+    assert capped["total_merchants"] == 3
 
 
 def test_top_merchants_raw_variants_group_under_one_normalized_key(
@@ -4075,7 +3877,7 @@ def test_top_merchants_raw_variants_group_under_one_normalized_key(
     assert body["total_merchants"] == 1
     assert len(body["rows"]) == 1
     row = body["rows"][0]
-    assert row["merchant_normalized"] == normalize_merchant("Swiggy")
+    assert row["merchant_canonical"] == normalize_merchant("Swiggy")
     assert row["total_paise"] == -30000
     # Label is a deterministic pick of one of the raw variants (MAX); don't
     # over-pin which one (it's collation-dependent), just that it's a real raw.
@@ -4115,7 +3917,7 @@ def test_top_merchants_empty_merchant_bucket_filtered(
     resp = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05")
     body = resp.json()
     assert body["total_merchants"] == 1
-    assert [r["merchant_normalized"] for r in body["rows"]] == [normalize_merchant("Uber")]
+    assert [r["merchant_canonical"] for r in body["rows"]] == [normalize_merchant("Uber")]
     assert -99999 not in [r["total_paise"] for r in body["rows"]]
 
 
@@ -4162,7 +3964,7 @@ def test_top_merchants_truncation_and_count_rows_invariants(
     assert trunc["truncated"] is True
     assert len(trunc["rows"]) == 2  # == limit
     # The two most-negative, in order.
-    assert [r["merchant_normalized"] for r in trunc["rows"]] == [
+    assert [r["merchant_canonical"] for r in trunc["rows"]] == [
         normalize_merchant("Amazon"),
         normalize_merchant("Swiggy"),
     ]
@@ -4206,7 +4008,7 @@ def test_top_merchants_net_credit_merchant_sorts_last(
 
     resp = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05")
     rows = resp.json()["rows"]
-    assert [r["merchant_normalized"] for r in rows] == [
+    assert [r["merchant_canonical"] for r in rows] == [
         normalize_merchant("Amazon"),
         normalize_merchant("Flipkart"),
     ]
@@ -4309,7 +4111,7 @@ def test_top_merchants_excludes_income_transfer_and_pending(
     resp = client.get(f"{_TOP_MERCHANTS_URL}?month=2026-05")
     body = resp.json()
     assert body["total_merchants"] == 1
-    assert [r["merchant_normalized"] for r in body["rows"]] == [normalize_merchant("Amazon")]
+    assert [r["merchant_canonical"] for r in body["rows"]] == [normalize_merchant("Amazon")]
     assert body["rows"][0]["total_paise"] == -10000
 
 
@@ -4360,7 +4162,7 @@ def test_top_merchants_cross_user_isolation(
     assert body["total_merchants"] == 1
     assert body["rows"] == [
         {
-            "merchant_normalized": normalize_merchant("Amazon"),
+            "merchant_canonical": normalize_merchant("Amazon"),
             "merchant_label": "Amazon",
             "total_paise": -10000,
         }
@@ -4462,7 +4264,7 @@ def test_top_merchants_missing_month_returns_422(
 # F3a tag cross-filter (?label_id=) — tag-analysis arc Phase A
 #
 # Optional label filter added to spend-by-category, top-merchants,
-# spend-by-period, and spend-by-category-by-period. It's an EXISTS subquery
+# spend-by-period, and category-trend. It's an EXISTS subquery
 # (Transaction.labels.any(Label.id == label_id)), copied from the
 # transactions.py list route — so a txn either matches the tag or doesn't (no
 # join-row duplication, no double-counting), and every response echoes the
@@ -4537,7 +4339,15 @@ def test_spend_by_category_label_filter_scopes_to_tagged(
     body = client.get(f"{_SBC_URL}?month=2026-05&label_id={travel.id}").json()
     assert body["label_id"] == travel.id
     assert body["rows"] == [
-        {"category_id": food.id, "category_name": "Food", "total_paise": -15000},
+        {
+            "category_id": food.id,
+            "category_name": "Food",
+            "parent_id": None,
+            "parent_name": None,
+            "display_color": "#2a78d6",
+            "parent_display_color": None,
+            "total_paise": -15000,
+        },
     ]
 
 
@@ -4567,7 +4377,15 @@ def test_spend_by_category_multi_tagged_txn_not_double_counted(
 
     body = client.get(f"{_SBC_URL}?month=2026-05&label_id={travel.id}").json()
     assert body["rows"] == [
-        {"category_id": food.id, "category_name": "Food", "total_paise": -15000},
+        {
+            "category_id": food.id,
+            "category_name": "Food",
+            "parent_id": None,
+            "parent_name": None,
+            "display_color": "#2a78d6",
+            "parent_display_color": None,
+            "total_paise": -15000,
+        },
     ]
 
 
@@ -4640,48 +4458,7 @@ def test_top_merchants_label_filter_scopes_rows_and_total_merchants(
     assert body["label_id"] == travel.id
     assert body["total_merchants"] == 1
     assert body["truncated"] is False
-    assert [r["merchant_normalized"] for r in body["rows"]] == [normalize_merchant("Swiggy")]
-
-
-def test_spend_by_category_by_period_label_filter_scopes_grid(
-    client: TestClient,
-    axis_account: Account,
-    seeded_categories: list[Category],
-    session: Session,
-) -> None:
-    """The category×period grid narrows to tagged txns — an untagged txn in the
-    SAME category is excluded, so only the tagged cell survives."""
-    food = next(c for c in seeded_categories if c.name == "Food")
-    tagged = _make_txn(
-        user_id=axis_account.user_id,
-        account_id=axis_account.id,
-        txn_date=date(2026, 5, 10),
-        amount_paise=-15000,
-        fingerprint="fp-a",
-        category_id=food.id,
-    )
-    plain = _make_txn(
-        user_id=axis_account.user_id,
-        account_id=axis_account.id,
-        txn_date=date(2026, 5, 12),
-        amount_paise=-50000,
-        fingerprint="fp-b",
-        category_id=food.id,
-    )
-    session.add_all([tagged, plain])
-    session.commit()
-    travel = _tag_txns(session, user_id=axis_account.user_id, name="travel", txns=[tagged])
-
-    url = f"{_SBCBP_URL}?bucket=month&start=2026-05-01&end=2026-05-31"
-    body = client.get(f"{url}&label_id={travel.id}").json()
-    assert body["label_id"] == travel.id
-    assert body["categories"] == [{"category_id": food.id, "category_name": "Food"}]
-    assert body["buckets"] == [
-        {
-            "period": "2026-05",
-            "totals": [{"category_id": food.id, "total_paise": -15000}],
-        }
-    ]
+    assert [r["merchant_canonical"] for r in body["rows"]] == [normalize_merchant("Swiggy")]
 
 
 @pytest.mark.parametrize("bad", ["0", "-1"])
@@ -5170,7 +4947,7 @@ def test_spend_by_tag_invalid_month_returns_422_without_echo(
 # The tag×time generalization of spend-by-tag: the group-by-tag INNER JOIN shape
 # (arc decision #7, which INTENTIONALLY double-counts a multi-tagged txn across
 # its tags) + the clipped-window Python `_bucket_of`/`_iter_periods` bucketing
-# from spend-by-period. Two things differ from spend-by-category-by-period, both
+# from spend-by-period. Two things differ from category-trend, both
 # from tags being many:many:
 #   1. The untagged residual is EXCLUDED (INNER JOIN drops zero-label txns) — no
 #      null-id line, unlike the category route's LEFT JOIN uncategorized bucket.
@@ -5267,7 +5044,7 @@ def test_spend_by_tag_by_period_multi_tag_double_counts_and_no_total_identity(
     """A txn carrying two tags appears in BOTH lines at full amount (the intended
     group-by double-count, arc decision #7). The NEGATIVE identity: Σ of a
     bucket's cells does NOT equal that bucket's spend-by-period total — no
-    cross-tag total identity exists here (unlike spend-by-category-by-period)."""
+    cross-tag total identity exists here (unlike category-trend)."""
     txn = _make_txn(
         user_id=axis_account.user_id,
         account_id=axis_account.id,
@@ -5663,7 +5440,11 @@ def test_available_years(
     client: TestClient,
     session: Session,
     axis_account: Account,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Years are calendar years (PRD §F8): a 15 March 2024 row offers 2024, through
+    the current year, with no gap."""
+    monkeypatch.setattr(clock, "utcnow", lambda: datetime(2026, 11, 15, 6, 0, tzinfo=UTC))
     session.add(
         _make_txn(
             user_id=axis_account.user_id,
@@ -5676,9 +5457,7 @@ def test_available_years(
     session.commit()
     resp = client.get("/api/v1/dashboards/available-years")
     assert resp.status_code == 200
-    years = resp.json()["years"]
-    assert 2024 in years
-    assert 2026 in years
+    assert resp.json()["years"] == [2026, 2025, 2024]
 
 
 def test_year_parameter_dashboards(
@@ -5718,16 +5497,18 @@ def test_available_years_reaches_a_future_dated_row(
     client: TestClient,
     session: Session,
     axis_account: Account,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A future-dated row (a backfilled import, or a clock-skewed manual entry)
     must still be reachable — the fix for the old `max(current_year,
     current_year)` tautology, which was a no-op and could silently return `[]`
-    when every row was outside the current year."""
+    when every row was outside the current year. Years are calendar years."""
+    monkeypatch.setattr(clock, "utcnow", lambda: datetime(2026, 11, 15, 6, 0, tzinfo=UTC))
     session.add(
         _make_txn(
             user_id=axis_account.user_id,
             account_id=axis_account.id,
-            txn_date=date(2030, 1, 15),
+            txn_date=date(2030, 6, 15),
             amount_paise=-5000,
             fingerprint="fp-future",
         )
@@ -5737,7 +5518,7 @@ def test_available_years_reaches_a_future_dated_row(
     assert resp.status_code == 200
     years = resp.json()["years"]
     assert 2030 in years
-    assert 2026 in years  # current year is always offered, even mid-range
+    assert 2026 in years  # the current year is always offered, even mid-range
     assert years == sorted(years, reverse=True)
 
 
@@ -5785,3 +5566,335 @@ def test_overview_on_a_year_period_covers_the_whole_year(
     assert body["period"] == "2025"
     assert body["income_paise"] == 100000
     assert body["expense_paise"] == -30000
+
+
+def test_overview_cashback_ytd_is_spend_side(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """ADR-0013 rule 4: the card YTD block splits positive spend by category. ``cashback``
+    is positive spend in the spend "Cashback" or a child of it (one hop, ADR-0012 rule 6);
+    ``refund`` is every other positive spend, uncategorized included; income never counts.
+    ``spend_ytd = gross + refund + cashback``."""
+    uid = axis_account.user_id
+    food = Category(color="#2a78d6", user_id=uid, name="Food", kind="spend")
+    cashback = Category(color="#2a78d6", user_id=uid, name=CASHBACK_CATEGORY_NAME, kind="spend")
+    salary = Category(color="#2a78d6", user_id=uid, name="Salary", kind="income")
+    session.add_all([food, cashback, salary])
+    session.flush()
+    rewards = Category(user_id=uid, name="Card Rewards", kind="spend", parent_id=cashback.id)
+    session.add(rewards)
+    session.flush()
+
+    rows = (
+        (-20000, "spend", None),
+        (3000, "spend", food.id),
+        (500, "spend", cashback.id),
+        (100, "spend", rewards.id),
+        (1000, "income", salary.id),
+        (200, "spend", None),
+    )
+    session.add_all(
+        [
+            _make_txn(
+                user_id=uid,
+                account_id=axis_account.id,
+                txn_date=date(2026, 4, 10 + i),
+                amount_paise=amount,
+                fingerprint=f"fp-cb-ytd-{i}",
+                transaction_type=txn_type,
+                category_id=category_id,
+            )
+            for i, (amount, txn_type, category_id) in enumerate(rows)
+        ]
+    )
+    session.commit()
+
+    row = client.get(f"{_OVERVIEW_URL}?month=2026-05").json()["accounts"][0]
+    assert row["gross_spend_ytd_paise"] == -20000
+    assert row["refund_ytd_paise"] == 3200
+    assert row["cashback_ytd_paise"] == 600
+    assert row["spend_ytd_paise"] == -16200
+
+
+# =============================================================================
+# Category trend (PRD §F8 view 6) — GET /dashboards/category-trend?months=12
+#
+# A trailing window of whole calendar months ending in the IST business month,
+# signed spend per parent category with a subcategory drilldown. Archived
+# children roll into their parent (ADR-0012 rule 6); Σ parents for a month is
+# that month's spend-by-period total.
+# =============================================================================
+
+_CATEGORY_TREND_URL = "/api/v1/dashboards/category-trend"
+_TREND_NOW = datetime(2026, 5, 10, 6, 0, tzinfo=UTC)
+
+
+class _TrendWorld:
+    """The invented category family used by the category-trend tests."""
+
+    def __init__(self, household: Category, supplies: Category, repairs: Category, trips: Category):
+        self.household = household
+        self.supplies = supplies
+        self.repairs = repairs
+        self.trips = trips
+
+
+def _seed_trend_world(session: Session, account: Account) -> _TrendWorld:
+    uid = account.user_id
+    household = Category(user_id=uid, name="Household", color="#2a78d6")
+    session.add(household)
+    session.flush()
+    supplies = Category(user_id=uid, name="Supplies", parent_id=household.id)
+    repairs = Category(
+        user_id=uid,
+        name="Repairs",
+        parent_id=household.id,
+        archived_at=datetime(2026, 1, 1),
+    )
+    trips = Category(color="#d95926", user_id=uid, name="Trips")
+    session.add_all([supplies, repairs, trips])
+    session.flush()
+
+    def txn(
+        n: int,
+        d: date,
+        amount: int,
+        cat: Category | None,
+        *,
+        transaction_type: str = "spend",
+        confirmed: bool = True,
+    ) -> Transaction:
+        return _make_txn(
+            user_id=uid,
+            account_id=account.id,
+            txn_date=d,
+            amount_paise=amount,
+            fingerprint=f"fp-ct-{n}",
+            transaction_type=transaction_type,
+            category_id=cat.id if cat else None,
+            confirmed_at=_DEFAULT_CONFIRMED if confirmed else None,
+        )
+
+    session.add_all(
+        [
+            txn(1, date(2025, 6, 1), -10000, supplies),  # first day of the window
+            txn(2, date(2026, 3, 5), -8000, supplies),
+            txn(3, date(2026, 3, 20), 3000, supplies),  # refund
+            txn(4, date(2026, 3, 10), -2000, household),  # direct row
+            txn(5, date(2025, 9, 1), -7000, repairs),  # archived child
+            txn(6, date(2026, 4, 1), -4000, trips),
+            txn(7, date(2026, 5, 31), -1500, None),  # last day of the window
+            # Noise that must be excluded.
+            txn(8, date(2025, 5, 31), -99900, supplies),
+            txn(9, date(2026, 6, 1), -99900, supplies),
+            txn(10, date(2026, 3, 15), 50000, supplies, transaction_type="income"),
+            txn(11, date(2026, 3, 16), -50000, supplies, transaction_type="transfer"),
+            txn(12, date(2026, 3, 17), -50000, supplies, confirmed=False),
+        ]
+    )
+    session.commit()
+    return _TrendWorld(household, supplies, repairs, trips)
+
+
+def test_category_trend_matches_monthly_by_category(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each parent's monthly series equals the sum of its family's rows in the
+    month's spend-by-category view, to the paisa (PRD §Verification 5)."""
+    monkeypatch.setattr(clock, "utcnow", lambda: _TREND_NOW)
+    world = _seed_trend_world(session, axis_account)
+
+    resp = client.get(f"{_CATEGORY_TREND_URL}?months=12")
+    assert resp.status_code == 200
+    body = resp.json()
+    periods = body["periods"]
+    assert periods[0] == "2025-06"
+    assert periods[-1] == "2026-05"
+    assert len(periods) == 12
+    assert body["label_id"] is None
+
+    cats = session.query(Category).filter(Category.user_id == axis_account.user_id).all()
+    family: dict[int | None, set[int | None]] = {None: {None}}
+    for c in cats:
+        if c.parent_id is None:
+            family[c.id] = {c.id}
+    for c in cats:
+        if c.parent_id is not None:
+            family[c.parent_id].add(c.id)
+
+    parents = {p["parent_id"]: p for p in body["parents"]}
+    for i, month in enumerate(periods):
+        rows = client.get(f"/api/v1/dashboards/spend-by-category?month={month}").json()["rows"]
+        by_cat = {r["category_id"]: r["total_paise"] for r in rows}
+        month_total = 0
+        for pid, p in parents.items():
+            expected = sum(by_cat.get(cid, 0) for cid in family[pid])
+            assert p["totals_paise"][i] == expected, (month, pid)
+            month_total += p["totals_paise"][i]
+        assert month_total == sum(by_cat.values())
+
+    household = parents[world.household.id]
+    assert household["totals_paise"][periods.index("2026-03")] == -7000  # refund lowers March
+    assert household["totals_paise"][periods.index("2025-09")] == -7000  # archived child stays in
+    assert parents[world.trips.id]["totals_paise"][periods.index("2026-04")] == -4000
+    assert body["parents"][-1]["parent_id"] is None
+    assert body["parents"][-1]["subcategories"] == []
+
+
+def test_category_trend_drilldown_sums_to_parent_and_keeps_archived_children(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(clock, "utcnow", lambda: _TREND_NOW)
+    world = _seed_trend_world(session, axis_account)
+
+    body = client.get(f"{_CATEGORY_TREND_URL}?months=12").json()
+    household = next(p for p in body["parents"] if p["parent_id"] == world.household.id)
+    subs = household["subcategories"]
+    assert [s["category_id"] for s in subs] == [
+        world.supplies.id,
+        world.repairs.id,
+        world.household.id,
+    ]
+    assert [s["archived"] for s in subs] == [False, True, False]
+    assert [s["is_direct"] for s in subs] == [False, False, True]
+    assert subs[2]["category_name"] == "Household"
+    assert subs[2]["totals_paise"][body["periods"].index("2026-03")] == -2000
+    for i in range(len(body["periods"])):
+        assert sum(s["totals_paise"][i] for s in subs) == household["totals_paise"][i]
+
+
+def test_category_trend_colours_its_series_on_the_server(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inheriting children rotate the palette after the parent's slot by position (archived
+    siblings keep theirs); the direct row and the parent keep the parent's own colour."""
+    monkeypatch.setattr(clock, "utcnow", lambda: _TREND_NOW)
+    world = _seed_trend_world(session, axis_account)
+
+    body = client.get(f"{_CATEGORY_TREND_URL}?months=12").json()
+    household = next(p for p in body["parents"] if p["parent_id"] == world.household.id)
+    assert household["color"] == "#2a78d6"
+    assert [s.get("color") for s in household["subcategories"]] == [
+        "#008300",
+        "#d55181",
+        "#2a78d6",
+    ]
+    trips = next(p for p in body["parents"] if p["parent_id"] == world.trips.id)
+    assert trips["color"] == "#d95926"
+    uncategorised = next(p for p in body["parents"] if p["parent_id"] is None)
+    assert uncategorised["color"] is None
+
+
+def test_spend_by_category_rows_carry_their_display_colors(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    world = _seed_trend_world(session, axis_account)
+
+    rows = client.get(f"{_SBC_URL}?year=2025").json()["rows"]
+    by_id = {r["category_id"]: r for r in rows}
+    for cat in (world.supplies, world.repairs):
+        assert by_id[cat.id].get("display_color") == "#2a78d6"
+        assert by_id[cat.id].get("parent_display_color") == "#2a78d6"
+
+    by_id = {r["category_id"]: r for r in client.get(f"{_SBC_URL}?year=2026").json()["rows"]}
+    household = by_id[world.household.id]
+    assert household.get("display_color") == "#2a78d6"
+    assert household["parent_display_color"] is None
+    trips = by_id[world.trips.id]
+    assert trips.get("display_color") == "#d95926"
+    assert trips["parent_display_color"] is None
+    assert by_id[None]["display_color"] is None
+    assert by_id[None]["parent_display_color"] is None
+
+
+@pytest.mark.parametrize(
+    ("instant", "first", "last"),
+    [
+        (datetime(2026, 3, 31, 18, 0, tzinfo=UTC), "2025-04", "2026-03"),
+        (datetime(2026, 3, 31, 19, 30, tzinfo=UTC), "2025-05", "2026-04"),
+    ],
+    ids=["2330-ist-31-mar", "0100-ist-1-apr"],
+)
+def test_category_trend_window_ends_in_the_business_month(
+    client: TestClient,
+    seeded_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+    instant: datetime,
+    first: str,
+    last: str,
+) -> None:
+    monkeypatch.setattr(clock, "utcnow", lambda: instant)
+    periods = client.get(f"{_CATEGORY_TREND_URL}?months=12").json()["periods"]
+    assert (periods[0], periods[-1], len(periods)) == (first, last, 12)
+    assert len(client.get(f"{_CATEGORY_TREND_URL}?months=3").json()["periods"]) == 3
+
+
+@pytest.mark.parametrize("months", ["0", "61", "x"])
+def test_category_trend_months_out_of_range_422(
+    client: TestClient, seeded_user: User, months: str
+) -> None:
+    assert client.get(f"{_CATEGORY_TREND_URL}?months={months}").status_code == 422
+
+
+def test_category_trend_excludes_other_users(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(clock, "utcnow", lambda: _TREND_NOW)
+    other = User(id=uuid.UUID("00000000-0000-0000-0000-000000000099"))
+    session.add(other)
+    session.commit()
+    other_account = Account(
+        user_id=other.id, name="Other CC", type="credit_card", issuer="axis", last4="9999"
+    )
+    other_cat = Category(color="#2a78d6", user_id=other.id, name="STOLEN-PROTECTED-NAME")
+    session.add_all([other_account, other_cat])
+    session.commit()
+    session.add(
+        _make_txn(
+            user_id=other.id,
+            account_id=other_account.id,
+            txn_date=date(2026, 5, 2),
+            amount_paise=-77700,
+            fingerprint="fp-ct-other",
+            category_id=other_cat.id,
+        )
+    )
+    session.commit()
+
+    resp = client.get(_CATEGORY_TREND_URL)
+    assert resp.status_code == 200
+    assert resp.json()["parents"] == []
+    assert "STOLEN-PROTECTED-NAME" not in resp.text
+
+
+def test_category_trend_label_filter_scopes_series(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(clock, "utcnow", lambda: _TREND_NOW)
+    world = _seed_trend_world(session, axis_account)
+    tagged = session.query(Transaction).filter(Transaction.fingerprint == "fp-ct-6").one()
+    label = _tag_txns(session, user_id=axis_account.user_id, name="trip", txns=[tagged])
+
+    body = client.get(f"{_CATEGORY_TREND_URL}?label_id={label.id}").json()
+    assert body["label_id"] == label.id
+    assert [p["parent_id"] for p in body["parents"]] == [world.trips.id]
+    assert sum(body["parents"][0]["totals_paise"]) == -4000

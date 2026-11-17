@@ -48,7 +48,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { listSpendByTagByPeriod } from "@/lib/api/client";
 import { formatINR } from "@/lib/format";
 import { MONTH_ABBR } from "@/lib/charts";
-import { periodRange } from "@/lib/period";
+import { periodLabel as periodName, periodRange } from "@/lib/period";
 import { labelDisplay } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import { useBalanceHidden } from "@/components/balance-visibility";
@@ -158,7 +158,7 @@ export function SpendByTagHeatmap({ year }: { year: number }) {
           <CardTitle as="h2" className="text-[14px]">
             Tag spend over time
           </CardTitle>
-          <span className="text-[12.5px] text-muted-foreground">· {year}</span>
+          <span className="text-[12.5px] text-muted-foreground">· {periodName({ year })}</span>
         </div>
         <p className="text-[11.5px] text-muted-foreground">
           Darker = more spend under a tag that month. Tags overlap, so they don’t

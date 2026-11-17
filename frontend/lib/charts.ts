@@ -1,7 +1,6 @@
 /** Shared chart-axis helpers for the /spending time-series bars (spend-by-period,
  * cashflow, category-trend). Money formatting lives in `lib/format.ts`
- * (`compactINR`) and window math in `lib/dates.ts` (`trailingMonths`,
- * `trailingWeeksWindow`) — this module is just the period → x-axis-label mapping. */
+ * (`compactINR`) and window math in `lib/dates.ts` (`trailingWeeksWindow`) — this module is just the period → x-axis-label mapping. */
 
 /** Grain of a time-series bucket: ISO week or calendar month. */
 export type Grain = "week" | "month";
@@ -33,4 +32,15 @@ export function periodLabel(period: string, grain: Grain): string {
   }
   const m = Number(period.split("-")[1]);
   return MONTH_ABBR[m] ?? period;
+}
+
+/** Year starts inside a chronological `YYYY-MM` period list: every January entry
+ * (the first period included), labelled with its year, "2027". Drives the dashed
+ * 1 January markers on the category trend. */
+export function yearBoundaries(
+  periods: readonly string[],
+): { period: string; label: string }[] {
+  return periods
+    .filter((p) => p.endsWith("-01"))
+    .map((p) => ({ period: p, label: p.slice(0, 4) }));
 }

@@ -6,8 +6,10 @@ import type { QueryClient } from "@tanstack/react-query";
  * (`/dashboard`), and any open import review queue's per-row confidence.
  *
  * Call this from every mutation that learns or mutates a rule — the import
- * commit (the primary learning event), board txn create/edit (which run
- * `learn_merchant_memory` server-side), the category/label managers (a
+ * commit (the primary learning event), board txn create/edit and the board's bulk
+ * categorise (which run `learn_merchant_memory` server-side), applying a correction to
+ * past rows, archiving a category with "move its transactions" (it teaches once per
+ * merchant), the category/label managers (a
  * delete/rename changes which rules are live / their joined names), and the
  * ALIAS manager's create / rename-canonical / delete (ADR-0011: an alias decides
  * which raw descriptors fold into one canonical, so every one of the three

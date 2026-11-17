@@ -1,18 +1,26 @@
 """``/api/v1/imports`` — upload a statement (PRD §F1) + review/commit lifecycle.
 
-* ``POST /imports`` — upload a statement file. Thin route: validates the
-  upload size, delegates to :func:`app.services.import_service.import_statement`,
-  commits, and returns the summary. Exception → HTTP mapping is hardcoded
-  with **generic** detail strings — no ``account_id``, password, issuer, or
+* ``POST /imports`` — upload a statement file. Thin route: the body is read in memory under
+  the size cap (``app/api/uploads.py``, ADR-0010 rule 13), then it delegates to
+  :func:`app.services.import_service.import_statement`, commits, and returns the summary.
+  Exception → HTTP mapping is hardcoded with **generic** detail strings — no
+  ``account_id``, password, issuer, or
   exception args echoed — so a future Sentry / log-capture path doesn't
   surface user-supplied input through the response body either.
 
   Mapping:
-  * :class:`AccountNotFoundError` → 404 ``"account not found"``
+  * :class:`AccountNotFoundError` → 422 ``"account not found or archived"``
   * :class:`NonInrAccountError` → 422 ``"statement import requires an INR account"``
   * :class:`ParserNotRegisteredError` → 422 ``"no parser registered for this issuer/type"``
   * :class:`InvalidPasswordError` → 422 ``"incorrect or missing PDF password"``
+  * :class:`StatementMerchantTooLongError` → 422 naming the row's position (ADR-0006 rule 3b)
+  * :class:`RunningBalanceMismatchError` → 422
+    ``"running balance does not match on page {page}, row {row}"`` (a bank row whose printed
+    balance does not follow; the position is the only payload, ADR-0010 rule 11)
   * :class:`ParserError` → 422 ``"could not parse statement file"``
+
+  Any other exception raised inside a parser is logged by type only (``statement_parser_crashed``)
+  and becomes a :class:`ParserError` (``parse_statement``), so it takes the last row above.
 
   ``InvalidPasswordError`` is-a ``ParserError`` so the specific catch must
   come first; the inline comment guards a future accidental reorder.
@@ -41,10 +49,10 @@
   deliberately omits per its docstring.
 
 * ``POST /imports/{batch_id}/commit`` — bulk-stamp ``confirmed_at`` on the
-  listed ids. Atomic: any invalid id → 422 with ``invalid_ids: [...]``, no
-  writes. Body is id-list only — category edits the user made in the queue
-  must be PATCHed to ``/transactions/{id}`` before commit. Commit reads
-  ``category_id`` from the DB, not the request.
+  ``transaction_ids`` and delete the ``discard_ids`` in the same request. Atomic: any
+  invalid id → 422 with ``invalid_ids: [...]``, no writes. Body is id lists only — category
+  edits the user made in the queue must be PATCHed to ``/transactions/{id}`` before commit.
+  Commit reads ``category_id`` from the DB, not the request.
 
 * ``DELETE /imports/{batch_id}`` — cancel: hard-delete pending rows of this
   batch. If zero rows remain on the batch after delete, hard-delete the
@@ -59,47 +67,59 @@
   batch's statement-balance reconciliation (PRD §F1/§F4a) and return the
   full breakdown. Declared **after** ``/pending`` so that literal path is
   never captured as a ``batch_id``. See :func:`get_batch_reconciliation`.
+
+* ``GET`` / ``POST /imports/samples`` — the bundled synthetic sample statements (ADR-0003
+  rule 15). Open to guests, who cannot upload; ``POST`` stages one into a matching account
+  and returns the same summary as an upload.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Annotated, Literal, cast, get_args
 from uuid import UUID
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.api.deps import CurrentUserId, SessionDep
+from app.api.deps import CurrentUserId, NonGuestUserId, SessionDep
+from app.api.uploads import read_upload
 from app.core import clock
+from app.core.log_config import get_logger
 from app.models import (
     Account,
     Category,
+    CategoryKindStr,
     ImportBatch,
     Transaction,
     TransactionLabel,
 )
 from app.models.instrument import AssetClassStr
-from app.parsers.base import InvalidPasswordError, ParserError
+from app.parsers.base import InvalidPasswordError, ParserError, RunningBalanceMismatchError
 from app.schemas import (
     BatchReconciliation,
     ImportCommit,
     ImportSummary,
     InvestmentCsvImportSummary,
+    InvestmentCsvUploadForm,
     PendingImportBatch,
+    SampleImportCreate,
+    SampleStatementRead,
+    StatementUploadForm,
     TransactionCandidate,
-    TransactionRead,
 )
 from app.schemas.transactions import ConfidenceStr
 from app.services.category_service import (
-    FALLBACK_CATEGORY_NAME,
+    CASHBACK_CATEGORY_NAME,
     default_category_id,
-    resolve_category_labels,
+    fallback_category_id,
 )
 from app.services.import_service import (
     AccountNotFoundError,
     NonInrAccountError,
     ParserNotRegisteredError,
+    StatementMerchantTooLongError,
     import_statement,
     is_cashback_credit,
 )
@@ -108,11 +128,22 @@ from app.services.merchant_alias import load_alias_resolver
 from app.services.merchant_labels import LABEL_PREFILL_MIN, learn_merchant_memory
 from app.services.reconciliation_service import (
     auto_link_cc_bill,
-    is_cc_payment,
+    card_bill_transfer_gate,
+    is_card_bill_debit_row,
+    is_card_payment_row,
     reconcile_batch,
     rows_removed_since_import,
 )
-from app.services.tag_service import prefetch_tag_strength
+from app.services.sample_statements import (
+    SAMPLES,
+    SampleAccountMismatchError,
+    UnknownSampleError,
+    eligible_account_ids,
+    import_sample_statement,
+)
+from app.services.tag_service import is_seeded, prefetch_tag_strength
+from app.services.transaction_delete import delete_owned_transactions
+from app.services.transaction_reads import transaction_reads
 
 # Confidence thresholds (PRD §F3-derived). Locked at the backend so frontend
 # tooltip copy doesn't have to know them — the response carries the label.
@@ -123,47 +154,115 @@ from app.services.tag_service import prefetch_tag_strength
 CONFIDENT_MIN: int = LABEL_PREFILL_MIN
 UNCERTAIN_MIN: int = 1
 
-# CC statements are ~MBs in practice. The cap defends the worker process
-# against malformed multipart uploads or accidental large files — it is
-# not a security boundary.
+# CC statements are ~MBs in practice. The cap covers the whole request body (multipart
+# overhead is a few hundred bytes) and is enforced while streaming, not after buffering
+# (app/api/uploads.py). It defends the worker process against malformed multipart uploads or
+# accidental large files — it is not a security boundary.
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+# FastAPI infers no body schema for a route that reads its own multipart stream, so the docs
+# are stated here.
+_STATEMENT_UPLOAD_BODY = {
+    "required": True,
+    "content": {
+        "multipart/form-data": {
+            "schema": {
+                "type": "object",
+                "required": ["account_id", "file"],
+                "properties": {
+                    "account_id": {"type": "integer"},
+                    "file": {"type": "string", "format": "binary"},
+                    "password": {"type": "string"},
+                },
+            }
+        }
+    },
+}
+_INVESTMENT_CSV_UPLOAD_BODY = {
+    "required": True,
+    "content": {
+        "multipart/form-data": {
+            "schema": {
+                "type": "object",
+                "required": ["asset_class", "file"],
+                "properties": {
+                    "asset_class": {"type": "string"},
+                    "file": {"type": "string", "format": "binary"},
+                },
+            }
+        }
+    },
+}
+_TOO_LARGE_RESPONSE: dict[int | str, dict[str, str]] = {
+    413: {"description": "Request body over the upload cap"}
+}
+
+
+@dataclass(frozen=True, slots=True)
+class StatementUpload:
+    account_id: int
+    # Never rendered into a repr / traceback.
+    password: str | None = field(repr=False)
+    file_bytes: bytes = field(repr=False)
+
+
+async def read_statement_upload(request: Request) -> StatementUpload:
+    fields, file_bytes = await read_upload(
+        request, StatementUploadForm, max_bytes=MAX_UPLOAD_BYTES, max_fields=2
+    )
+    return StatementUpload(
+        account_id=fields.account_id, password=fields.password, file_bytes=file_bytes
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class InvestmentCsvUpload:
+    asset_class: str
+    file_bytes: bytes = field(repr=False)
+
+
+async def read_investment_csv_upload(request: Request) -> InvestmentCsvUpload:
+    fields, file_bytes = await read_upload(
+        request, InvestmentCsvUploadForm, max_bytes=MAX_UPLOAD_BYTES, max_fields=1
+    )
+    return InvestmentCsvUpload(asset_class=fields.asset_class, file_bytes=file_bytes)
+
 
 # Allowed asset-class form values for the CSV importer (validated here, not via a
 # Literal-typed Form param, so a bad value yields a controlled 422 that doesn't echo
 # the rejected input — same input-hygiene reason the upload fields avoid pattern/min).
 _ASSET_CLASS_VALUES: frozenset[str] = frozenset(get_args(AssetClassStr))
 
+logger = get_logger(__name__)
+
 router = APIRouter(prefix="/imports", tags=["imports"])
 
 
-@router.post("", response_model=ImportSummary)
+@router.post(
+    "",
+    response_model=ImportSummary,
+    openapi_extra={"requestBody": _STATEMENT_UPLOAD_BODY},
+    responses=_TOO_LARGE_RESPONSE,
+)
 def create_import(
     session: SessionDep,
-    user_id: CurrentUserId,
-    account_id: Annotated[int, Form()],
-    file: Annotated[UploadFile, File()],
-    # Do not add min_length/pattern — RequestValidationError echoes rejected input.
-    password: Annotated[str | None, Form()] = None,
+    # Declared before the upload so 401/403 fire before a body byte is read.
+    user_id: NonGuestUserId,
+    upload: Annotated[StatementUpload, Depends(read_statement_upload)],
 ) -> ImportSummary:
-    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="file too large",
-        )
-    file_bytes = file.file.read()
     try:
         result = import_statement(
             user_id=user_id,
-            account_id=account_id,
-            file_bytes=file_bytes,
-            password=password,
+            account_id=upload.account_id,
+            file_bytes=upload.file_bytes,
+            password=upload.password,
             session=session,
         )
     # Order matters: InvalidPasswordError is a ParserError subclass.
     except AccountNotFoundError as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="account not found",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="account not found or archived",
         ) from e
     except NonInrAccountError as e:
         raise HTTPException(
@@ -180,6 +279,16 @@ def create_import(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="incorrect or missing PDF password",
         ) from e
+    except RunningBalanceMismatchError as e:
+        # Position only: never statement text (ADR-0010 rules 11 and 13).
+        logger.warning("statement_running_balance_mismatch", page=e.page, row=e.row)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"running balance does not match on page {e.page}, row {e.row}",
+        ) from e
+    except StatementMerchantTooLongError as e:
+        # Row position only, already logged by the service: never statement text.
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
     except ParserError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -189,15 +298,19 @@ def create_import(
     return ImportSummary.model_validate(result)
 
 
-@router.post("/investments", response_model=InvestmentCsvImportSummary)
+@router.post(
+    "/investments",
+    response_model=InvestmentCsvImportSummary,
+    openapi_extra={"requestBody": _INVESTMENT_CSV_UPLOAD_BODY},
+    responses=_TOO_LARGE_RESPONSE,
+)
 def create_investment_csv_import(
     session: SessionDep,
-    user_id: CurrentUserId,
-    file: Annotated[UploadFile, File()],
-    # Applied to rows without an asset_class column (e.g. a single-asset Zerodha
-    # tradebook — the user picks the class once here). Validated against the model
+    user_id: NonGuestUserId,
+    # ``asset_class`` is applied to rows without an asset_class column (e.g. a single-asset
+    # Zerodha tradebook — the user picks the class once). Validated against the model
     # Literal below; a bad value → 422 without echoing the input.
-    asset_class: Annotated[str, Form()],
+    upload: Annotated[InvestmentCsvUpload, Depends(read_investment_csv_upload)],
 ) -> InvestmentCsvImportSummary:
     """Import a canonical investment-transaction CSV (PRD §F7). Account-less.
 
@@ -205,22 +318,16 @@ def create_investment_csv_import(
     carries counts + PII-safe per-row warnings. Generic error detail strings (no PII /
     input echo), same as ``POST /imports``.
     """
-    if asset_class not in _ASSET_CLASS_VALUES:
+    if upload.asset_class not in _ASSET_CLASS_VALUES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="invalid asset_class",
         )
-    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="file too large",
-        )
-    file_bytes = file.file.read()
     try:
         result = import_investment_csv(
             user_id=user_id,
-            file_bytes=file_bytes,
-            default_asset_class=cast("AssetClassStr", asset_class),
+            file_bytes=upload.file_bytes,
+            default_asset_class=cast("AssetClassStr", upload.asset_class),
             session=session,
         )
     except ParserError as e:
@@ -273,25 +380,24 @@ def _candidate_strength(
     real category — so it degrades to "none" the same way the old LEFT JOIN's
     ``NULL = NULL`` did. A ``(canonical, category_id)`` pair ABSENT from
     ``strength`` is "no rule at all" -> ``"none"``; one PRESENT at
-    ``hit_count == 0`` is a seeded, never-confirmed row (ADR-0011 decision 4)
-    -> ``"seeded"``. Collapsing that distinction with a
+    ``hit_count == 0`` and not pinned is a seeded, never-confirmed row
+    (ADR-0011 rule 11) -> ``"seeded"``. Collapsing that distinction with a
     ``.get(key, (0, False))`` default is exactly what
     :func:`app.services.tag_service.prefetch_tag_strength`'s docstring forbids.
 
-    The zero-hit branch carries ``pinned`` THROUGH rather than hard-coding
-    ``False``: pinning a seeded row is the one way a row reaches
-    ``hit_count == 0, pinned=True``, because
-    :func:`app.services.tag_service.pin_tag` deliberately never bumps
-    ``hit_count`` on an existing row. ``TagPicker`` checks ``pinned`` ahead of
-    ``confidence``, so that pin renders as user-authored instead of an
-    unconfirmed dictionary suggestion.
+    A pinned row is never "seeded" (:func:`~app.services.tag_service.is_seeded`):
+    pinning a seed row is the one way to reach ``hit_count == 0, pinned=True``,
+    because :func:`app.services.tag_service.pin_tag` deliberately never bumps
+    ``hit_count`` on an existing row. It reads ``(0, "none", True)`` and
+    ``TagPicker`` checks ``pinned`` ahead of ``confidence``, so it renders as
+    user-authored instead of an unconfirmed dictionary suggestion.
     """
     entry = strength.get((canonical, category_id)) if category_id is not None else None
     if entry is None:
         return 0, "none", False
     hit_count, pinned = entry
-    if hit_count == 0:
-        return 0, "seeded", pinned
+    if is_seeded(hit_count=hit_count, pinned=pinned):
+        return 0, "seeded", False
     return hit_count, _confidence(hit_count), pinned
 
 
@@ -364,6 +470,18 @@ def list_pending_imports(
     ]
 
 
+def _cc_payment_candidate(txn: Transaction, *, bank_batch: bool) -> bool:
+    """Whether the review queue should offer the card-bill link on this row (PRD §F4a-1).
+
+    On a card batch it is an ``income`` credit naming a bill payment; on a bank batch it is a
+    debit naming one. The card clause is gated on the batch kind, so a bank income row that
+    merely says "PAYMENT RECEIVED" is never flagged.
+    """
+    if bank_batch:
+        return is_card_bill_debit_row(txn)
+    return is_card_payment_row(txn)
+
+
 @router.get("/{batch_id}/candidates", response_model=list[TransactionCandidate])
 def list_candidates(
     batch_id: int,
@@ -390,7 +508,15 @@ def list_candidates(
     kept the raw ``hit_count`` regardless. That is a deliberate side effect
     (more consistent with the real prefill), not a regression.
     """
-    _get_batch_or_404(session, batch_id=batch_id, user_id=user_id)
+    batch = _get_batch_or_404(session, batch_id=batch_id, user_id=user_id)
+    bank_batch = (
+        batch.account_id is not None
+        and session.scalar(
+            select(Account.type).where(Account.id == batch.account_id, Account.user_id == user_id)
+        )
+        == "bank"
+    )
+    commits_as_transfer = card_bill_transfer_gate(session, user_id=user_id, batch=batch)
 
     stmt = (
         select(Transaction)
@@ -409,36 +535,27 @@ def list_candidates(
     strength = prefetch_tag_strength(session, user_id=user_id, resolver=resolver)
 
     txns = list(session.scalars(stmt))
-    # `TransactionCandidate` extends `TransactionRead`, so it inherits
-    # `category_name`/`category_parent_name` — populate them here too rather than
-    # letting the queue ship them as permanent nulls. A suggested category is
+    # `TransactionCandidate` extends `TransactionRead`, so it inherits the category names and
+    # `card_bill_link_offered`: build them with the shared builder, once for the whole batch,
+    # rather than letting the queue ship them as permanent nulls. A suggested category is
     # normally active, but a batch left in the queue while its category is archived
     # would otherwise render "Uncategorized" over a real suggestion.
-    category_names = resolve_category_labels(
-        session,
-        category_ids=[t.category_id for t in txns if t.category_id is not None],
-        user_id=user_id,
-    )
+    reads = transaction_reads(session, txns, user_id=user_id)
 
     candidates = []
-    for txn in txns:
+    for txn, read in zip(txns, reads, strict=True):
         canonical = resolver.canonical(txn.merchant_normalized)
         prior_matches, confidence, pinned = _candidate_strength(
             strength, canonical=canonical, category_id=txn.category_id
         )
-        read = TransactionRead.model_validate(txn)
-        if txn.category_id is not None:
-            read.category_name, read.category_parent_name = category_names.get(
-                txn.category_id, (None, None)
-            )
         candidates.append(
             TransactionCandidate(
                 **read.model_dump(),
                 prior_matches=prior_matches,
                 confidence=confidence,
                 pinned=pinned,
-                cc_payment_candidate=txn.transaction_type == "income"
-                and is_cc_payment(txn.merchant_normalized),
+                cc_payment_candidate=_cc_payment_candidate(txn, bank_batch=bank_batch),
+                uncategorised_commits_as_transfer=commits_as_transfer(txn),
             )
         )
     return candidates
@@ -451,7 +568,13 @@ def commit_import_batch(
     session: SessionDep,
     user_id: CurrentUserId,
 ) -> None:
-    """Bulk-stamp ``confirmed_at`` + emit F3 learning signal. Atomic.
+    """Bulk-stamp ``confirmed_at`` + emit F3 learning signal, and delete ``discard_ids``. Atomic.
+
+    Discard ids follow the same eligibility rules as commit ids (pending, this user's, this
+    batch's) and an id in both lists is invalid. Discarded rows go through the shared delete
+    (:func:`delete_owned_transactions`, ADR-0002 rule 5) after the checks and before pass 1,
+    and never teach: every pass below runs over the committed rows only. The batch row stays
+    even when a discard leaves it empty.
 
     Pre-flight gathers ALL invalid ids in one pass (don't short-circuit) so
     the frontend can recover without a candidates refetch:
@@ -460,53 +583,54 @@ def commit_import_batch(
       → silently bucketed into ``invalid_ids`` (never leak whether the id
       exists for a different user).
     * Already confirmed → ``invalid_ids``.
-    * A **spend-kind** row (``spend`` / ``refund``) with ``category_id IS NULL``
-      **or a category that was archived mid-review** → **defaulted**, not
-      rejected: the row lands on the user's spend ``"Other"`` category (PRD §F5
-      fallback). One spend fallback serves both, since a refund nets against
-      spend in the same category. This keeps a row off a dead bucket AND stops
-      pass 3 resurrecting a ``merchant_tag_map`` row for the archived category.
-      Only if ``"Other"`` is itself archived/absent does the row fall back to
-      ``invalid_ids``. ``income`` / ``transfer``
-      keep committing with their current category — income may be uncategorized,
-      and pass-2 auto-link can flip an income CC-payment to a ``transfer``, which
-      must stay category-null, so we never stamp a default on it. Defaulted ids
-      are tracked so pass 3 skips *category* learning them (a fallback isn't a
-      merchant→category decision worth teaching F3); their labels are still
-      learned.
-    * ``income`` with ``category_id IS NULL`` **and** ``merchant_raw`` naming it
-      cashback (``is_cashback_credit``, the same keyword ``import_service._map_type``
-      already used to type the row ``income`` rather than ``spend``) → also
-      **defaulted**, to the seeded income ``"Cashback"`` category, and tracked
-      in ``defaulted_ids`` for the same reason: a keyword guess isn't a
-      merchant→category decision worth teaching F3 either. Unlike the spend
-      fallback this one is NOT guarded by ``invalid_ids`` if the category is
-      missing — income tolerates staying uncategorized, so a renamed/archived
-      "Cashback" category just means the row commits uncategorized, same as any
-      other income row without this keyword.
+    * A **spend** row (refunds included — a refund is a positive ``spend``,
+      ADR-0009) with ``category_id IS NULL`` **or a category that was archived
+      mid-review** → **defaulted**, not rejected: the row lands on the user's
+      spend ``"Other"`` (PRD §F5 fallback), which always exists (ADR-0012 rule
+      8). This keeps a row off a dead bucket AND stops pass 3 resurrecting a
+      ``merchant_tag_map`` row for the archived category.
+    * An **income** row whose category was archived mid-review → **defaulted**
+      to the income ``"Other"`` the same way. An income row with
+      ``category_id IS NULL`` stays null: income may commit uncategorized, and
+      a pass-2 auto-link moves a leg's category to ``pre_link_category_id``
+      (ADR-0002 rule 9), so a defaulted income row would be saved as a pre-link
+      category for no reason. ``transfer`` rows keep their category.
+    * A bank debit naming a card-bill payment with ``category_id IS NULL`` commits as an
+      unpaired ``transfer`` with no category instead, when ``card_bill_transfer_gate`` says
+      so: a live card names the bank "Paid from" and a committed statement of it covers the
+      debit's date (ADR-0002 rule 7b). Pass 2 may link it; left unlinked it stays out of
+      spend. Otherwise it is an ordinary spend and defaults to "Other". A card credit naming a
+      bill payment with ``category_id IS NULL`` commits as an unpaired ``transfer`` the same way,
+      always (rule 7c), so it never counts as income.
+    * A positive ``spend`` row naming cashback (``is_cashback_credit``) that is
+      still in the spend ``"Cashback"`` ``import_statement`` pre-filled it into
+      (ADR-0013 rule 2) keeps that category and counts as **defaulted**: a
+      keyword guess, not a merchant→category decision (ADR-0004 rule 5).
+
+    Defaulted ids are tracked so pass 3 skips *category* learning them (a
+    fallback isn't a merchant→category decision worth teaching F3, ADR-0004
+    rule 5); their labels are still learned.
 
     On any invalid id → 422 with nested
     ``detail={"message": ..., "invalid_ids": [int, ...]}`` and **no writes**
     (the in-memory ``category_id`` defaulting never reaches a flush).
 
     Commit is **three-pass** — pass 1 stamps every ``confirmed_at`` and
-    explicitly flushes, pass 2 runs F4a-1 CC-bill auto-link per row (each in its
-    own savepoint via the service), pass 3 emits the F3 (category) + F3a (label)
-    learning signal per row via the shared ``learn_merchant_memory`` (which opens
-    the per-write ``record_tag`` / ``record_label`` savepoints). The F2
+    explicitly flushes, pass 2 runs F4a-1 CC-bill auto-link per row, card and bank
+    rows alike (each in its own savepoint via the service), pass 3 emits the F3 (category) +
+    F3a (label) learning signal per row via the shared ``learn_merchant_memory`` (single-statement
+    ``record_tag`` / ``record_label`` upserts, no savepoints). The F2
     SAVEPOINT-entry-flush hazard
     ([transactions.py:156-167](backend/app/api/v1/transactions.py#L156-L167))
     means that in a single-pass loop, iteration N's savepoint would flush
     iteration N's pending UPDATE inside the savepoint's scope — coupling
     the row's DB state to the savepoint's success. Pass 1's explicit
     ``session.flush()`` releases every UPDATE to the parent transaction
-    *before* any savepoint opens, so a pass-3 conflict-recovery rollback
+    *before* any savepoint opens, so a savepoint rollback (pass 2)
     reverts only its own write. Pass 2 catches nothing — an F4a constraint
     failure propagates and takes the whole request with it (see below).
-    Within pass 3 the same protection holds per write: each
-    begin_nested() entry flush lands prior dirty state (e.g. a category
-    hit_count bump) on the PARENT transaction before the next savepoint opens,
-    so no inter-write flush between the category and label writes is needed.
+    Pass 3 opens no savepoint at all: each upsert is one statement on the parent
+    transaction, so no inter-write flush is needed.
     Atomic rollback on uncaught exceptions still relies on ``get_db``'s implicit
     ``Session.close()`` cleanup
     ([core/db.py:64-77](backend/app/core/db.py#L64-L77)).
@@ -535,10 +659,12 @@ def commit_import_batch(
     thread state from /candidates into /commit; rejected per CLAUDE.md
     §Simplicity.
     """
-    _get_batch_or_404(session, batch_id=batch_id, user_id=user_id)
+    batch = _get_batch_or_404(session, batch_id=batch_id, user_id=user_id)
 
-    requested_ids = set(payload.transaction_ids)
-    rows = list(
+    commit_ids = set(payload.transaction_ids)
+    discard_ids = set(payload.discard_ids)
+    requested_ids = commit_ids | discard_ids
+    fetched = list(
         session.scalars(
             select(Transaction).where(
                 Transaction.id.in_(requested_ids),
@@ -547,17 +673,34 @@ def commit_import_batch(
             )
         )
     )
-    # The user's active spend "Other" category — the fallback for a staged spend
-    # row committed without a tag (PRD §F5), refunds included: a refund is a
-    # spend row with a positive amount, so it lands in the same bucket. Looked up
-    # once; None only if the user archived or renamed it away (then those rows
-    # fall back to the 422 guard).
-    spend_other_id = default_category_id(session, user_id=user_id, name=FALLBACK_CATEGORY_NAME)
-    # Same idea for a cashback-named income row (see the docstring above) —
-    # income kind, and None here is NOT guarded: it just means those rows
-    # commit uncategorized, same as any other income row.
-    cashback_default_id = default_category_id(
-        session, user_id=user_id, name="Cashback", kind="income"
+    # Only the committed rows go through the cashback / category / defaulting / learning
+    # passes below; the discarded ones are only checked, then deleted.
+    rows = [r for r in fetched if r.id in commit_ids]
+    discard_rows = [r for r in fetched if r.id in discard_ids]
+    # The user's fallback "Other" per kind (PRD §F5), looked up lazily — only
+    # when a row needs one — and at most once per kind. It always exists
+    # (ADR-0012 rule 8), so there is no "no fallback" branch.
+    fallback_ids: dict[CategoryKindStr, int] = {}
+
+    def fallback_for(kind: CategoryKindStr) -> int:
+        if kind not in fallback_ids:
+            fallback_ids[kind] = fallback_category_id(session, user_id=user_id, kind=kind)
+        return fallback_ids[kind]
+
+    # Positive spend rows naming cashback, and the user's spend "Cashback" that
+    # import_statement pre-filled them into (ADR-0013 rule 2) — looked up only if
+    # there is such a row.
+    cashback_row_ids = {
+        r.id
+        for r in rows
+        if r.transaction_type == "spend"
+        and r.amount_paise > 0
+        and is_cashback_credit(r.merchant_raw or "")
+    }
+    cashback_id = (
+        default_category_id(session, user_id=user_id, name=CASHBACK_CATEGORY_NAME, kind="spend")
+        if cashback_row_ids
+        else None
     )
 
     # Active (non-archived) category ids among the rows' current categories. A
@@ -585,47 +728,58 @@ def commit_import_batch(
         else set()
     )
 
-    returned_ids = {r.id for r in rows}
-    invalid_ids: set[int] = requested_ids - returned_ids
-    # Rows we defaulted to "Other" — excluded from pass-3 learning below, since a
-    # fallback isn't a merchant→category decision worth teaching F3.
+    commit_row_ids = {r.id for r in rows}
+    invalid_ids: set[int] = (
+        (requested_ids - {r.id for r in fetched})
+        | {r.id for r in fetched if r.confirmed_at is not None}
+        | (commit_ids & discard_ids)
+    )
+    # Rows the server defaulted ("Other", or the Cashback prefill) — excluded from
+    # pass-3 learning below, since a default isn't a merchant→category decision.
     defaulted_ids: set[int] = set()
+    commits_as_transfer = card_bill_transfer_gate(session, user_id=user_id, batch=batch)
     for r in rows:
         if r.confirmed_at is not None:
-            invalid_ids.add(r.id)
             continue
-        # A spend-kind row with no category — or one whose category was archived
-        # mid-review — defaults to "Other" rather than being rejected. income/
-        # transfer stay as-is: income may commit uncategorized, and auto_link
-        # (pass 2) can flip an income CC-payment to a transfer, which MUST stay
-        # category-null — so we never stamp a default on it.
-        if r.transaction_type in ("spend", "refund") and (
-            r.category_id is None or r.category_id not in active_category_ids
-        ):
-            if spend_other_id is None:
-                invalid_ids.add(r.id)  # no fallback category to land on — keep the guard
-            else:
-                r.category_id = spend_other_id
-                defaulted_ids.add(r.id)
-        elif (
-            r.transaction_type == "income"
-            and r.category_id is None
-            and cashback_default_id is not None
-            and is_cashback_credit(r.merchant_raw or "")
-        ):
-            r.category_id = cashback_default_id
+        archived = r.category_id is not None and r.category_id not in active_category_ids
+        # A spend row with no category, or one archived mid-review, defaults to
+        # spend "Other". An income row only moves when its category was archived:
+        # income may commit uncategorized, and auto_link (pass 2) moves a linked leg's
+        # category to pre_link_category_id (ADR-0002 rule 9), so a defaulted income row would
+        # save a category nobody chose.
+        if r.category_id is None and commits_as_transfer(r):
+            # ADR-0002 rules 7b, 7c: the bank leg of a bill whose card statement for this date is
+            # in, or a card's bill-payment credit, committed uncategorised. A transfer from the
+            # start, so pass 2 can still link it and an unlink leaves it out of spend and income.
+            # No category, nothing learned.
+            r.transaction_type = "transfer"
+        elif r.transaction_type == "spend" and (r.category_id is None or archived):
+            r.category_id = fallback_for("spend")
+            defaulted_ids.add(r.id)
+        elif r.transaction_type == "income" and archived:
+            r.category_id = fallback_for("income")
+            defaulted_ids.add(r.id)
+        elif r.id in cashback_row_ids and r.category_id == cashback_id:
+            # Still in the keyword prefill import_statement gave it: a server
+            # default, not a merchant decision, so it does not teach (ADR-0004
+            # rule 5). A user who moved it elsewhere made a real choice.
             defaulted_ids.add(r.id)
 
     if invalid_ids:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
-                "message": "some transactions are not eligible to commit",
+                "message": "some transactions are not eligible to commit or discard",
                 "invalid_ids": sorted(invalid_ids),
             },
         )
 
-    now = clock.utcnow()
+    # The shared delete (ADR-0002 rule 5): it releases any row pointing at a discarded one,
+    # and its flush also writes the defaulted categories above. It is ORM-enabled, so the
+    # discarded objects leave the session, and nothing below touches them.
+    delete_owned_transactions(session, user_id=user_id, ids={r.id for r in discard_rows})
+
+    now = clock.naive_utcnow()
     # Pass 1: stamp every confirmed_at and flush to the parent transaction.
     # Without this explicit flush, pass-2's first savepoint would flush
     # pending UPDATEs inside its own savepoint scope (per the F2 docstring's
@@ -635,7 +789,9 @@ def commit_import_batch(
         txn.confirmed_at = now
     session.flush()
 
-    # Pass 2: F4a-1 CC-bill auto-link. Per-row savepoint inside the service.
+    # Pass 2: F4a-1 CC-bill auto-link, for card payments and bank debits alike (whichever
+    # statement commits second links to the confirmed leg already on the board, ADR-0002
+    # rule 7). Per-row savepoint inside the service.
     # Must run BEFORE pass 3 so any transaction_type flip lands before
     # learn_merchant_memory's should_learn_tag eligibility check.
     for txn in rows:
@@ -646,31 +802,32 @@ def commit_import_batch(
     # seeder use, so commit can't silently diverge from the learning contract.
     # One SELECT prefetches the committed rows' labels (avoids an N-query loop),
     # then one pass per row:
-    #   * category — skipped for ``defaulted_ids`` (a fallback to "Other" isn't a
+    #   * category — skipped for ``defaulted_ids`` (a server default isn't a
     #     merchant→category decision worth teaching), passed through otherwise;
-    #   * labels — never excluded by ``defaulted_ids`` (a row defaulted to "Other"
-    #     can still carry legitimate user labels).
+    #   * labels — never excluded by ``defaulted_ids`` (a defaulted row can still
+    #     carry legitimate user labels).
     # ``learn_merchant_memory`` applies the shared ``should_learn_tag`` gate once,
     # so rows pass-2 flipped to ``transfer`` (auto-linked CC payments) learn
     # neither — the gate reads the post-flip ``transaction_type``. Each
-    # record_tag/record_label opens its own begin_nested() SAVEPOINT whose entry
-    # flush lands prior dirty state on the PARENT transaction (protected from a
-    # conflict-recovery rollback), so no inter-write flush is needed here.
+    # record_tag/record_label is one upsert statement on the parent transaction,
+    # so no inter-write flush is needed here.
     labels_by_txn: dict[int, list[int]] = {}
     for txn_id, label_id in session.execute(
         select(TransactionLabel.transaction_id, TransactionLabel.label_id).where(
-            TransactionLabel.transaction_id.in_(returned_ids),
-            # user_id scope is defense-in-depth (returned_ids is already
+            TransactionLabel.transaction_id.in_(commit_row_ids),
+            # user_id scope is defense-in-depth (commit_row_ids is already
             # user+batch-scoped and the composite FK guarantees ownership) —
             # parity with every other user-scoped query in this router.
             TransactionLabel.user_id == user_id,
         )
     ):
         labels_by_txn.setdefault(txn_id, []).append(label_id)
+    resolver = load_alias_resolver(session, user_id=user_id)
     for txn in rows:
         learn_merchant_memory(
             session,
             user_id=user_id,
+            resolver=resolver,
             merchant_normalized=txn.merchant_normalized,
             transaction_type=txn.transaction_type,
             category_id=None if txn.id in defaulted_ids else txn.category_id,
@@ -805,3 +962,60 @@ def get_batch_reconciliation(
         status=recon_status,
         rows_removed_since_import=removed,
     )
+
+
+@router.get("/samples", response_model=list[SampleStatementRead])
+def list_sample_statements(
+    session: SessionDep, user_id: CurrentUserId
+) -> list[SampleStatementRead]:
+    """The bundled sample statements, each with the caller's accounts it can be imported
+    into (ADR-0003 rule 15). Open to guests, unlike ``POST /imports``."""
+    return [
+        SampleStatementRead(
+            id=sample.id,
+            label=sample.label,
+            issuer=sample.issuer,
+            account_type=sample.account_type,
+            account_ids=eligible_account_ids(session, user_id=user_id, sample=sample),
+        )
+        for sample in SAMPLES
+    ]
+
+
+@router.post("/samples", response_model=ImportSummary)
+def import_sample(
+    payload: SampleImportCreate, session: SessionDep, user_id: CurrentUserId
+) -> ImportSummary:
+    """Stage a bundled sample statement into one of the caller's accounts (ADR-0003 rule 15).
+
+    Open to guests. Generic detail strings, as ``POST /imports``. A bundled sample that fails
+    to parse is a shipped bug, not a client error, so ``ParserError`` is left unmapped (500).
+    """
+    try:
+        result = import_sample_statement(
+            session, user_id=user_id, account_id=payload.account_id, sample_id=payload.sample_id
+        )
+    except UnknownSampleError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="unknown sample statement",
+        ) from e
+    except AccountNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="account not found or archived",
+        ) from e
+    except NonInrAccountError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="statement import requires an INR account",
+        ) from e
+    except SampleAccountMismatchError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="this sample is for a different bank or account type",
+        ) from e
+    except StatementMerchantTooLongError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
+    session.commit()
+    return ImportSummary.model_validate(result)

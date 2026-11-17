@@ -1,14 +1,16 @@
 """``/api/v1/dashboards`` — read-only aggregate views (PRD §F8).
 
-v1 ships ``GET /dashboards/spend-by-category`` (PRD §F8 view 2) and
-``GET /dashboards/spend-by-period`` (view 3, the weekly/monthly spend bar).
+v1 ships ``GET /dashboards/spend-by-category`` (PRD §F8 view 2),
+``GET /dashboards/spend-by-period`` (view 3, the weekly/monthly spend bar) and
+``GET /dashboards/category-trend`` (view 6, monthly spend per parent category).
 The remaining views (portfolio tiles, net worth over time) depend on F7 / FX
 wiring and land later.
 
 Routes here are pure aggregation: signed-sum SQL over the existing
 ``transactions`` table, scoped to the current user, filtered to the
 review-committed board (``confirmed_at IS NOT NULL``). No service layer —
-there's no business logic, just an indexed GROUP BY.
+there's no business logic, just an indexed GROUP BY, beyond the per-user alias
+fold (ADR-0011) that top-merchants and tagging-stats apply in Python.
 """
 
 from __future__ import annotations
@@ -17,16 +19,18 @@ import calendar
 import re
 from collections import defaultdict
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Annotated, Literal, NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from app.api.deps import CurrentUserId, SessionDep
 from app.core import clock
+from app.core.fiscal_year import parse_year
 from app.models import Account, Category, Label, MerchantTagMap, Transaction, TransactionLabel
 from app.schemas import (
     NET_WORTH_EXCLUDED_TYPES,
@@ -34,19 +38,11 @@ from app.schemas import (
     AvailableYearsResponse,
     CashflowByPeriodBucket,
     CashflowByPeriodResponse,
-    HierarchicalParentPeriodTotal,
-    HierarchicalParentRef,
-    HierarchicalParentSpend,
-    HierarchicalSpendResponse,
-    HierarchicalSubcategoryPeriodTotal,
-    HierarchicalSubcategoryRef,
-    HierarchicalSubcategorySpend,
-    HierarchicalTrendBucket,
-    HierarchicalTrendResponse,
+    CategoryTrendParent,
+    CategoryTrendResponse,
+    CategoryTrendSubcategory,
     OverviewResponse,
     PeriodTotalsResponse,
-    SpendByCategoryByPeriodBucket,
-    SpendByCategoryByPeriodResponse,
     SpendByCategoryResponse,
     SpendByCategoryRow,
     SpendByPeriodBucket,
@@ -56,16 +52,16 @@ from app.schemas import (
     SpendByTagPeriodTotal,
     SpendByTagResponse,
     SpendByTagRow,
-    SpendCategoryPeriodTotal,
-    SpendCategoryRef,
-    SubcategoryMover,
     TaggingStatsResponse,
     TagRef,
     TopMerchantRow,
     TopMerchantsResponse,
 )
+from app.services.category_colors import category_colors
+from app.services.category_service import CASHBACK_CATEGORY_NAME
 from app.services.fx_service import latest_rate
 from app.services.holdings_service import compute_holdings, summarize_holdings
+from app.services.merchant_alias import is_unknown_via, load_alias_resolver
 from app.services.tag_service import AUTO_TAGGABLE_TYPES
 from app.services.transaction_queries import confirmed_only
 
@@ -75,11 +71,6 @@ router = APIRouter(prefix="/dashboards", tags=["dashboards"])
 # rather than via Query(pattern=) so FastAPI's RequestValidationError can't echo
 # the rejected input — matches the imports.py:80 input-echo discipline.
 _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
-_YEAR_RE = re.compile(r"^\d{4}$")
-# Bounds a shape-valid-but-nonsense year like "0000": ``_YEAR_RE`` alone accepts
-# it, and ``date(0, 1, 1)`` raises ValueError — an uncontrolled 500, not a 422.
-_MIN_YEAR = 1900
-_MAX_YEAR = 2100
 
 
 # ---------- route prologue ----------------------------------------------------
@@ -94,21 +85,23 @@ _MAX_YEAR = 2100
 
 class PeriodWindow(NamedTuple):
     """A validated period — a calendar month (``YYYY-MM``) or a calendar year
-    (``YYYY``) — expanded to its inclusive calendar-date bounds.
+    (``YYYY``: ``2026`` = 1 January – 31 December 2026, PRD §F8; only tax uses the
+    financial year) — expanded to its inclusive calendar-date bounds.
 
     One shape for both request forms, replacing ``MonthWindow`` (month-only) +
     ``PeriodBounds`` (month-or-year, but re-deriving the month case through
     ``_month_window`` instead of owning it). ``mon`` is ``None`` for a year
-    window. ``key`` is the canonical wire echo — ``month`` or ``year`` as given,
-    verbatim — the single ``period`` field every period-taking response now
-    carries instead of an optional ``month``/``year`` pair plus a pop-if-absent
-    ``@model_serializer``.
+    window, and ``year`` is the calendar year either way. ``key`` is the
+    canonical wire echo — ``month`` or ``year`` as given, verbatim — the single
+    ``period`` field every period-taking response now carries instead of an
+    optional ``month``/``year`` pair plus a pop-if-absent ``@model_serializer``.
 
     The boundary is calendar-local: ``Transaction.date`` is a naive calendar
     date and ``confirmed_at`` (UTC) is **not** consulted, so a row dated
     ``2026-05-31`` lands in the May bucket regardless of its ``confirmed_at``
-    instant. No route defaults to "current period" — the user's timezone is the
-    frontend's concern, so one of ``month`` / ``year`` is always required.
+    instant. No month/year route defaults to "current period" — the user's timezone
+    is the frontend's concern, so one of ``month`` / ``year`` is always required
+    (``category-trend`` is the exception: it is anchored on ``clock.today()``).
     """
 
     first: date
@@ -125,12 +118,12 @@ def _period_window(month: str | None, year: str | None) -> PeriodWindow:
     input is never echoed back (input-echo discipline; see imports.py:80).
     """
     if year is not None:
-        if not _YEAR_RE.match(year) or not (_MIN_YEAR <= int(year) <= _MAX_YEAR):
+        y = parse_year(year)
+        if y is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="year must match YYYY",
             )
-        y = int(year)
         return PeriodWindow(first=date(y, 1, 1), last=date(y, 12, 31), year=y, mon=None, key=year)
     if month is not None:
         if not _MONTH_RE.match(month):
@@ -157,15 +150,17 @@ def available_years(
     session: SessionDep,
     user_id: CurrentUserId,
 ) -> AvailableYearsResponse:
-    """Distinct calendar years worth offering in a year picker.
+    """Calendar years worth offering in a spend year picker, newest first (PRD §F8).
 
-    Every year spanned by the user's confirmed transactions, plus the current
-    year always — so a just-registered user with no data yet still sees this
-    year as an option, and a future-dated row (a manual entry, or a backfilled
-    import) is still reachable rather than clipped off. One MIN/MAX pass, not a
+    Every year from the earliest to the latest of the user's confirmed transactions
+    and the current year (of ``clock.today()``, the IST business date), with no gap —
+    so a just-registered user with no data yet still sees this year as an option, and a
+    future-dated row
+    (a manual entry, or a backfilled import) is still reachable rather than
+    clipped off. One MIN/MAX pass, not a
     separate current-year comparison computed twice against itself (which is
     a no-op ``max(x, x)`` and can silently return ``[]`` when every row
-    predates or postdates ``current_year``).
+    predates or postdates the current year).
     """
     min_date, max_date = session.execute(
         confirmed_only(
@@ -174,10 +169,10 @@ def available_years(
             )
         )
     ).one()
-    current_year = clock.today().year
-    start_year = min(current_year, min_date.year) if min_date else current_year
-    end_year = max(current_year, max_date.year) if max_date else current_year
-    return AvailableYearsResponse(years=list(range(end_year, start_year - 1, -1)))
+    current = clock.today().year
+    start = min(current, min_date.year) if min_date else current
+    end = max(current, max_date.year) if max_date else current
+    return AvailableYearsResponse(years=list(range(end, start - 1, -1)))
 
 
 def _require_ordered(start: date, end: date) -> None:
@@ -247,11 +242,19 @@ def spend_by_category(
     year: Annotated[str | None, Query()] = None,
     label_id: Annotated[int | None, Query(gt=0)] = None,
 ) -> SpendByCategoryResponse:
-    """Signed-sum spend per category for the given calendar month or year."""
+    """Signed-sum spend per category for the given calendar month or calendar year.
+
+    Each row also names its parent (``parent_id`` / ``parent_name``), joined on id +
+    ``user_id`` and never on ``archived_at``, so a rollup by parent still places an
+    archived subcategory under it (ADR-0012 rule 6). ``display_color`` and
+    ``parent_display_color`` are the two rows' server-resolved colours, from
+    ``category_colors`` whatever the archive state (ADR-0012 rule 7).
+    """
     window = _period_window(month, year)
     first, last = window.first, window.last
 
     total_paise = func.sum(Transaction.amount_paise).label("total_paise")
+    parent = aliased(Category)
 
     # LEFT JOIN keeps uncategorized rows (category_id IS NULL) in the result;
     # the Category.user_id == user_id predicate on the JOIN itself (not the
@@ -270,6 +273,8 @@ def spend_by_category(
         select(
             Transaction.category_id,
             Category.name.label("category_name"),
+            Category.parent_id.label("parent_id"),
+            parent.name.label("parent_name"),
             total_paise,
         )
         .outerjoin(
@@ -279,13 +284,17 @@ def spend_by_category(
                 Category.user_id == user_id,
             ),
         )
+        .outerjoin(
+            parent,
+            and_(parent.id == Category.parent_id, parent.user_id == user_id),
+        )
         .where(
             Transaction.user_id == user_id,
             Transaction.transaction_type == "spend",
             Transaction.date >= first,
             Transaction.date <= last,
         )
-        .group_by(Transaction.category_id, Category.name)
+        .group_by(Transaction.category_id, Category.name, Category.parent_id, parent.name)
         # Portable NULL-last sort: boolean key first (False < True puts
         # categorized rows above the uncategorized bucket), then most-
         # negative-sum first within the categorized block, then category_id
@@ -306,13 +315,18 @@ def spend_by_category(
     if label_id is not None:
         stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
 
+    colors = category_colors(session, user_id=user_id)
     rows = [
         SpendByCategoryRow(
             category_id=cat_id,
             category_name=cat_name,
+            parent_id=parent_id,
+            parent_name=parent_name,
+            display_color=colors[cat_id].display if cat_id in colors else None,
+            parent_display_color=colors[parent_id].display if parent_id is not None else None,
             total_paise=int(total),
         )
-        for cat_id, cat_name, total in session.execute(stmt).all()
+        for cat_id, cat_name, parent_id, parent_name, total in session.execute(stmt).all()
     ]
     return SpendByCategoryResponse(period=window.key, rows=rows, label_id=label_id)
 
@@ -324,7 +338,7 @@ def spend_by_tag(
     month: Annotated[str | None, Query()] = None,
     year: Annotated[str | None, Query()] = None,
 ) -> SpendByTagResponse:
-    """Signed-sum spend per tag for the given calendar month or year."""
+    """Signed-sum spend per tag for the given calendar month or calendar year."""
     window = _period_window(month, year)
     first, last = window.first, window.last
 
@@ -418,20 +432,10 @@ def top_merchants(
     label_id: Annotated[int | None, Query(gt=0)] = None,
     limit: Annotated[int, Query(ge=1, le=50)] = 5,
 ) -> TopMerchantsResponse:
-    """Biggest-spender merchants for the given calendar month or year."""
+    """Biggest-spender merchants for the given calendar month or calendar year, grouped by
+    the per-user canonical merchant (ADR-0011 rule 8)."""
     window = _period_window(month, year)
     first, last = window.first, window.last
-
-    total_paise = func.sum(Transaction.amount_paise).label("total_paise")
-    merchant_label = func.coalesce(
-        func.max(Transaction.merchant_raw), Transaction.merchant_normalized
-    ).label("merchant_label")
-    # Window function over the grouped result set — evaluated before ORDER
-    # BY/LIMIT truncate it, so every surviving row carries the PRE-limit group
-    # count. Folds what used to be a second COUNT(DISTINCT ...) query (a full
-    # extra scan) into the one already-grouped pass, worth it now that a year
-    # request is 12x the row volume of a month.
-    total_merchants_col = func.count().over().label("total_merchants")
 
     # merchant_normalized != "" drops the no-merchant bucket, so total_merchants
     # counts only merchants that can actually appear in `rows`.
@@ -447,26 +451,38 @@ def top_merchants(
         # duplication of the grouped sum.
         where.append(Transaction.labels.any(Label.id == label_id))
 
-    stmt = (
-        select(Transaction.merchant_normalized, merchant_label, total_paise, total_merchants_col)
+    stmt = confirmed_only(
+        select(
+            Transaction.merchant_normalized,
+            func.max(Transaction.merchant_raw),
+            func.sum(Transaction.amount_paise),
+        )
         .where(*where)
         .group_by(Transaction.merchant_normalized)
-        # Most-negative (biggest spend) first; normalized key asc is a stable
-        # tiebreak for equal totals (deterministic across runs / dialects).
-        .order_by(total_paise.asc(), Transaction.merchant_normalized.asc())
-        .limit(limit)
     )
-    stmt = confirmed_only(stmt)
-    result = session.execute(stmt).all()
+    # Aliases fold several normalized keys into one canonical, so the grouping is finished
+    # here: SQL sums per normalized key, Python re-sums per canonical.
+    resolver = load_alias_resolver(session, user_id=user_id)
+    totals: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    for merchant_normalized, raw_max, total in session.execute(stmt):
+        canonical = resolver.canonical(merchant_normalized)
+        totals[canonical] = totals.get(canonical, 0) + int(total)
+        # An identity group keeps a representative raw descriptor; an aliased or
+        # unknown-via group shows its canonical.
+        if merchant_normalized == canonical and raw_max:
+            labels[canonical] = raw_max
+    # Most-negative (biggest spend) first; canonical asc is a stable tiebreak for equal totals.
+    ranked = sorted(totals.items(), key=lambda kv: (kv[1], kv[0]))
     rows = [
         TopMerchantRow(
-            merchant_normalized=mn,
-            merchant_label=label or mn,
-            total_paise=int(total),
+            merchant_canonical=canonical,
+            merchant_label=labels.get(canonical, canonical),
+            total_paise=total,
         )
-        for mn, label, total, _ in result
+        for canonical, total in ranked[:limit]
     ]
-    total_merchants = int(result[0].total_merchants) if result else 0
+    total_merchants = len(totals)
 
     return TopMerchantsResponse(
         period=window.key,
@@ -600,7 +616,8 @@ def cashflow_by_period(
     the same portability reason (no dialect-neutral ISO-week GROUP BY).
 
     Type filter ``("spend", "income")`` and board-only
-    (``confirmed_at``) match ``period_totals``: ``income_paise`` = Σ income (≥ 0);
+    (``confirmed_at``) match ``period_totals``: ``income_paise`` = **signed** Σ income
+    (an income reversal nets it down, ADR-0009 rule 5);
     ``expense_paise`` = **signed** Σ(spend, signed) (≤ 0 in the common case but
     legitimately > 0 in a refund-dominant bucket — never clamped, or the
     ``net = income + expense`` identity breaks); ``net_paise`` = income + expense
@@ -650,121 +667,6 @@ def cashflow_by_period(
 
 
 @router.get(
-    "/spend-by-category-by-period",
-    response_model=SpendByCategoryByPeriodResponse,
-)
-def spend_by_category_by_period(
-    session: SessionDep,
-    user_id: CurrentUserId,
-    bucket: Annotated[Literal["week", "month"], Query()],
-    start: Annotated[date, Query()],
-    end: Annotated[date, Query()],
-    label_id: Annotated[int | None, Query(gt=0)] = None,
-) -> SpendByCategoryByPeriodResponse:
-    """Signed-sum spend **per category per bucket** over [start, end] — the
-    /spending category-trend bar (PRD §F8 view 3, "how is my category mix
-    shifting?"). One category at a time, picked from a dropdown; NOT a stack.
-
-    The category×time generalization of ``spend_by_category``: same LEFT JOIN
-    Category (with the cross-user-safe ``Category.user_id == user_id`` predicate
-    on the join, guarding the foreign-category name leak), same
-    ``transaction_type == "spend"`` type filter (refunds are the positive
-    rows), same board-only (``confirmed_at``) and
-    INR-only signed-sum convention. Window / bucketing / zero-fill are identical
-    to ``spend_by_period`` / ``cashflow_by_period`` (clipped ``[start, end]``,
-    Python-side ``_bucket_of`` / ``_iter_periods`` for portability, ``income`` and
-    ``transfer`` excluded).
-
-    ``totals`` per bucket is **dense** — a cell for every category in the echoed
-    ``categories`` set, zero-filled — so the response is a gap-free category×period
-    grid. Each cell's ``total_paise`` is signed and **never clamped** (a net-credit
-    category surfaces positive), so ``Σ`` of a bucket's cells reconciles exactly to
-    that bucket's ``spend_by_period`` total. The frontend does not clamp either — its
-    one consumer renders the signed magnitude (see the schema docstring).
-    """
-    _require_ordered(start, end)
-
-    # LEFT JOIN + join-side user predicate mirror spend_by_category exactly (see
-    # its docstring for the cross-user name-leak rationale).
-    stmt = (
-        select(
-            Transaction.date,
-            Transaction.category_id,
-            Category.name.label("category_name"),
-            Transaction.amount_paise,
-        )
-        .outerjoin(
-            Category,
-            and_(
-                Category.id == Transaction.category_id,
-                Category.user_id == user_id,
-            ),
-        )
-        .where(
-            Transaction.user_id == user_id,
-            Transaction.transaction_type == "spend",
-            Transaction.date >= start,
-            Transaction.date <= end,
-        )
-    )
-    # Board rows only (confirmed_at IS NOT NULL) — shared with spend_by_category.
-    stmt = confirmed_only(stmt)
-    # Optional F3a tag filter — EXISTS subquery (see spend_by_category). Independent
-    # of the Category outerjoin above; narrows to tagged txns only.
-    if label_id is not None:
-        stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
-
-    # Flat accumulators (int money type; no nested defaultdict — keeps ty clean
-    # and matches cashflow_by_period's flat reduce):
-    #   cell_totals[(period, category_id)] -> signed Σ for that grid cell,
-    #   grand[category_id]               -> signed Σ across all buckets (stack order),
-    #   names[category_id]               -> the joined display name (id-stable).
-    cell_totals: dict[tuple[str, int | None], int] = defaultdict(int)
-    grand: dict[int | None, int] = defaultdict(int)
-    names: dict[int | None, str | None] = {}
-    for d, cat_id, cat_name, amt in session.execute(stmt).all():
-        period = _bucket_of(d, bucket).period
-        cell_totals[(period, cat_id)] += amt
-        grand[cat_id] += amt
-        names[cat_id] = cat_name
-
-    # Stable stack order = spend_by_category's portable sort, applied to the grand
-    # totals: categorized first (is None False < True), most-negative first
-    # (biggest overall spender at the bottom of the stack), category_id asc
-    # tiebreak; uncategorized (None) pinned last.
-    ordered = sorted(
-        grand,
-        key=lambda cid: (cid is None, grand[cid], cid if cid is not None else 0),
-    )
-    categories = [
-        SpendCategoryRef(category_id=cid, category_name=names.get(cid)) for cid in ordered
-    ]
-
-    buckets = [
-        SpendByCategoryByPeriodBucket(
-            period=p,
-            totals=[
-                # .get((p, cid), 0) is load-bearing: zero-filled cells (a category
-                # with no activity in period p, or a fully zero-filled period) are
-                # enumerated here but never written to cell_totals — don't
-                # "simplify" to a direct index.
-                SpendCategoryPeriodTotal(category_id=cid, total_paise=cell_totals.get((p, cid), 0))
-                for cid in ordered
-            ],
-        )
-        for p in _iter_periods(start, end, bucket)
-    ]
-    return SpendByCategoryByPeriodResponse(
-        bucket=bucket,
-        start=start,
-        end=end,
-        categories=categories,
-        buckets=buckets,
-        label_id=label_id,
-    )
-
-
-@router.get(
     "/spend-by-tag-by-period",
     response_model=SpendByTagByPeriodResponse,
 )
@@ -780,17 +682,17 @@ def spend_by_tag_by_period(
     spend under a tag growing over time?").
 
     The tag×time generalization of ``spend_by_tag`` (which is single-month), and
-    the tag analog of ``spend_by_category_by_period``. It combines two shapes that
+    the tag analog of ``category_trend``. It combines two shapes that
     already exist: the group-by-tag JOIN from ``spend_by_tag`` (arc decision #7 —
     the INNER JOIN over ``transaction_labels`` + ``Label``, which INTENTIONALLY
     double-counts a multi-tagged txn across its tags) and the clipped-window
     Python-side ``_bucket_of`` / ``_iter_periods`` bucketing + zero-fill from
-    ``spend_by_period`` / ``spend_by_category_by_period``. Window / type filter
+    ``spend_by_period`` / ``category_trend``. Window / type filter
     (``transaction_type == "spend"``) / board-only (``confirmed_at``) / INR-only signed-int
     convention are all identical to those routes (``income`` and ``transfer``
     excluded).
 
-    Two things differ from ``spend_by_category_by_period``, both flowing from tags
+    Two things differ from ``category_trend``, both flowing from tags
     being many:many where category is 1:1:
 
     1. **The untagged residual is excluded.** The INNER JOIN keeps only txns that
@@ -846,7 +748,7 @@ def spend_by_tag_by_period(
     # Board rows only (confirmed_at IS NOT NULL) — shared with the sibling routes.
     stmt = confirmed_only(stmt)
 
-    # Flat accumulators (int money type; mirrors spend_by_category_by_period's flat
+    # Flat accumulators (int money type; mirrors category_trend's flat
     # reduce). label_id is non-null here (INNER JOIN + no untagged bucket), so the
     # key types are plain int — no `int | None` like the category route.
     #   cell_totals[(period, label_id)] -> signed Σ for that grid cell,
@@ -954,7 +856,7 @@ def overview(
     aren't recorded, so a CC ``balance_paise`` is lifetime accumulated spend
     rather than real outstanding debt, and counting it (even clamped) would
     understate net worth without bound; each CC row instead carries
-    ``spend_ytd_paise`` (calendar year-to-date spend). Investment accounts are
+    ``spend_ytd_paise`` (calendar-year-to-date spend). Investment accounts are
     placeholders — holdings live in ``instruments`` / ``investment_transactions``,
     so an opening balance there would double-count the same money once itemised
     (``AccountCreate`` pins it to 0; rows predating that rule are inert here).
@@ -986,49 +888,62 @@ def overview(
         acct_id: int(total or 0) for acct_id, total in session.execute(balance_stmt).all()
     }
 
-    # Per-CC calendar year-to-date spend: signed net Σ(spend, signed) over
-    # [Jan 1 of the requested period's year, end of the requested period]. Window
-    # derives strictly from `month`/`year` (`window.year` / `window.last`, both
-    # parsed by _period_window), never date.today() — the route stays deterministic
-    # on its input. A year request's "YTD" is the whole year (window.last is
-    # already Dec 31), so this generalizes without a special case.
+    # Per-CC calendar-year-to-date spend (PRD §F8: spend years run 1 January –
+    # 31 December): signed net Σ(spend, signed) over [1 January of the year the
+    # requested period starts in, end of the requested period]. Window derives strictly from
+    # `month`/`year` (`window.first` / `window.last`, both parsed by _period_window),
+    # never the clock — the route stays deterministic on its input. A year request's
+    # "YTD" is the whole year (window.first is already 1 January, window.last 31 December),
+    # so this generalizes without a special case.
     # Signed and never clamped here (a refund-dominant window is legitimately
     # positive; the frontend floors to a non-negative "spent" magnitude). Only
     # credit-card accounts get a value; every other type maps to None below.
-    # gross_spend and refund split the SAME spend-typed rows by SIGN, not by type
-    # (ADR-0009: a refund is a `spend` row with a positive amount). The two
-    # predicates are exhaustive over spend rows because zero-paise amounts are
-    # rejected at every write path, so gross_spend + refund == the signed net.
-    # `cashback` still keys off the type — an income row is a different taxonomy,
-    # not a differently-signed spend. The predicate is inlined rather than
-    # extracted: this is its only backend consumer (AGENTS.md §Simplicity first).
-    ytd_first = date(window.year, 1, 1)
+    # Only spend rows count, split three ways (ADR-0013 rule 4): gross_spend is the
+    # negative ones; a positive one (a refund, ADR-0009, or a purchase cashback,
+    # ADR-0013) is `cashback` if its category is the spend "Cashback" or a child
+    # of it (one hop, ADR-0012 rule 6; archive state ignored), else `refund`. The
+    # three are exhaustive because zero-paise amounts are rejected at every write
+    # path, so gross_spend + refund + cashback == the signed net. The refund case
+    # orders its whens rather than negating is_cashback: for an uncategorized row
+    # that predicate is NULL, and NOT NULL would silently drop the refund.
+    # Inlined rather than extracted: this is its only backend consumer.
+    ytd_first = date(window.first.year, 1, 1)
+    ytd_cat = aliased(Category)
+    ytd_parent = aliased(Category)
+    is_spend = Transaction.transaction_type == "spend"
+    is_cashback = or_(
+        and_(ytd_cat.kind == "spend", ytd_cat.name == CASHBACK_CATEGORY_NAME),
+        and_(ytd_parent.kind == "spend", ytd_parent.name == CASHBACK_CATEGORY_NAME),
+    )
     gross_spend_sum = func.sum(
-        case(
-            (
-                and_(Transaction.transaction_type == "spend", Transaction.amount_paise < 0),
-                Transaction.amount_paise,
-            ),
-            else_=0,
-        )
+        case((and_(is_spend, Transaction.amount_paise < 0), Transaction.amount_paise), else_=0)
     ).label("gross_spend")
     refund_sum = func.sum(
         case(
-            (
-                and_(Transaction.transaction_type == "spend", Transaction.amount_paise > 0),
-                Transaction.amount_paise,
-            ),
+            (and_(is_spend, Transaction.amount_paise > 0, is_cashback), 0),
+            (and_(is_spend, Transaction.amount_paise > 0), Transaction.amount_paise),
             else_=0,
         )
     ).label("refund")
     cashback_sum = func.sum(
-        case((Transaction.transaction_type == "income", Transaction.amount_paise), else_=0)
+        case(
+            (and_(is_spend, Transaction.amount_paise > 0, is_cashback), Transaction.amount_paise),
+            else_=0,
+        )
     ).label("cashback")
     ytd_stmt = (
         select(Transaction.account_id, gross_spend_sum, refund_sum, cashback_sum)
+        .outerjoin(
+            ytd_cat,
+            and_(ytd_cat.id == Transaction.category_id, ytd_cat.user_id == user_id),
+        )
+        .outerjoin(
+            ytd_parent,
+            and_(ytd_parent.id == ytd_cat.parent_id, ytd_parent.user_id == user_id),
+        )
         .where(
             Transaction.user_id == user_id,
-            Transaction.transaction_type.in_(("spend", "income")),
+            is_spend,
             Transaction.date >= ytd_first,
             Transaction.date <= last,
         )
@@ -1036,8 +951,8 @@ def overview(
     )
     ytd_stmt = confirmed_only(ytd_stmt)
     # Three accumulators, not four: `spend_ytd_paise` below is the signed net
-    # gross_spend + refund, derived inline at the point of use rather than
-    # carried as its own dict that has to be kept in lockstep with the other
+    # gross_spend + refund + cashback, derived inline at the point of use rather
+    # than carried as its own dict that has to be kept in lockstep with the other
     # three on every write.
     ytd_gross_spend: dict[int, int] = {}
     ytd_refund: dict[int, int] = {}
@@ -1057,7 +972,7 @@ def overview(
             currency=a.currency,
             balance_paise=a.opening_balance_paise + summed.get(a.id, 0),
             spend_ytd_paise=(
-                ytd_gross_spend.get(a.id, 0) + ytd_refund.get(a.id, 0)
+                ytd_gross_spend.get(a.id, 0) + ytd_refund.get(a.id, 0) + ytd_cashback.get(a.id, 0)
                 if a.type == "credit_card"
                 else None
             ),
@@ -1163,8 +1078,18 @@ def tagging_stats(
     pre-tagged alongside 10 bill-payment credits read 0.80, exactly the PRD
     §Success-metrics bar it was added to measure.
     """
+    # coalesce: a link moves a row's category into pre_link_category_id (ADR-0002 rule 9), so
+    # the user's current choice is whichever of the two is set. The CHECK guarantees they are
+    # never both set, which makes the coalesce exact.
     kept_expr = func.sum(
-        case((Transaction.category_id == Transaction.auto_category_id, 1), else_=0)
+        case(
+            (
+                func.coalesce(Transaction.category_id, Transaction.pre_link_category_id)
+                == Transaction.auto_category_id,
+                1,
+            ),
+            else_=0,
+        )
     )
     stmt = (
         select(func.count(), kept_expr)
@@ -1209,79 +1134,111 @@ def tagging_stats(
         or 0
     )
 
-    rules_count = session.scalar(
-        select(func.count())
-        .select_from(MerchantTagMap)
+    # Live, non-seeded rules (ADR-0004 rule 10, ADR-0011 rule 11): the category
+    # must be live, and the row not a never-confirmed seed (``hit_count == 0`` and
+    # not pinned — a pin is user-authored, so it counts). Seed rows are excluded so
+    # a fresh user's dictionary doesn't inflate "learned rules" before any import.
+    # A key that resolves to an unknown-via canonical (a gateway handle) is not a rule
+    # either (ADR-0011 rule 12), which only the resolver can tell, so the keys come back
+    # and are counted in Python.
+    rule_keys = session.scalars(
+        select(MerchantTagMap.merchant_normalized)
+        .join(
+            Category,
+            and_(
+                Category.id == MerchantTagMap.category_id,
+                Category.user_id == user_id,
+                Category.archived_at.is_(None),
+            ),
+        )
         .where(
             MerchantTagMap.user_id == user_id,
-            # hit_count == 0 marks a seeded dictionary entry the user has
-            # never confirmed (a later phase backfills ~100 of these at
-            # registration). Excluded so a fresh user's unconfirmed seed rows
-            # don't inflate "learned rules" before any import runs.
-            MerchantTagMap.hit_count != 0,
+            or_(MerchantTagMap.hit_count > 0, MerchantTagMap.pinned.is_(True)),
         )
     )
+    resolver = load_alias_resolver(session, user_id=user_id)
     return TaggingStatsResponse(
         total_auto_tagged=total_auto,
         kept=kept,
         acceptance_rate=(kept / total_auto) if total_auto else None,
-        rules_count=int(rules_count or 0),
+        rules_count=sum(1 for key in rule_keys if not is_unknown_via(resolver.canonical(key))),
         imported_total=imported_total,
         pre_tagged=pre_tagged,
         coverage_rate=(pre_tagged / imported_total) if imported_total else None,
     )
 
 
-@router.get("/hierarchical-spend", response_model=HierarchicalSpendResponse)
-def hierarchical_spend(
+def _trailing_month_window(today: date, months: int) -> tuple[date, date]:
+    """Whole calendar months ending in ``today``'s month, current month included.
+
+    Returns the first day of the oldest month and the last day of ``today``'s
+    month, so a future-dated row later this month still counts.
+    """
+    idx = today.year * 12 + today.month - 1 - (months - 1)
+    first = date(idx // 12, idx % 12 + 1, 1)
+    last = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+    return first, last
+
+
+@dataclass(slots=True)
+class _TrendAcc:
+    name: str | None
+    archived: bool
+    totals: list[int]
+    is_direct: bool = False
+    subs: dict[int, _TrendAcc] = field(default_factory=dict)
+
+
+@router.get("/category-trend", response_model=CategoryTrendResponse)
+def category_trend(
     session: SessionDep,
     user_id: CurrentUserId,
-    month: Annotated[str | None, Query()] = None,
-    year: Annotated[str | None, Query()] = None,
+    months: Annotated[int, Query(ge=1, le=60)] = 12,
     label_id: Annotated[int | None, Query(gt=0)] = None,
-) -> HierarchicalSpendResponse:
-    """Hierarchical parent/subcategory spend breakdown and top movers."""
-    window = _period_window(month, year)
-    first, last = window.first, window.last
+) -> CategoryTrendResponse:
+    """Monthly signed spend per parent category with a subcategory drilldown
+    (PRD §F8 view 6), over the trailing ``months`` whole calendar months ending
+    in the IST business month (anchored on ``clock.today()``, not a picker).
 
-    if window.mon is not None:
-        prev_last = first - timedelta(days=1)
-        prev_first = date(prev_last.year, prev_last.month, 1)
-    else:
-        prev_first = date(window.year - 1, 1, 1)
-        prev_last = date(window.year - 1, 12, 31)
+    Values are signed (ADR-0009 / ADR-0013) and never clamped. A subcategory,
+    archived or not, rolls into its parent (ADR-0012 rule 6), so each parent's
+    series is the sum of its ``subcategories``; spend booked straight to a
+    parent is its ``is_direct`` row. Every parent with an in-window row is
+    returned and the frontend folds the tail. For each month the sum over
+    parents equals that month's ``spend-by-period`` total. Uncategorized spend
+    is the ``parent_id=None`` entry, last, with no subcategories.
 
-    ParentCategory = aliased(Category)
+    Colours come from ``category_colors`` (ADR-0012 rule 7): the parent's ``display_color`` on
+    each parent, and each series' rotated ``series`` colour on its subcategory.
+    """
+    first, last = _trailing_month_window(clock.today(), months)
+    periods = list(_iter_periods(first, last, "month"))
+    slot = {p: i for i, p in enumerate(periods)}
 
+    Parent = aliased(Category)
     stmt = (
         select(
             Transaction.date,
             Transaction.category_id,
+            Transaction.amount_paise,
             Category.name.label("category_name"),
             Category.parent_id,
-            Category.color.label("category_color"),
-            ParentCategory.name.label("parent_name"),
-            ParentCategory.color.label("parent_color"),
-            Transaction.amount_paise,
+            Category.archived_at.label("category_archived_at"),
+            Parent.name.label("parent_name"),
+            Parent.archived_at.label("parent_archived_at"),
         )
         .outerjoin(
             Category,
-            and_(
-                Category.id == Transaction.category_id,
-                Category.user_id == user_id,
-            ),
+            and_(Category.id == Transaction.category_id, Category.user_id == user_id),
         )
         .outerjoin(
-            ParentCategory,
-            and_(
-                ParentCategory.id == Category.parent_id,
-                ParentCategory.user_id == user_id,
-            ),
+            Parent,
+            and_(Parent.id == Category.parent_id, Parent.user_id == user_id),
         )
         .where(
             Transaction.user_id == user_id,
             Transaction.transaction_type == "spend",
-            Transaction.date >= prev_first,
+            Transaction.date >= first,
             Transaction.date <= last,
         )
     )
@@ -1289,322 +1246,60 @@ def hierarchical_spend(
     if label_id is not None:
         stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
 
-    rows = session.execute(stmt).all()
-
-    current_cat_totals: dict[
-        tuple[int | None, str | None, int | None, str | None, str | None, str | None], int
-    ] = defaultdict(int)
-    prev_cat_totals: dict[str, int] = defaultdict(int)
-
-    for row in rows:
-        txn_date = row.date
+    n = len(periods)
+    accs: dict[int | None, _TrendAcc] = {}
+    for row in session.execute(stmt).all():
+        i = slot[_bucket_of(row.date, "month").period]
         amt = int(row.amount_paise)
         cat_id = row.category_id
-        cat_name = row.category_name
-        parent_id = row.parent_id
-        parent_name = row.parent_name
-        cat_color = row.category_color
-        parent_color = row.parent_color
-
-        if first <= txn_date <= last:
-            key = (cat_id, cat_name, parent_id, parent_name, cat_color, parent_color)
-            current_cat_totals[key] += amt
-        elif prev_first <= txn_date <= prev_last:
-            name = cat_name or "Uncategorized"
-            prev_cat_totals[name] += amt
-
-    parents_map: dict[int | None, dict] = {}
-    total_spend_paise = 0
-
-    for (
-        cat_id,
-        cat_name,
-        parent_id,
-        parent_name,
-        cat_color,
-        parent_color,
-    ), signed_total in current_cat_totals.items():
         if cat_id is None:
-            p_id = None
-            p_name = "Uncategorized"
-            p_color = None
+            parent = accs.setdefault(None, _TrendAcc(None, False, [0] * n))
+            parent.totals[i] += amt
+            continue
+        if row.parent_id is None:
+            pkey = cat_id
+            meta = (row.category_name, row.category_archived_at is not None)
             is_direct = True
-            sub_id = None
-            sub_name = "Uncategorized"
-            sub_color = None
-        elif parent_id is None:
-            p_id = cat_id
-            p_name = cat_name or "Category"
-            p_color = cat_color
-            is_direct = True
-            sub_id = cat_id
-            sub_name = f"{p_name} (Direct)"
-            sub_color = cat_color
         else:
-            p_id = parent_id
-            p_name = parent_name or "Category"
-            p_color = parent_color
+            pkey = row.parent_id
+            meta = (row.parent_name, row.parent_archived_at is not None)
             is_direct = False
-            sub_id = cat_id
-            sub_name = cat_name or "Subcategory"
-            sub_color = cat_color
+        parent = accs.setdefault(pkey, _TrendAcc(*meta, [0] * n))
+        parent.totals[i] += amt
+        sub = parent.subs.get(cat_id)
+        if sub is None:
+            sub = parent.subs[cat_id] = _TrendAcc(
+                row.category_name,
+                row.category_archived_at is not None,
+                [0] * n,
+                is_direct=is_direct,
+            )
+        sub.totals[i] += amt
 
-        if p_id not in parents_map:
-            parents_map[p_id] = {
-                "parent_id": p_id,
-                "parent_name": p_name,
-                "color": p_color,
-                "total_paise": 0,
-                "direct_paise": 0,
-                "subcategories": {},
-            }
-
-        parents_map[p_id]["total_paise"] += signed_total
-        if is_direct:
-            parents_map[p_id]["direct_paise"] += -signed_total
-
-        sub_key = (sub_id, sub_name, is_direct, sub_color)
-        parents_map[p_id]["subcategories"][sub_key] = (
-            parents_map[p_id]["subcategories"].get(sub_key, 0) + signed_total
-        )
-
-    for p_data in parents_map.values():
-        total_spend_paise += max(0, -p_data["total_paise"])
-
-    parent_list: list[HierarchicalParentSpend] = []
-    for p_id, p_data in parents_map.items():
-        p_total = p_data["total_paise"]
-        p_spend = max(0, -p_total)
-        p_direct = max(0, p_data["direct_paise"])
-        p_pct = (p_spend / total_spend_paise * 100.0) if total_spend_paise > 0 else 0.0
-
-        subcat_list: list[HierarchicalSubcategorySpend] = []
-        for (s_id, s_name, is_dir, s_col), s_total in p_data["subcategories"].items():
-            s_spend = max(0, -s_total)
-            s_pct = (s_spend / p_spend * 100.0) if p_spend > 0 else 0.0
-            subcat_list.append(
-                HierarchicalSubcategorySpend(
-                    category_id=s_id,
-                    category_name=s_name,
-                    spend_paise=s_spend,
-                    total_paise=s_total,
-                    percentage=round(s_pct, 2),
-                    is_direct=is_dir,
-                    color=s_col,
+    colors = category_colors(session, user_id=user_id)
+    ordered = sorted(accs.items(), key=lambda kv: (kv[0] is None, sum(kv[1].totals), kv[0] or 0))
+    parents = [
+        CategoryTrendParent(
+            parent_id=pid,
+            parent_name=acc.name,
+            color=colors[pid].display if pid is not None else None,
+            archived=acc.archived,
+            totals_paise=acc.totals,
+            subcategories=[
+                CategoryTrendSubcategory(
+                    category_id=cid,
+                    category_name=s.name,
+                    color=colors[cid].series,
+                    archived=s.archived,
+                    is_direct=s.is_direct,
+                    totals_paise=s.totals,
                 )
-            )
-
-        subcat_list.sort(key=lambda s: (s.is_direct, -s.spend_paise, s.category_name))
-
-        parent_list.append(
-            HierarchicalParentSpend(
-                parent_id=p_id,
-                parent_name=p_data["parent_name"],
-                spend_paise=p_spend,
-                direct_paise=p_direct,
-                total_paise=p_total,
-                percentage=round(p_pct, 2),
-                color=p_data["color"],
-                subcategories=subcat_list,
-            )
-        )
-
-    parent_list.sort(key=lambda p: (p.parent_id is None, -p.spend_paise, p.parent_name or ""))
-
-    current_subcat_spend: dict[str, tuple[int | None, str | None, int]] = {}
-    for (
-        cat_id,
-        cat_name,
-        _parent_id,
-        parent_name,
-        _,
-        _,
-    ), signed_total in current_cat_totals.items():
-        name = cat_name or "Uncategorized"
-        spend = max(0, -signed_total)
-        current_subcat_spend[name] = (cat_id, parent_name, spend)
-
-    all_mover_names = set(current_subcat_spend.keys()) | set(prev_cat_totals.keys())
-    movers: list[SubcategoryMover] = []
-
-    for name in all_mover_names:
-        cat_id, p_name, curr_spend = current_subcat_spend.get(name, (None, None, 0))
-        prev_signed = prev_cat_totals.get(name, 0)
-        prev_spend = max(0, -prev_signed)
-        delta = curr_spend - prev_spend
-
-        if prev_spend > 0:
-            growth = round(((curr_spend - prev_spend) / prev_spend) * 100.0, 2)
-        else:
-            growth = None
-
-        if curr_spend > 0 or prev_spend > 0:
-            movers.append(
-                SubcategoryMover(
-                    category_id=cat_id,
-                    category_name=name,
-                    parent_name=p_name,
-                    current_paise=curr_spend,
-                    previous_paise=prev_spend,
-                    delta_paise=delta,
-                    growth_rate=growth,
+                for cid, s in sorted(
+                    acc.subs.items(),
+                    key=lambda kv: (kv[1].is_direct, sum(kv[1].totals), kv[0]),
                 )
-            )
-
-    movers.sort(key=lambda m: (-abs(m.delta_paise), m.category_name))
-
-    return HierarchicalSpendResponse(
-        period=window.key,
-        total_spend_paise=total_spend_paise,
-        parents=parent_list,
-        top_movers=movers,
-        label_id=label_id,
-    )
-
-
-@router.get("/hierarchical-trend", response_model=HierarchicalTrendResponse)
-def hierarchical_trend(
-    session: SessionDep,
-    user_id: CurrentUserId,
-    bucket: Annotated[Literal["week", "month"], Query()],
-    start: Annotated[date, Query()],
-    end: Annotated[date, Query()],
-    label_id: Annotated[int | None, Query(gt=0)] = None,
-) -> HierarchicalTrendResponse:
-    """Stacked hierarchical spend trend over [start, end]."""
-    _require_ordered(start, end)
-
-    ParentCategory = aliased(Category)
-
-    stmt = (
-        select(
-            Transaction.date,
-            Transaction.category_id,
-            Category.name.label("category_name"),
-            Category.parent_id,
-            Category.color.label("category_color"),
-            ParentCategory.name.label("parent_name"),
-            ParentCategory.color.label("parent_color"),
-            Transaction.amount_paise,
+            ],
         )
-        .outerjoin(
-            Category,
-            and_(
-                Category.id == Transaction.category_id,
-                Category.user_id == user_id,
-            ),
-        )
-        .outerjoin(
-            ParentCategory,
-            and_(
-                ParentCategory.id == Category.parent_id,
-                ParentCategory.user_id == user_id,
-            ),
-        )
-        .where(
-            Transaction.user_id == user_id,
-            Transaction.transaction_type == "spend",
-            Transaction.date >= start,
-            Transaction.date <= end,
-        )
-    )
-    stmt = confirmed_only(stmt)
-    if label_id is not None:
-        stmt = stmt.where(Transaction.labels.any(Label.id == label_id))
-
-    rows = session.execute(stmt).all()
-
-    parents_meta: dict[int | None, dict] = {}
-    period_parent_totals: dict[tuple[str, int | None], int] = defaultdict(int)
-    period_subcat_totals: dict[tuple[str, int | None, int | None], int] = defaultdict(int)
-
-    for row in rows:
-        txn_date = row.date
-        p_lbl = _bucket_of(txn_date, bucket).period
-        amt = int(row.amount_paise)
-        cat_id = row.category_id
-        cat_name = row.category_name
-        p_id = row.parent_id
-        p_name = row.parent_name
-        p_color = row.parent_color
-
-        if cat_id is None:
-            parent_id_eff = None
-            parent_name_eff = "Uncategorized"
-            parent_color_eff = None
-            sub_id_eff = None
-            sub_name_eff = "Uncategorized"
-        elif p_id is None:
-            parent_id_eff = cat_id
-            parent_name_eff = cat_name or "Category"
-            parent_color_eff = row.category_color
-            sub_id_eff = cat_id
-            sub_name_eff = f"{parent_name_eff} (Direct)"
-        else:
-            parent_id_eff = p_id
-            parent_name_eff = p_name or "Category"
-            parent_color_eff = p_color
-            sub_id_eff = cat_id
-            sub_name_eff = cat_name or "Subcategory"
-
-        if parent_id_eff not in parents_meta:
-            parents_meta[parent_id_eff] = {
-                "parent_name": parent_name_eff,
-                "color": parent_color_eff,
-                "subcategories": {},
-            }
-        parents_meta[parent_id_eff]["subcategories"][sub_id_eff] = sub_name_eff
-
-        period_parent_totals[(p_lbl, parent_id_eff)] += amt
-        period_subcat_totals[(p_lbl, parent_id_eff, sub_id_eff)] += amt
-
-    echoed_parents: list[HierarchicalParentRef] = []
-    for p_id, p_info in parents_meta.items():
-        sub_refs = [
-            HierarchicalSubcategoryRef(category_id=s_id, category_name=s_name)
-            for s_id, s_name in p_info["subcategories"].items()
-        ]
-        echoed_parents.append(
-            HierarchicalParentRef(
-                parent_id=p_id,
-                parent_name=p_info["parent_name"],
-                color=p_info["color"],
-                subcategories=sub_refs,
-            )
-        )
-
-    echoed_parents.sort(key=lambda p: (p.parent_id is None, p.parent_name))
-
-    timeline_buckets: list[HierarchicalTrendBucket] = []
-    for p_lbl in _iter_periods(start, end, bucket):
-        totals: list[HierarchicalParentPeriodTotal] = []
-        for p_ref in echoed_parents:
-            p_id = p_ref.parent_id
-            p_total = period_parent_totals.get((p_lbl, p_id), 0)
-
-            sub_totals: list[HierarchicalSubcategoryPeriodTotal] = []
-            for s_ref in p_ref.subcategories:
-                s_id = s_ref.category_id
-                s_tot = period_subcat_totals.get((p_lbl, p_id, s_id), 0)
-                sub_totals.append(
-                    HierarchicalSubcategoryPeriodTotal(category_id=s_id, total_paise=s_tot)
-                )
-
-            totals.append(
-                HierarchicalParentPeriodTotal(
-                    parent_id=p_id,
-                    total_paise=p_total,
-                    subcategories=sub_totals,
-                )
-            )
-
-        timeline_buckets.append(HierarchicalTrendBucket(period=p_lbl, totals=totals))
-
-    return HierarchicalTrendResponse(
-        bucket=bucket,
-        start=start,
-        end=end,
-        parents=echoed_parents,
-        buckets=timeline_buckets,
-        label_id=label_id,
-    )
+        for pid, acc in ordered
+    ]
+    return CategoryTrendResponse(periods=periods, parents=parents, label_id=label_id)

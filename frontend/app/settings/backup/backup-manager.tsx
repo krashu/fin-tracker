@@ -14,12 +14,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { IconArchive, IconDoc, IconUpload } from "@/components/icons";
 import { Field } from "@/components/form/fields";
+import { GuestUploadGate } from "@/components/auth/guest-upload-gate";
 import {
   ApiError,
   downloadBackup,
   importBackup,
   type BackupImportSummary,
 } from "@/lib/api/client";
+import { saveBlob } from "@/lib/download";
 import { cn } from "@/lib/utils";
 
 export function BackupManager() {
@@ -29,17 +31,7 @@ export function BackupManager() {
 
   const download = useMutation({
     mutationFn: downloadBackup,
-    onSuccess: ({ blob, filename }) => {
-      // Trigger the browser save from the returned blob (the client wrapper stays DOM-free).
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = filename;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
-    },
+    onSuccess: ({ blob, filename }) => saveBlob(blob, filename),
   });
 
   const load = useMutation({
@@ -102,61 +94,63 @@ export function BackupManager() {
           <CardTitle>Load from backup</CardTitle>
         </CardHeader>
         <CardContent className="flex max-w-xl flex-col gap-4">
-          <p className="text-[12.5px] text-muted-foreground">
-            Import a backup zip. It’s additive — transactions already present
-            are skipped, so nothing is overwritten. Safe to load into your
-            current data or a fresh setup.
-          </p>
-          <Field label="Backup zip">
-            {/* sr-only (not hidden) keeps the file input in the tab order + a11y tree;
-                the visible label is the button and shows the focus ring via has-[]. */}
-            <label className="flex cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-[12.5px] transition-colors hover:bg-muted/50 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring">
-              <input
-                type="file"
-                accept=".zip,application/zip"
-                className="sr-only"
-                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-              />
-              <IconDoc className="size-3.5 shrink-0 text-muted-foreground" />
-              <span
-                className={cn(
-                  "truncate",
-                  file ? "text-foreground" : "text-muted-foreground",
-                )}
-              >
-                {file ? file.name : "Choose a backup…"}
-              </span>
-            </label>
-          </Field>
-
-          {load.isError ? (
-            <p className="text-[12px] text-neg">
-              {load.error instanceof ApiError
-                ? load.error.detail
-                : "Couldn’t load — try again."}
+          <GuestUploadGate notice="Guests can’t load a backup.">
+            <p className="text-[12.5px] text-muted-foreground">
+              Import a backup zip. It’s additive — transactions already present
+              are skipped, so nothing is overwritten. Safe to load into your
+              current data or a fresh setup.
             </p>
-          ) : null}
+            <Field label="Backup zip">
+              {/* sr-only (not hidden) keeps the file input in the tab order + a11y tree;
+                  the visible label is the button and shows the focus ring via has-[]. */}
+              <label className="flex cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-[12.5px] transition-colors hover:bg-muted/50 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring">
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  className="sr-only"
+                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                />
+                <IconDoc className="size-3.5 shrink-0 text-muted-foreground" />
+                <span
+                  className={cn(
+                    "truncate",
+                    file ? "text-foreground" : "text-muted-foreground",
+                  )}
+                >
+                  {file ? file.name : "Choose a backup…"}
+                </span>
+              </label>
+            </Field>
 
-          {summary ? <LoadSummary summary={summary} /> : null}
+            {load.isError ? (
+              <p className="text-[12px] text-neg">
+                {load.error instanceof ApiError
+                  ? load.error.detail
+                  : "Couldn’t load — try again."}
+              </p>
+            ) : null}
 
-          <div>
-            <Button
-              type="button"
-              onClick={handleLoad}
-              disabled={file == null || load.isPending}
-              className="h-9 gap-1.5 px-3.5 text-[12.5px] font-medium"
-            >
-              <IconUpload className="size-3.5" />
-              {load.isPending ? "Loading…" : "Load backup"}
-            </Button>
-          </div>
+            {summary ? <LoadSummary summary={summary} /> : null}
+
+            <div>
+              <Button
+                type="button"
+                onClick={handleLoad}
+                disabled={file == null || load.isPending}
+                className="h-9 gap-1.5 px-3.5 text-[12.5px] font-medium"
+              >
+                <IconUpload className="size-3.5" />
+                {load.isPending ? "Loading…" : "Load backup"}
+              </Button>
+            </div>
+          </GuestUploadGate>
         </CardContent>
       </Card>
     </div>
   );
 }
 
-function LoadSummary({ summary }: { summary: BackupImportSummary }) {
+export function LoadSummary({ summary }: { summary: BackupImportSummary }) {
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border bg-muted/40 px-3 py-2.5 text-[12.5px]">
       <p className="text-foreground">
@@ -174,14 +168,17 @@ function LoadSummary({ summary }: { summary: BackupImportSummary }) {
         {summary.rows_rejected > 0
           ? `, rejected ${summary.rows_rejected} row${summary.rows_rejected === 1 ? "" : "s"}`
           : ""}
+        {summary.links_not_restored > 0
+          ? `, ${summary.links_not_restored} link${summary.links_not_restored === 1 ? "" : "s"} not restored`
+          : ""}
         .
       </p>
 
       {summary.warnings.length > 0 ? (
         <div className="flex flex-col gap-1">
           <p className="font-medium text-foreground">
-            {summary.warnings.length} row
-            {summary.warnings.length === 1 ? "" : "s"} skipped:
+            {summary.warnings.length} warning
+            {summary.warnings.length === 1 ? "" : "s"}:
           </p>
           <ul className="ml-3 list-disc text-muted-foreground">
             {summary.warnings.map((w, i) => (

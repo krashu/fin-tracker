@@ -13,9 +13,12 @@ What lives here:
 * :data:`FIXTURES_ROOT` / :data:`LOCAL_ROOT` — anchor paths for test
   fixtures and the gitignored ``_local/`` real-PDF directory.
 * Real-PDF + password fixtures (``axis_real_pdf``, ``axis_real_password``,
-  ``icici_real_pdf``, ``icici_real_password``) — parametrize over the
-  files matching ``_local/<issuer>_cc*.pdf`` and skip when absent / when
-  the corresponding ``*_TEST_PWD`` env var is unset.
+  ``icici_real_pdf``, ``icici_real_password``, ``hdfc_bank_real_pdf``,
+  ``hdfc_bank_real_password``, ``axis_bank_real_pdf``, ``axis_bank_real_password``,
+  ``icici_bank_real_pdf``, ``icici_bank_real_password``, ``sbi_bank_real_pdf``,
+  ``sbi_bank_real_password``) — parametrize over the files matching
+  ``_local/<issuer>_cc*.pdf`` (``_local/<bank>_bank*.pdf`` for a bank) and skip when absent /
+  when the corresponding ``*_TEST_PWD`` (card) / ``*_BANK_TEST_PWD`` (bank) env var is unset.
 """
 
 from __future__ import annotations
@@ -86,6 +89,13 @@ os.environ["APPLY_MIGRATIONS_ON_STARTUP"] = "false"
 # setdefault) so a dev ``.env`` can't re-enable it; the seeder gets its own
 # targeted coverage in ``tests/services/test_demo_seed.py``.
 os.environ["SEED_DEMO_ON_STARTUP"] = "false"
+
+# Registration is closed by default once a first user exists (ADR-0003 rule 12), but
+# most API tests register freely — the isolation matrix registers two users per test.
+# Force it open here (assignment, so a dev ``.env`` can't close it); a test of the
+# shipped default must ``monkeypatch.delenv("REGISTRATION_ENABLED")`` and build its
+# own ``Settings(_env_file=None, ...)``.
+os.environ["REGISTRATION_ENABLED"] = "true"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -175,6 +185,10 @@ def _pdf_id(path: Path | None) -> str:
 # still collect; the fixture body calls ``pytest.skip`` in that case.
 _AXIS_PDFS: list[Path | None] = list(_glob_local("axis_cc")) or [None]  # type: ignore[list-item]
 _ICICI_PDFS: list[Path | None] = list(_glob_local("icici_cc")) or [None]  # type: ignore[list-item]
+_HDFC_BANK_PDFS: list[Path | None] = list(_glob_local("hdfc_bank")) or [None]
+_AXIS_BANK_PDFS: list[Path | None] = list(_glob_local("axis_bank")) or [None]
+_ICICI_BANK_PDFS: list[Path | None] = list(_glob_local("icici_bank")) or [None]
+_SBI_BANK_PDFS: list[Path | None] = list(_glob_local("sbi_bank")) or [None]
 
 
 @pytest.fixture(params=_AXIS_PDFS, ids=_pdf_id)
@@ -206,4 +220,68 @@ def icici_real_password() -> str:
     pwd = os.environ.get("ICICI_TEST_PWD")
     if not pwd:
         pytest.skip("ICICI_TEST_PWD env var not set")
+    return pwd
+
+
+@pytest.fixture(params=_HDFC_BANK_PDFS, ids=_pdf_id)
+def hdfc_bank_real_pdf(request: pytest.FixtureRequest) -> bytes:
+    path: Path | None = request.param
+    if path is None:
+        pytest.skip(f"no HDFC bank PDFs at {LOCAL_ROOT}/hdfc_bank*.pdf")
+    return path.read_bytes()
+
+
+@pytest.fixture
+def hdfc_bank_real_password() -> str:
+    pwd = os.environ.get("HDFC_BANK_TEST_PWD")
+    if not pwd:
+        pytest.skip("HDFC_BANK_TEST_PWD env var not set")
+    return pwd
+
+
+@pytest.fixture(params=_SBI_BANK_PDFS, ids=_pdf_id)
+def sbi_bank_real_pdf(request: pytest.FixtureRequest) -> bytes:
+    path: Path | None = request.param
+    if path is None:
+        pytest.skip(f"no SBI bank PDFs at {LOCAL_ROOT}/sbi_bank*.pdf")
+    return path.read_bytes()
+
+
+@pytest.fixture
+def sbi_bank_real_password() -> str:
+    pwd = os.environ.get("SBI_BANK_TEST_PWD")
+    if not pwd:
+        pytest.skip("SBI_BANK_TEST_PWD env var not set")
+    return pwd
+
+
+@pytest.fixture(params=_ICICI_BANK_PDFS, ids=_pdf_id)
+def icici_bank_real_pdf(request: pytest.FixtureRequest) -> bytes:
+    path: Path | None = request.param
+    if path is None:
+        pytest.skip(f"no ICICI bank PDFs at {LOCAL_ROOT}/icici_bank*.pdf")
+    return path.read_bytes()
+
+
+@pytest.fixture
+def icici_bank_real_password() -> str:
+    pwd = os.environ.get("ICICI_BANK_TEST_PWD")
+    if not pwd:
+        pytest.skip("ICICI_BANK_TEST_PWD env var not set")
+    return pwd
+
+
+@pytest.fixture(params=_AXIS_BANK_PDFS, ids=_pdf_id)
+def axis_bank_real_pdf(request: pytest.FixtureRequest) -> bytes:
+    path: Path | None = request.param
+    if path is None:
+        pytest.skip(f"no Axis bank PDFs at {LOCAL_ROOT}/axis_bank*.pdf")
+    return path.read_bytes()
+
+
+@pytest.fixture
+def axis_bank_real_password() -> str:
+    pwd = os.environ.get("AXIS_BANK_TEST_PWD")
+    if not pwd:
+        pytest.skip("AXIS_BANK_TEST_PWD env var not set")
     return pwd

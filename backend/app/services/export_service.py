@@ -12,16 +12,28 @@ spend subset the user actually backs up (investments round-trip separately via
 * **Integer paise only** — ``amount_paise`` / ``opening_balance_paise`` are written as their
   raw ``int`` (never a float or a scaled decimal). The importer parses them back with
   ``int()``; there is no rupee↔paise scaling on this path.
-* **The dedup fingerprint is NOT exported.** The formula bakes in ``account_id``
+* **No hash is exported.** The fingerprint formula bakes in ``account_id``
   (:func:`app.services.fingerprint.transaction_fingerprint`), which is install-specific, so a
   carried value would never match a natively-created row. ``merchant_normalized`` (the true
   identity input) is exported verbatim; the importer re-normalizes it (a hand-edited cell is
-  its threat model) and recomputes the fingerprint from the resolved ``account_id``.
+  its threat model) and recomputes the fingerprint from the resolved ``account_id``. Provenance
+  (ADR-0006 rule 17) travels the same way: the ``origin_*`` columns carry the *inputs* of the
+  row's origin identity — its frozen inputs once edited, its own current inputs when unedited,
+  blank when it has none — and restore recomputes ``origin_fingerprint`` on the target.
+
+``metadata.json`` carries ``format_version`` (:data:`BACKUP_FORMAT_VERSION`, owned by the
+parser). The importer accepts only the current version and requires every column, so any
+change to the column set bumps it.
 
 Only ``confirmed_at IS NOT NULL`` rows are exported — pending/in-review rows would otherwise
 be silently auto-confirmed on restore. ``transfer_pair_id`` is exported indirectly as a
 backup-local ``transfer_group`` token (shared by both legs of a pair) so the importer can
-re-link the pair without leaking install-specific ids.
+re-link the pair without leaking install-specific ids; ``pre_link_type`` rides along
+verbatim, and ``pre_link_category_*`` as a category name and kind (like ``category_*``), so
+an unlink after restore still gives each leg back its own type and category (ADR-0002
+rule 9). A refund's link to its original (ADR-0009 rule 13) travels the same way as the
+pair: ``row_ref`` / ``refund_of_ref`` are backup-local tokens, meaningful only inside one
+zip.
 """
 
 from __future__ import annotations
@@ -44,16 +56,13 @@ from app.models import Account, Category, Transaction
 from app.parsers.backup_csv import (
     ACCOUNT_COLUMNS,
     ACCOUNTS_CSV,
+    BACKUP_FORMAT_VERSION,
     CATEGORIES_CSV,
     CATEGORY_COLUMNS,
     METADATA_JSON,
     TRANSACTION_COLUMNS,
     TRANSACTIONS_CSV,
 )
-
-# Backup-format version stamped into metadata.json. Bump only on a
-# breaking change to the CSV column set so a future importer can branch.
-BACKUP_FORMAT_VERSION = 1
 
 
 def _cell(value: object) -> str:
@@ -77,6 +86,26 @@ def _write_csv(header: tuple[str, ...], rows: list[tuple[object, ...]]) -> bytes
     return buffer.getvalue().encode("utf-8")
 
 
+def _origin_cells(
+    t: Transaction, account_name_by_id: dict[int, str]
+) -> tuple[object, object, object, object]:
+    """``origin_date, origin_amount_paise, origin_merchant_normalized, origin_account_name``.
+
+    Blank when the row has no provenance. An edited row exports its frozen inputs; an unedited
+    row with provenance (origin == identity) exports its own current inputs.
+    """
+    if t.origin_fingerprint is None:
+        return None, None, None, None
+    if t.origin_date is not None:
+        return (
+            t.origin_date,
+            t.origin_amount_paise,
+            t.origin_merchant_normalized,
+            account_name_by_id.get(t.origin_account_id) if t.origin_account_id else None,
+        )
+    return t.date, t.amount_paise, t.merchant_normalized, account_name_by_id.get(t.account_id)
+
+
 def build_backup_zip(session: Session, *, user_id: UUID) -> bytes:
     """Build the backup zip for ``user_id`` and return its bytes.
 
@@ -97,8 +126,16 @@ def build_backup_zip(session: Session, *, user_id: UUID) -> bytes:
         )
     )
 
-    account_ids = {t.account_id for t in transactions}
-    category_ids = {t.category_id for t in transactions if t.category_id is not None}
+    # An account referenced only as a row's origin (the row was moved off it) is still needed
+    # by name in accounts.csv, or restore could not resolve the origin.
+    account_ids = {t.account_id for t in transactions} | {
+        t.origin_account_id for t in transactions if t.origin_account_id is not None
+    }
+    # A saved pre-link category is exported like a live one, so it (and its parent) lands in
+    # categories.csv even when no row currently sits on it.
+    category_ids = {t.category_id for t in transactions if t.category_id is not None} | {
+        t.pre_link_category_id for t in transactions if t.pre_link_category_id is not None
+    }
 
     # Restate ``user_id`` on both re-fetches even though these ids come from the user's own
     # transactions above — every other query in this module scopes it, and if a bad FK ever
@@ -170,6 +207,11 @@ def build_backup_zip(session: Session, *, user_id: UUID) -> bytes:
     transaction_rows: list[tuple[object, ...]] = []
     for t in transactions:
         category = category_by_id.get(t.category_id) if t.category_id is not None else None
+        pre_link_category = (
+            category_by_id.get(t.pre_link_category_id)
+            if t.pre_link_category_id is not None
+            else None
+        )
         # Shared token for a transfer pair: both legs resolve to the same min(id) so the
         # importer can regroup and re-link them without exporting install-specific ids.
         transfer_group = (
@@ -191,6 +233,12 @@ def build_backup_zip(session: Session, *, user_id: UUID) -> bytes:
                 t.source,
                 t.confirmed_at,
                 transfer_group,
+                t.pre_link_type,
+                pre_link_category.name if pre_link_category is not None else None,
+                pre_link_category.kind if pre_link_category is not None else None,
+                str(t.id),
+                str(t.refund_of_id) if t.refund_of_id is not None else None,
+                *_origin_cells(t, account_name_by_id),
             )
         )
 

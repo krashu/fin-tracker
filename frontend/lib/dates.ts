@@ -28,9 +28,10 @@ export function monthRange(anchor: Date): { date_from: string; date_to: string }
   return { date_from: toLocalYMD(first), date_to: toLocalYMD(last) };
 }
 
-/** `{date_from, date_to}` spanning a full calendar year (Jan 1 → Dec 31) as
- * local YYYY-MM-DD. Mirrors `monthRange` for year-level filtering on the
- * /expenses board. */
+/** `{date_from, date_to}` spanning calendar year `year` (1 Jan → 31 Dec, PRD §F8)
+ * as local YYYY-MM-DD — the same span as `periodRange({ year })`, which the
+ * /expenses summary strip totals over. Mirrors `monthRange` for year-level
+ * filtering on the /expenses board. */
 export function yearRange(year: number): { date_from: string; date_to: string } {
   const first = new Date(year, 0, 1);
   const last = new Date(year, 11, 31);
@@ -54,20 +55,5 @@ export function trailingWeeksWindow(
     now.getMonth(),
     now.getDate() - toMonday - weeksBack * 7,
   );
-  return { start: toLocalYMD(start), end: toLocalYMD(now) };
-}
-
-/** `{start, end}` for [first-of-month `monthsBack` months ago .. today] as local
- * YYYY-MM-DD. `monthsBack=11` yields 12 month buckets (11 prior + the current
- * partial month), mirroring `trailingWeeksWindow`'s "13 weeks → 14 buckets".
- * Shared by the /spending monthly period bar, cashflow bar, and category-trend
- * bar so their `spend-by-period` / `cashflow-by-period` / `spend-by-category-
- * by-period` month queries resolve to one cache-key shape. Local Y/M/D only —
- * never toISOString(). */
-export function trailingMonths(
-  now: Date,
-  monthsBack: number,
-): { start: string; end: string } {
-  const start = new Date(now.getFullYear(), now.getMonth() - monthsBack, 1);
   return { start: toLocalYMD(start), end: toLocalYMD(now) };
 }

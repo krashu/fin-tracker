@@ -6,9 +6,8 @@ the slice runs without a real PDF.
 
 The slice exercises both branches of the commit's category-id rule: the
 two spend rows get PATCHed to a category first (commit would reject them
-otherwise); the income row (``PAYMENT RECEIVED``) commits with
-``category_id IS NULL`` per the locked decision in
-``imports-review-flow``.
+otherwise); the income row (``PAYMENT RECEIVED``) commits as an unpaired ``transfer``
+with ``category_id IS NULL`` (ADR-0002 rule 7c).
 """
 
 from __future__ import annotations
@@ -146,7 +145,9 @@ def test_create_then_import_then_review_then_commit_then_list(
         "category_name",
         "category_parent_name",
         "transfer_pair_id",
+        "refund_of_id",
         "labels",
+        "card_bill_link_offered",
     }
     assert {row["account_id"] for row in rows} == {account_id}
 

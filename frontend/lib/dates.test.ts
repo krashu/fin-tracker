@@ -4,7 +4,6 @@ import {
   monthRange,
   thisMonthAnchor,
   toLocalYMD,
-  trailingMonths,
   trailingWeeksWindow,
   yearRange,
 } from "@/lib/dates";
@@ -54,7 +53,7 @@ describe("monthRange", () => {
 });
 
 describe("yearRange", () => {
-  it("computes Jan 1 to Dec 31 for the given year", () => {
+  it("computes the calendar year, 1 Jan to 31 Dec", () => {
     expect(yearRange(2026)).toEqual({
       date_from: "2026-01-01",
       date_to: "2026-12-31",
@@ -71,16 +70,5 @@ describe("trailingWeeksWindow", () => {
     expect(window.end).toBe("2026-06-17");
     // Monday of that week is 2026-06-15. 2 weeks back is 2026-06-01.
     expect(window.start).toBe("2026-06-01");
-  });
-});
-
-describe("trailingMonths", () => {
-  it("computes first-of-month monthsBack ago to today", () => {
-    const midAugust = new Date(2026, 7, 15);
-    const window = trailingMonths(midAugust, 3);
-
-    expect(window.end).toBe("2026-08-15");
-    // 3 months back first of month: 2026-05-01
-    expect(window.start).toBe("2026-05-01");
   });
 });

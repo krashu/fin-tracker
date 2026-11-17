@@ -7,8 +7,6 @@ upload.
 
 from __future__ import annotations
 
-import io
-import zipfile
 from datetime import datetime
 
 import pytest
@@ -17,36 +15,17 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Account, Label, Transaction, TransactionLabel, User
-from app.parsers.backup_csv import (
-    ACCOUNTS_CSV,
-    CATEGORIES_CSV,
-    TRANSACTIONS_CSV,
-    parse_backup_zip,
-)
+from app.parsers.backup_csv import BACKUP_FORMAT_VERSION, parse_backup_zip
 from app.services.fingerprint import transaction_fingerprint
-
-_ACCOUNTS_HEADER = "name,type,issuer,last4,opening_balance_paise,currency,archived_at"
-_CATEGORIES_HEADER = "name,kind,color,archived_at"
-_TRANSACTIONS_HEADER = (
-    "date,account_name,amount_paise,transaction_type,merchant_raw,"
-    "merchant_normalized,category_name,category_kind,labels,source,confirmed_at,transfer_group"
-)
+from tests.backup_zip import account, make_backup_zip, txn
 
 
 def _minimal_backup_zip() -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as zf:
-        zf.writestr(
-            ACCOUNTS_CSV, f"{_ACCOUNTS_HEADER}\nAxis CC,credit_card,axis,1234,-50000,INR,\n"
-        )
-        zf.writestr(CATEGORIES_CSV, f"{_CATEGORIES_HEADER}\nFood,spend,#4f46e5,\n")
-        zf.writestr(
-            TRANSACTIONS_CSV,
-            f"{_TRANSACTIONS_HEADER}\n"
-            "2026-07-01,Axis CC,-50000,spend,SWIGGY,swiggy,Food,spend,online;lunch,import,"
-            "2026-07-01T10:00:00,\n",
-        )
-    return buffer.getvalue()
+    return make_backup_zip(
+        accounts=[account(opening_balance_paise=-50000)],
+        categories=[{"name": "Food", "kind": "spend", "color": "#4f46e5"}],
+        transactions=[txn(category_name="Food", category_kind="spend", labels="online;lunch")],
+    )
 
 
 @pytest.fixture
@@ -171,24 +150,19 @@ def test_import_backup_normalizes_a_hand_edited_merchant_cell(
     the row staged as a NEW transaction (both then counting in spend-by-category) and the
     merchant could never auto-tag, because both prefetch maps key on the lowercase form.
     """
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as zf:
-        zf.writestr(
-            ACCOUNTS_CSV, f"{_ACCOUNTS_HEADER}\nAxis CC,credit_card,axis,1234,-50000,INR,\n"
-        )
-        zf.writestr(CATEGORIES_CSV, f"{_CATEGORIES_HEADER}\nFood,spend,#4f46e5,\n")
-        zf.writestr(
-            TRANSACTIONS_CSV,
-            f"{_TRANSACTIONS_HEADER}\n"
-            # merchant_normalized hand-edited to mixed case; everything else matches the
-            # native row seeded by `seeded_spend`.
-            "2026-07-01,Axis CC,-50000,spend,SWIGGY,SwiGGy,Food,spend,,import,"
-            "2026-07-01T10:00:00,\n",
-        )
+    zip_bytes = make_backup_zip(
+        accounts=[account(opening_balance_paise=-50000)],
+        categories=[{"name": "Food", "kind": "spend", "color": "#4f46e5"}],
+        # merchant_normalized hand-edited to mixed case; everything else matches the
+        # native row seeded by `seeded_spend`.
+        transactions=[
+            txn(merchant_normalized="SwiGGy", category_name="Food", category_kind="spend")
+        ],
+    )
 
     response = client.post(
         "/api/v1/backup/import",
-        files={"file": ("backup.zip", buffer.getvalue(), "application/zip")},
+        files={"file": ("backup.zip", zip_bytes, "application/zip")},
     )
 
     assert response.status_code == 200
@@ -201,6 +175,46 @@ def test_import_backup_normalizes_a_hand_edited_merchant_cell(
     assert rows[0].merchant_normalized == "swiggy"
 
 
+def test_import_backup_normalizes_a_decomposed_merchant_cell(
+    client: TestClient, session: Session, seeded_user: User, seeded_spend: None
+) -> None:
+    """ADR-0006 rule 3: a zip cell holding the decomposed spelling of a merchant already
+    stored precomposed restores as that same row, not a new one."""
+    row = session.scalars(select(Transaction).where(Transaction.user_id == seeded_user.id)).one()
+    row.merchant_raw = "CAF\u00c9"
+    row.merchant_normalized = "caf\u00e9"
+    row.fingerprint = transaction_fingerprint(
+        txn_date=row.date,
+        amount_paise=row.amount_paise,
+        normalized_merchant="caf\u00e9",
+        account_id=row.account_id,
+    )
+    session.commit()
+
+    zip_bytes = make_backup_zip(
+        accounts=[account(opening_balance_paise=-50000)],
+        categories=[{"name": "Food", "kind": "spend", "color": "#4f46e5"}],
+        transactions=[
+            txn(merchant_normalized="CAFE\u0301", category_name="Food", category_kind="spend")
+        ],
+    )
+
+    response = client.post(
+        "/api/v1/backup/import",
+        files={"file": ("backup.zip", zip_bytes, "application/zip")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["txns_imported"] == 0
+    assert body["txns_skipped_dupe"] == 1
+
+    session.expire_all()
+    rows = list(session.scalars(select(Transaction).where(Transaction.user_id == seeded_user.id)))
+    assert len(rows) == 1
+    assert rows[0].merchant_normalized == "caf\u00e9"
+
+
 def test_import_backup_rejects_unreadable_upload(client: TestClient, seeded_user: User) -> None:
     response = client.post(
         "/api/v1/backup/import",
@@ -209,3 +223,37 @@ def test_import_backup_rejects_unreadable_upload(client: TestClient, seeded_user
 
     assert response.status_code == 422
     assert response.json()["detail"] == "could not parse backup file"
+
+
+def test_import_backup_refuses_another_format_version(
+    client: TestClient, session: Session, seeded_user: User
+) -> None:
+    """A zip of any other ``format_version`` is a 422 naming the expected version; nothing
+    is written."""
+    response = client.post(
+        "/api/v1/backup/import",
+        files={
+            "file": (
+                "backup.zip",
+                make_backup_zip(accounts=[account()], transactions=[txn()], format_version=1),
+                "application/zip",
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        f"unsupported backup format version (expected {BACKUP_FORMAT_VERSION}); export a new backup"
+    )
+    assert session.scalar(select(func.count()).select_from(Transaction)) == 0
+    assert session.scalar(select(func.count()).select_from(Account)) == 0
+
+
+def test_import_backup_over_cap_is_413(client: TestClient, seeded_user: User) -> None:
+    response = client.post(
+        "/api/v1/backup/import",
+        files={"file": ("backup.zip", b"\0" * (26 * 1024 * 1024), "application/zip")},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "file too large"

@@ -9,9 +9,12 @@
  * `monthAnchor`, a different, board-specific control this component doesn't
  * own).
  *
- * `allowMonth={false}` renders year-only. `allowMonth={true}` (default) adds
- * the month dropdown; picking "All months" drops back to a year-only period,
- * matching `Period`'s own shape (`mon` absent = whole year).
+ * The year is the calendar year (PRD §F8), shown as "2026". `allowMonth={false}`
+ * renders year-only. `allowMonth={true}` (default) adds the month dropdown, listed
+ * January to December; picking "All months" drops back to a year-only period,
+ * matching `Period`'s own shape (`mon` absent = whole year). Picking another year
+ * keeps the month. `yearLabel` overrides how a year is named: the /tax page passes
+ * FY start years, year-only, and says "Tax year 2026-27".
  */
 import {
   DropdownMenu,
@@ -21,7 +24,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Pill } from "@/components/ui/pill";
 import { IconChevronDown } from "@/components/icons";
-import type { Period } from "@/lib/period";
+import { periodLabel, type Period } from "@/lib/period";
 
 const MONTH_NAMES = [
   "January",
@@ -43,28 +46,33 @@ export function PeriodPicker({
   availableYears,
   onChange,
   allowMonth = true,
+  yearLabel = (y) => periodLabel({ year: y }),
 }: {
   period: Period;
   availableYears: number[];
   onChange: (next: Period) => void;
   allowMonth?: boolean;
+  yearLabel?: (year: number) => string;
 }) {
+  const year = period.year;
   return (
     <div className="flex items-center gap-2">
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Pill active={true}>
-            {period.year}
+            {yearLabel(year)}
             <IconChevronDown className="size-3 opacity-70" />
           </Pill>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="max-h-72 w-32">
+        <DropdownMenuContent align="start" className="max-h-72 w-36">
           {availableYears.map((yr) => (
             <DropdownMenuItem
               key={yr}
-              onSelect={() => onChange({ year: yr, mon: period.mon })}
+              onSelect={() =>
+                onChange(period.mon != null ? { year: yr, mon: period.mon } : { year: yr })
+              }
             >
-              {yr}
+              {yearLabel(yr)}
             </DropdownMenuItem>
           ))}
         </DropdownMenuContent>
@@ -79,14 +87,11 @@ export function PeriodPicker({
             </Pill>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="max-h-72 w-40">
-            <DropdownMenuItem onSelect={() => onChange({ year: period.year })}>
+            <DropdownMenuItem onSelect={() => onChange({ year })}>
               <span className="text-muted-foreground">All months</span>
             </DropdownMenuItem>
-            {MONTH_NAMES.map((name, idx) => (
-              <DropdownMenuItem
-                key={name}
-                onSelect={() => onChange({ year: period.year, mon: idx + 1 })}
-              >
+            {MONTH_NAMES.map((name, i) => (
+              <DropdownMenuItem key={name} onSelect={() => onChange({ year, mon: i + 1 })}>
                 {name}
               </DropdownMenuItem>
             ))}

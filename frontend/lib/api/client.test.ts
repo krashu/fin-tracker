@@ -5,6 +5,7 @@ import {
   createAccount,
   deleteAccount,
   getAuthConfig,
+  invalidIdsFromError,
   listAccounts,
   listCategories,
   listCategoryTree,
@@ -324,6 +325,20 @@ describe("API Client (lib/api/client.ts)", () => {
 
       await expect(login("test@example.com", "wrongpass")).rejects.toThrow(ApiError);
       expect(refreshCalls).toBe(0); // Did not trigger refresh
+    });
+  });
+
+  describe("invalidIdsFromError", () => {
+    it("invalidIdsFromError reads invalid_ids from a 422 body", () => {
+      const err = new ApiError(422, "x", { detail: { message: "m", invalid_ids: [4, 9] } });
+      expect(invalidIdsFromError(err)).toEqual([4, 9]);
+    });
+
+    it("returns [] for another status or error shape", () => {
+      const body = { detail: { invalid_ids: [4] } };
+      expect(invalidIdsFromError(new ApiError(400, "x", body))).toEqual([]);
+      expect(invalidIdsFromError(new ApiError(422, "x", { detail: "nope" }))).toEqual([]);
+      expect(invalidIdsFromError(new Error("boom"))).toEqual([]);
     });
   });
 });

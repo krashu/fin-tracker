@@ -7,6 +7,8 @@
   to ``/transactions/{id}`` before commit. Commit reads ``category_id``
   from the DB, not the request, so the route stays a pure lifecycle
   transition (no edit + commit mixing).
+* :class:`SampleStatementRead` / :class:`SampleImportCreate` — the guest-usable bundled sample
+  statements (``GET`` / ``POST /api/v1/imports/samples``, ADR-0003 rule 15).
 * :class:`InvestmentCsvImportSummary` — response body of
   ``POST /api/v1/imports/investments`` (investment-transaction CSV, PRD §F7).
   Account-less and commits directly (no review queue — investments have no
@@ -26,7 +28,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ImportSummary(BaseModel):
@@ -36,7 +38,9 @@ class ImportSummary(BaseModel):
     existed (the file was seen before) — not that the upload was a no-op. A
     re-upload re-parses and reconciles, re-staging rows missing from the DB.
     ``pending_count`` is the batch's rows still awaiting review after the import;
-    the frontend routes on it (>0 → review queue, 0 → "all already in expenses").
+    the frontend routes on it (>0 → review queue, 0 → nothing to review).
+    ``skipped`` counts rows already in the DB (duplicates); ``zero_amount_count`` counts
+    zero-amount rows, which are not transactions (ADR-0010 rule 5).
 
     ``duplicate_of_account_id`` is *an* other account of the same user that this
     byte-identical file was already imported into (a wrong-account mis-import — the
@@ -56,6 +60,7 @@ class ImportSummary(BaseModel):
     batch_id: int
     imported: int
     skipped: int
+    zero_amount_count: int
     already_imported: bool
     pending_count: int
     duplicate_of_account_id: int | None = None
@@ -63,16 +68,48 @@ class ImportSummary(BaseModel):
     reconciliation_delta_paise: int | None = None
 
 
+class SampleStatementRead(BaseModel):
+    """One bundled sample statement (ADR-0003 rule 15) on ``GET /imports/samples``.
+
+    ``account_ids`` are the caller's live accounts the sample can be imported into: the
+    server owns that match, so the UI never compares issuers itself.
+    """
+
+    id: str
+    label: str
+    issuer: str
+    account_type: Literal["credit_card", "bank"]
+    account_ids: list[int]
+
+
+class SampleImportCreate(BaseModel):
+    """Request body of ``POST /api/v1/imports/samples``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str = Field(min_length=1, max_length=64)
+    account_id: int = Field(gt=0)
+
+
 class ImportCommit(BaseModel):
     """Request body for ``POST /api/v1/imports/{batch_id}/commit``.
 
-    ``min_length=1`` because empty-list commits are a frontend bug, not a
-    valid no-op (the cancel route exists for "do nothing").
+    ``transaction_ids`` are the pending rows to commit and ``discard_ids`` the pending rows
+    to delete, in the same atomic request (ADR-0002 rule 5). Either list may be empty, but
+    not both: an empty request is a frontend bug, not a valid no-op (the cancel route exists
+    for "do nothing"). An id in both lists is refused by the route.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    transaction_ids: list[int] = Field(min_length=1)
+    transaction_ids: list[int] = Field(default_factory=list)
+    discard_ids: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _names_a_row(self) -> ImportCommit:
+        if not self.transaction_ids and not self.discard_ids:
+            raise ValueError("nothing to commit or discard")
+        return self
 
 
 class PendingImportBatch(BaseModel):
@@ -113,6 +150,8 @@ class InvestmentCsvImportSummary(BaseModel):
     ``already_imported`` short-circuits an identical re-upload (matched by
     ``source_file_hash``) — the client shows "already imported — nothing new".
     ``warnings`` are PII-safe (line number + reason; never raw cells / folio / PAN).
+    ``rows_rejected`` counts rows, and ``warnings`` may be fewer: a refused instrument (an
+    uncovered sell, ADR-0015 rule 9) rejects all its rows but gets one warning per uncovered sell.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -165,3 +204,26 @@ class BatchReconciliation(BaseModel):
     delta_paise: int | None
     status: Literal["unavailable", "matched", "mismatched"]
     rows_removed_since_import: int
+
+
+class StatementUploadForm(BaseModel):
+    """Non-file fields of ``POST /imports``. Read by ``app.api.uploads``, not FastAPI ``Form()``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: int
+    # No length/pattern constraint: nothing may give a validation error a reason to quote it.
+    password: str | None = None
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def _blank_is_none(cls, v: object) -> object:
+        return None if v == "" else v
+
+
+class InvestmentCsvUploadForm(BaseModel):
+    """Non-file field of ``POST /imports/investments``; membership is checked by the route."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_class: str

@@ -2,7 +2,7 @@
 
 /**
  * Monthly spend by category (PRD §F8 view 2). A ranked horizontal bar list for
- * the selected month from `GET /dashboards/spend-by-category`.
+ * the selected month (or year) from `GET /dashboards/spend-by-category`.
  *
  * `total_paise` is signed (spend negative, refund positive); rows arrive
  * server-ordered (most-negative first, uncategorized pinned last) and are
@@ -30,10 +30,15 @@ import {
 } from "@/lib/api/client";
 import { formatINR, formatMonthYear, formatPercent } from "@/lib/format";
 import {
+  periodLabel as periodName,
+  periodParams,
+  previousPeriod,
+  type Period,
+} from "@/lib/period";
+import {
   categoryColorVar,
   categoryLabel,
   getParentSubcategorySpend,
-  resolveSiblingDisplayColor,
   rollUpSpendByCategory,
 } from "@/lib/categories";
 import { cn } from "@/lib/utils";
@@ -65,43 +70,40 @@ export function SpendByCategory({
   });
   const rows = query.data?.rows ?? [];
 
-  // Previous period (month or year) for the per-category delta chip.
-  const prevParams = useMemo(() => {
-    if (month) {
-      const [y, m] = month.split("-").map(Number);
-      const d = new Date(y, m - 2, 1);
-      const prevM = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-      return { month: prevM };
-    }
-    return { year: String(year - 1) };
-  }, [month, year]);
+  // Previous period (month, or year) for the per-category delta chip.
+  const period = useMemo<Period>(
+    () =>
+      month
+        ? { year: Number(month.slice(0, 4)), mon: Number(month.slice(5, 7)) }
+        : { year },
+    [month, year],
+  );
+  const prevPeriod = useMemo(() => previousPeriod(period), [period]);
+  const prevParams = useMemo(() => periodParams(prevPeriod), [prevPeriod]);
+  const prevLabel = periodName(prevPeriod);
 
   const prevQuery = useQuery({
     queryKey: ["dashboards", "spend-by-category", { ...prevParams, label_id: labelId }],
     queryFn: () => listSpendByCategory({ ...prevParams, label_id: labelId }),
-    enabled: month != null,
   });
 
-  // The aggregate carries only id/name/total — join the shared ["categories"] cache.
+  // Rollups read each row's own parent_id/parent_name (ADR-0012 rule 6); the shared
+  // ["categories"] cache supplies the live names, colours and the picker.
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
     queryFn: () => listCategories(),
   });
   const allCategories = categoriesQuery.data ?? [];
-  // Every dot/bar in this card renders siblings next to each other (the
-  // parent list, the drilldown, the flat "All Detailed" view, the net-credit
-  // footer), so color resolution goes through the shade-aware helper, not
-  // plain `resolveCategoryColor` (locked decision #5 / 5.6). Built once here
-  // rather than per-element — `resolveCategoryColor` used to be handed the
-  // raw `allCategories` array inside this same `.map`, rebuilding a fresh
-  // Map on every iteration.
-  const colorById = useMemo(
-    () =>
-      new Map<number, CategoryColor | null>(
-        allCategories.map((c) => [c.id, resolveSiblingDisplayColor(c, allCategories)]),
-      ),
-    [allCategories],
-  );
+  // View 2 colours from the rows' server-resolved display colours (ADR-0012 rule 7), so an
+  // archived subcategory keeps its family hue; no category-list join.
+  const colorById = useMemo(() => {
+    const m = new Map<number, CategoryColor>();
+    for (const r of rows) {
+      if (r.category_id != null && r.display_color) m.set(r.category_id, r.display_color);
+      if (r.parent_id != null && r.parent_display_color) m.set(r.parent_id, r.parent_display_color);
+    }
+    return m;
+  }, [rows]);
   const colorFor = (id: number | null): CategoryColor | null =>
     id != null ? (colorById.get(id) ?? null) : null;
   const categoriesById = useMemo(
@@ -121,12 +123,12 @@ export function SpendByCategory({
 
   // Hierarchical rollups for current and previous period
   const parentRollups = useMemo(
-    () => rollUpSpendByCategory(rows, allCategories),
-    [rows, allCategories],
+    () => rollUpSpendByCategory(rows),
+    [rows],
   );
   const prevRollups = useMemo(
-    () => rollUpSpendByCategory(prevQuery.data?.rows ?? [], allCategories),
-    [prevQuery.data?.rows, allCategories],
+    () => rollUpSpendByCategory(prevQuery.data?.rows ?? []),
+    [prevQuery.data?.rows],
   );
 
   const prevParentMagById = useMemo(() => {
@@ -186,12 +188,12 @@ export function SpendByCategory({
   // denominator skews every share (5.3 — the 166.7%-and-overflowing-bar case).
   const subcategorySpendItems = useMemo(() => {
     if (selectedParentId == null) return [];
-    return getParentSubcategorySpend(rows, selectedParentId, allCategories);
+    return getParentSubcategorySpend(rows, selectedParentId);
   }, [selectedParentId, rows, allCategories]);
 
   const displayPeriodLabel = month
     ? formatMonthYear(new Date(Number(month.split("-")[0]), Number(month.split("-")[1]) - 1, 1))
-    : `${year}`;
+    : periodName({ year });
 
   return (
     <Card>
@@ -365,6 +367,7 @@ export function SpendByCategory({
                           <DeltaChip
                             mag={mag}
                             prevMag={prevSubcatMagById.get(subcat.categoryId)}
+                            prevLabel={prevLabel}
                           />
                         ) : null}
                       </span>
@@ -473,6 +476,7 @@ export function SpendByCategory({
                         <DeltaChip
                           mag={mag}
                           prevMag={prevParentMagById.get(r.parentId)}
+                          prevLabel={prevLabel}
                         />
                       ) : null}
                     </span>
@@ -499,12 +503,17 @@ export function SpendByCategory({
             {spendRows.map((r) => {
               const mag = -r.total_paise;
               const sharePct = totalSpend > 0 ? (mag * 100) / totalSpend : 0;
-              // `r.category_name` is the row's STORED name — the aggregate join
-              // predicates on id + user_id only, never `archived_at`, so an
-              // archived category still arrives named. Passing it through
+              // `r.category_name` / `r.parent_name` are the row's STORED names — the
+              // aggregate joins predicate on id + user_id only, never `archived_at`, so
+              // an archived category still arrives named. Passing them through
               // `categoryLabel` keeps the breadcrumb for active rows and stops an
               // archived one from rendering as "Uncategorized".
-              const displayName = categoryLabel(r.category_id, categoriesById, r.category_name);
+              const displayName = categoryLabel(
+                r.category_id,
+                categoriesById,
+                r.category_name,
+                r.parent_name,
+              );
 
               return (
                 <li key={r.category_id ?? "uncategorized"}>
@@ -540,6 +549,7 @@ export function SpendByCategory({
                         <DeltaChip
                           mag={mag}
                           prevMag={prevSubcatMagById.get(r.category_id)}
+                          prevLabel={prevLabel}
                         />
                       ) : null}
                     </span>
@@ -579,7 +589,7 @@ export function SpendByCategory({
             `creditRollups` could show the header with an empty list (5.7). */}
         {creditDisplayRows.length > 0 && selectedParentId == null ? (
           <p className="mt-3 border-t border-border/60 pt-2.5 text-[11.5px] text-muted-foreground">
-            Net credit this month:{" "}
+            Net credit in {displayPeriodLabel}:{" "}
             {creditDisplayRows.map((r, i) => {
               const catId = "parentId" in r ? r.parentId : r.category_id;
               const catName = "parentName" in r ? r.parentName : r.category_name;
@@ -606,7 +616,8 @@ export function SpendByCategory({
   );
 }
 
-/** "vs last month" spend-change chip. `mag` / `prevMag` are positive magnitudes
+/** "vs {previous period}" spend-change chip (`prevLabel` names it: last month, or
+ * the previous year). `mag` / `prevMag` are positive magnitudes
  * (paise). Not wrapped in `Sensitive`: a percentage change is a ratio, not an
  * amount, so it leaks no balance (same stance as `formatPercent`). Color follows
  * spend semantics — more spending is "bad" (neg/red), less is "good" (pos/green),
@@ -614,11 +625,13 @@ export function SpendByCategory({
 function DeltaChip({
   mag,
   prevMag,
+  prevLabel,
 }: {
   mag: number;
   prevMag: number | undefined;
+  prevLabel: string;
 }) {
-  // Absent last month (or last month was net-credit/zero) → nothing to compare.
+  // Absent in the previous period (or last month was net-credit/zero) → nothing to compare.
   if (prevMag === undefined) {
     return <span className="text-[11px] text-muted-foreground">new</span>;
   }
@@ -631,11 +644,11 @@ function DeltaChip({
       </span>
     );
   }
-  const up = pct > 0; // spent more than last month
+  const up = pct > 0; // spent more than in the previous period
   return (
     <span
       className={cn("text-[11px] tabular-nums", up ? "text-neg" : "text-pos")}
-      title="vs last month"
+      title={`vs ${prevLabel}`}
     >
       {up ? "▲" : "▼"} {formatPercent(Math.abs(pct))}
     </span>

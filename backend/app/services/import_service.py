@@ -4,7 +4,10 @@ Public surface:
 
 * :data:`PARSERS` — dispatch table from ``(issuer, account_type)`` to parser class.
 * :class:`ImportResult` — frozen value object returned to the route.
-* :func:`import_statement` — the orchestrator.
+* :func:`import_statement` — the orchestrator: load the account, parse, then persist.
+* :func:`load_statement_account`, :func:`parser_for`, :func:`persist_statement` — its three
+  steps, public so the bundled sample statements (:mod:`app.services.sample_statements`) can
+  reuse the persist half without a file upload.
 
 Caller (the route) owns the commit. This module uses the caller's
 session and never calls :meth:`Session.commit` itself, matching the
@@ -13,14 +16,17 @@ project CLAUDE.md.
 
 Decisions locked in for v1 (see :file:`docs/` ADRs when they land):
 
-* CC-only. Parser ``payment`` rows are imported as ``income``; this is the
+* Card and bank statements. Parser ``payment`` rows are imported as ``income``; this is the
   input contract for F4a reconciliation (``reconciliation_service.auto_link_cc_bill``
-  gates on ``transaction_type == "income"`` and flips matched CC-bill pairs
-  to ``transfer`` at commit). An unmatched payment correctly stays ``income``
-  — a lone ``transfer`` leg would violate ADR-0002's exactly-two-pairing
-  invariant. Do NOT "fix" this to ``transfer`` at import time.
-* Zero-paise rows are skipped before fingerprinting — a zero-amount
-  transaction is not a transaction.
+  flips matched CC-bill pairs to ``transfer`` at the commit of either side's batch: the
+  card side gates on a positive ``income`` or ``transfer`` row, the bank side finds it).
+  Staging keeps ``income``: the commit, not the import, retypes an unmatched uncategorised
+  payment to an unpaired ``transfer`` (ADR-0002 rule 7c). Do NOT "fix" this to ``transfer``
+  at import time.
+* Zero-paise rows are dropped before fingerprinting — a zero-amount
+  transaction is not a transaction (ADR-0009 rule 3) — and counted in
+  ``zero_amount_count``, never in ``skipped``, which counts duplicates only
+  (ADR-0010 rule 5).
 * Row dedup is a per-fingerprint **multiset difference**, not set membership
   (ADR-0006): the DB holds ``n_db`` rows for a fingerprint, the file yields
   ``n_file``, and ``max(0, n_file - n_db)`` are staged with ascending
@@ -60,13 +66,25 @@ from sqlalchemy.orm import Session
 from app.core.log_config import get_logger
 from app.models import Account, ImportBatch, Transaction
 from app.models.transaction import TransactionTypeStr
-from app.parsers import AxisCC, IciciCC, RawTransaction, StatementParser
+from app.parsers import (
+    AxisBank,
+    AxisCC,
+    HdfcBank,
+    IciciBank,
+    IciciCC,
+    ParsedStatement,
+    RawTransaction,
+    SbiBank,
+    StatementParser,
+)
+from app.parsers.base import parse_statement
+from app.services.category_service import CASHBACK_CATEGORY_NAME, default_category_id
 from app.services.fingerprint import transaction_fingerprint
-from app.services.merchant import normalize_merchant
+from app.services.merchant import merchant_too_long, normalize_merchant
 from app.services.merchant_alias import EMPTY_RESOLVER, load_alias_resolver
 from app.services.merchant_labels import prefetch_label_map
 from app.services.occurrence import OccurrenceAllocator
-from app.services.reconciliation_service import reconcile_batch
+from app.services.reconciliation_service import is_card_bill_debit, reconcile_batch
 from app.services.tag_service import AUTO_TAGGABLE_TYPES, prefetch_tag_map
 from app.services.transaction_labels import link_labels
 
@@ -85,13 +103,30 @@ class NonInrAccountError(ValueError):
     """``account_id`` is a non-INR account — v1 statement import is INR-only.
 
     Distinct from :class:`AccountNotFoundError` (a USD account is *found*, not
-    missing) so the route can map it to 422, not 404.
+    missing) so the route gives it its own 422 detail.
     """
+
+
+class StatementMerchantTooLongError(ValueError):
+    """A statement row's merchant will not fit a merchant column (ADR-0006 rule 3b).
+
+    ``row`` is the 1-based ordinal in the parser's output. It is the whole payload: the
+    message names a position and never statement text, so the route can return and log
+    it, as with :class:`~app.parsers.base.RunningBalanceMismatchError` (ADR-0010 rule 11).
+    """
+
+    def __init__(self, *, row: int) -> None:
+        self.row = row
+        super().__init__(f"merchant on statement row {row} is longer than 512 characters")
 
 
 PARSERS: dict[tuple[str, str], type[StatementParser]] = {
     ("axis", "credit_card"): AxisCC,
     ("icici", "credit_card"): IciciCC,
+    ("hdfc", "bank"): HdfcBank,
+    ("axis", "bank"): AxisBank,
+    ("icici", "bank"): IciciBank,
+    ("sbi", "bank"): SbiBank,
 }
 
 
@@ -102,17 +137,41 @@ SUPPORTED_CC_ISSUERS: tuple[str, ...] = tuple(
     sorted(issuer for (issuer, atype) in PARSERS if atype == "credit_card")
 )
 
+# Bank issuers with a registered statement parser; the same guard, for bank accounts.
+SUPPORTED_BANK_ISSUERS: tuple[str, ...] = tuple(
+    sorted(issuer for (issuer, atype) in PARSERS if atype == "bank")
+)
+
+# The brand label the UI shows for each parser's issuer id. Beside PARSERS so adding a parser
+# means adding its label here and nowhere in the frontend; a test fails if one is missing.
+ISSUER_LABELS: dict[str, str] = {"axis": "Axis", "icici": "ICICI", "hdfc": "HDFC", "sbi": "SBI"}
+
+
+def statement_import_supported(account_type: str, issuer: str | None) -> bool:
+    """Whether a statement for an account of this type and issuer has a parser.
+
+    The same ``(issuer, type)`` lookup :func:`import_statement` dispatches on, so the answer
+    the API gives is exactly what an upload would find.
+    """
+    return issuer is not None and (issuer, account_type) in PARSERS
+
+
+def statement_issuers() -> list[tuple[str, str, str]]:
+    """Every ``(account_type, issuer, label)`` a statement parser exists for, sorted."""
+    return sorted((atype, issuer, ISSUER_LABELS[issuer]) for (issuer, atype) in PARSERS)
+
 
 @dataclass(frozen=True, slots=True)
 class ImportResult:
     batch_id: int
     imported: int
     skipped: int
+    zero_amount_count: int
     already_imported: bool
     # Rows on this batch still awaiting review (confirmed_at IS NULL) after the
-    # import. The frontend routes on this: >0 → open the review queue, 0 → "all
-    # transactions already in expenses". Counts newly-staged rows plus any that
-    # were already pending on the batch.
+    # import. The frontend routes on this: >0 → open the review queue, 0 → nothing
+    # to review (all rows already in expenses, or none that are transactions). Counts
+    # newly-staged rows plus any that were already pending on the batch.
     pending_count: int
     # AN other account this byte-identical file was already imported into (there may
     # be more than one — this reports one, deterministically the lowest batch id).
@@ -131,22 +190,12 @@ class ImportResult:
     reconciliation_delta_paise: int | None = None
 
 
-def import_statement(
-    *,
-    user_id: UUID,
-    account_id: int,
-    file_bytes: bytes,
-    password: str | None,
-    session: Session,
-) -> ImportResult:
-    """Parse a statement, dedup, persist rows + an ImportBatch.
+def load_statement_account(session: Session, *, user_id: UUID, account_id: int) -> Account:
+    """The caller's live INR account a statement may be staged into.
 
     Raises:
         AccountNotFoundError: account not found, not owned by ``user_id``, or archived.
         NonInrAccountError: account is non-INR (v1 spending is INR-only).
-        ParserNotRegisteredError: no parser registered for
-            ``(account.issuer, account.type)``.
-        ParserError / InvalidPasswordError: propagated from the parser.
     """
     # ``archived_at IS NULL`` matches the four sibling account pre-flights — transactions.py:204,
     # transactions.py:346, accounts.py:137 and accounts.py:222 — which all refuse an archived
@@ -167,14 +216,81 @@ def import_statement(
         # v1 spending is INR-only; a USD account's cents would be imported as INR
         # paise (the parsers emit INR magnitudes). Fails fast before parser dispatch.
         raise NonInrAccountError(f"account_id={account_id} currency={account.currency}")
+    return account
 
+
+def parser_for(account: Account) -> type[StatementParser]:
+    """The registered parser for ``(account.issuer, account.type)``.
+
+    Reads :data:`PARSERS` at call time (tests monkeypatch it).
+
+    Raises:
+        ParserNotRegisteredError: no parser registered for the pair.
+    """
     parser_cls = PARSERS.get((account.issuer or "", account.type))
     if parser_cls is None:
         raise ParserNotRegisteredError(
             f"no parser for issuer={account.issuer!r} type={account.type!r}"
         )
+    return parser_cls
 
-    source_file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+def import_statement(
+    *,
+    user_id: UUID,
+    account_id: int,
+    file_bytes: bytes,
+    password: str | None,
+    session: Session,
+) -> ImportResult:
+    """Parse a statement, dedup, persist rows + an ImportBatch.
+
+    The bytes and password never leave this call (ADR-0010 rule 13); the batch keeps only
+    ``source_file_hash``.
+
+    Raises:
+        AccountNotFoundError: account not found, not owned by ``user_id``, or archived.
+        NonInrAccountError: account is non-INR (v1 spending is INR-only).
+        ParserNotRegisteredError: no parser registered for
+            ``(account.issuer, account.type)``.
+        ParserError / InvalidPasswordError: propagated from the parser;
+            ``parse_statement`` turns any other parser exception into a
+            ``ParserError`` that logs only its type (A52).
+        StatementMerchantTooLongError: a row's merchant is past 512 characters, raw or
+            normalized (ADR-0006 rule 3b); nothing is staged.
+    """
+    account = load_statement_account(session, user_id=user_id, account_id=account_id)
+    parser_cls = parser_for(account)
+    statement = parse_statement(parser_cls, file_bytes, password)
+    return persist_statement(
+        session,
+        user_id=user_id,
+        account=account,
+        parser_name=parser_cls.__name__,
+        source_file_hash=hashlib.sha256(file_bytes).hexdigest(),
+        statement=statement,
+    )
+
+
+def persist_statement(
+    session: Session,
+    *,
+    user_id: UUID,
+    account: Account,
+    parser_name: str,
+    source_file_hash: str,
+    statement: ParsedStatement,
+) -> ImportResult:
+    """Stage an already-parsed statement: dedup, persist rows + an ImportBatch.
+
+    Shared by the upload path (:func:`import_statement`) and the bundled sample statements,
+    which compose the parser's ``interpret_*`` steps themselves. The caller commits.
+
+    Raises:
+        StatementMerchantTooLongError: a row's merchant is past 512 characters, raw or
+            normalized (ADR-0006 rule 3b); the caller must not commit the flushed batch.
+    """
+    account_id = account.id
 
     # Re-upload reconciliation: reuse the prior completed batch instead of
     # short-circuiting, so the dedup loop below re-stages rows missing from the
@@ -231,27 +347,30 @@ def import_statement(
             user_id=user_id,
             account_id=account_id,
             source_file_hash=source_file_hash,
-            parser_name=parser_cls.__name__,
+            parser_name=parser_name,
             status="pending",
         )
         session.add(batch)
         session.flush()
 
-    parsed_statement = parser_cls.parse(file_bytes, password)
-    rows = parsed_statement.rows
+    rows = statement.rows
 
     # Pass 1 — identity only. Normalizing and fingerprinting before the persist loop
     # is what lets the prefetch below scope itself to THIS FILE's fingerprints (see
     # there); the loop used to do both inline, which forced a date-window proxy.
     # Zero-paise rows are dropped here — a zero-amount transaction is not a
-    # transaction — so they never reach the allocator, exactly as before.
-    skipped = 0
+    # transaction — and counted in `zero_amount_count`, so they never reach the
+    # allocator and never count as duplicates.
+    zero_amount_count = 0
     parsed: list[tuple[RawTransaction, str, str]] = []
     for idx, row in enumerate(rows):
         if row.amount_paise == 0:
             logger.debug("import_service: skipping zero-paise row", idx=idx)
-            skipped += 1
+            zero_amount_count += 1
             continue
+        if merchant_too_long(row.merchant_raw):
+            logger.warning("statement_merchant_too_long", row=idx + 1)
+            raise StatementMerchantTooLongError(row=idx + 1)
         normalized = normalize_merchant(row.merchant_raw)
         parsed.append(
             (
@@ -337,6 +456,14 @@ def import_statement(
     # LABEL_PREFILL_MIN, summed across every raw descriptor an alias folds
     # together). Same one-SELECT-then-dict-lookup shape as tag_map.
     label_map = prefetch_label_map(session, user_id=user_id, resolver=resolver) if rows else {}
+    # The user's active spend "Cashback" (ADR-0013 rule 2), looked up once. None
+    # if they archived or renamed it: a cashback credit is then staged like any
+    # other positive spend (auto-tag, else spend "Other" at commit).
+    cashback_id = (
+        default_category_id(session, user_id=user_id, name=CASHBACK_CATEGORY_NAME, kind="spend")
+        if rows
+        else None
+    )
     # Collected (txn, [label_id, ...]) for prefilled rows — the join rows are
     # inserted after the post-loop flush assigns txn.id (below).
     label_prefills: list[tuple[Transaction, list[int]]] = []
@@ -344,11 +471,11 @@ def import_statement(
     # Pass 2 — allocate + persist, in file order (the allocator's per-file tally
     # depends on it).
     imported = 0
+    skipped = 0
     allocator = OccurrenceAllocator(existing_counts)
     for row, normalized, fp in parsed:
         # `is None` — occurrence 0 is a valid first sighting (see the allocator's
-        # docstring). `skipped` is this importer's own counter and already carries the
-        # zero-paise rows from pass 1, which is why it doesn't move into the allocator.
+        # docstring). `skipped` is this importer's own counter and counts duplicates only.
         occurrence = allocator.allocate(fp)
         if occurrence is None:
             skipped += 1
@@ -360,7 +487,30 @@ def import_statement(
         # merchant_normalized (ADR-0011). merchant_normalized itself is never
         # overwritten with the canonical; it still feeds the F4 fingerprint.
         canonical = resolver.canonical(normalized)
-        auto_category_id = tag_map.get(canonical) if txn_type in AUTO_TAGGABLE_TYPES else None
+        # A flagged card-bill debit on a bank is never prefilled (ADR-0004 rule 8): a rule learned
+        # from one bill must not decide the next, which commits as a transfer or Other (ADR-0002
+        # rule 7b).
+        card_bill_debit = (
+            account.type == "bank" and row.amount_paise < 0 and is_card_bill_debit(normalized)
+        )
+        auto_category_id = (
+            tag_map.get(canonical)
+            if txn_type in AUTO_TAGGABLE_TYPES and not card_bill_debit
+            else None
+        )
+        category_id = auto_category_id
+        if (
+            cashback_id is not None
+            and txn_type == "spend"
+            and row.amount_paise > 0
+            and is_cashback_credit(row.merchant_raw)
+        ):
+            # A credit naming cashback goes to spend "Cashback" whatever the
+            # merchant's tag rule says (the credit rarely names the purchase it
+            # rewards). It is a keyword default, not an F3 suggestion, so the
+            # acceptance metric's auto_category_id is left NULL (ADR-0013).
+            category_id = cashback_id
+            auto_category_id = None
 
         txn = Transaction(
             user_id=user_id,
@@ -370,10 +520,11 @@ def import_statement(
             transaction_type=txn_type,
             merchant_raw=row.merchant_raw,
             merchant_normalized=normalized,
-            category_id=auto_category_id,
+            category_id=category_id,
             # Freeze the suggestion for the acceptance-rate metric. Mirrors
-            # category_id here; the two diverge later iff the user edits the
-            # category before/after commit (PATCH leaves auto_category_id).
+            # category_id here (except a cashback prefill, above); the two diverge
+            # later iff the user edits the category before/after commit (PATCH
+            # leaves auto_category_id).
             auto_category_id=auto_category_id,
             fingerprint=fp,
             # ADR-0007 rule 9 — stamped at STAGE time, not at commit, so editing a
@@ -424,13 +575,13 @@ def import_statement(
     # own metadata on EVERY import, including a re-upload — unlike imported_count /
     # skipped_count / status above, this isn't "the first import's outcome": same
     # file in, same metadata out, and a re-upload repairs a batch stamped before
-    # this shipped. reconcile_batch may itself stamp period_start/period_end via
-    # the window fallback (see its docstring) before computing the delta, so this
-    # assignment runs first.
-    batch.statement_opening_balance_paise = parsed_statement.summary.opening_balance_paise
-    batch.statement_closing_balance_paise = parsed_statement.summary.closing_balance_paise
-    batch.period_start = parsed_statement.summary.period_start
-    batch.period_end = parsed_statement.summary.period_end
+    # this shipped. period_* is stored exactly as printed (None when the PDF has
+    # none); reconcile_batch reads these columns, computing any fallback window
+    # without writing it back (ADR-0010 rule 8), so this assignment runs first.
+    batch.statement_opening_balance_paise = statement.summary.opening_balance_paise
+    batch.statement_closing_balance_paise = statement.summary.closing_balance_paise
+    batch.period_start = statement.summary.period_start
+    batch.period_end = statement.summary.period_end
     batch.reconciliation_delta_paise = reconcile_batch(session, user_id=user_id, batch=batch)
 
     # Rows on this batch still awaiting review after the import — the frontend's
@@ -455,10 +606,12 @@ def import_statement(
     logger.info(
         "import_completed",
         import_batch_id=batch.id,
-        parser=parser_cls.__name__,
+        parser=parser_name,
         rows_in=len(rows),
         rows_imported=imported,
         rows_skipped=skipped,
+        # Zero-amount lines are dropped by rule (ADR-0009 rule 3), not duplicates.
+        rows_rejected=zero_amount_count,
         already_imported=already_imported,
         pending_count=pending_count,
         # Aggregate rupee figure, not a merchant or account number — PII-safe.
@@ -469,6 +622,7 @@ def import_statement(
         batch_id=batch.id,
         imported=imported,
         skipped=skipped,
+        zero_amount_count=zero_amount_count,
         already_imported=already_imported,
         pending_count=pending_count,
         duplicate_of_account_id=duplicate_of_account_id,
@@ -481,45 +635,41 @@ _CASHBACK_RE = re.compile(r"CASHBACK", re.IGNORECASE)
 
 
 def is_cashback_credit(merchant_raw: str) -> bool:
-    """Whether ``merchant_raw`` names this credit as cashback (PRD §F5).
+    """Whether ``merchant_raw`` names this credit as cashback (ADR-0013).
 
     A plain keyword, not per-issuer regex vocabulary (unlike ``_REFUND_RE`` in
     each parser) — the word appears verbatim across issuers, so one check here
-    covers every parser rather than duplicating it per statement format.
-    Exported so ``app.api.v1.imports.commit_import_batch`` can re-run the same
-    check at commit time for its category default (PRD §F5 fallback) — one
-    rule, not two copies that can drift.
+    covers every parser rather than duplicating it per statement format. Picks
+    the spend "Cashback" prefill at staging (:func:`import_statement`), and is
+    exported so ``app.api.v1.imports.commit_import_batch`` can recognise that
+    prefill at commit and not teach it — one rule, not two copies that can drift.
     """
     return bool(_CASHBACK_RE.search(merchant_raw))
 
 
 def _map_type(row: RawTransaction) -> TransactionTypeStr:
-    """Parser TxnType → model transaction_type (CC-only, v1).
+    """Parser TxnType → model transaction_type.
 
-    Only two types are reachable from a CC statement: ``payment`` folds to
-    ``income`` (the F4a input contract) and a cashback-named credit is
-    ``income``; **everything else is ``spend``**. A parser ``refund`` needs no
-    branch of its own — a refund IS a ``spend`` row with a positive amount
-    (ADR-0009), and the parser already hands over that positive sign
-    (``RawTransaction.__post_init__`` enforces ``refund >= 0``). So the sign
-    carries refund-ness and this function never has to guess at it.
+    ``payment`` folds to ``income`` (the F4a input contract; the commit retypes an
+    uncategorised flagged one to an unpaired ``transfer``, ADR-0002 rule 7c, so staging
+    stays ``income``) and so does a bank ``deposit``, unless its text names cashback, which
+    is a rebate and so a positive ``spend`` (ADR-0009 rule 7, ADR-0013 rule 1); **everything
+    else is ``spend``**.
+    A parser ``refund`` needs no branch of its own — a refund IS a ``spend`` row with a
+    positive amount (ADR-0009), and the parser already hands over that positive sign
+    (``RawTransaction.__post_init__`` enforces ``refund >= 0``). A cashback credit is a
+    positive ``spend`` too: a rebate on purchases, never income (ADR-0013 rule 1). So the
+    sign carries refund-ness and this function never has to guess at it.
 
     Zero-paise rows are filtered out upstream, so the ``other`` branch is
     always strictly signed: negative is a spend the parser's vocabulary didn't
-    otherwise match; positive is a cashback credit (see ``is_cashback_credit``)
-    or, failing that, a merchant refund — which is the ``spend`` default below
-    (PRD §F5).
+    otherwise match; positive is a refund or cashback credit. Defaulting an
+    unmatched positive credit to income would inflate spend by the credit's
+    full magnitude (PRD §F4a note 3). Which category a cashback credit lands in
+    is :func:`import_statement`'s job, not this one's.
     """
     if row.txn_type == "payment":
         return "income"  # F4a input contract — see module docstring; do NOT change to "transfer"
-    # An unmatched credit-card credit named cashback in its own description is
-    # income, not a merchant refund — the one case where the sign alone is not
-    # enough, since a refund and a cashback credit are both positive.
-    if row.amount_paise > 0 and is_cashback_credit(row.merchant_raw):
+    if row.txn_type == "deposit" and not is_cashback_credit(row.merchant_raw):
         return "income"
-    # Everything else is spend-typed and keeps the parser's sign: negative is an
-    # ordinary spend, positive is a refund. An unmatched positive credit (not a
-    # "payment", not matched by _REFUND_RE, not named cashback) therefore lands
-    # as a refund rather than income — defaulting it to income would inflate
-    # spend by the credit's full magnitude (PRD §F4a note 3).
     return "spend"

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.core.config import Settings
+from app.core.demo_data import ACCOUNTS
 from app.models import (
     Account,
     Category,
@@ -40,7 +41,7 @@ def test_create_guest_sandbox_populates_isolated_data(session: Session) -> None:
 
     # Check accounts seeded
     accounts = session.scalars(select(Account).where(Account.user_id == guest.id)).all()
-    assert len(accounts) == 2
+    assert len(accounts) == len(ACCOUNTS)
 
     # Check transactions seeded
     transactions = session.scalars(select(Transaction).where(Transaction.user_id == guest.id)).all()
@@ -71,6 +72,44 @@ def test_delete_guest_sandbox_topological_cleanup(session: Session) -> None:
     assert session.scalars(select(Transaction).where(Transaction.user_id == guest_id)).all() == []
     assert session.scalars(select(Category).where(Category.user_id == guest_id)).all() == []
     assert session.scalars(select(Instrument).where(Instrument.user_id == guest_id)).all() == []
+
+
+def test_teardown_clears_a_linked_leg_with_a_pre_link_category(session: Session) -> None:
+    """ADR-0002 rule 9: CHECK ``pre_link_category_while_linked`` forbids un-pairing a row that
+    still holds a saved category, so teardown Phase 1 clears both columns together."""
+    guest, _ = create_guest_sandbox(session, ttl_hours=2)
+    a, b = session.scalars(
+        select(Transaction)
+        .where(Transaction.user_id == guest.id, Transaction.category_id.is_not(None))
+        .order_by(Transaction.id)
+    ).all()[:2]
+    saved = a.category_id
+    a.transaction_type = b.transaction_type = "transfer"
+    a.transfer_pair_id, b.transfer_pair_id = b.id, a.id
+    a.pre_link_category_id, a.category_id = saved, None
+    session.commit()
+
+    delete_guest_sandbox(session, guest.id)
+
+    assert session.scalars(select(Transaction).where(Transaction.user_id == guest.id)).all() == []
+
+
+def test_teardown_deletes_subcategories_before_parents(session: Session) -> None:
+    """ADR-0012 rule 11: teardown is the only hard delete, and it goes children-first.
+
+    ``categories.parent_id`` is ``ON DELETE NO ACTION`` (rule 1), so deleting a parent
+    while its subcategories exist fails instead of cascading. The guest's seeded
+    taxonomy has both levels, so a parents-first teardown cannot pass here.
+    """
+    guest, _ = create_guest_sandbox(session, ttl_hours=2)
+    subcategories = session.scalars(
+        select(Category).where(Category.user_id == guest.id, Category.parent_id.is_not(None))
+    ).all()
+    assert subcategories, "precondition: the seeded taxonomy has subcategories"
+
+    delete_guest_sandbox(session, guest.id)
+
+    assert session.scalars(select(Category).where(Category.user_id == guest.id)).all() == []
 
 
 def test_delete_guest_sandbox_refuses_non_guest_user(session: Session) -> None:
@@ -127,6 +166,22 @@ def test_create_guest_sandbox_enforces_cap(
     create_guest_sandbox(session, ttl_hours=2)
 
     # Second guest fails with GuestCapReachedError
+    with pytest.raises(GuestCapReachedError):
+        create_guest_sandbox(session, ttl_hours=2)
+
+
+def test_guest_cap_counts_live_guests_only(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0003 rule 15: MAX_GUEST_ACCOUNTS counts live guests. An expired guest the
+    sweeper has not pruned yet must not hold a seat."""
+    monkeypatch.setattr(
+        "app.services.guest_service.get_settings", lambda: Settings(MAX_GUEST_ACCOUNTS=1)
+    )
+
+    create_guest_sandbox(session, ttl_hours=-1)  # expired, not yet pruned
+    create_guest_sandbox(session, ttl_hours=2)  # the one live seat
+
     with pytest.raises(GuestCapReachedError):
         create_guest_sandbox(session, ttl_hours=2)
 

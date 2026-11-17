@@ -10,7 +10,7 @@
  *
  * Values are unsigned magnitudes (always positive on screen). `expense_paise`
  * from `period-totals` is signed (≤ 0 typically); we negate it for display.
- * Income is always ≥ 0.
+ * Income is signed too: an income reversal nets it down.
  *
  * The 14-week trailing sparkline is always anchored to "today" — it does NOT
  * follow the filter state. It answers "what's my recent spending velocity?"
@@ -21,7 +21,7 @@ import { useQuery } from "@tanstack/react-query";
 import { listPeriodTotals, listSpendByPeriod } from "@/lib/api/client";
 import { monthRange, trailingWeeksWindow } from "@/lib/dates";
 import { formatINR, formatMonthYear } from "@/lib/format";
-import { periodRange } from "@/lib/period";
+import { currentYear, periodLabel, periodRange } from "@/lib/period";
 import { cn } from "@/lib/utils";
 import { Sensitive, useBalanceHidden } from "@/components/balance-visibility";
 import { useAvailableYears } from "@/components/dashboard/use-available-years";
@@ -34,7 +34,7 @@ export type SummaryStripProps = {
 };
 
 export function SummaryStrip({
-  year = new Date().getFullYear(),
+  year = currentYear(),
   monthAnchor = new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   allDates = false,
   allYears = false,
@@ -109,7 +109,7 @@ export function SummaryStrip({
   //   other two flags is also set — it always wins.
   // - allYears false, allDates true ("All months"): show yearly totals
   // - both false (specific month): show monthly totals only
-  const showLabel = allYears ? "All years" : allDates ? String(year) : monthLabel;
+  const showLabel = allYears ? "All years" : allDates ? periodLabel({ year }) : monthLabel;
   const totalsQ = allYears ? allTotalsQ : allDates ? yearTotalsQ : monthTotalsQ;
   const spend = allYears ? allSpend : allDates ? yearSpend : monthSpend;
   const income = allYears ? allIncome : allDates ? yearIncome : monthIncome;

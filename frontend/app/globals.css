@@ -109,6 +109,10 @@
   --chart-4: oklch(50% 0.16 28);
   --chart-5: oklch(55% 0.10 280);
   --chart-6: oklch(48% 0.08 165);
+  /* Uncategorized series on the category trend. A new token, so the D4 lock on the six
+     values above is untouched. Validated against the seeded "Other" root #94a3b8:
+     node validate_palette.js "#94a3b8,#5b6168" --mode light --surface "#ffffff". */
+  --chart-uncategorized: #5b6168;
 }
 
 .dark {
@@ -155,6 +159,8 @@
   --chart-4: oklch(70% 0.17 28);
   --chart-5: oklch(68% 0.12 280);
   --chart-6: oklch(62% 0.10 165);
+  /* node validate_palette.js "#94a3b8,#d6d9dc" --mode dark --surface "#171c22" */
+  --chart-uncategorized: #d6d9dc;
 }
 
 @layer base {

@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Distinct calendar years worth offering in a year picker — the shared query
+ * Distinct calendar years worth offering in a spend year picker — the shared query
  * behind every `<PeriodPicker>` (overview.tsx, spending-dashboard.tsx,
  * filter-row.tsx). One query, not three copies of the same
  * `["dashboards", "available-years"]` fetch.
@@ -15,6 +15,7 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { listAvailableYears } from "@/lib/api/client";
+import { currentYear } from "@/lib/period";
 
 export function useAvailableYears() {
   const query = useQuery({
@@ -22,6 +23,6 @@ export function useAvailableYears() {
     queryFn: listAvailableYears,
   });
   const fetched = query.data?.years;
-  const years = fetched && fetched.length > 0 ? fetched : [new Date().getUTCFullYear()];
+  const years = fetched && fetched.length > 0 ? fetched : [currentYear()];
   return { ...query, years };
 }

@@ -37,8 +37,11 @@ from app.models import (
     Transaction,
     User,
 )
-from app.parsers import ParsedStatement, RawTransaction, StatementSummary
+from app.parsers import HdfcBank, ParsedStatement, RawTransaction, StatementSummary
 from app.services import import_service
+from app.services.category_service import CASHBACK_CATEGORY_NAME, FALLBACK_CATEGORY_NAME
+from app.services.merchant import normalize_merchant
+from tests.fk_bypass import foreign_keys_off
 
 # -----------------------------------------------------------------------------
 # Stub parser — copies test_imports.py's pattern.
@@ -142,7 +145,7 @@ def test_candidates_returns_only_pending_rows_of_this_batch(
         "2026-03-05",
     ]
     # Wire shape — same as TransactionRead + prior_matches + confidence + pinned
-    # + cc_payment_candidate.
+    # + cc_payment_candidate + uncategorised_commits_as_transfer.
     assert set(candidates[0].keys()) == {
         "id",
         "account_id",
@@ -154,11 +157,14 @@ def test_candidates_returns_only_pending_rows_of_this_batch(
         "category_name",
         "category_parent_name",
         "transfer_pair_id",
+        "refund_of_id",
         "labels",
+        "card_bill_link_offered",
         "prior_matches",
         "confidence",
         "pinned",
         "cc_payment_candidate",
+        "uncategorised_commits_as_transfer",
     }
 
 
@@ -333,8 +339,9 @@ def test_candidates_cc_payment_candidate_flag(
     """``cc_payment_candidate`` is the type+merchant gate ``is_cc_payment`` uses
     (``auto_link_cc_bill``'s gate 3), surfaced so the review queue can offer the
     "Card bill payment" action (PRD §F4a-1). True only for an income row whose
-    merchant matches — a cashback-named income credit, an ordinary spend, and
-    an income row with an unrelated merchant must all read False.
+    merchant matches — a cashback credit (a positive spend, ADR-0013), an
+    ordinary spend, and an income row with an unrelated merchant must all read
+    False.
     """
     _StubAxisParser.rows = [
         # income (payment) + merchant match -> True.
@@ -344,7 +351,7 @@ def test_candidates_cc_payment_candidate_flag(
             merchant_raw="PAYMENT RECEIVED",
             txn_type="payment",
         ),
-        # income (cashback) but not a card-bill merchant -> False.
+        # cashback is a positive spend, and not a card-bill merchant -> False.
         RawTransaction(
             date=date(2026, 3, 9),
             amount_paise=17500,
@@ -359,8 +366,8 @@ def test_candidates_cc_payment_candidate_flag(
             txn_type="purchase",
         ),
         # income (payment) but an unrelated merchant -> False (merchant gate).
-        # Only "payment" reaches bare `income` here — _map_type folds every
-        # other positive, non-cashback credit to `spend` (a refund).
+        # Only "payment" reaches `income` here — _map_type folds every other
+        # positive credit to `spend` (a refund or cashback).
         RawTransaction(
             date=date(2026, 3, 7),
             amount_paise=250000,
@@ -375,7 +382,7 @@ def test_candidates_cc_payment_candidate_flag(
     }
     assert candidates["PAYMENT RECEIVED"]["transaction_type"] == "income"
     assert candidates["PAYMENT RECEIVED"]["cc_payment_candidate"] is True
-    assert candidates["CASHBACK FOR SWIGGY TRANSACTIONS"]["transaction_type"] == "income"
+    assert candidates["CASHBACK FOR SWIGGY TRANSACTIONS"]["transaction_type"] == "spend"
     assert candidates["CASHBACK FOR SWIGGY TRANSACTIONS"]["cc_payment_candidate"] is False
     assert candidates["SWIGGY BLR"]["transaction_type"] == "spend"
     assert candidates["SWIGGY BLR"]["cc_payment_candidate"] is False
@@ -478,15 +485,15 @@ def test_candidates_pinned_survives_seeded_hit_count_zero(
     stub_parser: type[_StubAxisParser],
     session: Session,
 ) -> None:
-    """A PINNED seed row must surface ``pinned: true`` alongside
-    ``confidence: "seeded"``.
+    """A PINNED seed row must surface ``pinned: true``, and is not "seeded".
 
     ``pin_tag`` never bumps ``hit_count`` on an existing row, so pinning a seed
     row is the one way to reach ``hit_count == 0, pinned=True``. Hard-coding
     ``pinned=False`` in ``_candidate_strength``'s zero-hit branch made the user's
     own authored rule render as an unconfirmed dictionary suggestion — TagPicker
     checks ``pinned`` before ``confidence``, so carrying the real flag is the
-    whole fix.
+    whole fix. A pin is user-authored (ADR-0011 rule 11), so the pair reads
+    ``confidence: "none"`` — "seeded" is only a never-confirmed, unpinned row.
     """
     food = next(c for c in seeded_categories if c.name == "Food")
     session.add(
@@ -513,7 +520,7 @@ def test_candidates_pinned_survives_seeded_hit_count_zero(
     row = client.get(f"/api/v1/imports/{batch_id}/candidates").json()[0]
     assert row["category_id"] == food.id
     assert row["prior_matches"] == 0
-    assert row["confidence"] == "seeded"
+    assert row["confidence"] == "none"
     assert row["pinned"] is True
 
 
@@ -637,8 +644,10 @@ def test_commit_atomic_422_with_invalid_ids(
     )
     assert commit.status_code == 422, commit.text
     body = commit.json()
-    assert body["detail"]["message"] == "some transactions are not eligible to commit"
-    assert body["detail"]["invalid_ids"] == [99999]
+    assert body["detail"] == {
+        "message": "some transactions are not eligible to commit or discard",
+        "invalid_ids": [99999],
+    }
 
     # No writes — every row still pending.
     with session_factory() as s:
@@ -692,9 +701,8 @@ def test_commit_defaults_untagged_refund_to_other(
 ) -> None:
     """An untagged refund row commits under the spend "Other" category — the
     same spend-kind fallback an untagged spend row gets, since a refund nets
-    against spend in the same category (PRD §F5). Not rejected (cf.
-    test_commit_refund_with_null_category_rejected, which seeds no category so
-    the row IS rejected). The default is NOT learned, mirroring the spend case."""
+    against spend in the same category (PRD §F5). The default is NOT learned,
+    mirroring the spend case."""
     _StubAxisParser.rows = [
         RawTransaction(
             date=date(2026, 3, 10),
@@ -726,7 +734,7 @@ def test_commit_defaults_untagged_refund_to_other(
         assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
 
 
-def test_commit_defaults_untagged_cashback_income_to_cashback_category(
+def test_commit_keeps_the_cashback_prefill_and_does_not_teach_it(
     client: TestClient,
     session: Session,
     axis_account: Account,
@@ -734,20 +742,20 @@ def test_commit_defaults_untagged_cashback_income_to_cashback_category(
     stub_parser: type[_StubAxisParser],
     session_factory: sessionmaker[Session],
 ) -> None:
-    """An unmatched credit named cashback in its own description types as
-    ``income`` (``is_cashback_credit`` — not the generic ``refund`` fallback,
-    see ``test_commit_defaults_untagged_refund_to_refund_category`` for that
-    case), and an untagged one commits under the seeded income "Cashback"
-    category, not left null. The Cashback default is NOT learned, mirroring
-    the Other/Refund fallbacks.
+    """A credit naming cashback stages as a positive ``spend`` pre-filled into the
+    spend "Cashback" (ADR-0013 rules 1-2), and commits there. Committed still in
+    that keyword prefill, it is a server default and teaches no rule (ADR-0004
+    rule 5).
 
-    ``seeded_categories`` mirrors migrations 0003+0029's demo-user seed, which
-    predates the income category set (Salary/Freelancing/Cashback/Other) that
-    ``provisioning.py`` gives a *newly registered* user — so "Cashback" is
-    seeded here directly rather than widening that shared fixture.
+    ``seeded_categories`` mirrors the old migration seed, which has no spend
+    "Cashback" — so it is added here rather than widening that shared fixture.
     """
     cashback_cat = Category(
-        user_id=axis_account.user_id, name="Cashback", kind="income", is_seeded=False
+        color="#2a78d6",
+        user_id=axis_account.user_id,
+        name=CASHBACK_CATEGORY_NAME,
+        kind="spend",
+        is_seeded=True,
     )
     session.add(cashback_cat)
     session.commit()
@@ -763,22 +771,20 @@ def test_commit_defaults_untagged_cashback_income_to_cashback_category(
     ]
     batch_id = _import_and_get_batch_id(client, axis_account.id)
 
-    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
-    assert len(candidates) == 1
-    assert candidates[0]["transaction_type"] == "income"
-    assert candidates[0]["category_id"] is None
+    (candidate,) = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert candidate["transaction_type"] == "spend"
+    assert candidate["amount_paise"] == 17500
+    assert candidate["category_id"] == cashback_cat.id
 
     commit = client.post(
-        f"/api/v1/imports/{batch_id}/commit",
-        json={"transaction_ids": [candidates[0]["id"]]},
+        f"/api/v1/imports/{batch_id}/commit", json={"transaction_ids": [candidate["id"]]}
     )
     assert commit.status_code == 204, commit.text
 
     with session_factory() as s:
-        row = s.get(Transaction, candidates[0]["id"])
+        row = s.get(Transaction, candidate["id"])
         assert row is not None
         assert row.category_id == cashback_cat.id
-        # A fallback default isn't a merchant→category decision worth teaching F3.
         assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
 
 
@@ -1026,6 +1032,60 @@ def test_commit_defaults_archived_category_row_to_other(
         assert s.scalar(select(func.count()).select_from(MerchantTagMap)) == 0
 
 
+def test_commit_income_row_with_archived_category_falls_back_to_other(
+    client: TestClient,
+    session: Session,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """An income row whose category was archived mid-review commits under the
+    income fallback "Other", never on the dead bucket (PRD §F5, ADR-0012 rule 8).
+    ``seeded_categories`` has no income Other, so this test adds the root the
+    migration and provisioning give every user."""
+    income_other = Category(
+        color="#2a78d6",
+        user_id=axis_account.user_id,
+        name=FALLBACK_CATEGORY_NAME,
+        kind="income",
+        is_seeded=True,
+    )
+    bonus = Category(color="#2a78d6", user_id=axis_account.user_id, name="Bonus", kind="income")
+    session.add_all([income_other, bonus])
+    session.commit()
+    session.refresh(income_other)
+    session.refresh(bonus)
+
+    # A "payment" that matches no card-bill merchant, so the F4a flip leaves it income.
+    _StubAxisParser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 7),
+            amount_paise=250000,
+            merchant_raw="SALARY CREDITED VIA NEFT",
+            txn_type="payment",
+        ),
+    ]
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+    (candidate,) = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert candidate["transaction_type"] == "income"
+
+    patch = client.patch(f"/api/v1/transactions/{candidate['id']}", json={"category_id": bonus.id})
+    assert patch.status_code == 200, patch.text
+    assert client.delete(f"/api/v1/categories/{bonus.id}").status_code == 204
+
+    commit = client.post(
+        f"/api/v1/imports/{batch_id}/commit", json={"transaction_ids": [candidate["id"]]}
+    )
+    assert commit.status_code == 204, commit.text
+
+    with session_factory() as s:
+        row = s.get(Transaction, candidate["id"])
+        assert row is not None
+        assert row.transaction_type == "income"
+        assert row.category_id == income_other.id
+
+
 def test_commit_accumulates_onto_existing_rule(
     client: TestClient,
     axis_account: Account,
@@ -1205,6 +1265,7 @@ def test_reupload_after_partial_cancel_resurfaces_cancelled_rows(
         "batch_id": batch_id,
         "imported": n_purchases,
         "skipped": 1,  # the surviving income row
+        "zero_amount_count": 0,
         "already_imported": True,
         "pending_count": n_purchases,
         "duplicate_of_account_id": None,
@@ -1400,51 +1461,193 @@ def test_commit_learning_failure_rolls_back_atomically(
         assert confirmed == []
 
 
-def test_commit_refund_with_null_category_rejected(
+@pytest.mark.parametrize("body", [{}, {"transaction_ids": [], "discard_ids": []}])
+def test_import_commit_body_rejects_an_empty_request(
     client: TestClient,
     axis_account: Account,
-    seeded_user: User,
     stub_parser: type[_StubAxisParser],
+    body: dict,
 ) -> None:
-    """Untagged refund falls back to 422 when there's no "Other" category to
-    default to (this test seeds no categories). A refund is a `spend` row
-    (positive amount, ADR-0009), so the null-category rule reaches it through
-    the SAME `spend` branch as any other untagged spend — there is no separate
-    refund case left to guard."""
-    _StubAxisParser.rows = [
+    """Neither list names a row: a frontend bug, not a no-op (cancel exists for that)."""
+    batch_id = _import_and_get_batch_id(client, axis_account.id)
+    resp = client.post(f"/api/v1/imports/{batch_id}/commit", json=body)
+    assert resp.status_code == 422
+
+
+# -----------------------------------------------------------------------------
+# Discard in the commit request (ADR-0002 rule 5, A70).
+# -----------------------------------------------------------------------------
+def _batch_with_three_rows(client: TestClient, account: Account) -> tuple[int, int, int, int]:
+    """Import and return ``(batch_id, a, b, c)``: three distinct pending row ids."""
+    batch_id = _import_and_get_batch_id(client, account.id)
+    ids = sorted(c["id"] for c in client.get(f"/api/v1/imports/{batch_id}/candidates").json())
+    return batch_id, ids[0], ids[1], ids[2]
+
+
+def test_commit_discards_listed_pending_rows_in_the_same_request(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 5: the discard is the shared delete. A confirmed refund pointing at the
+    discarded row is released (a raw DELETE would fail ``fk_transactions_refund_of_id``)."""
+    batch_id, a, b, c = _batch_with_three_rows(client, axis_account)
+    with session_factory() as s:
+        refund = Transaction(
+            user_id=axis_account.user_id,
+            account_id=axis_account.id,
+            date=date(2026, 3, 9),
+            amount_paise=4200,
+            transaction_type="spend",
+            merchant_raw="REFUND",
+            merchant_normalized="refund",
+            fingerprint="a70-refund-fingerprint",
+            source="manual",
+            confirmed_at=datetime(2026, 3, 9, 10, 0, 0),
+            refund_of_id=b,
+        )
+        s.add(refund)
+        s.commit()
+        refund_id = refund.id
+
+    resp = client.post(
+        f"/api/v1/imports/{batch_id}/commit",
+        json={"transaction_ids": [a], "discard_ids": [b]},
+    )
+
+    assert resp.status_code == 204, resp.text
+    with session_factory() as s:
+        assert s.get(Transaction, a).confirmed_at is not None
+        assert s.get(Transaction, b) is None
+        assert s.get(Transaction, refund_id).refund_of_id is None
+        c_row = s.get(Transaction, c)
+        assert c_row is not None
+        assert c_row.confirmed_at is None
+
+
+@pytest.mark.parametrize("kind", ["other_batch", "confirmed", "missing"])
+def test_commit_with_an_ineligible_discard_id_422s_and_writes_nothing(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+    kind: str,
+) -> None:
+    batch_id, a, b, _ = _batch_with_three_rows(client, axis_account)
+    stub_parser.rows = [
         RawTransaction(
-            date=date(2026, 3, 10),
-            amount_paise=50000,
-            merchant_raw="SWIGGY BLR REFUND",
-            txn_type="refund",
+            date=date(2026, 4, 1),
+            amount_paise=-7700,
+            merchant_raw="OTHER FILE",
+            txn_type="purchase",
+        )
+    ]
+    other_batch_id = _import_and_get_batch_id(client, axis_account.id, content=b"file-B")
+    with session_factory() as s:
+        other_row = s.scalars(
+            select(Transaction).where(Transaction.import_batch_id == other_batch_id)
+        ).first()
+        assert other_row is not None
+        bad = {"other_batch": other_row.id, "confirmed": b, "missing": 99999}[kind]
+        if kind == "confirmed":
+            s.get(Transaction, b).confirmed_at = datetime(2026, 3, 9, 10, 0, 0)
+            s.commit()
+
+    resp = client.post(
+        f"/api/v1/imports/{batch_id}/commit",
+        json={"transaction_ids": [a], "discard_ids": [bad]},
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == {
+        "message": "some transactions are not eligible to commit or discard",
+        "invalid_ids": [bad],
+    }
+    with session_factory() as s:
+        assert s.get(Transaction, a).confirmed_at is None
+        if kind != "missing":
+            assert s.get(Transaction, bad) is not None
+
+
+def test_commit_discard_only_request_is_accepted(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    batch_id, _, b, _ = _batch_with_three_rows(client, axis_account)
+
+    resp = client.post(f"/api/v1/imports/{batch_id}/commit", json={"discard_ids": [b]})
+
+    assert resp.status_code == 204, resp.text
+    with session_factory() as s:
+        assert s.get(Transaction, b) is None
+
+
+def test_commit_id_in_both_lists_422s(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    batch_id, a, _, _ = _batch_with_three_rows(client, axis_account)
+
+    resp = client.post(
+        f"/api/v1/imports/{batch_id}/commit",
+        json={"transaction_ids": [a], "discard_ids": [a]},
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == {
+        "message": "some transactions are not eligible to commit or discard",
+        "invalid_ids": [a],
+    }
+    with session_factory() as s:
+        row = s.get(Transaction, a)
+        assert row is not None
+        assert row.confirmed_at is None
+
+
+def test_commit_teaches_the_committed_row_not_the_discarded_one(
+    client: TestClient,
+    axis_account: Account,
+    seeded_categories: list[Category],
+    stub_parser: type[_StubAxisParser],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """A discarded row is deleted, not decided: it never teaches F3 (ADR-0004)."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    stub_parser.rows = [
+        RawTransaction(
+            date=date(2026, 3, 5), amount_paise=-15000, merchant_raw="NETFLIX", txn_type="purchase"
+        ),
+        RawTransaction(
+            date=date(2026, 3, 6), amount_paise=-22000, merchant_raw="ZOMATO", txn_type="purchase"
         ),
     ]
     batch_id = _import_and_get_batch_id(client, axis_account.id)
+    by_merchant = {
+        c["merchant_raw"]: c["id"]
+        for c in client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    }
+    for txn_id in by_merchant.values():
+        patch = client.patch(f"/api/v1/transactions/{txn_id}", json={"category_id": food.id})
+        assert patch.status_code == 200, patch.text
 
-    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
-    assert len(candidates) == 1
-    assert candidates[0]["transaction_type"] == "spend"
-    assert candidates[0]["category_id"] is None
-
-    commit = client.post(
-        f"/api/v1/imports/{batch_id}/commit",
-        json={"transaction_ids": [candidates[0]["id"]]},
-    )
-    assert commit.status_code == 422
-    assert commit.json()["detail"]["invalid_ids"] == [candidates[0]["id"]]
-
-
-def test_import_commit_body_rejects_empty_id_list(
-    client: TestClient,
-    axis_account: Account,
-    stub_parser: type[_StubAxisParser],
-) -> None:
-    batch_id = _import_and_get_batch_id(client, axis_account.id)
     resp = client.post(
         f"/api/v1/imports/{batch_id}/commit",
-        json={"transaction_ids": []},
+        json={"transaction_ids": [by_merchant["NETFLIX"]], "discard_ids": [by_merchant["ZOMATO"]]},
     )
-    assert resp.status_code == 422
+
+    assert resp.status_code == 204, resp.text
+    with session_factory() as s:
+        learned = {m.merchant_normalized: m.category_id for m in s.scalars(select(MerchantTagMap))}
+    assert learned == {"netflix": food.id}
 
 
 def test_import_commit_body_rejects_unknown_field(
@@ -1607,10 +1810,11 @@ def test_pending_never_labels_a_batch_with_another_users_account(
 ) -> None:
     """OUR batch pointing at THEIR account must render a null label, not their PII.
 
-    ``import_batches.account_id`` is a plain ``ForeignKey("accounts.id")``
-    (import_batch.py:41), unlike the owned-link tables' ADR-0002 composite FKs, so the
-    DB permits this row — which is exactly why the read has to restate the predicate.
-    This is the only one of the three such reads that returns ``Account.last4``.
+    ADR-0003 rule 7: the read restates ``Account.user_id`` even though the composite
+    same-user FK on ``import_batches.account_id`` (rule 10) refuses this row. The two
+    are independent defences, so the row is stored with FKs off and the read must hold
+    on its own. This is the only one of the three such reads that returns
+    ``Account.last4``.
     """
     other_user = User(id=uuid.UUID("00000000-0000-0000-0000-000000000097"))
     session.add(other_user)
@@ -1626,32 +1830,33 @@ def test_pending_never_labels_a_batch_with_another_users_account(
     session.commit()
     session.refresh(their_account)
 
-    batch = ImportBatch(
-        user_id=seeded_user.id,  # our batch...
-        account_id=their_account.id,  # ...pointing at their account
-        source_file_hash="cross-user-account-hash",
-        parser_name="AxisCC",
-        status="pending",
-    )
-    session.add(batch)
-    session.commit()
-    session.refresh(batch)
-    session.add(
-        Transaction(
-            user_id=seeded_user.id,
-            account_id=their_account.id,
-            date=date(2026, 3, 6),
-            amount_paise=-15000,
-            transaction_type="spend",
-            merchant_raw="SOME SPEND",
-            merchant_normalized="some spend",
-            fingerprint="cross-user-account-fp",
-            source="import",
-            import_batch_id=batch.id,
-            confirmed_at=None,
+    with foreign_keys_off(session):
+        batch = ImportBatch(
+            user_id=seeded_user.id,  # our batch...
+            account_id=their_account.id,  # ...pointing at their account
+            source_file_hash="cross-user-account-hash",
+            parser_name="AxisCC",
+            status="pending",
         )
-    )
-    session.commit()
+        session.add(batch)
+        session.commit()
+        session.refresh(batch)
+        session.add(
+            Transaction(
+                user_id=seeded_user.id,
+                account_id=their_account.id,
+                date=date(2026, 3, 6),
+                amount_paise=-15000,
+                transaction_type="spend",
+                merchant_raw="SOME SPEND",
+                merchant_normalized="some spend",
+                fingerprint="cross-user-account-fp",
+                source="import",
+                import_batch_id=batch.id,
+                confirmed_at=None,
+            )
+        )
+        session.commit()
 
     rows = client.get("/api/v1/imports/pending").json()
     assert len(rows) == 1  # the batch is ours, so it still appears
@@ -1858,8 +2063,9 @@ def test_commit_f4a_pair_write_conflict_aborts_the_whole_batch(
 
     Fault injection by necessity: the branch is unreachable through the public
     surface. Both pair rows come from one ``user_id``-scoped SELECT, and
-    ``ck_transactions_no_self_pair`` cannot fire because the CC row is ``income``
-    while candidates must be ``spend``/``transfer``. So the only way to observe
+    ``ck_transactions_no_self_pair`` cannot fire because the CC row is positive on a card
+    while candidates are negative on its parent bank, so they are different rows on different
+    accounts. So the only way to observe
     the handler's behaviour is to make the flush raise.
 
     The listener predicate is load-bearing: nothing in this session is dirty with
@@ -1986,7 +2192,9 @@ def test_commit_f4a_does_not_learn_tag_for_flipped_row(
     # row (kind is now API-enforced). Its kind is irrelevant to what this test
     # asserts — that income/transfer never *learn* — but it must be a valid
     # assignment so the PATCH itself succeeds.
-    income_cat = Category(user_id=seeded_user.id, name="Salary", kind="income", is_seeded=False)
+    income_cat = Category(
+        color="#2a78d6", user_id=seeded_user.id, name="Salary", kind="income", is_seeded=False
+    )
     session.add(income_cat)
     session.commit()
     session.refresh(income_cat)
@@ -2554,3 +2762,650 @@ def test_reconciliation_route_cross_user_returns_404(
     # v1 single-user client always acts as seeded_user; this batch is not theirs.
     resp = client.get(f"/api/v1/imports/{batch.id}/reconciliation")
     assert resp.status_code == 404
+
+
+def _hdfc_rows(*lines: tuple[date, str, int]) -> list[RawTransaction]:
+    """Rows the real HDFC parser reads from a hand-built Layout A table: ``(date, narration,
+    signed paise)`` per line, each a debit (negative) or a deposit. No PDF is involved, so the
+    narration is typed by the parser's own column and reversal rules."""
+    table: list[list[str]] = [
+        ["Txn Date", "Narration", "Withdrawals", "Deposits", "Closing Balance"]
+    ]
+    balance = 100_000_000
+    for when, narration, paise in lines:
+        balance += paise
+        day = when.strftime("%d/%m/%Y")
+        table.append(
+            [
+                day,
+                f"{narration} Value Dt {day}",
+                f"{-paise / 100:.2f}" if paise < 0 else "0.00",
+                f"{paise / 100:.2f}" if paise > 0 else "0.00",
+                f"{balance / 100:.2f}",
+            ]
+        )
+    return HdfcBank.interpret_tables([table])
+
+
+def _stub_bank_parser(monkeypatch: pytest.MonkeyPatch, rows: list[RawTransaction]) -> None:
+    """The bank side of the commit is driven through a stubbed ``("hdfc", "bank")`` parser
+    whose ``parse`` returns ``rows`` (built by :func:`_hdfc_rows`), so no PDF bytes are needed."""
+
+    class _StubBankParser:
+        @classmethod
+        def parse(cls, pdf_bytes: bytes, password: str | None) -> ParsedStatement:
+            return ParsedStatement(rows=list(rows), summary=StatementSummary())
+
+    monkeypatch.setitem(import_service.PARSERS, ("hdfc", "bank"), _StubBankParser)
+
+
+def test_commit_bank_batch_links_to_confirmed_card_payment(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """PRD §Verification 6, "Either side second": commit the card statement first, then
+    import and commit the bank statement carrying the bill debit; the pair links at the bank
+    commit, each leg moves its category aside, and nothing is taught."""
+    _StubAxisParser.rows = list(_F4A_ROWS)
+    bank = Account(user_id=seeded_user.id, name="HDFC Bank", type="bank", issuer="hdfc")
+    session.add(bank)
+    session.flush()
+    axis_account.parent_account_id = bank.id
+    session.commit()
+
+    card_batch = _import_and_get_batch_id(client, axis_account.id)
+    cc_id = client.get(f"/api/v1/imports/{card_batch}/candidates").json()[0]["id"]
+    assert (
+        client.post(
+            f"/api/v1/imports/{card_batch}/commit", json={"transaction_ids": [cc_id]}
+        ).status_code
+        == 204
+    )
+    with session_factory() as s:
+        card_before = s.get(Transaction, cc_id)
+        assert card_before is not None and card_before.transfer_pair_id is None
+
+    _stub_bank_parser(
+        monkeypatch,
+        _hdfc_rows(
+            (_F4A_CC_DATE - timedelta(days=1), "CC 000000XXXXXX0000 AUTOPAY SI-TAD", -_F4A_AMOUNT)
+        ),
+    )
+    bank_batch = _import_and_get_batch_id(client, bank.id, content=b"bank-file")
+    bank_candidate = client.get(f"/api/v1/imports/{bank_batch}/candidates").json()[0]
+    assert bank_candidate["cc_payment_candidate"] is True
+    bank_id = bank_candidate["id"]
+    commit = client.post(
+        f"/api/v1/imports/{bank_batch}/commit", json={"transaction_ids": [bank_id]}
+    )
+    assert commit.status_code == 204, commit.text
+
+    with session_factory() as s:
+        cc_after, bank_after = s.get(Transaction, cc_id), s.get(Transaction, bank_id)
+        assert cc_after is not None and bank_after is not None
+        assert (cc_after.transfer_pair_id, bank_after.transfer_pair_id) == (bank_id, cc_id)
+        assert (cc_after.transaction_type, bank_after.transaction_type) == ("transfer", "transfer")
+        other = s.scalars(
+            select(Category).where(
+                Category.user_id == seeded_user.id,
+                Category.name == FALLBACK_CATEGORY_NAME,
+                Category.kind == "spend",
+            )
+        ).one()
+        assert bank_after.category_id is None
+        assert bank_after.pre_link_category_id == other.id
+        assert s.scalars(select(MerchantTagMap)).all() == []
+
+
+_BANK_DAY = date(2026, 4, 5)
+_CARD_PERIOD = (date(2026, 3, 16), date(2026, 4, 15))
+_CARD_PURCHASE = RawTransaction(
+    date=date(2026, 4, 1), amount_paise=-50_000, merchant_raw="SWIGGY BLR", txn_type="purchase"
+)
+_BILL = "CC 000000XXXXXX0000 AUTOPAY SI-TAD"
+
+
+def _bank_paying(
+    session: Session, user: User, card: Account | None, *, name: str = "HDFC Bank"
+) -> Account:
+    """An HDFC bank account; when ``card`` is given, it names this bank as "Paid from"."""
+    bank = Account(user_id=user.id, name=name, type="bank", issuer="hdfc")
+    session.add(bank)
+    session.flush()
+    if card is not None:
+        card.parent_account_id = bank.id
+    session.commit()
+    return bank
+
+
+def _card_statement(
+    client: TestClient,
+    card: Account,
+    *,
+    rows: list[RawTransaction],
+    period: tuple[date, date] | None,
+    content: bytes,
+    commit: bool = True,
+) -> int:
+    """Import a stubbed card statement into ``card`` and, by default, commit every row."""
+    _StubAxisParser.rows = list(rows)
+    _StubAxisParser.summary = (
+        StatementSummary(period_start=period[0], period_end=period[1])
+        if period is not None
+        else StatementSummary()
+    )
+    batch_id = _import_and_get_batch_id(client, card.id, content=content)
+    if commit:
+        ids = [c["id"] for c in client.get(f"/api/v1/imports/{batch_id}/candidates").json()]
+        resp = client.post(f"/api/v1/imports/{batch_id}/commit", json={"transaction_ids": ids})
+        assert resp.status_code == 204, resp.text
+    return batch_id
+
+
+def _bank_bill(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    bank: Account,
+    *,
+    day: date,
+    paise: int = -123_456,
+) -> dict:
+    """Import a one-debit bank statement naming a card-bill payment; return its candidate."""
+    _stub_bank_parser(monkeypatch, _hdfc_rows((day, _BILL, paise)))
+    batch_id = _import_and_get_batch_id(client, bank.id, content=b"bank-file")
+    (candidate,) = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    candidate["batch_id"] = batch_id
+    return candidate
+
+
+def _commit_one(client: TestClient, candidate: dict) -> None:
+    resp = client.post(
+        f"/api/v1/imports/{candidate['batch_id']}/commit",
+        json={"transaction_ids": [candidate["id"]]},
+    )
+    assert resp.status_code == 204, resp.text
+
+
+def _other_spend(session: Session, user: User) -> Category:
+    return session.scalars(
+        select(Category).where(
+            Category.user_id == user.id,
+            Category.name == FALLBACK_CATEGORY_NAME,
+            Category.kind == "spend",
+        )
+    ).one()
+
+
+def test_commit_keeps_a_covered_card_bill_debit_out_of_spend(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """PRD §Verification 6, "Unlinked card-bill debit" (ADR-0002 rule 7b): a flagged bank
+    debit committed uncategorised, with a committed statement of its "Paid from" card covering
+    its date, is an unpaired ``transfer`` in no category, and nothing is taught."""
+    bank = _bank_paying(session, seeded_user, axis_account)
+    _card_statement(
+        client, axis_account, rows=[_CARD_PURCHASE], period=_CARD_PERIOD, content=b"card-1"
+    )
+    cand = _bank_bill(client, monkeypatch, bank, day=_BANK_DAY)
+    assert cand.get("uncategorised_commits_as_transfer") is True
+
+    _commit_one(client, cand)
+
+    with session_factory() as s:
+        row = s.get(Transaction, cand["id"])
+        assert row is not None
+        assert (
+            row.transaction_type,
+            row.transfer_pair_id,
+            row.category_id,
+            row.pre_link_type,
+        ) == ("transfer", None, None, None)
+        assert (
+            s.scalars(
+                select(MerchantTagMap).where(MerchantTagMap.merchant_normalized.contains("autopay"))
+            ).all()
+            == []
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no_paid_from",
+        "card_paid_from_another_bank",
+        "card_archived",
+        "another_period",
+        "card_batch_pending",
+        "card_batch_cancelled",
+    ],
+)
+def test_commit_card_bill_debit_counts_as_spend_when_no_committed_card_statement_covers_it(
+    case: str,
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 7b, otherwise branch: without a live "Paid from" card holding a committed
+    statement that covers the debit's date, the flagged debit is ordinary spend in Other."""
+    if case == "card_paid_from_another_bank":
+        _bank_paying(session, seeded_user, axis_account, name="ICICI Bank")
+        bank = _bank_paying(session, seeded_user, None)
+    else:
+        bank = _bank_paying(session, seeded_user, None if case == "no_paid_from" else axis_account)
+    period, purchase = _CARD_PERIOD, _CARD_PURCHASE
+    if case == "another_period":
+        period = (date(2026, 5, 16), date(2026, 6, 15))
+        purchase = RawTransaction(
+            date=date(2026, 5, 20),
+            amount_paise=-50_000,
+            merchant_raw="SWIGGY BLR",
+            txn_type="purchase",
+        )
+    card_batch = _card_statement(
+        client,
+        axis_account,
+        rows=[purchase],
+        period=period,
+        content=b"card-1",
+        commit=case not in ("card_batch_pending", "card_batch_cancelled"),
+    )
+    if case == "card_batch_cancelled":
+        assert client.delete(f"/api/v1/imports/{card_batch}").status_code == 204
+    if case == "card_archived":
+        axis_account.archived_at = datetime(2026, 1, 1)
+        session.commit()
+
+    cand = _bank_bill(client, monkeypatch, bank, day=_BANK_DAY)
+    assert cand["uncategorised_commits_as_transfer"] is False
+    _commit_one(client, cand)
+
+    with session_factory() as s:
+        row = s.get(Transaction, cand["id"])
+        assert row is not None
+        assert row.transaction_type == "spend"
+        assert row.category_id == _other_spend(s, seeded_user).id
+
+
+@pytest.mark.parametrize(
+    ("debit_day", "expected"),
+    [(date(2026, 4, 5), "transfer"), (date(2026, 4, 12), "spend")],
+)
+def test_commit_card_bill_debit_covered_by_a_statement_with_no_printed_period(
+    debit_day: date,
+    expected: str,
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 7b + ADR-0010 rule 8: a card statement that prints no period covers the
+    first to last date of its own rows (1-10 April here), the same window the reconciler uses."""
+    bank = _bank_paying(session, seeded_user, axis_account)
+    _card_statement(
+        client,
+        axis_account,
+        rows=[
+            _CARD_PURCHASE,
+            RawTransaction(
+                date=date(2026, 4, 10),
+                amount_paise=-20_000,
+                merchant_raw="UBER MUM",
+                txn_type="purchase",
+            ),
+        ],
+        period=None,
+        content=b"card-1",
+    )
+    cand = _bank_bill(client, monkeypatch, bank, day=debit_day)
+    assert cand.get("uncategorised_commits_as_transfer") is (expected == "transfer")
+    _commit_one(client, cand)
+
+    with session_factory() as s:
+        row = s.get(Transaction, cand["id"])
+        assert row is not None
+        assert row.transaction_type == expected
+
+
+def test_commit_card_bill_debit_given_a_category_stays_spend(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 7b: a flagged debit given a category in review is spend in that category,
+    covered or not."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    bank = _bank_paying(session, seeded_user, axis_account)
+    _card_statement(
+        client, axis_account, rows=[_CARD_PURCHASE], period=_CARD_PERIOD, content=b"card-1"
+    )
+    cand = _bank_bill(client, monkeypatch, bank, day=_BANK_DAY)
+    patched = client.patch(f"/api/v1/transactions/{cand['id']}", json={"category_id": food.id})
+    assert patched.status_code == 200, patched.text
+
+    _commit_one(client, cand)
+
+    with session_factory() as s:
+        row = s.get(Transaction, cand["id"])
+        assert row is not None
+        assert (row.transaction_type, row.category_id) == ("spend", food.id)
+
+
+@pytest.mark.parametrize("paid_from", [True, False])
+def test_commit_keeps_an_unmatched_card_payment_out_of_income(
+    paid_from: bool,
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """PRD §Verification 4 and 6 (ADR-0002 rule 7c): a flagged card credit committed with no
+    category is an unpaired ``transfer`` in no category, whatever "Paid from" says, and the
+    month's income does not include it."""
+    if paid_from:
+        _bank_paying(session, seeded_user, axis_account)
+    batch_id = _card_statement(
+        client,
+        axis_account,
+        rows=[_F4A_ROWS[0]],
+        period=_CARD_PERIOD,
+        content=b"card-1",
+        commit=False,
+    )
+    (cand,) = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert cand["uncategorised_commits_as_transfer"] is True
+    cand["batch_id"] = batch_id
+
+    _commit_one(client, cand)
+
+    with session_factory() as s:
+        row = s.get(Transaction, cand["id"])
+        assert row is not None
+        assert (
+            row.transaction_type,
+            row.transfer_pair_id,
+            row.category_id,
+            row.pre_link_type,
+        ) == ("transfer", None, None, None)
+    overview = client.get("/api/v1/dashboards/overview?month=2026-04")
+    assert overview.status_code == 200, overview.text
+    assert overview.json()["income_paise"] == 0
+
+
+def test_commit_card_payment_given_a_category_keeps_its_kind(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rule 7c: a flagged credit given a category in review commits in that category's
+    kind, here income, so only the uncategorised credit is retyped."""
+    bonus = Category(color="#2a78d6", user_id=seeded_user.id, name="Bonus", kind="income")
+    session.add(bonus)
+    session.commit()
+    batch_id = _card_statement(
+        client,
+        axis_account,
+        rows=[_F4A_ROWS[0]],
+        period=_CARD_PERIOD,
+        content=b"card-1",
+        commit=False,
+    )
+    (cand,) = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    patched = client.patch(f"/api/v1/transactions/{cand['id']}", json={"category_id": bonus.id})
+    assert patched.status_code == 200, patched.text
+    cand["batch_id"] = batch_id
+
+    _commit_one(client, cand)
+
+    with session_factory() as s:
+        row = s.get(Transaction, cand["id"])
+        assert row is not None
+        assert (row.transaction_type, row.category_id) == ("income", bonus.id)
+
+
+def test_import_never_prefills_a_category_onto_a_card_bill_debit(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+) -> None:
+    """ADR-0004 rule 8 and ADR-0002 rule 7b: a tag rule learned from one card bill never
+    prefills the next flagged debit, so it reaches review uncategorised; an ordinary merchant on
+    the same statement is still prefilled."""
+    food = next(c for c in seeded_categories if c.name == "Food")
+    bank = _bank_paying(session, seeded_user, None)
+    rows = _hdfc_rows((_BANK_DAY, _BILL, -123_456), (_BANK_DAY, "SWIGGY BLR", -50_000))
+    for row in rows:
+        session.add(
+            MerchantTagMap(
+                user_id=seeded_user.id,
+                merchant_normalized=normalize_merchant(row.merchant_raw),
+                category_id=food.id,
+                hit_count=5,
+            )
+        )
+    session.commit()
+    _stub_bank_parser(monkeypatch, rows)
+
+    batch_id = _import_and_get_batch_id(client, bank.id, content=b"bank-file")
+
+    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    by_kind = {("bill" if c["cc_payment_candidate"] else "other"): c for c in candidates}
+    assert by_kind["bill"]["category_id"] is None
+    assert by_kind["other"]["category_id"] == food.id
+
+
+def _row_on(s: Session, account: Account) -> Transaction:
+    return s.scalars(select(Transaction).where(Transaction.account_id == account.id)).one()
+
+
+def test_commit_links_a_covered_card_bill_debit_to_a_card_payment_on_the_board(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """PRD §Verification 6, "CC-bill double-count, from two imports" (card first): the card's
+    payment credit is on the board, so the covered debit links to it at the bank commit and
+    keeps ``transfer`` as its pre-link type (ADR-0002 rules 7b, 9)."""
+    bank = _bank_paying(session, seeded_user, axis_account)
+    _card_statement(client, axis_account, rows=[_F4A_ROWS[0]], period=_CARD_PERIOD, content=b"c-1")
+    cand = _bank_bill(
+        client, monkeypatch, bank, day=_F4A_CC_DATE - timedelta(days=1), paise=-_F4A_AMOUNT
+    )
+    _commit_one(client, cand)
+
+    with session_factory() as s:
+        bank_row, card_row = _row_on(s, bank), _row_on(s, axis_account)
+        assert (bank_row.transfer_pair_id, card_row.transfer_pair_id) == (card_row.id, bank_row.id)
+        assert (bank_row.transaction_type, card_row.transaction_type) == ("transfer", "transfer")
+        assert bank_row.pre_link_type == "transfer"
+        assert bank_row.pre_link_category_id is None
+        assert card_row.pre_link_type == "transfer"
+
+
+def test_commit_links_a_later_card_payment_to_a_covered_card_bill_debit(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """ADR-0002 rules 7b, 7, 9: an unpaired covered debit links when the card's next statement
+    brings the matching payment, and an unlink leaves the debit an unpaired transfer."""
+    bank = _bank_paying(session, seeded_user, axis_account)
+    _card_statement(
+        client, axis_account, rows=[_CARD_PURCHASE], period=_CARD_PERIOD, content=b"card-1"
+    )
+    cand = _bank_bill(client, monkeypatch, bank, day=date(2026, 4, 15), paise=-_F4A_AMOUNT)
+    _commit_one(client, cand)
+    with session_factory() as s:
+        bank_row = _row_on(s, bank)
+        assert (bank_row.transaction_type, bank_row.transfer_pair_id) == ("transfer", None)
+
+    _card_statement(
+        client,
+        axis_account,
+        rows=[
+            RawTransaction(
+                date=date(2026, 4, 16),
+                amount_paise=_F4A_AMOUNT,
+                merchant_raw="PAYMENT RECEIVED THANK YOU",
+                txn_type="payment",
+            )
+        ],
+        period=(date(2026, 4, 16), date(2026, 5, 15)),
+        content=b"card-2",
+    )
+
+    with session_factory() as s:
+        bank_row = _row_on(s, bank)
+        card_payment = s.scalars(
+            select(Transaction).where(
+                Transaction.account_id == axis_account.id, Transaction.amount_paise > 0
+            )
+        ).one()
+        assert (bank_row.transfer_pair_id, card_payment.transfer_pair_id) == (
+            card_payment.id,
+            bank_row.id,
+        )
+        assert (bank_row.pre_link_type, card_payment.pre_link_type) == ("transfer", "transfer")
+        card_payment_id = card_payment.id
+
+    assert client.post(f"/api/v1/transactions/{card_payment_id}/unlink").status_code == 204
+    with session_factory() as s:
+        bank_row = _row_on(s, bank)
+        card_payment = s.get(Transaction, card_payment_id)
+        assert card_payment is not None
+        assert (bank_row.transaction_type, bank_row.transfer_pair_id) == ("transfer", None)
+        assert (card_payment.transaction_type, card_payment.transfer_pair_id) == ("transfer", None)
+
+
+def test_commit_links_a_card_payment_to_an_earlier_card_bill_debit_counted_as_spend(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """PRD §Verification 6, "CC-bill double-count, from two imports" (bank first): with no card
+    statement in yet the debit commits as spend in Other (ADR-0002 rule 7b), and the card's
+    later payment links to it, moving Other aside (rule 9)."""
+    bank = _bank_paying(session, seeded_user, axis_account)
+    cand = _bank_bill(
+        client, monkeypatch, bank, day=_F4A_CC_DATE - timedelta(days=1), paise=-_F4A_AMOUNT
+    )
+    _commit_one(client, cand)
+    with session_factory() as s:
+        bank_row = _row_on(s, bank)
+        assert bank_row.transaction_type == "spend"
+        assert bank_row.category_id == _other_spend(s, seeded_user).id
+
+    _card_statement(client, axis_account, rows=[_F4A_ROWS[0]], period=_CARD_PERIOD, content=b"c-1")
+
+    with session_factory() as s:
+        bank_row, card_row = _row_on(s, bank), _row_on(s, axis_account)
+        assert (bank_row.transfer_pair_id, card_row.transfer_pair_id) == (card_row.id, bank_row.id)
+        assert bank_row.pre_link_type == "spend"
+        assert bank_row.pre_link_category_id == _other_spend(s, seeded_user).id
+
+
+@pytest.mark.parametrize(
+    ("kind", "narration", "paise", "expected"),
+    [
+        ("bank", "CC 000000XXXXXX0000 AUTOPAY SI-TAD", -123_456, True),
+        ("bank", "UPI-SENTINEL GROCER-sentinelgrocer@example-EXAM0000001", -50_000, False),
+        # A bank income row is not a card-side "payment received" (the card clause is gated).
+        ("bank", "NEFT CR-EXAM0000002-SENTINEL PAYMENT RECEIVED", 70_000, False),
+        # A positive bank row is never a card-bill debit, even naming the vocabulary.
+        ("bank", "CC PAYMENT SENTINEL", 80_000, False),
+        # A returned bill payment is a positive spend (a reversal), not a debit to link.
+        ("bank", "REV-CC PAYMENT SENTINEL", 90_000, False),
+        # A card-batch negative row naming a bill payment is not a candidate either.
+        ("card", "CREDIT CARD PAYMENT", -30_000, False),
+        # A positive payment credit on a card is flagged, and commits as a transfer (rule 7c).
+        ("card", "PAYMENT RECEIVED THANK YOU", 30_000, True),
+    ],
+)
+def test_candidates_flag_a_bank_card_bill_debit(
+    kind: str,
+    narration: str,
+    paise: int,
+    expected: bool,
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    axis_account: Account,
+    stub_parser: type[_StubAxisParser],
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+) -> None:
+    """ADR-0010 rule 12: a bank debit naming a card-bill payment is ``cc_payment_candidate``,
+    so the review queue offers the link; the card-side clause does not fire on a bank batch."""
+    if kind == "bank":
+        account = Account(user_id=seeded_user.id, name="HDFC Bank", type="bank", issuer="hdfc")
+        session.add(account)
+        session.commit()
+        _stub_bank_parser(monkeypatch, _hdfc_rows((_BANK_DAY, narration, paise)))
+    else:
+        account = axis_account
+        txn_type = "payment" if paise > 0 else "purchase"
+        _StubAxisParser.rows = [
+            RawTransaction(
+                date=_BANK_DAY, amount_paise=paise, merchant_raw=narration, txn_type=txn_type
+            )
+        ]
+    batch_id = _import_and_get_batch_id(client, account.id)
+    candidates = client.get(f"/api/v1/imports/{batch_id}/candidates").json()
+    assert [c["cc_payment_candidate"] for c in candidates] == [expected]
+    # No "Paid from" is set here, so no flagged bank debit commits as a transfer (rule 7b); a
+    # flagged card credit does whatever "Paid from" says (rule 7c).
+    assert [c["uncategorised_commits_as_transfer"] for c in candidates] == [
+        kind == "card" and expected
+    ]
+    # A pending row is never offered the manual link: it needs confirmed rows (rule 11b).
+    assert [c["card_bill_link_offered"] for c in candidates] == [False]
