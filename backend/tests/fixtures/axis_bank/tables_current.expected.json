@@ -1,0 +1,50 @@
+[
+  {
+    "date": "2026-04-01",
+    "amount_paise": -125000,
+    "merchant_raw": "UPI/P2M/000000000001/SENTINEL GROCER/UTIB/Payment/",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-02",
+    "amount_paise": 7500000,
+    "merchant_raw": "NEFT/EXAMN0000000001/SENTINEL EMPLOYER PVT LTD/SALARY APR",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2026-04-03",
+    "amount_paise": -49900,
+    "merchant_raw": "UPI/P2M/000000000003/SENTINEL FOOD DELIVERY/UTIB/Order/",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-03",
+    "amount_paise": 49900,
+    "merchant_raw": "UPI/REV/000000000003/SENTINEL FOOD DELIVERY",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-04-05",
+    "amount_paise": -1234567,
+    "merchant_raw": "CreditCard Payment XX 0000 Ref#EXAMPLE0000000001",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-08",
+    "amount_paise": -200000,
+    "merchant_raw": "ATM-CASH/SENTINEL ATM/MUMBAI",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-09",
+    "amount_paise": 150000,
+    "merchant_raw": "IMPS/P2A/000000000009/SENTINEL FRIEND/ DINNER SPLIT",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2026-04-10",
+    "amount_paise": -35050,
+    "merchant_raw": "UPI/P2M/000000000010/SENTINEL PHARMACY/UTIB/Payment/",
+    "txn_type": "withdrawal"
+  }
+]

@@ -32,8 +32,11 @@ _PAYMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _REFUND_RE = re.compile(r"REFUND|REVERSAL|CHARGEBACK", re.IGNORECASE)
+# A token counts only as a whole run of letters, so KINGSTON, PINTEREST, RECHARGE and COFFEE stay
+# purchases, while a digit-glued IGST18% is still a tax line (A62, A68).
 _NON_PURCHASE_DEBIT_RE = re.compile(
-    r"FINANCE\s+CHARGE|INTEREST|LATE\s+PAYMENT|SERVICE\s+TAX|GST|FEE\b|CHARGE\b",
+    r"(?<![A-Z])(?:FINANCE\s+CHARGES?|INTEREST|LATE\s+PAYMENT|SERVICE\s+TAX"
+    r"|(?:[CSI]|UT)?GST|FEE|(?:SUR)?CHARGE)(?![A-Z])",
     re.IGNORECASE,
 )
 

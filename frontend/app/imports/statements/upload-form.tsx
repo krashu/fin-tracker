@@ -53,12 +53,12 @@ export function UploadForm() {
     queryFn: listAccounts,
   });
   // Never offer an account the backend will reject. Statement parsing dispatches on
-  // (issuer, type) and every registered parser is a credit_card one, so a bank / cash /
-  // investment pick posts the whole file and comes back with a 422 that names neither
-  // the account nor the type — nothing points at the picker as the cause. The two
-  // /expenses pickers filter for the same reason.
+  // (issuer, type), so an account with no registered parser posts the whole file and
+  // comes back with a 422 that names neither the account nor the type — nothing points
+  // at the picker as the cause. The server says which accounts have a parser
+  // (`statement_import_supported`); this never re-derives that from the type or issuer.
   const accounts = (accountsQuery.data ?? []).filter(
-    (a) => a.type === "credit_card",
+    (a) => a.statement_import_supported,
   );
   const selectedAccount = accounts.find((a) => a.id === accountId) ?? null;
 
@@ -74,7 +74,8 @@ export function UploadForm() {
       queryClient.invalidateQueries({ queryKey: ["imports", "pending"] });
       // Route on pending_count, not already_imported: anything to review (fresh
       // rows OR rows resurfaced by a re-upload) opens the queue; zero pending
-      // means everything's already in expenses, so stay and show the message.
+      // means nothing to review (every row already in expenses, or none that are
+      // transactions), so stay and show the message.
       // Carry the already-present (skipped) count so the queue can note that the
       // file's other rows are already imported and aren't shown there.
       // ...unless this exact file was already imported into a DIFFERENT account
@@ -120,7 +121,8 @@ export function UploadForm() {
 
       {accountsQuery.isSuccess && accounts.length === 0 ? (
         <p className="text-[11.5px] text-muted-foreground">
-          Statement import needs a credit-card account —{" "}
+          Statement import needs a card or bank account we can read statements
+          for —{" "}
           <Link
             href="/settings/accounts"
             className="font-medium text-primary hover:underline"
@@ -208,42 +210,7 @@ export function UploadForm() {
         </div>
       ) : null}
 
-      {/* Reached only when pending_count === 0: every parsed row is already in
-          expenses, so there is nothing to review. Wording distinguishes a
-          re-upload from a fresh upload whose rows all deduped away. */}
-      {summary ? (
-        <div className="rounded-md border border-border bg-muted/40 px-3 py-2.5 text-[12.5px]">
-          <p className="text-foreground">
-            {summary.already_imported
-              ? "This statement was already imported."
-              : "Nothing new to import from this statement."}
-          </p>
-          <p className="mt-1 text-muted-foreground">
-            All of its transactions are already in your{" "}
-            <Link
-              href="/expenses"
-              className="font-medium text-primary hover:underline"
-            >
-              expenses
-            </Link>
-            .
-          </p>
-          {/* PRD §F1/§F4a: with nothing pending, the review queue — the usual
-              mismatch banner — is never visited for this batch, so this is
-              the only surface left to say the statement's own closing
-              balance doesn't match. Null (not checked) and 0 (reconciled)
-              both render nothing. */}
-          {summary.reconciliation_delta_paise ? (
-            <p className="mt-1.5 text-warn">
-              Its statement closing balance doesn’t match your expenses:{" "}
-              <Sensitive>
-                {formatINR(Math.abs(summary.reconciliation_delta_paise))}
-              </Sensitive>{" "}
-              unaccounted for.
-            </p>
-          ) : null}
-        </div>
-      ) : null}
+      {summary ? <UploadResult summary={summary} /> : null}
 
       <div>
         <Button
@@ -317,7 +284,7 @@ function AccountPicker({
         {accounts.length === 0 ? (
           <DropdownMenuItem disabled>
             <span className="text-muted-foreground">
-              No credit-card accounts
+              No accounts we can import statements for
             </span>
           </DropdownMenuItem>
         ) : (
@@ -329,5 +296,60 @@ function AccountPicker({
         )}
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+/**
+ * The result panel, reached only when `pending_count === 0`: every parsed row is
+ * already in expenses (or the statement has none), so there is nothing to review.
+ * The headline tells the three apart: a re-upload, a statement with no rows
+ * (ADR-0010 rule 5: it imports as an empty batch), and one whose rows all
+ * deduped away. A statement of only zero-amount lines reads as one with no
+ * transactions and says how many it left out (ADR-0010 rule 5).
+ */
+export function UploadResult({ summary }: { summary: ImportSummary }) {
+  return (
+    <div className="rounded-md border border-border bg-muted/40 px-3 py-2.5 text-[12.5px]">
+      <p className="text-foreground">
+        {summary.already_imported
+          ? "This statement was already imported."
+          : summary.imported === 0 && summary.skipped === 0
+            ? "This statement has no transactions."
+            : "Nothing new to import from this statement."}
+      </p>
+      {summary.skipped > 0 ? (
+        <p className="mt-1 text-muted-foreground">
+          All of its transactions are already in your{" "}
+          <Link
+            href="/expenses"
+            className="font-medium text-primary hover:underline"
+          >
+            expenses
+          </Link>
+          .
+        </p>
+      ) : null}
+      {summary.zero_amount_count > 0 ? (
+        <p className="mt-1 text-muted-foreground">
+          Its {summary.zero_amount_count} zero-amount{" "}
+          {summary.zero_amount_count === 1 ? "line was" : "lines were"} left out: a zero
+          amount isn’t a transaction.
+        </p>
+      ) : null}
+      {/* PRD §F1/§F4a: with nothing pending, the review queue — the usual
+          mismatch banner — is never visited for this batch, so this is
+          the only surface left to say the statement's own closing
+          balance doesn't match. Null (not checked) and 0 (reconciled)
+          both render nothing. */}
+      {summary.reconciliation_delta_paise ? (
+        <p className="mt-1.5 text-warn">
+          Its statement closing balance doesn’t match your expenses:{" "}
+          <Sensitive>
+            {formatINR(Math.abs(summary.reconciliation_delta_paise))}
+          </Sensitive>{" "}
+          unaccounted for.
+        </p>
+      ) : null}
+    </div>
   );
 }

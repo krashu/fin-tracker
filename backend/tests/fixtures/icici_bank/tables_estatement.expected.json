@@ -1,0 +1,50 @@
+[
+  {
+    "date": "2026-04-02",
+    "amount_paise": -125000,
+    "merchant_raw": "SENTINEL GROCER UPI/SENTINEL GROCER/sentinelgrocer@example/Payment fr/AXIS BANK/000000000001/AXI0001/",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-03",
+    "amount_paise": 7500000,
+    "merchant_raw": "SENTINEL EMPLOYER PVT LTD NEFT-EXAMN00000000001-SENTINEL EMPLOYER PVT LTD",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2026-04-05",
+    "amount_paise": -200000,
+    "merchant_raw": "ATM NFS/CASH WDL/000000000002/SENTINEL ATM",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-06",
+    "amount_paise": -49900,
+    "merchant_raw": "SENTINEL FOOD UPI/SENTINEL FOOD/sentinelfood@example/Paid via AXIS BANK/000000000003/AXI0003/ 000/",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-07",
+    "amount_paise": 49900,
+    "merchant_raw": "UPI/REV/000000000003/SENTINEL FOOD sentinelfood@example/AXIS BANK",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-04-08",
+    "amount_paise": -1234567,
+    "merchant_raw": "MOBILE BANKING CRED Club UPI/CRED/credclub@example/payment on/AXIS BANK",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-10",
+    "amount_paise": 5000,
+    "merchant_raw": "UPI/SENTINEL PAY/cashback@example/CASHBACK",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2026-04-12",
+    "amount_paise": -32000,
+    "merchant_raw": "SENTINEL CAFE UPI/SENTINEL CAFE/sentinelcafe@example/Paid via AXIS BANK/000000000006/",
+    "txn_type": "withdrawal"
+  }
+]

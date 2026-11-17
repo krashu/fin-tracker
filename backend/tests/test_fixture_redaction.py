@@ -31,7 +31,11 @@ import pytest
 
 from app.core.pii_patterns import CARD_RE, PAN_RE
 
-FIXTURE_ROOT = Path(__file__).parent / "fixtures"
+# The bundled sample statements (app/sample_statements) are synthetic assets under the same guard.
+FIXTURE_ROOTS = (
+    Path(__file__).parent / "fixtures",
+    Path(__file__).parent.parent / "app" / "sample_statements",
+)
 
 PII_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("card-number", CARD_RE),
@@ -72,8 +76,10 @@ def _scan_for_pii(root: Path) -> list[str]:
     return failures
 
 
-def test_fixtures_have_no_pii() -> None:
-    failures = _scan_for_pii(FIXTURE_ROOT)
+@pytest.mark.parametrize("root", FIXTURE_ROOTS, ids=lambda p: p.name)
+def test_fixtures_have_no_pii(root: Path) -> None:
+    assert root.is_dir()
+    failures = _scan_for_pii(root)
     assert not failures, (
         "PII pattern matched in fixtures:\n  "
         + "\n  ".join(failures)

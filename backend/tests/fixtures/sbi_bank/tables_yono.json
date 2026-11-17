@@ -1,0 +1,87 @@
+[
+  [
+    [
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "Balance"
+    ],
+    [
+      "01/06/2026",
+      "01/06/2026",
+      "DEP TFR\nNEFT*EXAM0000001*EXAM000000000001*SENTINEL\nEMPLOYER\n0000000000001 AT 00001 PBB\nSENTINEL BRANCH, CITY",
+      "-",
+      "-",
+      "45,000.00",
+      "55,000.00"
+    ],
+    [
+      "03/06/2026",
+      "03/06/2026",
+      "WDL TFR\nUPI/DR/000000000002/SENTINEL GROCER\n/EXAM/sentinelgrocer@example/UPI\n0000000000002 AT 00001 PBB\nSENTINEL BRANCH, CITY",
+      "-",
+      "850.00",
+      "-",
+      "54,150.00"
+    ],
+    [
+      "07/06/2026",
+      "07/06/2026",
+      "POS ATM PURCH OTHPG\n000000000003SENTINEL STORE\nCITY",
+      "-",
+      "1,200.00",
+      "-",
+      "52,950.00"
+    ]
+  ],
+  [
+    [
+      "30/06/2026",
+      "30/06/2026",
+      "CREDIT INTEREST",
+      "-",
+      "-",
+      "120.00",
+      "53,070.00"
+    ],
+    [
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ],
+    [
+      "Statement Summary : 01-06-2026 To 30-06-2026",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ],
+    [
+      "Brought Forward( )",
+      "Dr Count",
+      "Cr Count",
+      "Total Debits( )",
+      "Total Credits( )",
+      "Closing Balance( )",
+      ""
+    ],
+    [
+      "10,000.00",
+      "2",
+      "2",
+      "2,050.00",
+      "45,120.00",
+      "53,070.00CR",
+      ""
+    ]
+  ]
+]

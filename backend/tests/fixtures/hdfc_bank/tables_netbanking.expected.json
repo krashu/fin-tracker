@@ -1,0 +1,44 @@
+[
+  {
+    "date": "2026-04-01",
+    "amount_paise": -125000,
+    "merchant_raw": "UPI-SENTINEL GROCER-SENTINELGROCER@EXAMPLE- EXAM0000001-000000000001-UPI",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-01",
+    "amount_paise": 7500000,
+    "merchant_raw": "NEFT CR-EXAM0000002-SENTINEL EMPLOYER PVT LTD-TEST USER-EXAMN00000000001",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2026-04-03",
+    "amount_paise": -49900,
+    "merchant_raw": "UPI-SENTINEL FOOD DELIVERY-SENTINELFOOD@EXAMPLE- EXAM0000003-000000000003-UPI",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-03",
+    "amount_paise": 49900,
+    "merchant_raw": "REV-UPI-000000000003-SENTINEL FOOD-SENTINELFOOD@EXAMPLE",
+    "txn_type": "refund"
+  },
+  {
+    "date": "2026-04-05",
+    "amount_paise": -1234567,
+    "merchant_raw": "CC 000000XXXXXX0000 AUTOPAY SI-TAD",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-07",
+    "amount_paise": -200000,
+    "merchant_raw": "ATW-000000XXXXXX0000-S1AEXAM0- MUMBAI",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-08",
+    "amount_paise": 2500,
+    "merchant_raw": "DEBIT CARD CASHBACK",
+    "txn_type": "deposit"
+  }
+]

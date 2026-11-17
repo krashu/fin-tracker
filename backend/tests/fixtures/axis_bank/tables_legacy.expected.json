@@ -1,0 +1,26 @@
+[
+  {
+    "date": "2024-01-02",
+    "amount_paise": 3000000,
+    "merchant_raw": "NEFT/EXAMN0000000002/SENTINEL EMPLOYER",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2024-01-05",
+    "amount_paise": -200000,
+    "merchant_raw": "ATM-CASH/SENTINEL ATM",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2024-01-08",
+    "amount_paise": 1500000,
+    "merchant_raw": "CHQ DEP/SENTINEL TENANT",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2024-01-10",
+    "amount_paise": -10400000,
+    "merchant_raw": "TRF TO FIXED DEPOSIT",
+    "txn_type": "withdrawal"
+  }
+]

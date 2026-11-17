@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict
+from datetime import date
 from typing import Any
 
 import pytest
@@ -63,13 +65,21 @@ def test_interpret_tables_flipkart_detected_without_header() -> None:
     ]
 
 
-def test_interpret_tables_empty_input_raises() -> None:
-    with pytest.raises(ParserError, match="no transactions found"):
-        AxisCC.interpret_tables([])
+@pytest.mark.parametrize("merchant", ["STARBUCKS COFFEE", "SENTINEL TOFFEE BLR"])
+def test_coffee_merchant_is_a_purchase(merchant: str) -> None:
+    """A62 (ADR-0009 rule 8): FEE is a whole word, so a merchant ending "...FEE" is a purchase."""
+    rows = AxisCC.interpret_tables([[["12/03/2026", merchant, "250.00"]]])
+    assert [(r.txn_type, r.amount_paise) for r in rows] == [("purchase", -25000)]
 
 
-def test_interpret_tables_only_headers_raises() -> None:
-    """Tables with only headers / summaries (no parseable date) must raise."""
+def test_interpret_tables_empty_input_returns_no_rows() -> None:
+    """No rows is not an error at this layer; ``ParsedStatement`` decides
+    whether the statement as a whole is empty (ADR-0010 rule 5)."""
+    assert AxisCC.interpret_tables([]) == []
+
+
+def test_interpret_tables_only_headers_returns_no_rows() -> None:
+    """Tables with only headers / summaries (no parseable date) yield no rows."""
     tables = [
         [
             ["Date", "Description", "Amount"],
@@ -77,8 +87,37 @@ def test_interpret_tables_only_headers_raises() -> None:
             ["Available Credit", "", "84,808.72"],
         ]
     ]
+    assert AxisCC.interpret_tables(tables) == []
+
+
+def test_zero_rows_with_summary_is_a_valid_statement(
+    text_pdf_bytes: Callable[[list[str]], bytes],
+) -> None:
+    """A month with no spend still prints balances: it parses to no rows and
+    the summary, never a ParserError (ADR-0010 rule 5)."""
+    pdf = text_pdf_bytes(
+        [
+            "Statement Period: 01/03/2026 to 31/03/2026",
+            "Previous Balance 5,699.00",
+            "Total Amount Due 5,699.00",
+        ]
+    )
+
+    parsed = AxisCC.parse(pdf, password=None)
+
+    assert parsed.rows == []
+    assert parsed.summary == StatementSummary(
+        opening_balance_paise=-569900,
+        closing_balance_paise=-569900,
+        period_start=date(2026, 3, 1),
+        period_end=date(2026, 3, 31),
+    )
+
+
+def test_zero_rows_and_no_summary_raises(text_pdf_bytes: Callable[[list[str]], bytes]) -> None:
+    """Neither rows nor any summary field: nothing to import (ADR-0010 rule 5)."""
     with pytest.raises(ParserError, match="no transactions found"):
-        AxisCC.interpret_tables(tables)
+        AxisCC.parse(text_pdf_bytes([]), password=None)
 
 
 def test_parse_corrupt_bytes_raises() -> None:

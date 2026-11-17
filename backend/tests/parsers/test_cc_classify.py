@@ -4,7 +4,7 @@ Both CC parsers own a private ``_classify(description, is_credit) -> TxnType``, 
 the snapshot fixtures only reach whichever tokens happen to appear in them. That is
 how commit 5515c5c's CHARGEBACK regression row landed on the Axis fixture ONLY,
 leaving the ICICI twin's credit-that-is-neither-payment-nor-refund fallthrough
-(``icici_cc.py:41``) unexecuted for a token both parsers claim to handle. A table
+(``_classify``'s final credit branch) unexecuted for a token both parsers claim to handle. A table
 test over the classifiers directly closes that class of gap for good: adding a
 token here exercises both, and no fixture edit can silently cover one twin only.
 
@@ -57,8 +57,23 @@ _SHARED: list[tuple[str, bool, TxnType]] = [
     # Ordinary spend.
     ("SENTINEL GROCERY MUM", False, "purchase"),
     ("SENTINEL CAFE BLR", False, "purchase"),
+    ("STARBUCKS COFFEE", False, "purchase"),
     # A refund token on the DEBIT side is not a refund — is_credit gates the branch.
     ("REFUND SENTINEL MERCHANT", False, "purchase"),
+    # Merchants that only contain a fee or tax token are purchases; tokens match as whole
+    # runs of letters (A62, A68).
+    ("KINGSTON TECHNOLOGY BLR", False, "purchase"),
+    ("PINTEREST ADS", False, "purchase"),
+    ("SENTINEL CHOCOLATE PAYMENT CO", False, "purchase"),
+    ("SENTINEL MOBILE RECHARGE", False, "purchase"),
+    # SURCHARGE is a whole token, so it is `other` on both issuers.
+    ("FUEL SURCHARGE", False, "other"),
+    # The GST family, including a digit-glued rate, and a plural FINANCE CHARGES.
+    ("IGST @ 18%", False, "other"),
+    ("CGST", False, "other"),
+    ("SGST", False, "other"),
+    ("IGST18%", False, "other"),
+    ("FINANCE CHARGES", False, "other"),
 ]
 
 
@@ -85,7 +100,7 @@ def test_shared_classification(
 _DIVERGENT: list[tuple[str, bool, TxnType, TxnType]] = [
     # Only ICICI's _NON_PURCHASE_DEBIT_RE has SERVICE TAX; Axis has SERVICE CHARGE.
     ("SERVICE TAX", False, "purchase", "other"),
-    # Only ICICI has a bare `CHARGE\b`, so a lone "CHARGE" is a purchase on Axis.
+    # Only ICICI has a whole-token CHARGE, so a lone "CHARGE" is a purchase on Axis.
     ("SENTINEL CHARGE", False, "purchase", "other"),
     # Only ICICI's _PAYMENT_RE has AUTOPAY PAYMENT.
     ("AUTOPAY PAYMENT", True, "other", "payment"),
@@ -112,7 +127,7 @@ def test_per_issuer_divergence_is_intentional(
 def test_service_charge_is_shared_even_though_service_tax_is_not() -> None:
     """The near-miss worth spelling out: SERVICE CHARGE matches on both.
 
-    Axis matches it literally; ICICI matches via its bare ``CHARGE\\b``. So the two
+    Axis matches it literally; ICICI matches via its whole-token CHARGE. So the two
     agree here and diverge on SERVICE TAX one line away in the same regex — which is
     exactly the kind of asymmetry a fixture-only test would never surface.
     """

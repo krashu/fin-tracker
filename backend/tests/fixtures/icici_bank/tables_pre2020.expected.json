@@ -1,0 +1,32 @@
+[
+  {
+    "date": "2019-04-02",
+    "amount_paise": -50000,
+    "merchant_raw": "UPI/000000000011/NA/sentinel@example/SENTINEL BANK",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2019-04-03",
+    "amount_paise": -125000,
+    "merchant_raw": "BIL/ONL/000000000012/SENTINEL RAIL/ GSTIN SENTINEL/00012",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2019-04-05",
+    "amount_paise": 2500000,
+    "merchant_raw": "NEFT-EXAMN00000000013-SENTINEL EMPLOYER",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2019-04-06",
+    "amount_paise": -200000,
+    "merchant_raw": "MOBILE BANKING MMT/IMPS/000000000014/SENTINEL",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2019-04-08",
+    "amount_paise": -75000,
+    "merchant_raw": "UPI/000000000015/NA/sentinelshop@example/SENTINEL SHOP",
+    "txn_type": "withdrawal"
+  }
+]

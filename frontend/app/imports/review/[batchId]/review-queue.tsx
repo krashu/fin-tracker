@@ -8,14 +8,11 @@
  * Contract notes that shape the logic (PRD §F1/§F3/§F9):
  *  - candidates are rows with confirmed_at IS NULL; committing removes them, so
  *    there is no "confirmed" group here.
- *  - staging is category-based, with one exception: a row with a category is
- *    selected by default, and so is an untagged cashback-named income credit —
- *    it commits under the seeded "Cashback" category with zero interaction
- *    (imports.py's commit-time fallback, excluded from F3 learning; see
- *    `defaultStagedFor`). Untagged spend still starts unchecked — a refund is
- *    a positive-amount `spend` row (ADR-0009), not its own type, so it gets no
+ *  - staging is category-based: a row with a category is selected by default;
+ *    untagged rows start unchecked — a refund or a cashback is a positive-amount
+ *    `spend` row (ADR-0009, ADR-0013), not its own type, so it gets no
  *    special-cased default either. A staged untagged spend commits under the
- *    seeded "Other" category (the backend defaults it); other income stays null.
+ *    kind's fallback category (the backend defaults it); income stays null.
  *  - propagation is invalidate-on-mutation (no SSE): a category PATCH refreshes
  *    this batch; a commit refreshes the board.
  */
@@ -52,6 +49,7 @@ import {
 } from "@/components/ui/command";
 import { TagPicker } from "@/components/review/tag-picker";
 import { LabelInput } from "@/components/labels/label-input";
+import { StatementPeriod } from "@/components/review/statement-period";
 import { ImportStepper } from "@/components/ui/stepper";
 import {
   Tooltip,
@@ -68,8 +66,8 @@ import {
   ApiError,
   cancelImport,
   commitImport,
-  deleteTransaction,
   getBatchReconciliation,
+  invalidIdsFromError,
   listAccounts,
   listCandidates,
   listCategories,
@@ -84,7 +82,6 @@ import {
 import {
   buildCategoryTree,
   categoryKindForType,
-  resolveCategoryColor,
 } from "@/lib/categories";
 import { CategoryDot } from "@/components/category-dot";
 import { formatINR, formatDateWithYear } from "@/lib/format";
@@ -110,64 +107,37 @@ const GRID_MIN_WIDTH = 900;
 // not a factor — core/rate_limit.py is applied in api/v1/auth.py only.)
 const BULK_CHUNK = 8;
 
-/** Mirrors the backend's `is_cashback_credit` (import_service.py) — same
- * keyword, so the credit-row default shown here is exactly what the backend
- * will actually stamp at commit. Duplicated rather than fetched because it's
- * a one-line rule; `categoryKindForType`/`kind_for_type` is the precedent for
- * mirroring a rule this small on both sides. */
-const CASHBACK_RE = /cashback/i;
-function isCashbackMerchant(merchantRaw: string | null): boolean {
-  return merchantRaw != null && CASHBACK_RE.test(merchantRaw);
-}
-
 /**
- * A staged row with no category commits under a seeded fallback — "Other" for
- * spend (a refund included: it's a positive-amount `spend` row, not its own
- * type — ADR-0009), "Cashback" for an income row whose merchant names it
- * cashback (`isCashbackMerchant`). Any other income stays uncategorized (an
- * auto-linked CC payment must become a category-null transfer, so income
- * never gets a blanket default). Drives the "will import as …" hint + the
- * picker's default label; the backend applies the actual category at commit.
+ * A staged row with no category commits under the spend fallback ("Other") when
+ * it is a spend (a refund or a cashback included: a positive-amount `spend` row,
+ * not its own type — ADR-0009, ADR-0013). Income stays uncategorized (an
+ * auto-linked CC payment must become a category-null transfer, so income never
+ * gets a blanket default). Drives the "will import as …" hint + the picker's
+ * default label; the backend applies the actual category at commit. A flagged
+ * card-bill debit the server says commits as a transfer
+ * (`uncategorised_commits_as_transfer`, ADR-0002 rule 7b) does not.
+ * A flagged card credit is income here and commits as a transfer when uncategorised
+ * (rule 7c), so it never defaults to Other either.
  */
 function defaultsToOther(c: TransactionCandidate): boolean {
   return (
     c.category_id == null &&
-    (c.transaction_type === "spend" ||
-      (c.transaction_type === "income" && isCashbackMerchant(c.merchant_raw)))
+    c.transaction_type === "spend" &&
+    !c.uncategorised_commits_as_transfer
   );
 }
 
 /**
  * Whether `c` is staged by DEFAULT, before any user toggle — what `toggled`
- * (below) represents a flip AWAY from. A row with a category counts, same as
- * always. An untagged cashback-named income row additionally counts: it
- * commits under a seeded fallback category with zero interaction, and
- * `commit_import_batch`'s `defaulted_ids` guard only excludes a row from F3
- * learning when its `category_id` is still NULL at commit time — so leaving
- * it null (never writing the fallback category id here) is what keeps this
- * auto-stage safe: the fallback can never masquerade as a real
- * merchant→category decision. Spend — a refund included, ADR-0009 collapsed
- * it into a positively-signed spend rather than its own type, so it no longer
- * gets a safe default of its own — and any other income are deliberately NOT
- * extended this way: spend's "Other" fallback is a bigger silent call (a
- * genuinely new merchant), and income otherwise has no safe default at all
- * (Salary vs Cashback vs Freelancing).
+ * (below) represents a flip AWAY from: exactly the rows that already have a
+ * category. Untagged spend is deliberately NOT staged this way: its "Other"
+ * fallback is a bigger silent call (a genuinely new merchant), and income has no
+ * safe default at all (Salary vs Cashback vs Freelancing). The backend's
+ * `defaulted_ids` guard keeps a commit-time fallback out of F3 learning only
+ * while `category_id` is still NULL, so the fallback is never written here.
  */
 function defaultStagedFor(c: TransactionCandidate): boolean {
-  return (
-    c.category_id != null ||
-    (c.transaction_type === "income" && isCashbackMerchant(c.merchant_raw))
-  );
-}
-
-/** Pull `invalid_ids` from a commit 422 body; [] for any other error shape. */
-function invalidIdsFromError(err: unknown): number[] {
-  if (!(err instanceof ApiError) || err.status !== 422) return [];
-  const detail = (err.body as { detail?: unknown } | undefined)?.detail;
-  const ids = (detail as { invalid_ids?: unknown } | undefined)?.invalid_ids;
-  return Array.isArray(ids)
-    ? ids.filter((x): x is number => typeof x === "number")
-    : [];
+  return c.category_id != null;
 }
 
 export function ReviewQueue({ batchId }: { batchId: number }) {
@@ -187,8 +157,8 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   const [toggled, setToggled] = useState<Set<number>>(new Set());
   // Rows the user marked for deletion via the row's discard button. This is a
   // *soft* (client-side, reversible) delete: the row stays visible, struck
-  // through, until Commit — which hard-deletes it (DELETE /transactions/{id}).
-  // A misclick is undoable any time before Commit. Not persisted; navigating
+  // through, until Commit — which deletes it in the same request that commits the
+  // staged rows. A misclick is undoable any time before Commit. Not persisted; navigating
   // away just leaves the row in the pending queue, unmarked.
   const [markedForDeletion, setMarkedForDeletion] = useState<Set<number>>(
     new Set(),
@@ -249,7 +219,7 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   // Statement balance reconciliation (PRD §F1/§F4a). The backend recomputes +
   // persists the delta on every GET, so this is always current with the DB —
   // not just an echo of what the upload computed. Invalidated below by the
-  // commit mutation, whose DELETEs of marked-for-deletion rows are the one
+  // commit mutation, whose discard of marked-for-deletion rows is the one
   // review-queue action that can move the batch's window sum — a category
   // PATCH can't (reconcile_batch sums amount_paise over the date window,
   // never filtered by category_id), so it deliberately does NOT invalidate
@@ -290,6 +260,11 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
     (accountsQuery.data ?? []).map((a) => [a.id, a]),
   );
   const categories = categoriesQuery.data ?? [];
+  // The spend fallback's display name comes from its server-computed role, never a
+  // literal (ADR-0012 rule 8): imports default an untagged staged spend into it.
+  const fallbackName =
+    categories.find((c) => c.role === "fallback" && c.kind === "spend")?.name ??
+    "the fallback category";
   const categoriesById = new Map<number, CategoryRead>(
     categories.map((c) => [c.id, c]),
   );
@@ -297,7 +272,7 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   const candidates = candidatesQuery.data ?? [];
   const candidatesById = new Map(candidates.map((c) => [c.id, c]));
   // Rows sharing an exact merchant_raw — the batching unit for review. Exact string
-  // only: normalize_merchant is lowercase + whitespace-collapse, so it would not
+  // only: normalize_merchant is lowercase + NFC + whitespace-collapse, so it would not
   // collapse "MYNTRA,BANGALORE" into "MYNTRA DESIGNS PRIVATE L,BANGALORE" either.
   // Widening that is the canonical-alias layer (plans/merchant-alias.md, ADR-0011).
   const merchantGroups = new Map<string, number[]>();
@@ -311,12 +286,10 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   // the account is resolved once from the first candidate and shown in the header
   // rather than repeated per row.
   const batchAccount = accountsById.get(candidates[0]?.account_id ?? -1);
-  // Checkbox state is category-based, plus one exception — see
-  // `defaultStagedFor`: a row is default-staged if it has a category
-  // (auto-tagged spends, or anything the user tags — incl. Cashback) OR is an
-  // untagged cashback-named income credit. `toggled` holds the ids the user
-  // flipped away from that default, so the effective set derives at render
-  // with no reconcile effect. Tagging a row (or picking a spend/income
+  // Checkbox state is category-based — see `defaultStagedFor`: a row is
+  // default-staged if it has a category (auto-tagged spends, or anything the user
+  // tags). `toggled` holds the ids the user flipped away from that default, so
+  // the effective set derives at render with no reconcile effect. Tagging a row (or picking a spend/income
   // category on a credit row) auto-selects it: after the PATCH refetch it
   // carries the new state → default-staged.
   const isStaged = (c: TransactionCandidate): boolean =>
@@ -335,20 +308,11 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
     .filter((c) => isEffectivelyStaged(c))
     .map((c) => c.id);
   const stagedCount = effectiveStaged.length;
-  // Staged spend rows without a category commit under "Other" (backend; a
-  // refund is a spend row, so it's covered here too — ADR-0009); staged
-  // cashback-named income rows without one commit under "Cashback" — split so
-  // the header names the right bucket instead of collapsing both under one
-  // "Other" count.
+  // Staged spend rows without a category commit under the fallback (backend; a
+  // refund or a cashback is a spend row, so it's covered here too — ADR-0009,
+  // ADR-0013), minus a card-bill debit that commits as a transfer (ADR-0002 rule 7b).
   const otherDefaultCount = candidates.filter(
-    (c) => isEffectivelyStaged(c) && c.category_id == null && c.transaction_type === "spend",
-  ).length;
-  const cashbackDefaultCount = candidates.filter(
-    (c) =>
-      isEffectivelyStaged(c) &&
-      c.category_id == null &&
-      c.transaction_type === "income" &&
-      isCashbackMerchant(c.merchant_raw),
+    (c) => isEffectivelyStaged(c) && defaultsToOther(c),
   ).length;
   // Header select-all. The `stagedCount > 0` conjunct is load-bearing: with every
   // row marked for deletion the counts would read `candidates.length > 0 && 0 === 0`
@@ -416,8 +380,8 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   // Force a set of ids to an ABSOLUTE staged state. Staging is derived — `toggled`
   // holds the ids flipped away from the default (`defaultStagedFor`) — so forcing a
   // state means storing a flip only when the wanted state differs from that
-  // default: a default-staged row (categorized, or an untagged cashback-named
-  // income credit) flips ON in `toggled` to go OFF; a not-default-staged row
+  // default: a default-staged row (a categorized one) flips ON in
+  // `toggled` to go OFF; a not-default-staged row
   // flips ON to go ON. Used by select-all / range-select and the label-save
   // auto-stage (`on: true`), and by commit success/error via `forceUnstage`.
   const setStagedFor = (ids: Iterable<number>, on: boolean) =>
@@ -448,8 +412,8 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
     // the refreshed category_id drives `isStaged`. Without the reset, a row the
     // user had flipped away from its default silently un-stages (or re-stages) the
     // instant they categorize it — `(category_id!=null) !== toggled.has(id)` flips
-    // to the wrong value. Works for any type — a Cashback (income) row auto-checks
-    // the same as a spend.
+    // to the wrong value. Works for any type — an income row auto-checks the
+    // same as a spend.
     onSuccess: (_data, vars) => {
       setToggled((prev) => {
         if (!prev.has(vars.id)) return prev;
@@ -648,39 +612,20 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
       }),
   });
 
-  // Commit does two things: commit the staged rows to the board AND hard-delete
-  // the rows marked for deletion. Commit-first — a failed commit (422) aborts
-  // before any destructive delete. Sets are snapshotted as mutation variables at
-  // click time so a concurrent category-PATCH refetch can't desync onSuccess.
+  // One request commits the staged rows AND discards the marked ones, atomically
+  // (ADR-0002 rule 5): a 422 names the ineligible rows and nothing is committed or
+  // removed. Sets are snapshotted as mutation variables at click time so a concurrent
+  // category-PATCH refetch can't desync onSuccess.
   const commitMutation = useMutation({
-    mutationFn: async ({
+    mutationFn: ({
       staged,
       marked,
     }: {
       staged: number[];
       marked: number[];
-    }) => {
-      // Skip the commit call when nothing is staged — ImportCommit requires
-      // min_length=1, so an empty commit would 422. A delete-only Commit is valid.
-      if (staged.length > 0) {
-        await commitImport(batchId, staged);
-      }
-      let failedDeletes = 0;
-      if (marked.length > 0) {
-        const results = await Promise.allSettled(
-          marked.map((id) => deleteTransaction(id)),
-        );
-        // A 404 (row already gone) is expected + idempotent; any other rejection
-        // is a genuine failure we surface rather than hide.
-        failedDeletes = results.filter(
-          (r) =>
-            r.status === "rejected" &&
-            !(r.reason instanceof ApiError && r.reason.status === 404),
-        ).length;
-      }
-      return { failedDeletes };
-    },
-    onSuccess: (result, { staged }) => {
+    }) =>
+      commitImport(batchId, { transaction_ids: staged, discard_ids: marked }),
+    onSuccess: (_data, { staged, marked }) => {
       queryClient.invalidateQueries({ queryKey: ["transactions"] });
       queryClient.invalidateQueries({ queryKey: ["dashboards"] });
       // Commit is the primary rule-learning event (imports.py learns both maps),
@@ -691,22 +636,25 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
       // preventing a second POST of now-confirmed ids. Uses the click-time
       // snapshot, not the render-derived set.
       forceUnstage(staged);
-      // Commit succeeded (commit-first). Surface any real delete failures softly:
-      // the failed rows are still in the DB and still in `markedForDeletion`, so
-      // they reappear marked on refetch and a re-Commit retries them.
-      setUnstagedNotice(
-        result.failedDeletes > 0
-          ? `Committed, but couldn't remove ${result.failedDeletes} row${
-              result.failedDeletes === 1 ? "" : "s"
-            } — still in the queue. Try Commit again.`
-          : null,
-      );
+      // The discarded rows are gone server-side: drop their marks.
+      setMarkedForDeletion((prev) => {
+        const next = new Set(prev);
+        marked.forEach((id) => next.delete(id));
+        return next;
+      });
+      setUnstagedNotice(null);
     },
     onError: (err) => {
       const bad = invalidIdsFromError(err);
       if (bad.length === 0) return;
       forceUnstage(bad);
-      // Commit-first aborts before deletes, so marked rows were NOT removed either.
+      // A named row may have been marked for discard: unmark it so it isn't re-sent.
+      setMarkedForDeletion((prev) => {
+        const next = new Set(prev);
+        bad.forEach((id) => next.delete(id));
+        return next;
+      });
+      // The request is atomic, so marked rows were NOT removed either.
       setUnstagedNotice(
         `${bad.length} row${bad.length === 1 ? "" : "s"} became ineligible and ${
           bad.length === 1 ? "was" : "were"
@@ -714,11 +662,10 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
       );
     },
     onSettled: () => {
-      // Queue + top-bar bell change regardless of outcome (deletes may have run;
-      // a 422 unstaged rows).
+      // Queue + top-bar bell change regardless of outcome (a 422 unstaged rows).
       queryClient.invalidateQueries({ queryKey: ["candidates", batchId] });
       queryClient.invalidateQueries({ queryKey: ["imports", "pending"] });
-      // Commit's DELETEs of marked-for-deletion rows are the other action that
+      // Commit's discard of marked-for-deletion rows is the other action that
       // can move the batch's window sum — refresh the reconciliation verdict
       // regardless of outcome, same as the two invalidations above.
       queryClient.invalidateQueries({ queryKey: ["reconciliation", batchId] });
@@ -735,7 +682,7 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
   });
 
   // Per-row soft delete: toggle a row in/out of the marked-for-deletion set.
-  // No API call — the actual DELETE fires on Commit. Reversible until then.
+  // No API call — the discard rides the Commit request. Reversible until then.
   function toggleMarked(id: number) {
     setUnstagedNotice(null);
     setMarkedForDeletion((prev) => {
@@ -807,9 +754,13 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
     setStagedFor(ids, true);
   }
 
-  // "Card bill payment" (PRD §F4a-1): the row stays `income` with
-  // `category_id` NULL, so auto_link_cc_bill can pair it with a matching
-  // bank debit at commit instead of a category ever being applied.
+  // "Card bill payment" (PRD §F4a-1): the row keeps `category_id` NULL, so
+  // auto_link_cc_bill can pair it with its other leg at commit (a card's
+  // payment credit with a bank debit, or a bank debit with the card's credit)
+  // instead of a category ever being applied. A row left unlinked commits as a
+  // transfer when the server's `uncategorised_commits_as_transfer` says so: always for a
+  // card credit (ADR-0002 rule 7c), and for a bank debit only when its card's statement
+  // is in, else as Other (rule 7b).
   function markCardPayment(id: number) {
     setUnstagedNotice(null);
     const c = candidatesById.get(id);
@@ -970,9 +921,17 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
       <Header
         pending={candidates.length}
         otherDefaultCount={otherDefaultCount}
-        cashbackDefaultCount={cashbackDefaultCount}
+        fallbackName={fallbackName}
         accountName={batchAccount?.name ?? null}
         accountLast4={batchAccount?.last4 ?? null}
+        period={
+          reconciliationQuery.data
+            ? {
+                start: reconciliationQuery.data.period_start,
+                end: reconciliationQuery.data.period_end,
+              }
+            : null
+        }
       />
 
       {alreadyPresent > 0 ? (
@@ -1100,6 +1059,7 @@ export function ReviewQueue({ batchId }: { batchId: number }) {
                   categories={categories}
                   staged={isEffectivelyStaged(c)}
                   defaultsToOther={isEffectivelyStaged(c) && defaultsToOther(c)}
+                  fallbackName={fallbackName}
                   marked={markedForDeletion.has(c.id)}
                   pending={pendingRowIds.has(c.id)}
                   discardDisabled={
@@ -1252,15 +1212,19 @@ function CancelImportConfirm({
 function Header({
   pending,
   otherDefaultCount,
-  cashbackDefaultCount,
+  fallbackName,
   accountName,
   accountLast4,
+  period,
 }: {
   pending: number;
   otherDefaultCount: number;
-  cashbackDefaultCount: number;
+  /** The spend fallback's display name, from its `role` (never a literal). */
+  fallbackName: string;
   accountName: string | null;
   accountLast4: string | null;
+  /** The batch's printed statement period; `null` while it is still loading. */
+  period: { start: string | null; end: string | null } | null;
 }) {
   return (
     <div className="pt-9 pb-5">
@@ -1285,14 +1249,14 @@ function Header({
         <span className="text-[12px] tabular-nums text-muted-foreground">
           <span className="text-foreground">{pending}</span> pending
         </span>
-        {otherDefaultCount > 0 ? (
-          <span className="text-[12px] tabular-nums text-muted-foreground">
-            · {otherDefaultCount} will import as Other
+        {period ? (
+          <span className="text-[12px] text-muted-foreground">
+            · <StatementPeriod start={period.start} end={period.end} />
           </span>
         ) : null}
-        {cashbackDefaultCount > 0 ? (
+        {otherDefaultCount > 0 ? (
           <span className="text-[12px] tabular-nums text-muted-foreground">
-            · {cashbackDefaultCount} will import as Cashback
+            · {otherDefaultCount} will import as {fallbackName}
           </span>
         ) : null}
       </div>
@@ -1303,6 +1267,45 @@ function Header({
   );
 }
 
+/**
+ * The "Card bill payment" item of a flagged row's category picker (PRD §F4a-1). `debit` is
+ * the bank side: the row links to the card's payment credit. Left unlinked it stays out of
+ * spend as an unpaired transfer when `commitsAsTransfer` (the server's
+ * `uncategorised_commits_as_transfer`), and otherwise imports as Other (ADR-0002 rule 7b);
+ * it can be linked later from the card's payment, "Paid your card bill elsewhere?"
+ * (ADR-0002 rule 11b). The credit side links to the bank debit, and otherwise always stays
+ * out of income as an unpaired transfer (rule 7c), so it has no flag-dependent variant.
+ */
+function CardPaymentOption({
+  debit,
+  commitsAsTransfer = false,
+  onSelect,
+}: {
+  debit: boolean;
+  commitsAsTransfer?: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <>
+      <CommandGroup>
+        <CommandItem value="__card_payment__" onSelect={onSelect}>
+          <span className="flex flex-col gap-0.5">
+            <span>Card bill payment</span>
+            <span className="text-[11px] text-muted-foreground">
+              {debit
+                ? commitsAsTransfer
+                  ? "links to your card's payment at commit if it is on the board; otherwise it stays out of spend as an unlinked transfer, since your card's statement for this date is in, and you can link it later from the card's payment (“Paid your card bill elsewhere?”)"
+                  : "links to your card's payment at commit if it is on the board and the card names this account as “Paid from”; otherwise it imports as Other until it is linked, since no statement of such a card covering this date is in yet. Link it later from the card's payment (“Paid your card bill elsewhere?”)"
+                : "links to your bank debit at commit, if that account is imported; otherwise it stays out of income as an unlinked transfer, and you can link it later with “Paid your card bill elsewhere?”"}
+            </span>
+          </span>
+        </CommandItem>
+      </CommandGroup>
+      <CommandSeparator />
+    </>
+  );
+}
+
 function ReviewRow({
   c,
   isLast,
@@ -1310,6 +1313,7 @@ function ReviewRow({
   categories,
   staged,
   defaultsToOther,
+  fallbackName,
   marked,
   pending,
   discardDisabled,
@@ -1333,6 +1337,7 @@ function ReviewRow({
   categories: CategoryRead[];
   staged: boolean;
   defaultsToOther: boolean;
+  fallbackName: string;
   marked: boolean;
   pending: boolean;
   /** Row-wide in-flight lock: a commit, a cancel or a bulk fan-out is running, so
@@ -1500,7 +1505,7 @@ function ReviewRow({
               confidence={c.confidence}
               categoryName={categoryName}
               defaultsToOther={defaultsToOther}
-              defaultCategoryName={c.transaction_type === "spend" ? "Other" : "Cashback"}
+              defaultCategoryName={fallbackName}
               cardPayment={c.cc_payment_candidate && staged && c.category_id == null}
               priorMatches={c.prior_matches}
               pinned={c.pinned}
@@ -1515,23 +1520,10 @@ function ReviewRow({
               <CommandList className="max-h-72">
                 <CommandEmpty>No matching categories.</CommandEmpty>
                 {c.cc_payment_candidate ? (
-                  <>
-                    <CommandGroup>
-                      <CommandItem
-                        value="__card_payment__"
-                        onSelect={selectCardPayment}
-                      >
-                        <span className="flex flex-col gap-0.5">
-                          <span>Card bill payment</span>
-                          <span className="text-[11px] text-muted-foreground">
-                            links to your bank debit at commit, if that
-                            account is imported
-                          </span>
-                        </span>
-                      </CommandItem>
-                    </CommandGroup>
-                    <CommandSeparator />
-                  </>
+                  <CardPaymentOption
+                    debit={false}
+                    onSelect={selectCardPayment}
+                  />
                 ) : null}
                 <CommandGroup>
                   <CommandItem
@@ -1552,7 +1544,7 @@ function ReviewRow({
                       >
                         <CategoryDot
                           categoryId={parent.id}
-                          color={resolveCategoryColor(parent, categories)}
+                          color={parent.display_color}
                         />
                         <span className="truncate">{parent.name}</span>
                       </CommandItem>
@@ -1565,7 +1557,7 @@ function ReviewRow({
                         >
                           <CategoryDot
                             categoryId={sub.id}
-                            color={resolveCategoryColor(sub, categories)}
+                            color={sub.display_color}
                             className="size-1.5"
                           />
                           <span className="truncate">{sub.name}</span>
@@ -1585,7 +1577,7 @@ function ReviewRow({
                       >
                         <CategoryDot
                           categoryId={parent.id}
-                          color={resolveCategoryColor(parent, categories)}
+                          color={parent.display_color}
                         />
                         <span className="truncate">{parent.name}</span>
                       </CommandItem>
@@ -1598,7 +1590,7 @@ function ReviewRow({
                         >
                           <CategoryDot
                             categoryId={sub.id}
-                            color={resolveCategoryColor(sub, categories)}
+                            color={sub.display_color}
                             className="size-1.5"
                           />
                           <span className="truncate">{sub.name}</span>
@@ -1618,7 +1610,12 @@ function ReviewRow({
               confidence={c.confidence}
               categoryName={categoryName}
               defaultsToOther={defaultsToOther}
-              defaultCategoryName="Other"
+              defaultCategoryName={fallbackName}
+              cardPayment={
+                c.cc_payment_candidate && staged && c.category_id == null
+              }
+              cardPaymentDebit
+              uncategorisedCommitsAsTransfer={c.uncategorised_commits_as_transfer}
               priorMatches={c.prior_matches}
               pinned={c.pinned}
               disabled={pending}
@@ -1631,6 +1628,13 @@ function ReviewRow({
               <CommandInput placeholder="Search categories…" />
               <CommandList className="max-h-72">
                 <CommandEmpty>No matching categories.</CommandEmpty>
+                {c.cc_payment_candidate ? (
+                  <CardPaymentOption
+                    debit
+                    commitsAsTransfer={c.uncategorised_commits_as_transfer}
+                    onSelect={selectCardPayment}
+                  />
+                ) : null}
                 <CommandGroup>
                   <CommandItem
                     value="__uncategorized__"
@@ -1649,7 +1653,7 @@ function ReviewRow({
                     >
                       <CategoryDot
                         categoryId={parent.id}
-                        color={resolveCategoryColor(parent, categories)}
+                        color={parent.display_color}
                       />
                       <span className="truncate">{parent.name}</span>
                     </CommandItem>
@@ -1662,7 +1666,7 @@ function ReviewRow({
                       >
                         <CategoryDot
                           categoryId={sub.id}
-                          color={resolveCategoryColor(sub, categories)}
+                          color={sub.display_color}
                           className="size-1.5"
                         />
                         <span className="truncate">{sub.name}</span>
@@ -1855,7 +1859,7 @@ function CommitBar({
                 >
                   <CategoryDot
                     categoryId={parent.id}
-                    color={resolveCategoryColor(parent, categories)}
+                    color={parent.display_color}
                   />
                   <span className="truncate">{parent.name}</span>
                 </DropdownMenuItem>
@@ -1867,7 +1871,7 @@ function CommitBar({
                   >
                     <CategoryDot
                       categoryId={sub.id}
-                      color={resolveCategoryColor(sub, categories)}
+                      color={sub.display_color}
                       className="size-1.5"
                     />
                     <span className="truncate">{sub.name}</span>

@@ -1,0 +1,32 @@
+[
+  {
+    "date": "2026-04-01",
+    "amount_paise": 7500000,
+    "merchant_raw": "BY TRANSFER-NEFT*EXAM0000001*EXAM000000000001*SENTINEL EMPLOYER",
+    "txn_type": "deposit"
+  },
+  {
+    "date": "2026-04-03",
+    "amount_paise": -125000,
+    "merchant_raw": "TO TRANSFER-UPI/DR/000000000001/SENTINEL GROCER/EXAM/sentinelgrocer@example/UPI",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-10",
+    "amount_paise": -200000,
+    "merchant_raw": "ATM WDL-ATM CASH 0000 SENTINEL BRANCH",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-15",
+    "amount_paise": -500000,
+    "merchant_raw": "TO TRANSFER-INB SENTINEL INSURANCE",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2026-04-30",
+    "amount_paise": 81200,
+    "merchant_raw": "CREDIT INTEREST--",
+    "txn_type": "deposit"
+  }
+]

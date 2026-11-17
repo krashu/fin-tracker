@@ -17,15 +17,27 @@ export type TagPickerProps = {
    * (e.g. spend -> Other; a refund is a positive-amount spend, so it lands there too).
    */
   defaultsToOther?: boolean;
-  defaultCategoryName?: string;
+  /** The fallback category's display name (from its `role`); shown when `defaultsToOther`. */
+  defaultCategoryName: string;
   /**
    * True for a staged, still-uncategorized card-bill-payment row
    * (`cc_payment_candidate`, PRD §F4a-1) — distinct from `defaultsToOther`
    * because nothing is actually applied here: the row stays `category_id`
-   * NULL either way, becoming a `transfer` if a matching bank debit is
-   * found at commit, or uncategorized `income` if not.
+   * NULL either way. A card credit becomes a `transfer` if a matching bank
+   * debit is found at commit, or stays an unlinked transfer if not (ADR-0002 rule 7c); a
+   * bank debit (`cardPaymentDebit`) becomes a `transfer` if the card's payment is found.
+   * Left unlinked, it stays an unpaired transfer when `uncategorisedCommitsAsTransfer`
+   * is set, and otherwise imports as Other (ADR-0002 rule 7b). Either side can be
+   * linked later by hand ("Paid your card bill elsewhere?", ADR-0002 rule 11b).
    */
   cardPayment?: boolean;
+  /** The flagged row is a bank debit, so the link is to the card's payment. */
+  cardPaymentDebit?: boolean;
+  /**
+   * With `cardPaymentDebit`: the server says this row, left uncategorised and unlinked,
+   * commits as a transfer (ADR-0002 rule 7b).
+   */
+  uncategorisedCommitsAsTransfer?: boolean;
   priorMatches: number;
   pinned?: boolean;
 } & React.ComponentProps<"button">;
@@ -34,17 +46,17 @@ export function TagPicker({
   confidence,
   categoryName,
   defaultsToOther = false,
-  defaultCategoryName = "Other",
+  defaultCategoryName,
   cardPayment = false,
+  cardPaymentDebit = false,
+  uncategorisedCommitsAsTransfer = false,
   priorMatches,
   pinned = false,
   className,
   ...props
 }: TagPickerProps) {
   if (categoryName == null) {
-    // Checked before `defaultsToOther` — mutually exclusive in practice (a
-    // card-payment merchant never also matches the cashback regex), but this
-    // is the more specific signal.
+    // Checked before `defaultsToOther` — the more specific signal.
     if (cardPayment) {
       return (
         <button
@@ -58,7 +70,13 @@ export function TagPicker({
           <span className="min-w-0 truncate">Card payment</span>
           <span
             className="shrink-0 rounded-sm bg-accent px-1 py-px text-[10px] font-medium uppercase tracking-wide text-accent-foreground"
-            title="Links to your bank debit at commit — no category is applied"
+            title={
+              !cardPaymentDebit
+                ? "Links to your bank debit at commit — stays out of income if none matches; link it later from this payment"
+                : uncategorisedCommitsAsTransfer
+                  ? "Links to your card's payment at commit — stays out of spend if none matches (the card's statement for this date is in); link it later from the card's payment"
+                  : "Links to your card's payment at commit — imports as Other if none matches (no card statement covering this date is in); link it later from the card's payment"
+            }
           >
             auto
           </span>

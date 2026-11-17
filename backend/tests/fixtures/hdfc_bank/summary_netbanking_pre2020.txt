@@ -1,0 +1,7 @@
+MR. TEST USER
+Statement From : 01/03/19 TO : 29/03/19
+Closing Balance
+445,050.00
+Opening Balance
+425,300.00
+**END OF STATEMENT**

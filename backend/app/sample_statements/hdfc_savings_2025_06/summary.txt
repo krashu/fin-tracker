@@ -1,0 +1,5 @@
+Statement From : 01/06/2025 To 30/06/2025
+Opening Balance : 1,50,000.00
+STATEMENT SUMMARY
+Opening Balance Debit Amount Credit Amount Closing Balance
+1,50,000.00 22,175.92 85,714.00 2,13,538.08

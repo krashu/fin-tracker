@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from app.parsers import IciciCC, InvalidPasswordError, ParserError
+from app.parsers import IciciCC, InvalidPasswordError, ParserError, StatementSummary
 
 
 def _serialize(rows: list[Any]) -> list[dict[str, Any]]:
@@ -27,20 +27,18 @@ def test_interpret_tables_snapshot(
     assert _serialize(rows) == icici_tables_expected
 
 
-def test_interpret_tables_empty_input_raises() -> None:
-    with pytest.raises(ParserError, match="no transactions found"):
-        IciciCC.interpret_tables([])
+def test_interpret_tables_empty_input_returns_no_rows() -> None:
+    assert IciciCC.interpret_tables([]) == []
 
 
-def test_interpret_tables_only_headers_raises() -> None:
+def test_interpret_tables_only_headers_returns_no_rows() -> None:
     tables = [
         [
             ["Trans Date", "Posting Date", "Description", "Amount"],
             ["", "", "Total Amount Due", "1,234"],
         ]
     ]
-    with pytest.raises(ParserError, match="no transactions found"):
-        IciciCC.interpret_tables(tables)
+    assert IciciCC.interpret_tables(tables) == []
 
 
 def test_parse_corrupt_bytes_raises() -> None:
@@ -95,3 +93,13 @@ def test_interpret_summary_cc_sign_credit_marker_is_positive() -> None:
     summary = IciciCC.interpret_summary(lines)
 
     assert summary.closing_balance_paise == 50000
+
+
+def test_interpret_summary_no_labels_returns_all_none() -> None:
+    """A layout with no summary block must degrade to an all-None
+    StatementSummary, never a ParserError (ADR-0010 rule 3)."""
+    lines = ["**** End of Statement ****"]
+
+    summary = IciciCC.interpret_summary(lines)
+
+    assert summary == StatementSummary()

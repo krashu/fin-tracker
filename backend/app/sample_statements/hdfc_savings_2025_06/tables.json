@@ -1,0 +1,46 @@
+[
+  [
+    [
+      "Txn Date",
+      "Narration",
+      "Withdrawals",
+      "Deposits",
+      "Closing Balance"
+    ],
+    [
+      "01/06/2025\n02/06/2025\n04/06/2025\n06/06/2025\n08/06/2025\n10/06/2025",
+      "NEFT CR-EXAM0000001-SENTINEL EMPLOYER PVT LTD-TEST USER-EXAMN00000000001 Value Dt 01/06/2025\nUPI-SWIGGY-swiggy@example-EXAM0000002-000000000002-UPI Value Dt 02/06/2025\nUPI-UBER INDIA-uber@example-EXAM0000003-000000000003-UPI Value Dt 04/06/2025\nUPI-BIGBASKET-bigbasket@example-EXAM0000004-000000000004-UPI Value Dt 06/06/2025\nUPI-NETFLIX-netflix@example-EXAM0000005-000000000005-UPI Value Dt 08/06/2025\nUPI-ZOMATO-zomato@example-EXAM0000006-000000000006-UPI Value Dt 10/06/2025",
+      "0.00\n450.00\n312.50\n1,840.75\n649.00\n689.00",
+      "85,000.00\n0.00\n0.00\n0.00\n0.00\n0.00",
+      "2,35,000.00\n2,34,550.00\n2,34,237.50\n2,32,396.75\n2,31,747.75\n2,31,058.75"
+    ]
+  ],
+  [
+    [
+      "Txn Date",
+      "Narration",
+      "Withdrawals",
+      "Deposits",
+      "Closing Balance"
+    ],
+    [
+      "10/06/2025\n12/06/2025\n15/06/2025\n18/06/2025\n20/06/2025\n24/06/2025",
+      "REV-UPI-000000000006-ZOMATO-zomato@example Value Dt 10/06/2025\nATW-000000XXXXXX0000-S1AEXAM0-MUMBAI Value Dt 12/06/2025\nCC 000000XXXXXX0000 AUTOPAY SI-TAD Value Dt 15/06/2025\nUPI-STARBUCKS-starbucks@example-EXAM0000007-000000000007-UPI Value Dt 18/06/2025\nDEBIT CARD CASHBACK Value Dt 20/06/2025\nUPI-DOMINOS PIZZA-dominos@example-EXAM0000008-000000000008-UPI Value Dt 24/06/2025",
+      "0.00\n5,000.00\n12,345.67\n365.00\n0.00\n524.00",
+      "689.00\n0.00\n0.00\n0.00\n25.00\n0.00",
+      "2,31,747.75\n2,26,747.75\n2,14,402.08\n2,14,037.08\n2,14,062.08\n2,13,538.08"
+    ],
+    [
+      "Opening Balance",
+      "Debit Amount",
+      "Credit Amount",
+      "Closing Balance"
+    ],
+    [
+      "1,50,000.00",
+      "22,175.92",
+      "85,714.00",
+      "2,13,538.08"
+    ]
+  ]
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "date": "2019-03-01",
+    "amount_paise": -1500000,
+    "merchant_raw": "ATW-000000XXXXXX0000-S1AEXAM0-CHENNAI",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2019-03-22",
+    "amount_paise": -1800000,
+    "merchant_raw": "IMPS-000000000001-SENTINEL JEWELLERS-EXAM-X XXXXXXX0000-SENTINEL JEWELLERS",
+    "txn_type": "withdrawal"
+  },
+  {
+    "date": "2019-03-29",
+    "amount_paise": 5275000,
+    "merchant_raw": "SALARY SENTINEL EMPLOYER PVT LTD",
+    "txn_type": "deposit"
+  }
+]

@@ -1,0 +1,5 @@
+TEST USER
+Statement of accountFrom : 01/04/2026 To : 30/04/2026
+STATEMENT SUMMARY :-
+Opening Balance Dr Count Cr Count Debits Credits Closing Bal
+200,000.00 4 3 16,094.67 75,524.00 259,429.33
