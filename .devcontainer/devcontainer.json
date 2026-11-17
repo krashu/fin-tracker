@@ -1,0 +1,41 @@
+{
+  "name": "fin-tracker (backend + frontend)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspaces/fintracker",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/fintracker,type=bind,consistency=cached",
+  // Linux-built venv and node_modules live in named volumes so they never land on (or
+  // read from) the Windows host's backend/.venv and frontend/node_modules.
+  "mounts": [
+    "source=fintracker-backend-venv,target=/workspaces/fintracker/backend/.venv,type=volume",
+    "source=fintracker-frontend-node-modules,target=/workspaces/fintracker/frontend/node_modules,type=volume",
+    // Claude Code state (memory, sessions, settings) lives on the host, so a rebuild keeps it.
+    // The host directory must exist before the container is created.
+    "source=${localEnv:HOME}/.claude,target=/home/dev/.claude,type=bind"
+  ],
+  // Keeps .claude.json inside the mounted directory instead of a separate, unmounted file.
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/dev/.claude",
+    // `pytest -n auto` would start one worker per logical CPU (14 here). On this 15W laptop
+    // chip throughput peaks near 7 processes; 14 workers ran the suite in 3:08, 8 in 2:01.
+    "PYTEST_XDIST_AUTO_NUM_WORKERS": "8"
+  },
+  "remoteUser": "dev",
+  "forwardPorts": [3000, 8000],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/workspaces/fintracker/backend/.venv/bin/python"
+      }
+    }
+  }
+}

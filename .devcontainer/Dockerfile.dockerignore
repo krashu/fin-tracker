@@ -1,0 +1,5 @@
+# Allowlist: the repo root is the build context, but only these are COPYed.
+*
+!.nvmrc
+!frontend/package.json
+!frontend/certs/

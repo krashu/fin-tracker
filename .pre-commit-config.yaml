@@ -39,6 +39,15 @@ repos:
         files: ^backend/app/
         pass_filenames: false
 
+      # ADR-0005 rule 5: the only suppression in app/ is `# ty: ignore[<rule>]`. Ruff PGH003
+      # catches the bare `# type: ignore`; nothing in ruff catches the coded form, which ty
+      # ignores, so it reads as a suppression and suppresses nothing.
+      - id: no-type-ignore-in-app
+        name: "no '# type: ignore' in backend/app"
+        entry: '#\s*type:\s*ignore'
+        language: pygrep
+        files: ^backend/app/.*\.py$
+
       - id: eslint
         name: eslint (frontend)
         entry: bash -c 'cd frontend && pnpm lint'
@@ -58,4 +67,4 @@ repos:
         entry: bash -c 'cd backend && uv run pytest tests/test_fixture_redaction.py -q --no-cov'
         language: system
         pass_filenames: false
-        files: ^backend/tests/fixtures/
+        files: ^backend/(tests/fixtures|app/sample_statements)/

@@ -1,0 +1,13 @@
+# Migrations are frozen snapshots: they must run against the schema as it was, not against
+# today's app code. ADR-0006 rule 19: a migration inlines what it needs and never imports
+# `app.*`. Everything else comes from backend/pyproject.toml.
+extend = "../../pyproject.toml"
+# `src` defaults to this file's directory, which would make isort see `alembic` as third-party
+# here and nowhere else; keep first-party detection rooted at backend/ like the parent config.
+src = ["../.."]
+
+[lint]
+extend-select = ["TID251"]
+
+[lint.flake8-tidy-imports.banned-api]
+"app".msg = "migrations never import app.* — inline what you need (ADR-0006 rule 19)"

@@ -77,7 +77,9 @@ target-version = "py313"
 # ANN carries the annotation-completeness half of what `mypy --strict` used to enforce
 # (disallow_untyped_defs / disallow_incomplete_defs): ty has no equivalent knob, since it
 # type-checks unannotated code rather than skipping it. See ADR 0005.
-select = ["E", "F", "I", "B", "UP", "SIM", "ANN"]
+# PGH003 bans bare `# type: ignore`, which ty honours and so silently hides a real error. It does
+# not flag the coded form; the `no-type-ignore-in-app` pre-commit hook bans that in app/ (ADR 0005).
+select = ["E", "F", "I", "B", "UP", "SIM", "ANN", "PGH003"]
 # ANN401 bans explicit `Any` in annotations — stricter than the old gate, which allowed it
 # (`disallow_any_explicit` was never enabled). The handful of `Any`s in app/ are deliberate.
 ignore = ["ANN401"]
@@ -112,8 +114,8 @@ testpaths = ["tests"]
 # lives in the Makefile's full-suite targets instead.
 addopts = "--cov --cov-report=term-missing --durations=15"
 markers = [
-    "real_pdf: requires _local/*.pdf fixtures and AXIS_TEST_PWD env var; skipped when absent",
-    "slow: single test costing >10s; deselected by `make test-fast`, always run by the gate",
+    "real_pdf: requires a _local/<parser>*.pdf fixture and its password env var (cards: AXIS_TEST_PWD, ICICI_TEST_PWD; banks: HDFC_BANK_TEST_PWD, ICICI_BANK_TEST_PWD, SBI_BANK_TEST_PWD, AXIS_BANK_TEST_PWD); skipped when absent",
+    "slow: single test costing >10s, or a migration test that runs upgrade/downgrade steps; deselected by `make test-fast`, always run by the gate",
 ]
 
 [tool.coverage.run]

@@ -7,6 +7,11 @@
 # /api/v1/auth/login into /v1/... -> 404.
 :80 {
 	handle /api/* {
+		# Proxy half of the upload guard (PRD §F1 Upload limits): the largest route cap
+		# (backup, 25 MiB) plus overhead. Caddy answers 413 itself; the handlers stream-count too.
+		request_body {
+			max_size 26MB
+		}
 		reverse_proxy backend:8000
 	}
 	handle {

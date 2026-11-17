@@ -9,6 +9,13 @@ Desktop.ini
 *~
 *.bak
 
+# Dev container is shared config: keep it tracked even when a contributor's global
+# gitignore excludes .devcontainer/ (a repo-level pattern outranks the global file).
+!.devcontainer/
+
+# Working plans: never committed, but scripts/package_source.py ships them in the source zip.
+plans/
+
 # Env (catch every .env variant; keep the template tracked)
 .env*
 !.env.example
@@ -49,6 +56,7 @@ htmlcov/
 
 # Node / Next.js
 node_modules/
+.pnpm-store/
 .next/
 out/
 backend/frontend_dist/
@@ -58,7 +66,12 @@ next-env.d.ts
 coverage/
 *.log
 
-# Claude
+# Claude: the project config is shared and must reach GitHub through scripts/package_source.py, so
+# re-include it even when a contributor's global gitignore excludes it (as for .devcontainer/
+# above). The re-includes come first so the personal, local-only paths below still win.
+!.claude/
+!CLAUDE.md
+!**/CLAUDE.md
 .claude/settings.local.json
 .claude/.session/
 

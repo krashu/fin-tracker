@@ -54,6 +54,7 @@ jobs:
       - name: Type check
         run: pnpm typecheck
 
+      # Worker cap lives in frontend/vitest.config.mts (D8); CI and local runs use the same count.
       - name: Run unit tests
         run: pnpm test
 
