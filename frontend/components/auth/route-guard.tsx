@@ -51,10 +51,8 @@ function ConnectionError({ onRetry }: { onRetry: () => void }) {
 }
 
 export function RouteGuard({
-  isDark,
   children,
 }: {
-  isDark: boolean;
   children: ReactNode;
 }) {
   const pathname = usePathname();
@@ -89,5 +87,5 @@ export function RouteGuard({
   if (status === "unknown") return <ConnectionError onRetry={refetch} />;
   if (status === "unauthenticated") return null; // redirect handled in the effect
 
-  return <AppShell isDark={isDark}>{children}</AppShell>;
+  return <AppShell>{children}</AppShell>;
 }

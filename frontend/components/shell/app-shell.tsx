@@ -7,15 +7,10 @@ import { TopBar } from "./top-bar";
  * The single global app chrome: a fixed top bar + a persistent left sidebar +
  * the rail-offset main scroll area. Rendered once in the root layout so every
  * page is just its own content (no per-page TopBar / SubNav / Sidebar wiring).
- *
- * `isDark` is read from the theme cookie in the server layout and threaded to
- * the (client) TopBar for the theme toggle.
  */
 export function AppShell({
-  isDark,
   children,
 }: {
-  isDark: boolean;
   children: ReactNode;
 }) {
   return (
@@ -29,7 +24,7 @@ export function AppShell({
       >
         Skip to content
       </a>
-      <TopBar isDark={isDark} />
+      <TopBar />
       <Sidebar />
       {/* tabIndex={-1} is what makes the skip link actually move focus: without
           it several browsers move only the scroll position, so the next Tab

@@ -3,6 +3,7 @@ import { type RenderOptions, render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React, { type ReactElement } from "react";
 import { BalanceVisibilityProvider } from "@/components/balance-visibility";
+import { ThemeProvider } from "@/components/theme-provider";
 
 export function createTestQueryClient(): QueryClient {
   return new QueryClient({
@@ -42,7 +43,9 @@ export function renderWithProviders(
   function Wrapper({ children }: { children: React.ReactNode }) {
     return (
       <QueryClientProvider client={queryClient}>
-        <BalanceVisibilityProvider>{children}</BalanceVisibilityProvider>
+        <ThemeProvider>
+          <BalanceVisibilityProvider>{children}</BalanceVisibilityProvider>
+        </ThemeProvider>
       </QueryClientProvider>
     );
   }

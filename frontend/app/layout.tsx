@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
 import { Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Providers } from "@/components/providers";
@@ -29,30 +28,27 @@ export const metadata: Metadata = {
   description: "Personal finance tracker",
 };
 
-export default async function RootLayout({
+// Inline script executed synchronously before first paint to prevent theme flash (FOUC)
+const themeScript = `(function(){try{var t=localStorage.getItem("theme");if(t==="dark"||(!t&&window.matchMedia("(prefers-color-scheme: dark)").matches)){document.documentElement.classList.add("dark")}else{document.documentElement.classList.remove("dark")}}catch(e){}})()`;
+
+export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  let isDark = false;
-  if (process.env.NEXT_OUTPUT_MODE === "standalone") {
-    try {
-      const cookieStore = await cookies();
-      isDark = cookieStore.get("theme")?.value === "dark";
-    } catch {
-      isDark = false;
-    }
-  }
-
   return (
     <html
       lang="en"
-      className={`${hanken.variable} ${jbMono.variable} ${isDark ? "dark" : ""}`}
+      suppressHydrationWarning
+      className={`${hanken.variable} ${jbMono.variable}`}
     >
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+      </head>
       <body className="text-[13px] leading-[1.35] antialiased">
         <Providers>
           <TooltipProvider delayDuration={150}>
-            <RouteGuard isDark={isDark}>{children}</RouteGuard>
+            <RouteGuard>{children}</RouteGuard>
           </TooltipProvider>
         </Providers>
       </body>

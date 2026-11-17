@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AuthProvider } from "@/components/auth/auth-provider";
 import { IdleLogoutWatcher } from "@/components/auth/use-idle-logout";
 import { BalanceVisibilityProvider } from "@/components/balance-visibility";
+import { ThemeProvider } from "@/components/theme-provider";
 
 /**
  * Client-side data layer. Mounted by the (server) root layout so the SSR
@@ -33,10 +34,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <IdleLogoutWatcher />
-        <BalanceVisibilityProvider>{children}</BalanceVisibilityProvider>
-      </AuthProvider>
+      <ThemeProvider>
+        <AuthProvider>
+          <IdleLogoutWatcher />
+          <BalanceVisibilityProvider>{children}</BalanceVisibilityProvider>
+        </AuthProvider>
+      </ThemeProvider>
     </QueryClientProvider>
   );
 }

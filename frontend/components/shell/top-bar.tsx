@@ -207,7 +207,7 @@ function PendingBell() {
   );
 }
 
-export function TopBar({ isDark }: { isDark: boolean }) {
+export function TopBar() {
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   // ⌘K / Ctrl+K opens the palette. Skip when the focus is in an editable
@@ -264,7 +264,7 @@ export function TopBar({ isDark }: { isDark: boolean }) {
 
         <BalanceToggle />
 
-        <ThemeToggle isDark={isDark} />
+        <ThemeToggle />
 
         <UserMenu />
       </div>
