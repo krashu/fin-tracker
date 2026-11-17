@@ -19,23 +19,32 @@ from __future__ import annotations
 import io
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.security import ACCESS_COOKIE_NAME, create_access_token
+from app.core import clock
+from app.core.fiscal_year import fy_start_year
+from app.core.security import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, create_access_token
 from app.models import (
     Account,
     Category,
     ImportBatch,
+    InvestmentTransaction,
     MerchantTagMap,
+    RealisedLot,
     Transaction,
     User,
 )
-from app.parsers.backup_csv import ACCOUNTS_CSV, CATEGORIES_CSV, TRANSACTIONS_CSV
+from app.parsers.backup_csv import ACCOUNTS_CSV, TRANSACTIONS_CSV
+from app.services import guest_service
 from app.services.fingerprint import transaction_fingerprint
+from tests.backup_zip import account, make_backup_zip, txn
 
 # A fixed second user, distinct from the seeded v1 user, for the session-insert idiom.
 _OTHER_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000099")
@@ -246,6 +255,72 @@ def test_import_batch_commit_cancel_and_reconciliation_are_scoped(
     assert client.get(f"/api/v1/imports/{batch.id}/reconciliation").status_code == 404
 
 
+def test_commit_discard_of_another_users_pending_row_422(
+    client: TestClient,
+    seeded_user: User,
+    seeded_categories: list[Category],
+    session: Session,
+) -> None:
+    """ADR-0003 rules 1 and 3: ``discard_ids`` is a list of body FKs. B naming A's pending row
+    gets a 422 listing it, A's row survives and B's own commit row is not committed."""
+    other = User(id=_OTHER_USER_ID)
+    session.add(other)
+    session.commit()
+
+    def pending_row(user: User, name: str) -> tuple[int, int]:
+        account = Account(
+            user_id=user.id, name=name, type="credit_card", issuer="axis", last4="1234"
+        )
+        session.add(account)
+        session.flush()
+        batch = ImportBatch(
+            user_id=user.id,
+            account_id=account.id,
+            source_file_hash=f"hash-{name}",
+            parser_name="AxisCC",
+            status="completed",
+        )
+        session.add(batch)
+        session.flush()
+        txn = Transaction(
+            user_id=user.id,
+            account_id=account.id,
+            import_batch_id=batch.id,
+            date=date(2026, 7, 1),
+            amount_paise=-50000,
+            transaction_type="spend",
+            merchant_raw="SWIGGY",
+            merchant_normalized="swiggy",
+            fingerprint=transaction_fingerprint(
+                txn_date=date(2026, 7, 1),
+                amount_paise=-50000,
+                normalized_merchant="swiggy",
+                account_id=account.id,
+            ),
+            source="import",
+        )
+        session.add(txn)
+        session.commit()
+        return batch.id, txn.id
+
+    _, a_row = pending_row(other, "A CC")
+    b_batch, b_row = pending_row(seeded_user, "B CC")
+
+    resp = client.post(
+        f"/api/v1/imports/{b_batch}/commit",
+        json={"transaction_ids": [b_row], "discard_ids": [a_row]},
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == {
+        "message": "some transactions are not eligible to commit or discard",
+        "invalid_ids": [a_row],
+    }
+    session.expire_all()
+    assert session.get(Transaction, a_row) is not None
+    assert session.get(Transaction, b_row).confirmed_at is None
+
+
 def test_backup_export_excludes_other_users_spend(
     client: TestClient, seeded_user: User, session: Session
 ) -> None:
@@ -335,7 +410,7 @@ def test_merchant_tags_do_not_leak_across_users(
     other = User(id=_OTHER_USER_ID)
     session.add(other)
     session.commit()
-    other_category = Category(user_id=other.id, name="Food", kind="spend")
+    other_category = Category(color="#2a78d6", user_id=other.id, name="Food", kind="spend")
     session.add(other_category)
     session.commit()
     session.add(
@@ -351,16 +426,112 @@ def test_merchant_tags_do_not_leak_across_users(
     assert stats.json()["rules_count"] == 0
 
 
+def test_category_parent_cannot_point_at_another_users_category(
+    seeded_user: User, session: Session
+) -> None:
+    """ADR-0003 rule 10 / ADR-0012 rule 1: the DB itself refuses a cross-user parent.
+
+    The router's 422 (rule 9) is skipped here on purpose: the composite same-user FK
+    ``(parent_id, user_id) → categories(id, user_id)`` must reject the row on its own.
+    """
+    other = User(id=_OTHER_USER_ID)
+    session.add(other)
+    session.commit()
+    their_parent = Category(color="#2a78d6", user_id=other.id, name="Theirs", kind="spend")
+    session.add(their_parent)
+    session.commit()
+
+    session.add(
+        Category(user_id=seeded_user.id, name="Mine", kind="spend", parent_id=their_parent.id)
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+
+def _sell_all(client: TestClient, instrument_id: int) -> int:
+    r = client.post(
+        "/api/v1/investment-transactions",
+        json={
+            "date": "2026-02-10",
+            "instrument_id": instrument_id,
+            "transaction_type": "sell",
+            "units": "10",
+            "price_per_unit_native": "160",
+            "amount_native_paise": 160000,
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_realised_lots_are_isolated_per_user(unauth_client: TestClient, session: Session) -> None:
+    """ADR-0003 rule 11 for ``realised_lots`` (ADR-0015 rule 5): B's investment writes and
+    rebuilds never touch A's rows, B cannot address A's sell, and the DB itself refuses a
+    row whose txns belong to someone else (composite same-user FK)."""
+    _register(unauth_client, "lots-owner@example.com")
+    a_iid = _make_instrument(unauth_client)
+    a_buy = _make_investment_txn(unauth_client, a_iid)
+    a_sell = _sell_all(unauth_client, a_iid)
+    a_user = session.scalars(select(User).where(User.email == "lots-owner@example.com")).one()
+    a_rows = [
+        (r.id, r.user_id, r.sell_txn_id, r.buy_txn_id)
+        for r in session.scalars(select(RealisedLot).order_by(RealisedLot.id))
+    ]
+    assert a_rows == [(a_rows[0][0], a_user.id, a_sell, a_buy)]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "lots-intruder@example.com")
+    b_iid = _make_instrument(unauth_client, symbol="INF-ISO-B")
+    b_buy = _make_investment_txn(unauth_client, b_iid)
+    _sell_all(unauth_client, b_iid)
+    # B cannot reach A's sell; B's own delete runs B's rebuild (and is refused).
+    assert unauth_client.delete(f"/api/v1/investment-transactions/{a_sell}").status_code == 404
+    assert (
+        unauth_client.delete(f"/api/v1/investment-transactions/{b_buy}").status_code == 422
+    )  # uncovers B's own sell; refused, still scoped to B
+
+    session.expire_all()
+    mine = list(session.scalars(select(RealisedLot).where(RealisedLot.user_id == a_user.id)))
+    assert [(r.id, r.user_id, r.sell_txn_id, r.buy_txn_id) for r in mine] == a_rows
+    for r in session.scalars(select(RealisedLot)):
+        owners = {
+            t.user_id
+            for t in session.scalars(
+                select(InvestmentTransaction).where(
+                    InvestmentTransaction.id.in_([r.sell_txn_id, r.buy_txn_id])
+                )
+            )
+        }
+        assert owners == {r.user_id}
+
+    b_user = session.scalars(select(User).where(User.email == "lots-intruder@example.com")).one()
+    session.add(
+        RealisedLot(
+            user_id=b_user.id,
+            sell_txn_id=a_sell,
+            buy_txn_id=a_buy,
+            units=Decimal("1"),
+            cost_native_paise=1,
+            proceeds_native_paise=1,
+            sell_fees_native_paise=0,
+            buy_date=date(2026, 1, 10),
+            sell_date=date(2026, 2, 10),
+            kind="fifo",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+
 def test_merchant_aliases_are_isolated_per_user(unauth_client: TestClient) -> None:
     """A new owned table (ADR-0011 merchant-alias layer, Phase A4): B can
     neither list A's aliases nor address one of A's alias ids (scoped 404,
     never 403 -- no existence leak).
 
-    Pattern/canonical deliberately DON'T match anything in the Phase A5 seed dictionary —
-    every user (A and B) already has ~96 seeded aliases post-registration, including a
-    "swiggy"->"swiggy" identity row, so a canonical of "swiggy" here would 422 on rule 4
-    (decision 7: no cascades -- a submitted canonical already matched by an existing pattern
-    is rejected) for a reason that has nothing to do with what THIS test checks.
+    Pattern and canonical stay clear of the seed dictionary so this test checks isolation
+    only, not ADR-0011 rule 5's conflict rules.
     """
     _register(unauth_client, "alias-owner@example.com")
     create = unauth_client.post(
@@ -389,22 +560,371 @@ def test_merchant_aliases_are_isolated_per_user(unauth_client: TestClient) -> No
     assert unauth_client.delete(f"/api/v1/rules/aliases/{alias_id}").status_code == 404
 
 
+def test_categories_are_isolated_per_user(unauth_client: TestClient) -> None:
+    """ADR-0003 rules 8 and 9 for ``categories``: B cannot list, address or parent
+    under A's custom category."""
+    _register(unauth_client, "cat-owner@example.com")
+    create = unauth_client.post("/api/v1/categories", json={"name": "Iso Hobbies"})
+    assert create.status_code == 201, create.text
+    a_category = create.json()["id"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "cat-intruder@example.com")
+
+    b_categories = unauth_client.get("/api/v1/categories").json()
+    assert all(c["id"] != a_category for c in b_categories)
+    assert not any(c["name"] == "Iso Hobbies" for c in b_categories)
+    patch = unauth_client.patch(f"/api/v1/categories/{a_category}", json={"name": "hijacked"})
+    assert patch.status_code == 404
+    assert unauth_client.delete(f"/api/v1/categories/{a_category}").status_code == 404
+    child = unauth_client.post(
+        "/api/v1/categories", json={"name": "Under Theirs", "parent_id": a_category}
+    )
+    assert child.status_code == 422
+
+
+def test_labels_are_isolated_per_user(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 8 for ``labels``."""
+    _register(unauth_client, "label-owner@example.com")
+    create = unauth_client.post("/api/v1/labels", json={"name": "iso-trip"})
+    assert create.status_code == 201, create.text
+    a_label = create.json()["id"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "label-intruder@example.com")
+
+    assert all(lbl["id"] != a_label for lbl in unauth_client.get("/api/v1/labels").json())
+    patch = unauth_client.patch(f"/api/v1/labels/{a_label}", json={"name": "hijacked"})
+    assert patch.status_code == 404
+    assert unauth_client.delete(f"/api/v1/labels/{a_label}").status_code == 404
+
+
+def test_merchant_label_rules_are_isolated_per_user(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 8 for ``merchant_label_map`` (the pinned merchant→label rules)."""
+    _register(unauth_client, "rule-owner@example.com")
+    label = unauth_client.post("/api/v1/labels", json={"name": "iso-rule"})
+    assert label.status_code == 201, label.text
+    create = unauth_client.post(
+        "/api/v1/rules/labels",
+        json={"merchant": "isokirana445566", "label_id": label.json()["id"]},
+    )
+    assert create.status_code == 201, create.text
+    rule_id = create.json()["id"]
+    merchant = create.json()["merchant_normalized"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "rule-intruder@example.com")
+
+    b_rules = unauth_client.get("/api/v1/rules").json()
+    assert not any(r["merchant_canonical"] == merchant for r in b_rules)
+    assert not any(lr["id"] == rule_id for r in b_rules for lr in r["labels"])
+    patch = unauth_client.patch(f"/api/v1/rules/labels/{rule_id}", json={"pinned": False})
+    assert patch.status_code == 404
+    assert unauth_client.delete(f"/api/v1/rules/labels/{rule_id}").status_code == 404
+
+
+def test_refresh_sessions_are_isolated_per_user(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 7 for ``sessions``: B changing their password and logging out
+    revokes only B's refresh families, never A's."""
+    _register(unauth_client, "session-owner@example.com")
+    a_refresh = unauth_client.cookies.get(REFRESH_COOKIE_NAME)
+    assert a_refresh is not None
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "session-intruder@example.com")
+    changed = unauth_client.post(
+        "/api/v1/auth/change-password",
+        json={"current_password": "passphrase-123", "new_password": "another-passphrase"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert unauth_client.post("/api/v1/auth/logout").status_code == 204
+
+    unauth_client.cookies.clear()
+    unauth_client.cookies.set(REFRESH_COOKIE_NAME, a_refresh)
+    assert unauth_client.post("/api/v1/auth/refresh").status_code == 200
+
+
+def test_guest_sandbox_is_isolated_from_real_users(
+    unauth_client: TestClient, session: Session
+) -> None:
+    """ADR-0003 rule 15: a guest is just another tenant — it cannot see or address a
+    real user's rows, and the real user does not see the guest's seeded data."""
+    _register(unauth_client, "guest-neighbour@example.com")
+    a_account = _make_account(unauth_client, "Neighbour Bank")
+    a_cookie = unauth_client.cookies.get(ACCESS_COOKIE_NAME)
+    assert a_cookie is not None
+
+    guest, _ = guest_service.create_guest_sandbox(session)
+    guest_accounts = set(session.scalars(select(Account.id).where(Account.user_id == guest.id)))
+    assert guest_accounts
+
+    unauth_client.cookies.clear()
+    _act_as(unauth_client, guest.id)
+    seen_by_guest = {a["id"] for a in unauth_client.get("/api/v1/accounts").json()}
+    assert a_account not in seen_by_guest
+    assert seen_by_guest == guest_accounts
+    patch = unauth_client.patch(f"/api/v1/accounts/{a_account}", json={"name": "hijacked"})
+    assert patch.status_code == 404
+
+    unauth_client.cookies.clear()
+    unauth_client.cookies.set(ACCESS_COOKIE_NAME, a_cookie)
+    seen_by_a = {a["id"] for a in unauth_client.get("/api/v1/accounts").json()}
+    assert seen_by_a == {a_account}
+
+
 def _minimal_backup_zip() -> bytes:
     """A one-account / one-category / one-transaction backup zip referencing 'Axis CC'."""
-    accounts_header = "name,type,issuer,last4,opening_balance_paise,currency,archived_at"
-    categories_header = "name,kind,color,archived_at"
-    transactions_header = (
-        "date,account_name,amount_paise,transaction_type,merchant_raw,"
-        "merchant_normalized,category_name,category_kind,labels,source,confirmed_at,transfer_group"
+    return make_backup_zip(
+        accounts=[account(opening_balance_paise=-50000)],
+        categories=[{"name": "Food", "kind": "spend", "color": "#4f46e5"}],
+        transactions=[txn(category_name="Food", category_kind="spend", labels="lunch")],
     )
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as zf:
-        zf.writestr(ACCOUNTS_CSV, f"{accounts_header}\nAxis CC,credit_card,axis,1234,-50000,INR,\n")
-        zf.writestr(CATEGORIES_CSV, f"{categories_header}\nFood,spend,#4f46e5,\n")
-        zf.writestr(
-            TRANSACTIONS_CSV,
-            f"{transactions_header}\n"
-            "2026-07-01,Axis CC,-50000,spend,SWIGGY,swiggy,Food,spend,lunch,import,"
-            "2026-07-01T10:00:00,\n",
+
+
+def _make_spend(client: TestClient, account: int, merchant: str) -> int:
+    r = client.post(
+        "/api/v1/transactions",
+        json={
+            "date": "2026-01-15",
+            "account_id": account,
+            "amount_paise": -50000,
+            "transaction_type": "spend",
+            "merchant_raw": merchant,
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_bulk_categorise_rejects_foreign_rows_and_category(unauth_client: TestClient) -> None:
+    """ADR-0003 rules 8 and 9 for the bulk path: another user's ids are ``invalid_ids``
+    (never a 404/200 existence oracle), another user's category is a 422, and neither
+    writes anything."""
+    _register(unauth_client, "bulk-owner@example.com")
+    a_txn = _make_spend(unauth_client, _make_account(unauth_client, "Bulk A"), "SWIGGY")
+    a_category = unauth_client.post("/api/v1/categories", json={"name": "Bulk Iso"}).json()["id"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "bulk-intruder@example.com")
+    b_txn = _make_spend(unauth_client, _make_account(unauth_client, "Bulk B"), "SWIGGY")
+    b_category = unauth_client.post("/api/v1/categories", json={"name": "Bulk Mine"}).json()["id"]
+
+    foreign_row = unauth_client.post(
+        "/api/v1/transactions/bulk-categorise",
+        json={"transaction_ids": [b_txn, a_txn], "category_id": b_category},
+    )
+    assert foreign_row.status_code == 422
+    assert foreign_row.json()["detail"]["invalid_ids"] == [a_txn]
+
+    foreign_category = unauth_client.post(
+        "/api/v1/transactions/bulk-categorise",
+        json={"transaction_ids": [b_txn], "category_id": a_category},
+    )
+    assert foreign_category.status_code == 422
+
+    mine = unauth_client.get("/api/v1/transactions").json()
+    assert [t["category_id"] for t in mine] == [None]
+    assert unauth_client.get("/api/v1/dashboards/tagging-stats").json()["rules_count"] == 0
+
+
+def test_bulk_delete_rejects_foreign_rows(unauth_client: TestClient) -> None:
+    """ADR-0003 rules 8 and 9 for the bulk path: another user's ids are ``invalid_ids``
+    (never a 404/204 existence oracle), and nothing is deleted on either side."""
+    _register(unauth_client, "bulkdel-owner@example.com")
+    a_user = uuid.UUID(unauth_client.get("/api/v1/auth/me").json()["id"])
+    a_txn = _make_spend(unauth_client, _make_account(unauth_client, "BulkDel A"), "SWIGGY")
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "bulkdel-intruder@example.com")
+    b_txn = _make_spend(unauth_client, _make_account(unauth_client, "BulkDel B"), "SWIGGY")
+
+    resp = unauth_client.post(
+        "/api/v1/transactions/bulk-delete", json={"transaction_ids": [b_txn, a_txn]}
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["invalid_ids"] == [a_txn]
+    assert [t["id"] for t in unauth_client.get("/api/v1/transactions").json()] == [b_txn]
+
+    unauth_client.cookies.clear()
+    _act_as(unauth_client, a_user)
+    assert [t["id"] for t in unauth_client.get("/api/v1/transactions").json()] == [a_txn]
+
+
+def test_past_rows_foreign_source_404(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 8: another user's transaction id is a 404 on the past-rows preview."""
+    _register(unauth_client, "past-owner@example.com")
+    a_txn = _make_spend(unauth_client, _make_account(unauth_client, "Past A"), "SWIGGY")
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "past-intruder@example.com")
+
+    assert unauth_client.get(f"/api/v1/transactions/{a_txn}/past-rows").status_code == 404
+
+
+def test_link_foreign_source_404(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 8: another user's transaction id is a 404 on the manual link."""
+    _register(unauth_client, "link-owner@example.com")
+    a_txn = _make_spend(unauth_client, _make_account(unauth_client, "Link A"), "SWIGGY")
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "link-intruder@example.com")
+    b_txn = _make_spend(unauth_client, _make_account(unauth_client, "Link B"), "ZOMATO")
+
+    resp = unauth_client.post(f"/api/v1/transactions/{a_txn}/link", json={"partner_id": b_txn})
+
+    assert resp.status_code == 404
+
+
+def test_link_foreign_partner_422(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 9: the user's own row linked to another user's row is a 422 and
+    nothing is written, even when the amounts are equal and opposite."""
+    _register(unauth_client, "linkp-owner@example.com")
+    a_account = _make_account(unauth_client, "Linkp A")
+    a_income = unauth_client.post(
+        "/api/v1/transactions",
+        json={
+            "date": "2026-01-15",
+            "account_id": a_account,
+            "amount_paise": 50000,
+            "transaction_type": "income",
+            "merchant_raw": "REFUND",
+        },
+    ).json()["id"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "linkp-intruder@example.com")
+    b_txn = _make_spend(unauth_client, _make_account(unauth_client, "Linkp B"), "ZOMATO")
+
+    resp = unauth_client.post(f"/api/v1/transactions/{b_txn}/link", json={"partner_id": a_income})
+
+    assert resp.status_code == 422
+    mine = unauth_client.get("/api/v1/transactions").json()
+    assert [(t["transaction_type"], t["transfer_pair_id"]) for t in mine] == [("spend", None)]
+
+
+def test_link_candidates_foreign_source_404(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 8: another user's transaction id is a 404 on link-candidates."""
+    _register(unauth_client, "lcand-owner@example.com")
+    a_txn = _make_spend(unauth_client, _make_account(unauth_client, "Lcand A"), "SWIGGY")
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "lcand-intruder@example.com")
+
+    assert unauth_client.get(f"/api/v1/transactions/{a_txn}/link-candidates").status_code == 404
+
+
+def test_refund_candidates_foreign_source_404(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 8: another user's transaction id is a 404 on refund-candidates."""
+    _register(unauth_client, "rcand-owner@example.com")
+    a_txn = _make_spend(unauth_client, _make_account(unauth_client, "Rcand A"), "SWIGGY")
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "rcand-intruder@example.com")
+
+    assert unauth_client.get(f"/api/v1/transactions/{a_txn}/refund-candidates").status_code == 404
+
+
+def test_sample_import_into_a_foreign_account_422(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 9: a sample imported into another user's account is a 422 (a body FK
+    naming another user's row), and stages nothing there."""
+    _register(unauth_client, "sample-owner@example.com")
+    r = unauth_client.post(
+        "/api/v1/accounts",
+        json={"name": "Axis A", "type": "credit_card", "issuer": "axis"},
+    )
+    assert r.status_code == 201, r.text
+    a_account = r.json()["id"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "sample-intruder@example.com")
+
+    resp = unauth_client.post(
+        "/api/v1/imports/samples", json={"sample_id": "axis-cc-2025-06", "account_id": a_account}
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "account not found or archived"
+    assert unauth_client.get("/api/v1/imports/pending").json() == []
+
+
+def test_statement_upload_into_a_foreign_account_422(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 9: a statement uploaded into another user's account is a 422."""
+    _register(unauth_client, "upload-owner@example.com")
+    r = unauth_client.post(
+        "/api/v1/accounts",
+        json={"name": "Axis A", "type": "credit_card", "issuer": "axis"},
+    )
+    assert r.status_code == 201, r.text
+    a_account = r.json()["id"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "upload-intruder@example.com")
+
+    resp = unauth_client.post(
+        "/api/v1/imports",
+        data={"account_id": str(a_account)},
+        files={"file": ("s.pdf", b"x", "application/pdf")},
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "account not found or archived"
+
+
+def test_archive_reassign_to_foreign_category_422(unauth_client: TestClient) -> None:
+    """ADR-0003 rule 9: a ``reassign_to`` pointing at another user's category is a 422,
+    and the category is not archived."""
+    _register(unauth_client, "reassign-owner@example.com")
+    a_category = unauth_client.post("/api/v1/categories", json={"name": "Reassign Iso"}).json()[
+        "id"
+    ]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "reassign-intruder@example.com")
+    mine = unauth_client.post("/api/v1/categories", json={"name": "Reassign Mine"}).json()["id"]
+
+    resp = unauth_client.delete(f"/api/v1/categories/{mine}?reassign_to={a_category}")
+
+    assert resp.status_code == 422
+    names = {c["name"] for c in unauth_client.get("/api/v1/categories").json()}
+    assert "Reassign Mine" in names
+
+
+def test_tax_statement_is_isolated_per_user(unauth_client: TestClient) -> None:
+    """A's intraday trades and realised-sale years never surface in B's F11 statement."""
+    _register(unauth_client, "tax-owner@example.com")
+    r = unauth_client.post(
+        "/api/v1/instruments",
+        json={
+            "symbol": "ISO-EQ",
+            "name": "Iso Equity",
+            "asset_class": "indian_equity",
+            "currency": "INR",
+            "exchange": "NSE",
+            "current_nav": "110",
+        },
+    )
+    assert r.status_code == 201, r.text
+    iid = r.json()["id"]
+    for kind, amount in (("buy", 100000), ("sell", 110000)):
+        t = unauth_client.post(
+            "/api/v1/investment-transactions",
+            json={
+                "date": "2026-03-03",
+                "instrument_id": iid,
+                "transaction_type": kind,
+                "units": "10",
+                "price_per_unit_native": "100" if kind == "buy" else "110",
+                "amount_native_paise": amount,
+            },
         )
-    return buffer.getvalue()
+        assert t.status_code == 201, t.text
+    owner_view = unauth_client.get("/api/v1/tax/intraday-trades?year=2025").json()
+    assert len(owner_view["trades"]) == 1
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "tax-intruder@example.com")
+    other_view = unauth_client.get("/api/v1/tax/intraday-trades?year=2025").json()
+    assert other_view["trades"] == []
+    assert other_view["total_profit_paise"] == 0
+    years = unauth_client.get("/api/v1/tax/available-years").json()["years"]
+    assert years == [fy_start_year(clock.today())]

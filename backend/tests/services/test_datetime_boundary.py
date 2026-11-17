@@ -1,48 +1,57 @@
-"""What the DB actually hands back for a ``DateTime`` column.
+"""The ``DateTime`` boundary: what reaches a column, what comes back, and which clock wrote it.
 
-This is a **contract net**, not a feature test. Every service test in this
-directory runs with ``expire_on_commit=False``, so none of them ever re-reads a
-column from the database — the identity map answers instead. That means nothing in
-the suite observes the single most surprising thing about this stack:
+ADR-0001 rule 5 and its gate — ``ty`` cannot tell aware from naive (both are ``datetime``).
 
-    a ``datetime`` written **aware** (UTC) comes back **naive** from SQLite.
-
-Production depends on that being true, because 7 ``clock.utcnow()`` call sites still write
-*aware* values to two columns (``confirmed_at``, ``archived_at``) and rely on SQLite
-normalizing them — ADR-0001 rule 5 lists them as Postgres-cutover items. Without the
-assertions below, nothing in the suite observes the boundary at all. (``nav_updated_at``
-was the third such column until every one of its writers went naive.)
+1. **What SQLite hands back.** Every service test in this directory runs with
+   ``expire_on_commit=False``, so none of them ever re-reads a column — the identity map
+   answers instead. The first tests cross a session boundary to observe the most surprising
+   thing about this stack: a ``datetime`` written **aware** comes back **naive**, the offset
+   dropped. That is why an aware write is invisible after the fact, and why the guard in
+   group 3 inspects values in memory, at flush time. ``last_used`` on both merchant maps is
+   the concrete case: an explicit caller-supplied value, the ``base.utcnow_default`` Python
+   default on INSERT, and the ``server_default=func.now()`` backstop that only a raw non-ORM
+   ``INSERT`` can still reach.
+2. **Which clock wrote it (rule 5a).** Tests pin ``clock.naive_utcnow`` to an instant no wall
+   clock will produce and assert the *app* clock — not the DB's — wrote the column: on
+   SQLite ``func.now()`` and the app clock are otherwise indistinguishable.
+3. **Only naive UTC reaches a column (rule 5b).** ``tests/aware_guard.py`` fails any flush
+   that carries an aware ``DateTime`` value; it is driven here over every app-side writer of
+   ``confirmed_at`` / ``archived_at``, and installed on the route sessions of every API test.
+4. **The business date (rule 5c).** ``clock.today()`` is the IST date; instants stay UTC.
 
 (The ``.date()`` calls in ``nav_snapshot_service`` / ``performance_service`` are *not*
-what these tests protect, contrary to an earlier reading: they are mandatory
-``datetime`` → ``date`` conversions — ``as_of`` is a ``date`` — so deleting one is an
-immediate ``TypeError``, not a silent regression. They need no net.)
-
-``last_used`` on both merchant maps is the concrete case, and since remediation step 11
-it has three write paths, all pinned below: an explicit caller-supplied value, the
-``base.utcnow_default`` Python default on INSERT, and the ``server_default=func.now()``
-backstop that only a raw non-ORM ``INSERT`` can still reach.
-
-The second group of tests is the ADR-0001 rule-5 gate: they pin ``clock.naive_utcnow`` to
-a fixed instant and assert the *app* clock — not the DB's — wrote the column. That is the
-only assertion here that can go red on SQLite, where ``func.now()`` and the app clock are
-otherwise indistinguishable.
+what these tests protect: they are mandatory ``datetime`` → ``date`` conversions —
+``as_of`` is a ``date`` — so deleting one is an immediate ``TypeError``, not a silent
+regression. They need no net.)
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy import DateTime, select, text
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.models import Base, Category, Label, MerchantLabelMap, MerchantTagMap, User
+from app.models import (
+    Account,
+    Base,
+    Category,
+    ImportBatch,
+    Instrument,
+    Label,
+    MerchantLabelMap,
+    MerchantTagMap,
+    Transaction,
+    User,
+)
+from tests.aware_guard import install_aware_write_guard
 
 
 def _category(session: Session, user_id: object, name: str) -> Category:
-    c = Category(user_id=user_id, name=name)
+    c = Category(color="#2a78d6", user_id=user_id, name=name)
     session.add(c)
     session.flush()
     return c
@@ -282,3 +291,196 @@ def test_last_used_bump_is_naive_before_any_readback(session: Session, user: Use
     assert bumped.hit_count == 2, "second record_tag should have taken the bump branch"
     # Never re-read: this is the instant the service assigned, not what SQLite returned.
     assert bumped.last_used.tzinfo is None
+
+
+# --------------------------------------------------------------------------------------
+# ADR-0001 rule 5b: only naive UTC reaches a column — checked in memory, at flush time.
+#
+# After a round-trip through SQLite aware and naive are indistinguishable, so the guard
+# (tests/aware_guard.py) inspects the pending values in before_flush. The cases drive the
+# app-side writers of confirmed_at / archived_at that once wrote clock.utcnow() (aware),
+# calling the route functions directly with this module's session.
+# --------------------------------------------------------------------------------------
+
+
+def _bank(session: Session, user: User, name: str) -> Account:
+    account = Account(user_id=user.id, name=name, type="bank", issuer="hdfc")
+    session.add(account)
+    session.flush()
+    return account
+
+
+def _commit_import_batch(session: Session, user: User) -> None:
+    from app.api.v1.imports import commit_import_batch
+    from app.schemas.imports import ImportCommit
+
+    account = _bank(session, user, "HDFC")
+    food = _category(session, user.id, "Food")
+    batch = ImportBatch(
+        user_id=user.id, account_id=account.id, source_file_hash="h", parser_name="HDFCBank"
+    )
+    session.add(batch)
+    session.flush()
+    txn = Transaction(
+        user_id=user.id,
+        account_id=account.id,
+        date=date(2026, 5, 1),
+        amount_paise=-5000,
+        transaction_type="spend",
+        merchant_raw="Swiggy",
+        merchant_normalized="swiggy",
+        category_id=food.id,
+        fingerprint="f" * 64,
+        source="import",
+        import_batch_id=batch.id,
+    )
+    session.add(txn)
+    session.commit()
+    commit_import_batch(batch.id, ImportCommit(transaction_ids=[txn.id]), session, user.id)
+
+
+def _create_transaction(session: Session, user: User) -> None:
+    from app.api.v1.transactions import create_transaction
+    from app.schemas.transactions import TransactionCreate
+
+    account = _bank(session, user, "HDFC")
+    session.commit()
+    payload = TransactionCreate(
+        account_id=account.id,
+        date=date(2026, 5, 1),
+        amount_paise=-5000,
+        transaction_type="spend",
+        merchant_raw="Swiggy",
+    )
+    create_transaction(payload, session, user.id)
+
+
+def _create_transfer(session: Session, user: User) -> None:
+    from app.api.v1.transactions import create_transfer
+    from app.schemas.transactions import TransactionTransferCreate
+
+    source = _bank(session, user, "HDFC")
+    dest = _bank(session, user, "ICICI")
+    session.commit()
+    payload = TransactionTransferCreate(
+        date=date(2026, 5, 1),
+        source_account_id=source.id,
+        dest_account_id=dest.id,
+        amount_paise=5000,
+    )
+    create_transfer(payload, session, user.id)
+
+
+def _delete_instrument(session: Session, user: User) -> None:
+    from app.api.v1.instruments import delete_instrument
+
+    inst = Instrument(
+        user_id=user.id,
+        symbol="X",
+        name="X Fund",
+        asset_class="indian_mf",
+        currency="INR",
+        exchange="MFCentral",
+    )
+    session.add(inst)
+    session.commit()
+    delete_instrument(inst.id, session, user.id)
+
+
+def _seed_demo_data(session: Session, user: User) -> None:
+    from app.services.demo_seed import seed_demo_data
+    from app.services.provisioning import provision_default_categories
+
+    provision_default_categories(session, user.id)
+    session.commit()
+    seed_demo_data(session, user_id=user.id)
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        _commit_import_batch,
+        _create_transaction,
+        _create_transfer,
+        _delete_instrument,
+        _seed_demo_data,
+    ],
+    ids=lambda f: f.__name__.lstrip("_"),
+)
+def test_no_aware_datetime_reaches_a_column(
+    session: Session, user: User, write: Callable[[Session, User], None]
+) -> None:
+    """ADR-0001 rule 5b at every app-side ``confirmed_at`` / ``archived_at`` writer.
+
+    The guard raises inside the flush if any pending ``DateTime`` value carries a tzinfo;
+    the same guard runs over every route write in ``tests/api`` (``session_factory``).
+    """
+    install_aware_write_guard(session)
+    write(session, user)
+
+
+def test_the_aware_write_guard_bites(session: Session, user: User) -> None:
+    """The guard is not vacuous: an aware ``archived_at`` fails the flush, naming the column."""
+    install_aware_write_guard(session)
+    food = _category(session, user.id, "Food")
+    food.archived_at = datetime(2026, 5, 1, tzinfo=UTC)
+
+    with pytest.raises(AssertionError, match=r"Category\.archived_at"):
+        session.flush()
+
+
+# --------------------------------------------------------------------------------------
+# ADR-0001 rule 5c: ``clock.today()`` is the IST business date; instants stay UTC.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("instant", "business_date"),
+    [
+        (datetime(2026, 3, 31, 18, 29, tzinfo=UTC), date(2026, 3, 31)),  # 23:59 IST
+        (datetime(2026, 3, 31, 18, 30, tzinfo=UTC), date(2026, 4, 1)),  # 00:00 IST
+        (datetime(2026, 3, 31, 19, 30, tzinfo=UTC), date(2026, 4, 1)),  # 01:00 IST
+    ],
+    ids=["2359-ist-still-31-mar", "midnight-ist-is-1-apr", "0100-ist-is-1-apr"],
+)
+def test_today_is_the_ist_business_date(
+    monkeypatch: pytest.MonkeyPatch, instant: datetime, business_date: date
+) -> None:
+    """Between 18:30 and 24:00 UTC the UTC date is still yesterday in India.
+
+    ``today()`` answers with the IST date, so the evening of 31 March UTC is already
+    1 April — the first day of the financial year — while the stored instant
+    (``naive_utcnow``) stays the UTC wall clock. One ``clock.utcnow`` patch moves both.
+    """
+    monkeypatch.setattr(clock, "utcnow", lambda: instant)
+
+    assert clock.today() == business_date
+    assert clock.naive_utcnow() == instant.replace(tzinfo=None)
+
+
+@pytest.mark.parametrize(
+    "instant",
+    [
+        datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2026, 3, 31, 18, 30, tzinfo=UTC),
+        datetime(2026, 7, 15, 23, 59, tzinfo=UTC),
+        datetime(1990, 6, 1, 12, 0, tzinfo=UTC),
+    ],
+)
+def test_business_tz_constant_agrees_with_asia_kolkata(instant: datetime) -> None:
+    """The fixed +05:30 offset is ``Asia/Kolkata`` without a tzdata dependency.
+
+    India has observed no DST since 1945, so a fixed offset is exact for every date this
+    app can hold. Skipped where the host has no IANA database to compare against.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        kolkata = ZoneInfo("Asia/Kolkata")
+    except ZoneInfoNotFoundError:  # pragma: no cover - host-dependent
+        pytest.skip("no IANA tz database on this host")
+
+    ours = instant.astimezone(clock.BUSINESS_TZ)
+    theirs = instant.astimezone(kolkata)
+    assert ours.utcoffset() == theirs.utcoffset()
+    assert ours.date() == theirs.date()

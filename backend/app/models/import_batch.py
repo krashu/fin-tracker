@@ -21,14 +21,14 @@ reprocesses); ``imported_count`` still records how many landed.
 carry the statement's own summary block plus the computed verdict:
 
 * ``statement_opening_balance_paise`` / ``statement_closing_balance_paise`` —
-  read off the statement (``ParsedStatement.summary``), our sign convention
-  (negative = owed). Both ``NULL`` when the parser found no summary block
-  (e.g. the Flipkart co-branded layout) — never a parse failure.
-* ``period_start`` / ``period_end`` — the statement's billing period. When the
+  read off the statement (``ParsedStatement.summary``), in the user's position
+  (positive = money held, negative = owed; ADR-0010 rule 7). Both ``NULL`` when the parser
+  found no summary block (e.g. the Flipkart co-branded layout) — never a parse failure.
+* ``period_start`` / ``period_end`` — the statement's billing period as
+  printed, ``NULL`` when the PDF printed none (ADR-0010 rule 8). When the
   parser could read both balances but not the period, ``reconcile_batch``
   falls back to ``min(row.date)`` / ``max(row.date)`` over the batch's own
-  rows and stamps that here, so this column always reflects the window the
-  check actually ran over, not just what the PDF printed.
+  rows at reconcile time and never writes that window back here.
 * ``reconciliation_delta_paise`` — ``NULL`` = not checked (no usable
   metadata, or the batch is account-less); ``0`` = reconciled; non-zero =
   mismatch, this many paise (``actual − expected``, signed — see
@@ -66,7 +66,7 @@ import uuid
 from datetime import date
 from typing import Literal, get_args
 
-from sqlalchemy import BigInteger, Date, Enum, ForeignKey, String, text
+from sqlalchemy import BigInteger, Date, Enum, ForeignKey, ForeignKeyConstraint, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -76,18 +76,30 @@ ImportStatusStr = Literal["pending", "completed", "failed"]
 
 class ImportBatch(Base, TimestampMixin):
     __tablename__ = "import_batches"
+    __table_args__ = (
+        # ADR-0003 rule 10: the (id, user_id) target of the same-user composite FKs from
+        # transactions / investment_transactions.import_batch_id, and the composite FK
+        # for this table's own account_id.
+        Index("uq_import_batches_id_user", "id", "user_id", unique=True),
+        ForeignKeyConstraint(
+            ["account_id", "user_id"],
+            ["accounts.id", "accounts.user_id"],
+            name="fk_import_batches_account_id_accounts",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     # Nullable: spend batches carry an account; backup-restore and investment batches
     # are account-less (they resolve an account per row instead, or have none at all).
-    # A PLAIN FK, not ADR-0002's composite same-user one, so reads that join Account
-    # off this column must restate `Account.user_id` themselves — see
-    # `GET /imports/pending`.
-    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
+    # Composite same-user FK (``__table_args__``), so the DB refuses another user's
+    # account; reads that join Account off it still restate `Account.user_id`
+    # (ADR-0003 rule 7) — see `GET /imports/pending`.
+    account_id: Mapped[int | None] = mapped_column(nullable=True)
     source_file_hash: Mapped[str] = mapped_column(String(64), index=True)
     parser_name: Mapped[str] = mapped_column(String(64))
     imported_count: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    # Duplicates only; zero-amount statement lines are not counted (ADR-0010 rule 5).
     skipped_count: Mapped[int] = mapped_column(default=0, server_default=text("0"))
     status: Mapped[ImportStatusStr] = mapped_column(
         Enum(
@@ -100,7 +112,6 @@ class ImportBatch(Base, TimestampMixin):
         default="pending",
         server_default="pending",
     )
-    error_message: Mapped[str | None] = mapped_column(String(1024))
 
     # Balance reconciliation (migration 0030) — see the module docstring for
     # what each column means and its NULL semantics.

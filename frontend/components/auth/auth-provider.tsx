@@ -34,6 +34,7 @@ import {
 import {
   ApiError,
   DEMO_CREDENTIALS,
+  deleteMyAccount as apiDeleteMyAccount,
   demoSession as apiDemoSession,
   login as apiLogin,
   logout as apiLogout,
@@ -41,6 +42,7 @@ import {
   register as apiRegister,
   setAuthFailureHandler,
   type AuthUser,
+  type DeleteAccountRequest,
 } from "@/lib/api/client";
 
 const ME_KEY = ["auth", "me"] as const;
@@ -62,6 +64,9 @@ type AuthContextValue = {
     displayName?: string,
   ) => Promise<void>;
   logout: () => Promise<void>;
+  /** Erase the account (ADR-0003 rule 13b), then drop the session like logout. On failure
+   * the ApiError propagates and the session is kept. */
+  deleteAccount: (body: DeleteAccountRequest) => Promise<void>;
   /** Force a re-check of `/me` (the guard's retry affordance for `unknown`). */
   refetch: () => void;
 };
@@ -155,6 +160,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } finally {
           await resetSession(qc, null);
         }
+      },
+      deleteAccount: async (body) => {
+        await apiDeleteMyAccount(body);
+        await resetSession(qc, null);
       },
       refetch: () => void meQuery.refetch(),
     }),

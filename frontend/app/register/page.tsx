@@ -32,7 +32,9 @@ export default function RegisterPage() {
     staleTime: Infinity,
   }).data;
   const registrationEnabled = authConfig?.registration_enabled ?? true;
-  const demoEnabled = authConfig?.demo_login_enabled ?? false;
+  const demoEnabled = Boolean(
+    authConfig?.demo_login_enabled || authConfig?.guest_sandbox_enabled,
+  );
 
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");

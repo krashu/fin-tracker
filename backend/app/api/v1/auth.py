@@ -1,21 +1,30 @@
 """Auth routes (PRD §Users & access v2).
 
 * ``POST /auth/register`` — create a user + provision default categories; set
-  cookies. 409 on a duplicate email.
+  cookies. 409 on a duplicate email. 403 once a real user exists unless
+  ``REGISTRATION_ENABLED`` (the first user can always register).
 * ``POST /auth/login`` — verify credentials; set cookies. 401 on bad creds.
 * ``POST /auth/refresh`` — rotate the refresh token; reissue the access cookie.
   401 on a missing / unknown / expired / reused token (reuse revokes the family).
 * ``POST /auth/logout`` — revoke the refresh session; clear cookies. 204.
+* ``POST /auth/demo-session`` — start a guest sandbox (a fresh, password-less,
+  expiring user with synthetic data); set cookies. 403 unless
+  ``GUEST_SANDBOX_ENABLED``; 503 at ``MAX_GUEST_ACCOUNTS``.
 * ``POST /auth/change-password`` — verify current pw, re-hash, revoke every session
   and issue a fresh one for the caller (sign-out-everywhere-else). 400 on a wrong /
   unchanged password.
+* ``POST /auth/delete-account`` — verify the password and the typed phrase, hard-delete the
+  caller and everything they own (ADR-0003 rule 13b), clear cookies. 204; 400 on a wrong
+  password; 403 for the demo account and guests.
 * ``GET /auth/me`` — the authenticated user (id, email, display_name).
-* ``GET /auth/config`` — public, pre-auth client config (``demo_login_enabled``).
+* ``GET /auth/config`` — public, pre-auth client config (``demo_login_enabled``,
+  ``guest_sandbox_enabled``, ``registration_enabled``).
 
 Tokens are delivered **only** as httpOnly cookies — never in a response body, so
 JS can't read them (XSS can't exfiltrate the session). The refresh cookie is
 path-scoped to this router so it never rides non-auth requests. register / login
-/ refresh are rate-limited (argon2id is expensive → brute-force + DoS surface).
+/ refresh / demo-session / change-password / delete-account are rate-limited (argon2id is
+expensive → brute-force + DoS surface).
 """
 
 from __future__ import annotations
@@ -24,7 +33,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from app.api.deps import CurrentUser, SessionDep
 from app.core.config import API_V1_PREFIX, get_settings
-from app.core.demo import DEMO_EMAIL
 from app.core.rate_limit import RateLimit
 from app.core.security import (
     ACCESS_COOKIE_NAME,
@@ -35,6 +43,7 @@ from app.models import User
 from app.schemas import (
     AuthConfig,
     ChangePasswordRequest,
+    DeleteAccountRequest,
     LoginRequest,
     RegisterRequest,
     UserRead,
@@ -71,6 +80,16 @@ def _set_auth_cookies(response: Response, user: User, refresh_token: str) -> Non
     )
 
 
+def _user_read(user: User) -> UserRead:
+    return UserRead(
+        id=user.id,
+        email=user.email,
+        display_name=user.display_name,
+        is_guest=user.is_guest,
+        can_manage_credentials=auth_service.can_manage_credentials(user),
+    )
+
+
 def _clear_auth_cookies(response: Response) -> None:
     response.delete_cookie(ACCESS_COOKIE_NAME, path="/")
     response.delete_cookie(REFRESH_COOKIE_NAME, path=_REFRESH_COOKIE_PATH)
@@ -82,8 +101,11 @@ def register(
     session: SessionDep,
     response: Response,
     _: None = Depends(RateLimit(bucket="register")),
-) -> User:
-    if not get_settings().registration_enabled:
+) -> UserRead:
+    # ADR-0003 rule 12: the first user can always register; after that the gate
+    # decides. The check-then-insert is not atomic: two simultaneous first
+    # registrations can both pass, which still yields only the operator's own users.
+    if not get_settings().registration_enabled and auth_service.has_registered_user(session):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="registration is disabled",
@@ -102,7 +124,7 @@ def register(
         ) from e
     refresh_token = auth_service.start_session(session, user.id)
     _set_auth_cookies(response, user, refresh_token)
-    return user
+    return _user_read(user)
 
 
 @router.post("/login", response_model=UserRead)
@@ -111,7 +133,7 @@ def login(
     session: SessionDep,
     response: Response,
     _: None = Depends(RateLimit(bucket="login")),
-) -> User:
+) -> UserRead:
     user = auth_service.authenticate(session, email=payload.email, password=payload.password)
     if user is None:
         raise HTTPException(
@@ -120,7 +142,7 @@ def login(
         )
     refresh_token = auth_service.start_session(session, user.id)
     _set_auth_cookies(response, user, refresh_token)
-    return user
+    return _user_read(user)
 
 
 @router.post("/refresh", response_model=UserRead)
@@ -129,7 +151,7 @@ def refresh(
     session: SessionDep,
     response: Response,
     _: None = Depends(RateLimit(bucket="refresh")),
-) -> User:
+) -> UserRead:
     raw = request.cookies.get(REFRESH_COOKIE_NAME)
     if raw is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="no refresh token")
@@ -144,7 +166,7 @@ def refresh(
             detail="invalid refresh token",
         )
     _set_auth_cookies(response, user, rotated.refresh_token)
-    return user
+    return _user_read(user)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -161,12 +183,14 @@ def demo_session(
     session: SessionDep,
     response: Response,
     _: None = Depends(RateLimit(bucket="demo-session")),
-) -> User:
-    settings = get_settings()
-    if not settings.demo_login_permitted:
+) -> UserRead:
+    # Guests have their own gate (ADR-0003 rule 15), independent of the shared demo
+    # login's demo_login_permitted: a guest owns only synthetic data, so it may run
+    # over HTTPS where the demo login never does.
+    if not get_settings().guest_sandbox_enabled:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="demo access is disabled on this instance",
+            detail="guest sandboxes are disabled on this instance",
         )
     try:
         user, refresh_token = guest_service.create_guest_sandbox(session)
@@ -176,7 +200,7 @@ def demo_session(
             detail="demo is at capacity, try again later",
         ) from err
     _set_auth_cookies(response, user, refresh_token)
-    return user
+    return _user_read(user)
 
 
 @router.post("/change-password", response_model=UserRead)
@@ -186,15 +210,13 @@ def change_password(
     session: SessionDep,
     response: Response,
     _: None = Depends(RateLimit(bucket="change-password")),
-) -> User:
+) -> UserRead:
     # The demo account's credentials are source-published and shared across
     # visitors — never let a demo session rotate them (it would break "Try the
     # demo" until a reseed). Reachable only where the demo login itself is permitted
     # (Settings.demo_login_permitted — opted in, on plain http), since a session on this
     # account can't be obtained anywhere else.
-    if user.is_guest or (
-        user.email is not None and auth_service.normalize_email(user.email) == DEMO_EMAIL
-    ):
+    if not auth_service.can_manage_credentials(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="the demo account password can't be changed",
@@ -220,22 +242,50 @@ def change_password(
     # Fresh access + refresh cookies keep the acting device logged in; every other
     # device's refresh was just revoked.
     _set_auth_cookies(response, user, new_refresh)
-    return user
+    return _user_read(user)
+
+
+@router.post("/delete-account", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    payload: DeleteAccountRequest,
+    user: CurrentUser,
+    session: SessionDep,
+    response: Response,
+    _: None = Depends(RateLimit(bucket="delete-account")),
+) -> None:
+    # Demo and guest accounts are shared / ephemeral: refuse before any argon2 work.
+    if not auth_service.can_manage_credentials(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the demo account and guests can't be deleted",
+        )
+    # 400, not 401: the session is valid, so a wrong password is a body error — a 401 would
+    # send the client's refresh-and-replay transport into a logout.
+    if not auth_service.delete_account(session, user=user, password=payload.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="current password is incorrect",
+        )
+    _clear_auth_cookies(response)
 
 
 @router.get("/me", response_model=UserRead)
-def me(user: CurrentUser) -> User:
-    return user
+def me(user: CurrentUser) -> UserRead:
+    return _user_read(user)
 
 
 @router.get("/config", response_model=AuthConfig)
-def config() -> AuthConfig:
+def config(session: SessionDep) -> AuthConfig:
     # Deliberately reads the SAME expression authenticate() gates the demo login on
     # (Settings.demo_login_permitted) — one source of truth so the "Try the demo" button
-    # and the login 401 can never disagree. Exposes registration_enabled as well so the
-    # UI can adapt to private/demo deployments.
+    # and the login 401 can never disagree; likewise guest_sandbox_enabled is the flag
+    # POST /demo-session checks. registration_enabled is the EFFECTIVE value
+    # register applies — open while no real user exists (first-user bootstrap).
     settings = get_settings()
     return AuthConfig(
         demo_login_enabled=settings.demo_login_permitted,
-        registration_enabled=settings.registration_enabled,
+        guest_sandbox_enabled=settings.guest_sandbox_enabled,
+        registration_enabled=(
+            settings.registration_enabled or not auth_service.has_registered_user(session)
+        ),
     )

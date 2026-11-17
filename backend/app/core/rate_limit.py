@@ -6,9 +6,10 @@ multi-worker setup would swap this for a shared store (Redis). Deliberately not 
 new dependency (CLAUDE.md §2).
 
 Used as a FastAPI dependency: ``Depends(RateLimit(bucket="login"))`` raises
-429 once a client exceeds the window budget. Argon2id verification is expensive,
-so throttling login/register/refresh guards both credential brute-force and CPU
-exhaustion.
+429 once a client exceeds the window budget. Applied to register, login, refresh,
+demo-session and change-password. Argon2id verification is expensive, so throttling
+them guards both credential brute-force and CPU exhaustion (and, for demo-session,
+guest-sandbox churn).
 """
 
 from __future__ import annotations

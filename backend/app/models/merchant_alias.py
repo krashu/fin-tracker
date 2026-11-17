@@ -2,7 +2,7 @@
 
 Second normalisation layer, downstream of and independent from
 :func:`app.services.merchant.normalize_merchant` (frozen -- see its CHANGE
-HAZARD block). Where ``normalize_merchant`` is lowercase + whitespace collapse
+HAZARD block). Where ``normalize_merchant`` is lowercase, NFC and whitespace collapse
 and feeds the F4 fingerprint, this table lets a user fold multiple raw
 descriptors (``swiggy*blr*12345``, ``upi/swiggy/9876@ybl``) onto one
 ``canonical`` string, which becomes the new key F3/F3a read sites aggregate
@@ -40,7 +40,8 @@ class MerchantAlias(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     # 512 to match merchant_tag_map / merchant_label_map's merchant_normalized
-    # (migration 0020) -- normalize_merchant is length-unbounded.
+    # (migration 0020). The rules routes refuse a pattern or canonical that normalizes
+    # past this width (ADR-0006 rule 3b; services.merchant.MERCHANT_MAX_CHARS).
     pattern: Mapped[str] = mapped_column(String(512))
     canonical: Mapped[str] = mapped_column(String(512))
     is_seeded: Mapped[bool] = mapped_column(default=False, server_default=false())

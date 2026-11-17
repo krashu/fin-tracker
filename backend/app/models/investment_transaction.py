@@ -10,11 +10,18 @@ direction (buy adds units, sell removes them). This mirrors the parser's
 dividend, amount==0 for bonus, price required for buy/sip/sell, …) are enforced at
 the HTTP boundary by the create schema, not the DB.
 
+``amount_native_paise`` is the **gross trade value** (units x price as reported, before
+charges); ``fees_native_paise`` is the **charges on that trade**, held separately. A buy's
+cost is ``amount + fees``, a sell's net cash is ``amount - fees``, a dividend's amount is the
+payout and a bonus has amount 0. ``realised_lots`` splits a sell's gross and fees across the
+lots it consumed (ADR-0015 rule 5).
+
 ``units`` / ``price_per_unit_native`` use the scaled-int ``Units`` / ``PriceNative``
 types (8 dp); ``amount_native_paise`` / ``fees_native_paise`` stay integer paise
-like the rest of the app; ``fx_rate_to_inr`` is a scaled ``FxRate`` (6 dp), always
-``1.0`` in v1 (INR-only) — the column exists so v0.5's FX layer can stamp real
-rates without a migration.
+like the rest of the app; ``fx_rate_to_inr`` is a scaled ``FxRate`` (6 dp), stamped by
+the server at the transaction date and never defaulted or rewritten (ADR-0016) — exactly
+1 for INR, the cached rate on or before the date otherwise. It has no Python or DB
+default (dropped in 0038), so a writer that forgets to stamp it fails on NOT NULL.
 
 ``pair_id`` is the investment analogue of ``transactions.transfer_pair_id``: it links
 the two legs of ONE economic event. Same DB-level invariants as the spend table — a
@@ -39,9 +46,10 @@ composite FK when the *pointed-at* row is deleted first. The two conforming writ
 deliberately no defensive "null any row pointing at me" query, because the invariant
 holds by construction (one writer, and PATCH is note-only).
 
-Renamed from ``switch_pair_id`` in migration 0026. The FK / CHECK constraint **names**
-still carry the old ``switch_pair`` spelling — renaming a constraint on SQLite needs a
-full table rebuild, which 0026 exists to avoid.
+Renamed from ``switch_pair_id`` in migration 0026. The FK keeps its historical name
+``fk_investment_transactions_switch_pair_same_user`` (ADR-0002 Consequences) — renaming a
+constraint on SQLite needs a full table rebuild, which 0026 exists to avoid. The CHECK was
+renamed to ``ck_investment_transactions_no_self_pair`` in 0038, which rebuilds the table anyway.
 
 ``import_batch_id`` + ``fingerprint`` back the CSV importer (``investment_import_service``,
 PRD §F7). ``import_batch_id`` is a reserved audit-trail FK to the originating
@@ -117,10 +125,21 @@ class InvestmentTransaction(Base, TimestampMixin):
         ),
         CheckConstraint(
             "pair_id IS NULL OR pair_id != id",
-            name="ck_investment_transactions_no_self_pair",
+            name="no_self_pair",
         ),
-        # Backs the holdings FIFO read: per-instrument, oldest-first, with id as
-        # the same-date tie-break (PRD §F7 FIFO; tie-break = txn id ascending).
+        # ADR-0003 rule 10: same-user composite FKs to the instrument and the batch.
+        ForeignKeyConstraint(
+            ["instrument_id", "user_id"],
+            ["instruments.id", "instruments.user_id"],
+            name="fk_investment_transactions_instrument_id_instruments",
+        ),
+        ForeignKeyConstraint(
+            ["import_batch_id", "user_id"],
+            ["import_batches.id", "import_batches.user_id"],
+            name="fk_investment_transactions_import_batch_id_import_batches",
+        ),
+        # Backs the holdings FIFO read: per-instrument, oldest-first, with id as the
+        # stored key for same-date source order (ADR-0015 rule 3).
         Index(
             "ix_investment_transactions_user_instrument_date",
             "user_id",
@@ -146,7 +165,7 @@ class InvestmentTransaction(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
-    instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id"))
+    instrument_id: Mapped[int] = mapped_column()
     date: Mapped[date_t] = mapped_column(Date)
     transaction_type: Mapped[InvestmentTxnTypeStr] = mapped_column(
         Enum(
@@ -161,21 +180,17 @@ class InvestmentTransaction(Base, TimestampMixin):
     price_per_unit_native: Mapped[Decimal | None] = mapped_column(PriceNative(), nullable=True)
     amount_native_paise: Mapped[int] = mapped_column(BigInteger)
     fees_native_paise: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))
-    # Scaled FxRate (6 dp): server_default is the *scaled* int (1.0 → 1_000_000)
-    # because the raw SQL default lives below the TypeDecorator. Always 1.0 in v1.
-    fx_rate_to_inr: Mapped[Decimal] = mapped_column(
-        FxRate(), default=Decimal("1"), server_default=text("1000000")
-    )
+    # Scaled FxRate (6 dp). Server-stamped at the transaction date, never defaulted
+    # (ADR-0016) — see the module docstring.
+    fx_rate_to_inr: Mapped[Decimal] = mapped_column(FxRate())
     note: Mapped[str | None] = mapped_column(String(1024))
     # FK declared composite-style in __table_args__ (same-user invariant). Do NOT
     # add an inline ForeignKey here — that would create a second single-column FK
     # and drift from the migration (mirrors transactions.transfer_pair_id).
     pair_id: Mapped[int | None] = mapped_column()
     # Reserved audit-trail FK to the originating CAS import_batches row (NULL for
-    # manual rows; no batch-cancel verb this slice). Single-column FK, inline.
-    import_batch_id: Mapped[int | None] = mapped_column(
-        ForeignKey("import_batches.id"), nullable=True
-    )
+    # manual rows; no batch-cancel verb this slice). Composite FK in __table_args__.
+    import_batch_id: Mapped[int | None] = mapped_column(nullable=True)
     # CSV dedup key (NULL for manual rows). Unique per
     # (user_id, instrument_id, occurrence) — see __table_args__ + the class docstring
     # for the NULLs-distinct rationale.

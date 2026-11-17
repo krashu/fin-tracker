@@ -77,7 +77,8 @@ export default function LoginPage() {
     queryFn: getAuthConfig,
     staleTime: Infinity,
   }).data;
-  const demoEnabled = authConfig?.demo_login_enabled;
+  const demoEnabled =
+    authConfig?.demo_login_enabled || authConfig?.guest_sandbox_enabled;
   const registrationEnabled = authConfig?.registration_enabled ?? true;
   const isDemoOnly = Boolean(demoEnabled && !registrationEnabled);
 

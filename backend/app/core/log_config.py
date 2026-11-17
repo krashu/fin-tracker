@@ -11,8 +11,8 @@ pipeline, so every log line is structured + PII-masked.
 ``format_exc_info`` runs in the shared pre-chain *before* :func:`mask_pii` so
 PII embedded in exception messages (e.g. ``ValueError(f"bad PAN {pan}")``) gets
 scrubbed too — but only for the classes the free-text regexes actually cover,
-which is PAN and 16-digit cards. A bare account number in an exception string is
-**not** scrubbed; see :func:`mask_pii`'s own scope note below.
+which is PAN, 16-digit cards and 12-digit Aadhaar numbers. A bare account
+number in an exception string is **not** scrubbed; see :func:`mask_pii`'s own scope note below.
 
 Renderer is env-driven: ``ConsoleRenderer`` by default (local dev),
 ``JSONRenderer`` when ``LOG_FORMAT=json``. Verbosity is ``LOG_LEVEL``-driven
@@ -32,7 +32,7 @@ from typing import Any, cast
 import structlog
 
 from app.core.config import get_settings
-from app.core.pii_patterns import CARD_RE, PAN_RE
+from app.core.pii_patterns import AADHAAR_RE, CARD_RE, PAN_RE
 
 # Name tag on the root handler we own, so configure_logging() can replace just
 # our handler on repeat calls without disturbing handlers installed by others
@@ -78,7 +78,7 @@ def mask_pii(
        through unscrubbed — bind PII through the right key name or
        accept the leak. Pinned by
        ``test_pii_pass_through_under_innocuous_key``.
-    2. **Free-text regex** (PAN + 16-digit card only, via
+    2. **Free-text regex** (PAN, 16-digit card and 12-digit Aadhaar only, via
        :mod:`app.core.pii_patterns`) on the ``event``, ``exception`` +
        ``stack`` strings. ``format_exc_info`` and ``StackInfoRenderer``
        upstream render these into strings before this processor runs.
@@ -103,6 +103,7 @@ def mask_pii(
         if isinstance(text, str):
             text = PAN_RE.sub("***", text)
             text = CARD_RE.sub("***", text)
+            text = AADHAAR_RE.sub("***", text)
             event_dict[key] = text
 
     return event_dict

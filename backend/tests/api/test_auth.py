@@ -12,13 +12,23 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from app.core import clock, security
 from app.core.config import Settings, get_settings
 from app.core.demo import DEMO_EMAIL, DEMO_PASSWORD
 from app.core.security import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME
-from app.models import User
-from app.services.provisioning import _DEFAULT_INCOME_TAXONOMY, _DEFAULT_SPEND_TAXONOMY
+from app.models import Account, Category, User
+from app.services.demo_seed import seed_demo_data
+from app.services.guest_service import create_guest_sandbox
+from app.services.provisioning import (
+    _DEFAULT_INCOME_TAXONOMY,
+    _DEFAULT_SPEND_TAXONOMY,
+    provision_default_categories,
+    provision_seed_merchant_dictionary,
+)
+from tests.owned_tables import owned_tables, rows_owned_by, seed_rows_demo_seed_lacks
 
 _EMAIL = "alice@example.com"
 _PW = "correct horse battery"
@@ -85,7 +95,7 @@ def test_register_provisions_default_categories(unauth_client: TestClient) -> No
 
     assert {c["name"] for c in parents} == expected_parent_names
     assert {c["name"] for c in children} == expected_child_names
-    assert len(parents) == 10  # 9 spend parents + 1 income parent
+    assert len(parents) == len(_DEFAULT_SPEND_TAXONOMY) + len(_DEFAULT_INCOME_TAXONOMY)
     assert len(children) == len(expected_child_names)
     assert all(c["is_seeded"] for c in cats)  # app defaults, not user-created
     assert all(c["color"] for c in parents)  # parent colors provisioned, none null
@@ -191,6 +201,24 @@ def test_me_returns_current_user(unauth_client: TestClient) -> None:
     r = unauth_client.get("/api/v1/auth/me")
     assert r.status_code == 200
     assert r.json()["email"] == _EMAIL
+    assert set(r.json()) == {"id", "email", "display_name", "is_guest", "can_manage_credentials"}
+    assert r.json()["can_manage_credentials"] is True
+
+
+@pytest.mark.parametrize("kind", ["demo", "guest"])
+def test_me_says_demo_and_guest_cannot_manage_credentials(
+    kind: str, unauth_client: TestClient, session: Session, seeded_user: User
+) -> None:
+    """The server owns the rule the 403s enforce (ADR-0003 rules 13, 13b); the client reads it."""
+    if kind == "demo":
+        target_id = seeded_user.id
+    else:
+        guest, _ = create_guest_sandbox(session)
+        target_id = guest.id
+    unauth_client.cookies.set(ACCESS_COOKIE_NAME, security.create_access_token(target_id))
+    r = unauth_client.get("/api/v1/auth/me")
+    assert r.status_code == 200
+    assert r.json()["can_manage_credentials"] is False
 
 
 def test_expired_access_token_401(
@@ -457,6 +485,118 @@ def test_change_password_csrf_foreign_origin_rejected(client: TestClient) -> Non
     assert r.status_code == 403
 
 
+# --- delete account (ADR-0003 rule 13b) --------------------------------------
+_DELETE_URL = "/api/v1/auth/delete-account"
+_PHRASE = "delete my account"
+
+
+def _own_row_counts(session: Session, *, excluding: UUID) -> dict[str, int]:
+    return {
+        t.name: n
+        for t in owned_tables()
+        if (
+            n := session.scalar(select(func.count()).select_from(t).where(t.c.user_id != excluding))
+            or 0
+        )
+    }
+
+
+def test_delete_account_erases_every_owned_row(
+    unauth_client: TestClient, session: Session, seeded_user: User
+) -> None:
+    _register(unauth_client)
+    alice_id = UUID(unauth_client.get("/api/v1/auth/me").json()["id"])
+    # A second login: two live refresh families, both must die.
+    other = unauth_client.post("/api/v1/auth/login", json={"email": _EMAIL, "password": _PW})
+    assert other.status_code == 200
+    provision_seed_merchant_dictionary(session, alice_id)
+    seed_demo_data(session, user_id=alice_id)
+    seed_rows_demo_seed_lacks(session, alice_id)
+    # The other tenant owns rows too, and they must survive.
+    provision_default_categories(session, seeded_user.id)
+    session.flush()
+    seed_demo_data(session, user_id=seeded_user.id)
+    session.commit()
+
+    empty = [t.name for t in owned_tables() if rows_owned_by(session, t, alice_id) == 0]
+    assert empty == [], f"alice owns no rows in {empty}; seed them so deletion is tested"
+    others_before = _own_row_counts(session, excluding=alice_id)
+    assert others_before
+
+    r = unauth_client.post(_DELETE_URL, json={"password": _PW, "confirmation": _PHRASE})
+    assert r.status_code == 204, r.text
+    cookies = r.headers.get_list("set-cookie")
+    assert len(cookies) == 2 and all("Max-Age=0" in c for c in cookies)
+    assert any("Path=/;" in c or c.endswith("Path=/") for c in cookies)
+    assert any("Path=/api/v1/auth" in c for c in cookies)
+    assert ACCESS_COOKIE_NAME not in unauth_client.cookies
+    assert REFRESH_COOKIE_NAME not in unauth_client.cookies
+    assert unauth_client.get("/api/v1/auth/me").status_code == 401
+    unauth_client.cookies.set(ACCESS_COOKIE_NAME, security.create_access_token(alice_id))
+    assert unauth_client.get("/api/v1/auth/me").status_code == 401
+
+    session.expire_all()
+    leftover = {t.name: n for t in owned_tables() if (n := rows_owned_by(session, t, alice_id)) > 0}
+    assert leftover == {}
+    assert session.get(User, alice_id) is None
+    assert _own_row_counts(session, excluding=alice_id) == others_before
+
+
+def test_delete_account_wrong_password_400(unauth_client: TestClient, session: Session) -> None:
+    _register(unauth_client)
+    cats = session.scalar(select(func.count()).select_from(Category))
+    r = unauth_client.post(
+        _DELETE_URL, json={"password": "not my password", "confirmation": _PHRASE}
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "current password is incorrect"
+    assert "not my password" not in r.text
+    assert unauth_client.get("/api/v1/auth/me").status_code == 200
+    session.expire_all()
+    assert session.scalar(select(func.count()).select_from(Category)) == cats
+    assert unauth_client.post("/api/v1/auth/refresh").status_code == 200
+
+
+def test_delete_account_wrong_phrase_422(unauth_client: TestClient, session: Session) -> None:
+    _register(unauth_client)
+    r = unauth_client.post(_DELETE_URL, json={"password": _PW, "confirmation": "Delete My Account"})
+    assert r.status_code == 422
+    assert _PW not in r.text
+    assert unauth_client.get("/api/v1/auth/me").status_code == 200
+
+
+@pytest.mark.parametrize("kind", ["demo", "guest"])
+def test_delete_account_refused_for_demo_and_guest(
+    kind: str, unauth_client: TestClient, session: Session, seeded_user: User
+) -> None:
+    if kind == "demo":
+        target_id, password = seeded_user.id, DEMO_PASSWORD
+    else:
+        guest, _ = create_guest_sandbox(session)
+        target_id, password = guest.id, "anything"
+    unauth_client.cookies.set(ACCESS_COOKIE_NAME, security.create_access_token(target_id))
+    accounts_before = rows_owned_by(session, Account.__table__, target_id)  # ty: ignore[invalid-argument-type]
+    r = unauth_client.post(_DELETE_URL, json={"password": password, "confirmation": _PHRASE})
+    assert r.status_code == 403
+    session.expire_all()
+    assert session.get(User, target_id) is not None
+    assert rows_owned_by(session, Account.__table__, target_id) == accounts_before  # ty: ignore[invalid-argument-type]
+
+
+def test_delete_last_user_reopens_registration(
+    unauth_client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The seeded demo user is not a registered user, so alice is the last real one.
+    no_reg = Settings(registration_enabled=False, cors_allowed_origins="http://localhost:3000")
+    monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: no_reg)
+    _register(unauth_client)
+    assert unauth_client.get("/api/v1/auth/config").json()["registration_enabled"] is False
+    r = unauth_client.post(_DELETE_URL, json={"password": _PW, "confirmation": _PHRASE})
+    assert r.status_code == 204
+    assert unauth_client.get("/api/v1/auth/config").json()["registration_enabled"] is True
+    _register(unauth_client, email="bob@example.com")
+
+
 # --- auth config (demo-gate signal) ------------------------------------------
 def test_auth_config_demo_disabled_by_default(
     unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -471,6 +611,7 @@ def test_auth_config_demo_disabled_by_default(
     assert r.status_code == 200
     assert r.json()["demo_login_enabled"] is False
     assert r.json()["registration_enabled"] is True
+    assert r.json()["guest_sandbox_enabled"] is False
 
 
 def test_auth_config_demo_enabled_when_opted_in(
@@ -480,11 +621,14 @@ def test_auth_config_demo_enabled_when_opted_in(
     body = unauth_client.get("/api/v1/auth/config").json()
     assert body["demo_login_enabled"] is True
     assert body["registration_enabled"] is True
+    assert body["guest_sandbox_enabled"] is False
 
 
 def test_auth_config_registration_disabled(
     unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Once a real user exists, /auth/config reports the closed gate."""
+    _register(unauth_client)
     no_reg = Settings(
         registration_enabled=False,
         demo_login_enabled=True,
@@ -499,12 +643,38 @@ def test_auth_config_registration_disabled(
 def test_register_refused_when_registration_disabled(
     unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """ADR-0003 rule 12: with a first user in place, a closed gate refuses the next."""
+    _register(unauth_client)
+    unauth_client.cookies.clear()
     no_reg = Settings(
         registration_enabled=False,
         cors_allowed_origins="http://localhost:3000",
     )
     monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: no_reg)
-    r = unauth_client.post("/api/v1/auth/register", json={"email": _EMAIL, "password": _PW})
+    r = unauth_client.post(
+        "/api/v1/auth/register", json={"email": "bob@example.com", "password": _PW}
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"] == "registration is disabled"
+
+
+def test_first_user_registers_when_registration_disabled(
+    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0003 rule 12: the first user can always register, so a fresh instance with
+    the gate closed is not locked out. The seeded demo row does not count as a first
+    user. Once one exists, /auth/config flips to false and the next register is 403."""
+    no_reg = Settings(registration_enabled=False, cors_allowed_origins="http://localhost:3000")
+    monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: no_reg)
+
+    assert unauth_client.get("/api/v1/auth/config").json()["registration_enabled"] is True
+    _register(unauth_client)
+    unauth_client.cookies.clear()
+
+    assert unauth_client.get("/api/v1/auth/config").json()["registration_enabled"] is False
+    r = unauth_client.post(
+        "/api/v1/auth/register", json={"email": "bob@example.com", "password": _PW}
+    )
     assert r.status_code == 403
     assert r.json()["detail"] == "registration is disabled"
 
@@ -513,11 +683,10 @@ def test_register_refused_when_registration_disabled(
 def test_auth_config_demo_disabled_when_cookie_secure(
     unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch, demo_flag: bool
 ) -> None:
-    """On a hardened deploy without explicit override, the login page must hide 'Try the demo'."""
+    """On a hardened deploy the login page must hide 'Try the demo'."""
     hardened = Settings(
         cookie_secure=True,
         demo_login_enabled=demo_flag,
-        allow_demo_login_over_https=False,
         jwt_secret="a-real-random-secret",
         cors_allowed_origins="http://localhost:3000",
     )
@@ -527,42 +696,36 @@ def test_auth_config_demo_disabled_when_cookie_secure(
     assert r.json()["demo_login_enabled"] is False
 
 
-def test_demo_login_allowed_over_https_when_explicitly_permitted(
-    unauth_client: TestClient, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("guest_flag", [False, True])
+@pytest.mark.parametrize("demo_flag", [False, True])
+def test_demo_login_refused_over_https_whatever_the_flags(
+    unauth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    demo_flag: bool,
+    guest_flag: bool,
 ) -> None:
-    """A dedicated cloud demo showcase can allow demo login over HTTPS."""
-    demo_cloud = Settings(
+    """ADR-0003 rule 14: the shared demo login never runs over HTTPS. No flag reopens
+    it: not DEMO_LOGIN_ENABLED, not the guest gate (a separate gate, rule 15), and not
+    the retired ALLOW_DEMO_LOGIN_OVER_HTTPS override, set here in the environment to
+    prove nothing reads it any more."""
+    monkeypatch.setenv("ALLOW_DEMO_LOGIN_OVER_HTTPS", "true")
+    hardened = Settings(
         cookie_secure=True,
-        demo_login_enabled=True,
-        allow_demo_login_over_https=True,
+        demo_login_enabled=demo_flag,
+        guest_sandbox_enabled=guest_flag,
         jwt_secret="a-real-random-secret",
         cors_allowed_origins="http://localhost:3000",
     )
-    monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: demo_cloud)
-    monkeypatch.setattr("app.services.auth_service.get_settings", lambda: demo_cloud)
+    monkeypatch.setattr("app.api.v1.auth.get_settings", lambda: hardened)
+    monkeypatch.setattr("app.services.auth_service.get_settings", lambda: hardened)
 
-    r = unauth_client.get("/api/v1/auth/config")
-    assert r.status_code == 200
-    assert r.json()["demo_login_enabled"] is True
-
-    # And authenticate actually succeeds with the demo credentials
-    r_login = unauth_client.post(
+    r = unauth_client.post(
         "/api/v1/auth/login", json={"email": DEMO_EMAIL, "password": DEMO_PASSWORD}
     )
-    assert r_login.status_code == 200
-
-
-def test_demo_login_refused_when_demo_login_disabled_even_if_https_override_set() -> None:
-    """If DEMO_LOGIN_ENABLED is False, demo_login_permitted must stay False regardless of
-    allow_demo_login_over_https."""
-    s = Settings(
-        demo_login_enabled=False,
-        allow_demo_login_over_https=True,
-        cookie_secure=True,
-        jwt_secret="a-real-random-secret",
-        cors_allowed_origins="http://localhost:3000",
-    )
-    assert s.demo_login_permitted is False
+    assert r.status_code == 401
+    body = unauth_client.get("/api/v1/auth/config").json()
+    assert body["demo_login_enabled"] is False
+    assert body["guest_sandbox_enabled"] is guest_flag
 
 
 def test_validate_cookie_policy_requires_secure_for_samesite_none() -> None:

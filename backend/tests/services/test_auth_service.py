@@ -157,6 +157,51 @@ def test_authenticate_rejects_demo_login_by_default_on_plain_http(
         )
 
 
+def test_failed_logins_all_run_a_dummy_verify(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0003 rule 6: an unknown email, a password-less user and a gated demo login
+    each run exactly one argon2 verify against the dummy hash, so none of them answers
+    faster than a wrong password does (no timing oracle on which emails exist)."""
+    with Session(engine) as s:
+        auth_service.register_user(s, email=demo.DEMO_EMAIL, password=demo.DEMO_PASSWORD)
+        real = auth_service.register_user(s, email="real@example.com", password=_PW)
+        real_hash = real.password_hash
+        s.add(User(email="nopw@example.com", password_hash=None))
+        s.commit()
+
+    monkeypatch.delenv("DEMO_LOGIN_ENABLED", raising=False)
+    gate_closed = Settings(_env_file=None, cors_allowed_origins="http://localhost:3000")
+    assert gate_closed.demo_login_permitted is False
+    monkeypatch.setattr(auth_service, "get_settings", lambda: gate_closed)
+
+    calls: list[str] = []
+    real_verify = auth_service.verify_password
+
+    def spy(password: str, hashed: str) -> bool:
+        calls.append(hashed)
+        return real_verify(password, hashed)
+
+    monkeypatch.setattr(auth_service, "verify_password", spy)
+
+    for email, password in (
+        ("nobody@example.com", _PW),
+        ("nopw@example.com", _PW),
+        (demo.DEMO_EMAIL, demo.DEMO_PASSWORD),
+    ):
+        calls.clear()
+        with Session(engine) as s:
+            assert auth_service.authenticate(s, email=email, password=password) is None
+        assert calls == [auth_service._DUMMY_HASH], email
+
+    # Control: a wrong password for a real user verifies against that user's own hash.
+    calls.clear()
+    with Session(engine) as s:
+        assert auth_service.authenticate(s, email="real@example.com", password="wrong") is None
+    assert calls == [real_hash]
+
+
 def test_rotate_rejects_past_absolute_cap(engine: Engine) -> None:
     """A refresh family can't be rotated past the absolute lifetime cap even while
     live/unexpired, and hitting the cap revokes the whole family (OWASP absolute
@@ -168,12 +213,18 @@ def test_rotate_rejects_past_absolute_cap(engine: Engine) -> None:
     very expression it was stubbing — it would have kept passing had ``created_at`` been
     written by the DB's clock in a different timezone, which is the actual defect (B#55).
 
-    Only ``created_at`` moves; ``expires_at`` stays in the future, so the token is live on
-    the sliding TTL and the absolute cap is the sole thing rejecting it.
+    Only the revoked origin row's ``created_at`` moves: the family is rotated once first, so
+    the presented live row is fresh (inside the idle timeout) and ``expires_at`` stays in
+    the future. The absolute cap, measured from the family's first row, is the sole thing
+    rejecting it.
     """
     with Session(engine) as s:
         user = auth_service.register_user(s, email="cap@example.com", password=_PW)
-        raw = auth_service.start_session(s, user.id)
+        first = auth_service.start_session(s, user.id)
+    with Session(engine) as s:
+        rotated = auth_service.rotate_session(s, first)
+        assert rotated is not None
+        raw = rotated.refresh_token
 
     ttl = auth_service.get_settings().session_absolute_ttl_hours
     origin = clock.naive_utcnow() - timedelta(hours=ttl + 1)
@@ -182,7 +233,7 @@ def test_rotate_rejects_past_absolute_cap(engine: Engine) -> None:
         # rather than a datetime object, which raw SQL would push through sqlite3's
         # adapter — deprecated since 3.12 and not the app's storage path anyway.
         s.execute(
-            text("UPDATE sessions SET created_at = :t"),
+            text("UPDATE sessions SET created_at = :t WHERE revoked_at IS NOT NULL"),
             {"t": origin.isoformat(sep=" ")},
         )
         s.commit()
@@ -192,6 +243,54 @@ def test_rotate_rejects_past_absolute_cap(engine: Engine) -> None:
         # The whole family is revoked, not just the presented row.
         assert s.scalars(select(RefreshSession.revoked_at)).all() != []
         assert all(r is not None for r in s.scalars(select(RefreshSession.revoked_at)).all())
+
+
+def test_rotate_rejects_past_idle_timeout(engine: Engine) -> None:
+    """ADR-0003 rule 3: a family unused for 30 minutes dies. Every refresh revokes the
+    presented row and inserts a new one, so the live row's ``created_at`` is the family's
+    last use. Back-dated with raw SQL (no application symbol patched); ``expires_at`` stays
+    in the future and the 12h cap is far off, so the idle timeout alone rejects it — and
+    revokes the whole family."""
+    with Session(engine) as s:
+        user = auth_service.register_user(s, email="idle@example.com", password=_PW)
+        raw = auth_service.start_session(s, user.id)
+
+    idle = auth_service.get_settings().session_idle_timeout_minutes
+    last_used = clock.naive_utcnow() - timedelta(minutes=idle + 1)
+    with Session(engine) as s:
+        s.execute(
+            text("UPDATE sessions SET created_at = :t"),
+            {"t": last_used.isoformat(sep=" ")},
+        )
+        s.commit()
+
+    with Session(engine) as s:
+        assert auth_service.rotate_session(s, raw) is None
+        revoked = s.scalars(select(RefreshSession.revoked_at)).all()
+        assert revoked != []
+        assert all(r is not None for r in revoked)
+
+
+def test_idle_timeout_measures_from_last_refresh_not_login(engine: Engine) -> None:
+    """Control: idle is time since the last refresh, not since login. A family whose
+    login (origin row) is 2h old but which rotated a moment ago still rotates."""
+    with Session(engine) as s:
+        user = auth_service.register_user(s, email="active@example.com", password=_PW)
+        first = auth_service.start_session(s, user.id)
+    with Session(engine) as s:
+        rotated = auth_service.rotate_session(s, first)
+        assert rotated is not None
+
+    login = clock.naive_utcnow() - timedelta(hours=2)
+    with Session(engine) as s:
+        s.execute(
+            text("UPDATE sessions SET created_at = :t WHERE revoked_at IS NOT NULL"),
+            {"t": login.isoformat(sep=" ")},
+        )
+        s.commit()
+
+    with Session(engine) as s:
+        assert auth_service.rotate_session(s, rotated.refresh_token) is not None
 
 
 def test_rotate_succeeds_within_absolute_cap(engine: Engine) -> None:

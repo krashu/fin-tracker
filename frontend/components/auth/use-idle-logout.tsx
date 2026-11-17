@@ -6,10 +6,11 @@
  * Signs the user out after {@link IDLE_TIMEOUT_MS} of no real interaction, both
  * ending the session server-side and clearing the exposed financial screen.
  *
- * Why a client timer and not a shorter backend refresh TTL: the refresh window
- * slides on every silent refresh, and the dashboard's 30s poll (overview.tsx)
- * keeps refreshing a left-open tab indefinitely — so the backend never sees the
- * tab as idle. Genuine "user is idle" can only be observed from input events here.
+ * Why a client timer as well as the backend's idle timeout (ADR-0003 rule 3, the
+ * same 30 minutes): the backend observes idleness per refresh, and the dashboard's
+ * 30s poll (overview.tsx) keeps refreshing a left-open tab indefinitely — so the
+ * backend never sees the tab as idle. Genuine "user is idle" can only be observed
+ * from input events here.
  *
  * The check is interval-driven off a stored timestamp rather than a per-event
  * `setTimeout` reset: it stays cheap under a mousemove firehose and, unlike a
@@ -23,7 +24,7 @@ import { useEffect, useRef } from "react";
 
 import { useAuth, type AuthStatus } from "./auth-provider";
 
-export const IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 60 min
+export const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min, matching SESSION_IDLE_TIMEOUT_MINUTES
 const CHECK_INTERVAL_MS = 15_000;
 const WRITE_THROTTLE_MS = 5_000;
 

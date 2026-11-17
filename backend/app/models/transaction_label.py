@@ -10,8 +10,8 @@ are the isolation contract.
 
 Both FKs are ``ON DELETE CASCADE`` (SQLite honours it under
 ``PRAGMA foreign_keys=ON``; see ``app/core/db.py``): deleting a transaction OR a
-label auto-clears its link rows — that is why ``delete_transaction`` and the
-label ``DELETE`` route need no manual join cleanup.
+label auto-clears its link rows — that is why ``delete_owned_transactions`` (single, bulk and
+demo-reseed deletes) and the label ``DELETE`` route need no manual join cleanup.
 
 Writes go through ``services/transaction_labels.set_labels_on_transaction``: the
 ``user_id`` column means a plain ``secondary`` relationship can't auto-manage

@@ -32,10 +32,12 @@ import {
   createAccount,
   deleteAccount,
   listAccounts,
+  listStatementIssuers,
   patchAccount,
   type AccountCreate,
   type AccountRead,
   type AccountUpdate,
+  type StatementIssuer,
 } from "@/lib/api/client";
 import { formatMoney, rupeesToPaise } from "@/lib/format";
 import { Sensitive } from "@/components/balance-visibility";
@@ -58,20 +60,28 @@ const TYPE_LABELS: Record<AccountType, string> = {
 // for the currency-aware investment side.
 const CURRENCIES: Currency[] = ["INR"];
 
-// Mirror of backend SUPPORTED_CC_ISSUERS (app/services/import_service.py). Only
-// issuers with a registered CC statement parser belong here — a credit card with
-// any other issuer would crash at statement upload (ParserNotRegisteredError), so
-// the issuer picker below is constrained to this list. Keep in sync by hand.
-const CC_ISSUERS = [
-  { value: "axis", label: "Axis" },
-  { value: "icici", label: "ICICI" },
-] as const;
+// The issuers with a statement parser come from the server (`GET /accounts/statement-issuers`,
+// derived from the backend's parser registry), not a hand-kept mirror: a card or bank issuer
+// no parser keys on would never be found at statement upload, and a new parser then needs no
+// edit here. The list is static per deploy, so it is fetched once and never invalidated.
+function useStatementIssuers(): StatementIssuer[] {
+  const query = useQuery({
+    queryKey: ["statement-issuers"],
+    queryFn: listStatementIssuers,
+    staleTime: Infinity,
+  });
+  return query.data ?? [];
+}
 
-// Issuers are stored lowercase (the parser-dispatch key). For display, map a
-// known CC issuer to its brand-cased label; fall back to the raw value for
-// free-text issuers (e.g. "hdfc") where we have no canonical casing.
-function issuerLabel(issuer: string): string {
-  return CC_ISSUERS.find((i) => i.value === issuer)?.label ?? issuer;
+// Issuers are stored lowercase (the parser-dispatch key). For display, use the server's
+// brand-cased label; fall back to the raw value for a free-text issuer (cash, investment) or
+// a stored value no parser knows.
+function issuerLabel(issuers: StatementIssuer[], a: AccountRead): string {
+  const issuer = a.issuer ?? "";
+  return (
+    issuers.find((i) => i.account_type === a.type && i.issuer === issuer)
+      ?.label ?? issuer
+  );
 }
 
 /** The one open dialog (or none). `edit`/`archive` always carry their row. */
@@ -93,6 +103,7 @@ export function AccountsManager() {
   // without a row" combination unrepresentable.
   const [dialog, setDialog] = useState<AccountDialog>(null);
   const closeDialog = () => setDialog(null);
+  const issuers = useStatementIssuers();
 
   return (
     <Card className="max-w-3xl">
@@ -147,7 +158,7 @@ export function AccountsManager() {
                   {a.issuer ? (
                     <>
                       <span aria-hidden>·</span>
-                      <span>{issuerLabel(a.issuer)}</span>
+                      <span>{issuerLabel(issuers, a)}</span>
                     </>
                   ) : null}
                 </div>
@@ -230,6 +241,7 @@ function AccountFormDialog(props: AccountFormDialogProps) {
   // definite value is required (no non-null assertions).
   const account = props.mode === "edit" ? props.account : undefined;
   const queryClient = useQueryClient();
+  const statementIssuers = useStatementIssuers();
   const [name, setName] = useState(account?.name ?? "");
   const [type, setType] = useState<AccountType>(account?.type ?? "credit_card");
   const [currency, setCurrency] = useState<Currency>(
@@ -243,6 +255,11 @@ function AccountFormDialog(props: AccountFormDialogProps) {
   );
 
   const isCredit = type === "credit_card";
+  const isBank = type === "bank";
+  // Card and bank issuers are picked from the server's list (the parser-dispatch keys);
+  // cash and investment keep a free-text box.
+  const issuerOptions = statementIssuers.filter((i) => i.account_type === type);
+  const issuerIsListed = issuerOptions.some((i) => i.issuer === issuer);
   // An investment account is a placeholder — the backend 422s any non-zero
   // opening balance (PRD §F6), because its value is already counted as holdings.
   // Hiding the field is what keeps the only UI that can create an account from
@@ -293,15 +310,18 @@ function AccountFormDialog(props: AccountFormDialogProps) {
       // Net worth / account rows on /dashboard read the same accounts (PRD §F9);
       // nudge the dashboards query so a create/edit/archive shows there too.
       queryClient.invalidateQueries({ queryKey: ["dashboards"] });
+      // "Paid from" and archiving feed the review queue's card-bill outcome (ADR-0002 rule 7b).
+      queryClient.invalidateQueries({ queryKey: ["candidates"] });
       onClose();
     },
   });
 
   const canSubmit =
     name.trim().length > 0 &&
-    // A credit card must carry a supported issuer (the backend rejects anything
-    // else with 422); other types leave issuer optional.
-    (!isCredit || CC_ISSUERS.some((i) => i.value === issuer)) &&
+    // A credit card must carry a supported issuer and a bank either none or a supported
+    // one (the backend rejects anything else with 422); other types leave it optional.
+    (!isCredit || issuerIsListed) &&
+    (!isBank || issuer === "" || issuerIsListed) &&
     !mutation.isPending;
 
   // Only bank accounts can parent a card (backend rule 4). The list comes from
@@ -356,7 +376,15 @@ function AccountFormDialog(props: AccountFormDialogProps) {
                 <PickerButton label={TYPE_LABELS[type]}>
                   {(["credit_card", "bank", "cash", "investment"] as const).map(
                     (t) => (
-                      <DropdownMenuItem key={t} onSelect={() => setType(t)}>
+                      <DropdownMenuItem
+                        key={t}
+                        onSelect={() => {
+                          setType(t);
+                          // Each type has its own issuer list; a pick for one is not valid
+                          // for another.
+                          setIssuer("");
+                        }}
+                      >
                         {TYPE_LABELS[t]}
                       </DropdownMenuItem>
                     ),
@@ -391,15 +419,39 @@ function AccountFormDialog(props: AccountFormDialogProps) {
               <Field label="Issuer">
                 <PickerButton
                   label={
-                    CC_ISSUERS.find((i) => i.value === issuer)?.label ??
+                    issuerOptions.find((i) => i.issuer === issuer)?.label ??
                     "Select issuer…"
                   }
-                  muted={!CC_ISSUERS.some((i) => i.value === issuer)}
+                  muted={!issuerIsListed}
                 >
-                  {CC_ISSUERS.map((i) => (
+                  {issuerOptions.map((i) => (
                     <DropdownMenuItem
-                      key={i.value}
-                      onSelect={() => setIssuer(i.value)}
+                      key={i.issuer}
+                      onSelect={() => setIssuer(i.issuer)}
+                    >
+                      {i.label}
+                    </DropdownMenuItem>
+                  ))}
+                </PickerButton>
+              </Field>
+            ) : isBank ? (
+              // A bank's issuer is the same parser key, but optional: "None" keeps an
+              // account we cannot read statements for (its bank can go in the name).
+              <Field label="Issuer (optional)">
+                <PickerButton
+                  label={
+                    issuerOptions.find((i) => i.issuer === issuer)?.label ??
+                    (issuer === "" ? "None" : issuer)
+                  }
+                  muted={issuer === ""}
+                >
+                  <DropdownMenuItem onSelect={() => setIssuer("")}>
+                    None
+                  </DropdownMenuItem>
+                  {issuerOptions.map((i) => (
+                    <DropdownMenuItem
+                      key={i.issuer}
+                      onSelect={() => setIssuer(i.issuer)}
                     >
                       {i.label}
                     </DropdownMenuItem>
@@ -531,6 +583,8 @@ function ArchiveConfirm({
       // change on archive. It DOES move the row to the "archived" presentation,
       // which /dashboard reads off the same aggregate (PRD §F9).
       queryClient.invalidateQueries({ queryKey: ["dashboards"] });
+      // "Paid from" and archiving feed the review queue's card-bill outcome (ADR-0002 rule 7b).
+      queryClient.invalidateQueries({ queryKey: ["candidates"] });
       onClose();
     },
   });

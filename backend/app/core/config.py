@@ -117,18 +117,33 @@ class Settings(BaseSettings):
         default=14,
         gt=0,
         validation_alias="REFRESH_TOKEN_TTL_DAYS",
-        description="Refresh-token (sessions row) lifetime; the sliding-session window.",
+        description=(
+            "Refresh-token (sessions row) lifetime. In practice dominated by "
+            "SESSION_ABSOLUTE_TTL_HOURS and SESSION_IDLE_TIMEOUT_MINUTES, which kill the "
+            "family long before a row expires."
+        ),
+    )
+    session_idle_timeout_minutes: int = Field(
+        default=30,
+        gt=0,
+        validation_alias="SESSION_IDLE_TIMEOUT_MINUTES",
+        description=(
+            "Idle session timeout (OWASP idle timeout, ADR-0003 rule 3). A refresh family "
+            "unused for this long dies: auth_service.rotate_session measures it from the "
+            "presented live row's created_at, which is the family's last refresh."
+        ),
     )
     session_absolute_ttl_hours: int = Field(
         default=12,
         gt=0,
         validation_alias="SESSION_ABSOLUTE_TTL_HOURS",
         description=(
-            "Absolute session lifetime cap (OWASP absolute timeout). The refresh TTL bounds "
-            "*idle* lifetime (the sliding window); this bounds *total* lifetime from login — a "
-            "refresh family can't be rotated past this age no matter how active, so a stolen / "
-            "replayed refresh token can't be extended indefinitely. Enforced server-side in "
-            "auth_service.rotate_session against the family's origin (its first-issued row)."
+            "Absolute session lifetime cap (OWASP absolute timeout, ADR-0003 rule 3). "
+            "SESSION_IDLE_TIMEOUT_MINUTES bounds *idle* lifetime; this bounds *total* "
+            "lifetime from login — a refresh family can't be rotated past this age no matter "
+            "how active, so a stolen / replayed refresh token can't be extended indefinitely. "
+            "Enforced server-side in auth_service.rotate_session against the family's origin "
+            "(its first-issued row)."
         ),
     )
     cookie_secure: bool = Field(
@@ -147,25 +162,31 @@ class Settings(BaseSettings):
             "OFF by default: the demo row is stamped onto the fixed-UUID user by migration 0017 "
             "on EVERY stack (SEED_DEMO_ON_STARTUP gates the demo dataset, not the demo account), "
             "and on an upgraded or dev-seeded install that row owns the real data. Turn it on "
-            "only where a public password is acceptable — a dev box, or a throwaway showcase. "
-            "Necessary but not sufficient: see :attr:`demo_login_permitted`."
+            "only where a public password is acceptable — a dev box on plain http. Necessary "
+            "but not sufficient: see :attr:`demo_login_permitted`. A hosted demo uses "
+            "GUEST_SANDBOX_ENABLED instead."
         ),
     )
-    allow_demo_login_over_https: bool = Field(
+    guest_sandbox_enabled: bool = Field(
         default=False,
-        validation_alias="ALLOW_DEMO_LOGIN_OVER_HTTPS",
+        validation_alias="GUEST_SANDBOX_ENABLED",
         description=(
-            "Allow the demo login even when COOKIE_SECURE=true. Intended specifically for "
-            "dedicated public demo showcases (such as on FastAPI Cloud). OFF by default to "
-            "prevent accidental public credential access on real hosted deployments."
+            "Offer throwaway guest sandboxes at POST /auth/demo-session (ADR-0003 rule 15). "
+            "OFF by default. A separate gate from DEMO_LOGIN_ENABLED: a guest is a fresh, "
+            "password-less user owning only synthetic data, so unlike the shared demo login "
+            "it may run over HTTPS — this is the hosted-demo switch. Guests cannot upload "
+            "files, expire after 2h, and are capped by MAX_GUEST_ACCOUNTS."
         ),
     )
     registration_enabled: bool = Field(
-        default=True,
+        default=False,
         validation_alias="REGISTRATION_ENABLED",
         description=(
-            "Enable open user registration (POST /auth/register). Enabled by default. "
-            "Set false on demo-only deployments or private instances where signup should be closed."
+            "Keep user registration (POST /auth/register) open after the first user "
+            "(ADR-0003 rule 12). The first user can always register, so a fresh instance "
+            "is never locked out; after that registration is closed unless this is true. "
+            "Closed by default: an open register endpoint on a WAN instance is an "
+            "enumeration oracle for member emails. Set true while household members sign up."
         ),
     )
     frontend_dist_dir: str | None = Field(
@@ -190,7 +211,8 @@ class Settings(BaseSettings):
         default=True,
         validation_alias="RATE_LIMIT_ENABLED",
         description=(
-            "Enable the in-process auth-endpoint rate limiter (register/login/refresh). "
+            "Enable the in-process auth-endpoint rate limiter (register / login / refresh / "
+            "demo-session / change-password). "
             "On by default — argon2id is deliberately expensive, so an unthrottled login "
             "is both a brute-force and a CPU-DoS surface."
         ),
@@ -199,15 +221,18 @@ class Settings(BaseSettings):
         default=20,
         gt=0,
         validation_alias="AUTH_RATE_LIMIT_PER_MINUTE",
-        description="Max register/login/refresh attempts per client IP per 60s window.",
+        description=(
+            "Max register / login / refresh / demo-session / change-password attempts per "
+            "client IP per 60s window, counted per endpoint."
+        ),
     )
     max_guest_accounts: int = Field(
         default=100,
         gt=0,
         validation_alias="MAX_GUEST_ACCOUNTS",
         description=(
-            "Maximum number of active guest accounts. Reject new guest sessions "
-            "with 503 when reached."
+            "Maximum number of live (unexpired) guest accounts. Reject new guest sessions "
+            "with 503 when reached; an expired guest awaiting the sweeper holds no seat."
         ),
     )
     rate_limit_trust_proxy: bool = Field(
@@ -338,16 +363,14 @@ class Settings(BaseSettings):
     def demo_login_permitted(self) -> bool:
         """May the demo credentials authenticate?
 
-        True if explicitly opted in (`demo_login_enabled`), AND either:
-        - The transport is plain http (`not cookie_secure`), OR
-        - The operator explicitly permitted demo login over HTTPS
-          (`allow_demo_login_over_https`, e.g. for a dedicated cloud demo deployment).
+        Only when explicitly opted in (`demo_login_enabled`) AND the transport is plain
+        http (`not cookie_secure`): the shared demo login never runs over HTTPS
+        (ADR-0003 rule 14). Guest sandboxes have their own gate,
+        `guest_sandbox_enabled` (rule 15).
 
         Read by both `auth_service.authenticate` and `GET /auth/config`.
         """
-        if not self.demo_login_enabled:
-            return False
-        return not self.cookie_secure or self.allow_demo_login_over_https
+        return self.demo_login_enabled and not self.cookie_secure
 
     @model_validator(mode="after")
     def _validate_cookie_policy(self) -> Settings:

@@ -10,7 +10,7 @@
   are cleared by ``ON DELETE CASCADE`` (PRAGMA foreign_keys=ON), so no manual
   join cleanup here — contrast :mod:`app.api.v1.categories`, which **soft**-deletes
   and deliberately KEEPS its ``merchant_tag_map`` rows (an archived category's
-  rules survive and return on un-archive; the ``Category.archived_at IS NULL``
+  rules survive the one-way archive; the ``Category.archived_at IS NULL``
   filter on every read is what stops them being applied).
 
 All queries scope to ``user_id`` from :data:`CurrentUserId`. Cross-dialect 409

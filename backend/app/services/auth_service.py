@@ -14,6 +14,18 @@ Refresh rotation with reuse detection:
 * Presenting an already-revoked token (reuse — a stolen, rotated-past token) is
   treated as compromise: the **entire family** is revoked, killing any session
   an attacker spun off it. The legitimate user must log in again.
+* A family dies after ``SESSION_IDLE_TIMEOUT_MINUTES`` idle or
+  ``SESSION_ABSOLUTE_TTL_HOURS`` from login, whichever is first (ADR-0003 rule 3).
+  Every refresh revokes the presented row and inserts a new one, so the presented
+  live row's ``created_at`` is the family's last use and ``MIN(created_at)`` over
+  the family is the login time — no extra column needed.
+
+Idle precision caveat: idle is observed per refresh, and a refresh happens only
+when the access token (default 15 min) has expired. So an interactive user is
+cut off after 15–30 minutes of real inactivity, not exactly 30. An open tab that
+keeps polling (the dashboard's 30s refetch) keeps refreshing and never goes idle
+server-side; that case belongs to the frontend idle watcher
+(``frontend/components/auth/use-idle-logout.tsx``).
 """
 
 from __future__ import annotations
@@ -31,6 +43,7 @@ from app.core import clock
 from app.core.config import get_settings
 from app.core.db_errors import is_unique_violation
 from app.core.demo import DEMO_EMAIL
+from app.core.log_config import get_logger
 from app.core.security import (
     generate_refresh_token,
     hash_password,
@@ -42,6 +55,9 @@ from app.services.provisioning import (
     provision_default_categories,
     provision_seed_merchant_dictionary,
 )
+from app.services.user_teardown import teardown_user
+
+logger = get_logger(__name__)
 
 # A throwaway argon2 hash verified against on the user-not-found login path so a
 # missing email and a wrong password take the same time (no timing oracle). Minted
@@ -61,6 +77,13 @@ class RotatedSession(NamedTuple):
 
 def normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+def can_manage_credentials(user: User) -> bool:
+    """Whether ``user`` may change its password or delete itself (ADR-0003 rules 13, 13b):
+    false for a guest sandbox and for the shared demo login, true for everyone else.
+    The one predicate behind both 403s and ``UserRead.can_manage_credentials``."""
+    return not user.is_guest and (user.email is None or normalize_email(user.email) != DEMO_EMAIL)
 
 
 # --- registration / login ----------------------------------------------------
@@ -119,7 +142,8 @@ def authenticate(session: Session, *, email: str, password: str) -> User | None:
         verify_password(password, _DUMMY_HASH)  # equalize timing
         return None
     # The demo account ships a source-published password, so it authenticates only where
-    # the operator has explicitly opted in AND the transport is plain http
+    # the operator has explicitly opted in AND the transport is plain http — never over
+    # HTTPS, whatever the flags (ADR-0003 rule 14; guest sandboxes are a separate gate)
     # (Settings.demo_login_permitted — the same expression GET /auth/config reads, so the
     # button and this 401 can't disagree). Refused by default. Dummy verify keeps timing
     # equal to a normal wrong-password.
@@ -129,6 +153,28 @@ def authenticate(session: Session, *, email: str, password: str) -> User | None:
     if not verify_password(password, user.password_hash):
         return None
     return user
+
+
+def has_registered_user(session: Session) -> bool:
+    """Has any real user registered yet? (ADR-0003 rule 12's first-user bootstrap.)
+
+    A real user is a non-guest with an email other than the demo account's — the
+    demo row is stamped on every install by migration 0017, and guests are
+    throwaway, so neither closes first-user registration. An identity lookup on
+    ``users``, exempt from the user_id predicate rule.
+    """
+    return (
+        session.scalar(
+            select(User.id)
+            .where(
+                User.is_guest.is_(False),
+                User.email.is_not(None),
+                User.email != normalize_email(DEMO_EMAIL),
+            )
+            .limit(1)
+        )
+        is not None
+    )
 
 
 # --- refresh-token lifecycle -------------------------------------------------
@@ -160,8 +206,8 @@ def rotate_session(session: Session, raw_token: str) -> RotatedSession | None:
         session.commit()
         return None
 
-    # Absolute session cap (OWASP absolute timeout). The sliding refresh TTL above
-    # bounds *idle* lifetime; this bounds *total* lifetime from login, so a stolen /
+    # Absolute session cap (OWASP absolute timeout). The idle check below bounds
+    # *idle* lifetime; this bounds *total* lifetime from login, so a stolen /
     # replayed refresh token can't be rotated forever. Origin = the family's
     # first-issued row: rotation copies family_id but each row gets a fresh
     # created_at, so MIN(created_at) stays pinned to the login/mint time.
@@ -173,6 +219,15 @@ def rotate_session(session: Session, raw_token: str) -> RotatedSession | None:
     )
     if origin is not None and clock.naive_utcnow() - origin >= timedelta(
         hours=get_settings().session_absolute_ttl_hours
+    ):
+        _revoke_family(session, row.family_id)
+        session.commit()
+        return None
+
+    # Idle timeout (OWASP idle timeout, ADR-0003 rule 3). This live row was minted by
+    # the family's last refresh (or the login), so its created_at is the last use.
+    if clock.naive_utcnow() - row.created_at >= timedelta(
+        minutes=get_settings().session_idle_timeout_minutes
     ):
         _revoke_family(session, row.family_id)
         session.commit()
@@ -211,6 +266,22 @@ def rotate_session(session: Session, raw_token: str) -> RotatedSession | None:
     new_token = _issue(session, user_id=row.user_id, family_id=row.family_id, commit=False)
     session.commit()
     return RotatedSession(user_id=row.user_id, refresh_token=new_token)
+
+
+def delete_account(session: Session, *, user: User, password: str) -> bool:
+    """Erase the user and everything they own, in one transaction. Commits.
+
+    Returns ``False`` when ``password`` doesn't match (caller -> 400, nothing deleted).
+    Teardown removes the ``sessions`` rows too, so every refresh family dies; an access JWT
+    still in flight 401s because its user row is gone. Don't touch ``user`` afterwards.
+    """
+    if user.password_hash is None or not verify_password(password, user.password_hash):
+        return False
+    user_id = user.id
+    teardown_user(session, user_id)
+    session.commit()
+    logger.info("account_deleted", user_id=str(user_id))
+    return True
 
 
 def change_password(

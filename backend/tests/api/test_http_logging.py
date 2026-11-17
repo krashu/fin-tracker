@@ -243,6 +243,22 @@ def test_pii_processor_scrubs_card_number_in_exception_string() -> None:
     assert "***" in out["exception"]
 
 
+@pytest.mark.parametrize("aadhaar", ["2345 6789 0123", "2345-6789-0123", "234567890123"])
+def test_pii_processor_scrubs_aadhaar_in_exception_string(aadhaar: str) -> None:
+    out = mask_pii(None, "info", {"exception": f"ValueError: aadhaar {aadhaar} rejected"})
+    assert out["exception"] == "ValueError: aadhaar *** rejected"
+
+
+def test_pii_processor_aadhaar_rule_leaves_other_digit_runs_to_their_own_rule() -> None:
+    # A 13-digit run is neither a card nor an Aadhaar: \b keeps the 12-digit
+    # pattern from matching inside it. A 16-digit card is masked whole by the
+    # card rule (it runs first), never half-eaten by the Aadhaar rule.
+    thirteen = mask_pii(None, "info", {"exception": "ref 2345678901234 failed"})
+    assert thirteen["exception"] == "ref 2345678901234 failed"
+    card = mask_pii(None, "info", {"exception": "card 4111 1111 1111 1111 declined"})
+    assert card["exception"] == "card *** declined"
+
+
 def test_pii_processor_passes_through_unrelated_fields() -> None:
     payload = {"event": "hi", "duration_ms": 1.5, "status_code": 200, "method": "GET"}
     # Copy so the assertion compares to the original shape, not a mutated one

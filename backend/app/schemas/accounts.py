@@ -27,7 +27,7 @@ The additive backup-CSV import (``app.services.backup_import_service``) is
 deliberately **not** guarded by any of this — it constructs ``Account``
 directly, and it resolves a transaction's account by name with no type
 check either. Same ruling, and for the same reason, as the CC-issuer gate
-at ``app.api.v1.accounts._assert_cc_issuer_or_422``: a restore round-trips
+at ``app.api.v1.accounts._assert_issuer_or_422``: a restore round-trips
 the user's own export (PRD §F10, non-destructive), so rejecting a
 historical row would break it. Don't "fix" it into a boundary guard.
 
@@ -42,8 +42,9 @@ for v2 forward-compat — the gate is a validator here, not a DB constraint.
 ``"axis"``, ``"icici"``) can find the right parser. A user POSTing
 ``{"issuer": "Axis"}`` would otherwise create an account that crashes
 at upload time with ``LookupError``. For ``credit_card`` accounts the
-issuer must additionally be one of ``SUPPORTED_CC_ISSUERS`` — enforced in
-the route (``app.api.v1.accounts._assert_cc_issuer_or_422``), not here,
+issuer must additionally be one of ``SUPPORTED_CC_ISSUERS``, and a ``bank``'s
+issuer is either null or one of ``SUPPORTED_BANK_ISSUERS`` — enforced in
+the route (``app.api.v1.accounts._assert_issuer_or_422``), not here,
 because ``AccountUpdate`` has no ``type`` field and so can't self-validate
 the type-conditional rule (same reason ``parent_account_id`` validation is
 route-level).
@@ -83,11 +84,13 @@ the same problem is :func:`app.api.v1.transactions._assert_category_id_or_422`
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.models.account import AccountTypeStr, CurrencyStr
+from app.models.account import Account, AccountTypeStr, CurrencyStr
 from app.schemas._common import reject_null_name
+from app.services.import_service import statement_import_supported
 
 
 class AccountCreate(BaseModel):
@@ -129,7 +132,12 @@ class AccountCreate(BaseModel):
 
 
 class AccountRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    """An account as the API returns it.
+
+    Built with :meth:`from_account`, not ``from_attributes``: ``statement_import_supported`` is
+    not a column, it is derived from the parser registry, so an ORM row cannot validate into
+    this model by itself (a route that forgot would fail loudly, not ship a missing field).
+    """
 
     id: int
     name: str
@@ -140,6 +148,37 @@ class AccountRead(BaseModel):
     currency: CurrencyStr
     parent_account_id: int | None
     archived_at: datetime | None
+    # Whether an uploaded statement for this account has a parser, server-derived from
+    # ``import_service.PARSERS`` (the same lookup an upload dispatches on) so the frontend never
+    # re-derives the rule by matching issuer names.
+    statement_import_supported: bool
+
+    @classmethod
+    def from_account(cls, account: Account) -> AccountRead:
+        return cls(
+            id=account.id,
+            name=account.name,
+            type=account.type,
+            issuer=account.issuer,
+            last4=account.last4,
+            opening_balance_paise=account.opening_balance_paise,
+            currency=account.currency,
+            parent_account_id=account.parent_account_id,
+            archived_at=account.archived_at,
+            statement_import_supported=statement_import_supported(account.type, account.issuer),
+        )
+
+
+class StatementIssuerRead(BaseModel):
+    """One ``(account type, issuer)`` a statement parser exists for, with its display label.
+
+    The issuer pickers render these instead of a hand-mirrored list, so a new parser needs no
+    frontend edit (``import_service.statement_issuers``).
+    """
+
+    account_type: Literal["credit_card", "bank"]
+    issuer: str
+    label: str
 
 
 class AccountUpdate(BaseModel):

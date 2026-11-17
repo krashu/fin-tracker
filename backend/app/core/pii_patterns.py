@@ -21,6 +21,11 @@ Scope notes:
   ``PII_PATTERNS`` — the card + PAN halves are pinned equal by
   ``tests/test_fixture_redaction.test_redact_script_pattern_parity``,
   so a one-sided edit fails CI rather than drifting silently.
+* 12-digit Aadhaar numbers (first digit 2-9, optional space / hyphen
+  groups of four) are masked in logs only (ADR-0003 rule 17). They are
+  NOT part of the fixture-redaction guard or ``scripts/redact_fixture.py``;
+  :func:`app.core.log_config.mask_pii` applies them after the card rule, so
+  a 16-digit card is masked whole before the 12-digit pattern sees it.
 """
 
 from __future__ import annotations
@@ -29,3 +34,4 @@ import re
 
 PAN_RE = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
 CARD_RE = re.compile(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")
+AADHAAR_RE = re.compile(r"\b[2-9]\d{3}[-\s]?\d{4}[-\s]?\d{4}\b")

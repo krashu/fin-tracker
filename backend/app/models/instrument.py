@@ -30,7 +30,11 @@ current value as unavailable, and clearing the NAV clears its valuation date wit
 ``currency`` reuses the accounts enum; the investment side supports INR + USD and the
 currency is part of the active-symbol identity above (so a cross-listed ticker can be held
 in both). ``asset_class`` and ``exchange`` use ``Enum(native_enum=False)`` for the same
-SQLite→Postgres portability reason as the spend tables.
+SQLite→Postgres portability reason as the spend tables. Two CHECKs fix the currency of some
+classes: ``us_equity``/``us_etf`` are USD, ``indian_equity``/``indian_mf``/``nps`` are INR;
+``fd``, ``bond``, ``gold`` and ``other`` take either. The instrument API (422) and the CSV
+parser (row skipped) check first, so a bad value never reaches the DB as a 500 or an aborted
+file.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal, get_args
 
-from sqlalchemy import Enum, ForeignKey, Index, String, text
+from sqlalchemy import CheckConstraint, Enum, ForeignKey, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.account import CurrencyStr
@@ -58,6 +62,29 @@ AssetClassStr = Literal[
     "gold",
     "other",
 ]
+# Asset classes whose currency is fixed (PRD §F7). One list for the DB CHECKs below, the
+# instrument API validator, the investment CSV parser and ``GET /instruments/asset-classes``
+# (through :func:`class_currencies`), which sends the rule to the frontend.
+USD_ASSET_CLASSES: tuple[AssetClassStr, ...] = ("us_equity", "us_etf")
+INR_ASSET_CLASSES: tuple[AssetClassStr, ...] = ("indian_equity", "indian_mf", "nps")
+
+
+def class_currencies(asset_class: AssetClassStr) -> tuple[CurrencyStr, ...]:
+    """The currencies ``asset_class`` may carry: one for a fixed class, both for the rest."""
+    if asset_class in USD_ASSET_CLASSES:
+        return ("USD",)
+    if asset_class in INR_ASSET_CLASSES:
+        return ("INR",)
+    return ("INR", "USD")
+
+
+def _in_list(classes: tuple[str, ...]) -> str:
+    return ", ".join(f"'{c}'" for c in classes)
+
+
+_USD_ONLY = f"asset_class NOT IN ({_in_list(USD_ASSET_CLASSES)}) OR currency = 'USD'"
+_INR_ONLY = f"asset_class NOT IN ({_in_list(INR_ASSET_CLASSES)}) OR currency = 'INR'"
+
 ExchangeStr = Literal["NSE", "BSE", "MFCentral", "NASDAQ", "NYSE", "OTHER"]
 
 
@@ -73,6 +100,11 @@ class Instrument(Base, TimestampMixin):
             sqlite_where=text("archived_at IS NULL"),
             postgresql_where=text("archived_at IS NULL"),
         ),
+        # ADR-0003 rule 10: the (id, user_id) target of the same-user composite FK from
+        # investment_transactions.instrument_id.
+        Index("uq_instruments_id_user", "id", "user_id", unique=True),
+        CheckConstraint(_USD_ONLY, name="usd_only_asset_class"),
+        CheckConstraint(_INR_ONLY, name="inr_only_asset_class"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

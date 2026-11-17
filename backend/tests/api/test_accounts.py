@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models import Account, User
 from app.models.account import AccountTypeStr
 from app.schemas import NET_WORTH_EXCLUDED_TYPES
+from app.services import import_service
 
 
 def _post(client: TestClient, payload: dict[str, object]) -> tuple[int, dict[str, object]]:
@@ -327,6 +328,74 @@ def test_create_bank_no_issuer(
     assert body["issuer"] is None
 
 
+def test_create_bank_unsupported_issuer_rejected(
+    client: TestClient,
+    seeded_user: User,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """A bank issuer is the parser-dispatch key too: one we have no parser for is refused, so
+    "HDFC Bank" can no longer be stored where no parser would ever find it."""
+    for issuer in ("kotak", "HDFC Bank"):
+        status_code, body = _post(client, {"name": "Savings", "type": "bank", "issuer": issuer})
+        assert status_code == 422
+        expected = f"bank issuer must be one of: {', '.join(import_service.SUPPORTED_BANK_ISSUERS)}"
+        assert expected in str(body["detail"])
+    with session_factory() as s:
+        assert s.scalar(select(func.count()).select_from(Account)) == 0
+
+
+def test_create_bank_with_a_parsed_issuer(client: TestClient, seeded_user: User) -> None:
+    status_code, body = _post(client, {"name": "HDFC Savings", "type": "bank", "issuer": "HDFC"})
+    assert status_code == 201
+    assert (body["issuer"], body["statement_import_supported"]) == ("hdfc", True)
+
+
+def test_patch_bank_issuer_to_a_parsed_bank(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    bank = _seed_account(session, seeded_user.id, name="Savings", type="bank", issuer=None)
+    status_code, body = _patch(client, bank.id, {"issuer": "hdfc"})
+    assert (status_code, body["issuer"], body["statement_import_supported"]) == (200, "hdfc", True)
+    status_code, _ = _patch(client, bank.id, {"issuer": "kotak"})
+    assert status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("type", "issuer", "expected"),
+    [
+        ("credit_card", "axis", True),
+        ("bank", "hdfc", True),
+        ("bank", "axis", True),
+        ("bank", None, False),
+        ("cash", None, False),
+        ("bank", "zeta", False),  # a stored value no parser knows (e.g. from a backup restore)
+    ],
+)
+def test_statement_import_supported_follows_parsers(
+    type: AccountTypeStr,
+    issuer: str | None,
+    expected: bool,
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    _seed_account(session, seeded_user.id, name="Probe", type=type, issuer=issuer)
+    rows = client.get("/api/v1/accounts").json()
+    assert [r["statement_import_supported"] for r in rows] == [expected]
+
+
+def test_statement_issuers_lists_every_parser(client: TestClient, seeded_user: User) -> None:
+    resp = client.get("/api/v1/accounts/statement-issuers")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert {(r["account_type"], r["issuer"]) for r in rows} == {
+        (atype, issuer) for (issuer, atype) in import_service.PARSERS
+    }
+    assert {"account_type": "bank", "issuer": "hdfc", "label": "HDFC"} in rows
+
+
 def test_create_account_duplicate_name_returns_409(
     client: TestClient,
     seeded_user: User,
@@ -456,6 +525,7 @@ def test_list_accounts_response_shape(
         "currency",
         "parent_account_id",
         "archived_at",
+        "statement_import_supported",
     }
     assert "user_id" not in rows[0]
 
@@ -804,7 +874,7 @@ def test_patch_account_non_cc_self_with_parent_rejected(
 ) -> None:
     """A bank account trying to set a parent → 422 (only CCs can have parents)."""
     bank_a = _seed_account(session, seeded_user.id, name="HDFC", type="bank", issuer="hdfc")
-    bank_b = _seed_account(session, seeded_user.id, name="ICICI", type="bank", issuer="icici")
+    bank_b = _seed_account(session, seeded_user.id, name="ICICI", type="bank", issuer=None)
 
     status_code, body = _patch(client, bank_b.id, {"parent_account_id": bank_a.id})
     assert status_code == 422

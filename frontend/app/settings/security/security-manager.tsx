@@ -11,6 +11,10 @@
  * now-revoked cookie → `onAuthFailure` bounces the whole browser to /login before
  * the fresh Set-Cookie lands. Low probability for single-user self-host; the cost is
  * one re-login, cheaper than serializing the app around the mutation.
+ *
+ * Renders from `user.can_manage_credentials` (server-computed): the demo account and
+ * guests get a notice instead of a form that could only 403. Nothing renders until the
+ * user is known.
  */
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
@@ -57,6 +61,23 @@ export function SecurityManager() {
     if (!canSubmit) return;
     setDone(false);
     mutation.mutate();
+  }
+
+  // Until /auth/me lands there is nothing to decide: render neither the form nor the notice.
+  if (!user) return null;
+  if (!user.can_manage_credentials) {
+    return (
+      <Card className="max-w-xl">
+        <CardHeader>
+          <CardTitle>Change password</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-[12.5px] text-muted-foreground">
+            The demo account and guest sandboxes have no password to change.
+          </p>
+        </CardContent>
+      </Card>
+    );
   }
 
   return (

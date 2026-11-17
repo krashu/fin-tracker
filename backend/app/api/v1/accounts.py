@@ -40,14 +40,22 @@ from app.api.deps import CurrentUserId, SessionDep
 from app.core import clock
 from app.core.db_errors import is_unique_violation
 from app.models import Account
-from app.schemas import AccountCreate, AccountRead, AccountUpdate
-from app.services.import_service import SUPPORTED_CC_ISSUERS
+from app.schemas import AccountCreate, AccountRead, AccountUpdate, StatementIssuerRead
+from app.services.import_service import (
+    SUPPORTED_BANK_ISSUERS,
+    SUPPORTED_CC_ISSUERS,
+    statement_issuers,
+)
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
 
-def _assert_cc_issuer_or_422(account_type: str, issuer: str | None) -> None:
-    """A ``credit_card`` must carry an issuer we can parse statements for.
+def _assert_issuer_or_422(account_type: str, issuer: str | None) -> None:
+    """The issuer is the parser-dispatch key, so it must be one a parser is registered for.
+
+    A ``credit_card`` must carry a supported issuer. A ``bank`` may carry none, but a non-null
+    issuer must be a supported one: an issuer no parser keys on (``"HDFC Bank"`` for ``hdfc``)
+    would never be found at upload. Other account types stay free text.
 
     ``issuer`` is already lowercased by the schema validator before this runs,
     so the membership check is exact. Without this guard, a credit card with an
@@ -63,6 +71,11 @@ def _assert_cc_issuer_or_422(account_type: str, issuer: str | None) -> None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"credit_card issuer must be one of: {', '.join(SUPPORTED_CC_ISSUERS)}",
+        )
+    if account_type == "bank" and issuer is not None and issuer not in SUPPORTED_BANK_ISSUERS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"bank issuer must be one of: {', '.join(SUPPORTED_BANK_ISSUERS)} (or none)",
         )
 
 
@@ -81,8 +94,8 @@ def create_account(
     payload: AccountCreate,
     session: SessionDep,
     user_id: CurrentUserId,
-) -> Account:
-    _assert_cc_issuer_or_422(payload.type, payload.issuer)
+) -> AccountRead:
+    _assert_issuer_or_422(payload.type, payload.issuer)
     account = Account(
         user_id=user_id,
         name=payload.name,
@@ -107,20 +120,35 @@ def create_account(
             ) from e
         raise
     session.refresh(account)
-    return account
+    return AccountRead.from_account(account)
+
+
+@router.get("/statement-issuers", response_model=list[StatementIssuerRead])
+def list_statement_issuers(user_id: CurrentUserId) -> list[StatementIssuerRead]:
+    """Every ``(account type, issuer)`` a statement parser exists for, with its label.
+
+    The account forms render their issuer pickers from this. It is the same for every user (the
+    parser registry is code), but sits behind auth like the rest of ``/accounts``.
+    """
+    return [
+        StatementIssuerRead.model_validate(
+            {"account_type": atype, "issuer": issuer, "label": label}
+        )
+        for atype, issuer, label in statement_issuers()
+    ]
 
 
 @router.get("", response_model=list[AccountRead])
 def list_accounts(
     session: SessionDep,
     user_id: CurrentUserId,
-) -> list[Account]:
+) -> list[AccountRead]:
     stmt = (
         select(Account)
         .where(Account.user_id == user_id, Account.archived_at.is_(None))
         .order_by(Account.name.asc())
     )
-    return list(session.scalars(stmt))
+    return [AccountRead.from_account(a) for a in session.scalars(stmt)]
 
 
 @router.patch("/{account_id}", response_model=AccountRead)
@@ -129,7 +157,7 @@ def update_account(
     payload: AccountUpdate,
     session: SessionDep,
     user_id: CurrentUserId,
-) -> Account:
+) -> AccountRead:
     account = session.scalar(
         select(Account).where(
             Account.id == account_id,
@@ -151,14 +179,14 @@ def update_account(
     # with a null/unsupported stored issuer can't have any field patched (even a
     # rename) without supplying a valid issuer — the guard 422s on the unchanged
     # stored value. Intended: it pushes a broken account toward repair.
-    _assert_cc_issuer_or_422(account.type, updates.get("issuer", account.issuer))
+    _assert_issuer_or_422(account.type, updates.get("issuer", account.issuer))
     if not updates:
         # Empty body — no DB round-trip, no spurious updated_at bump.
-        return account
+        return AccountRead.from_account(account)
     # Idempotency short-circuit: every supplied field already equals the
     # current value → no-op. Mirrors categories.py's same-name short-circuit.
     if all(getattr(account, k) == v for k, v in updates.items()):
-        return account
+        return AccountRead.from_account(account)
 
     if "parent_account_id" in updates and updates["parent_account_id"] is not None:
         _assert_parent_account_or_422(
@@ -182,7 +210,7 @@ def update_account(
             ) from e
         raise
     session.refresh(account)
-    return account
+    return AccountRead.from_account(account)
 
 
 def _assert_parent_account_or_422(

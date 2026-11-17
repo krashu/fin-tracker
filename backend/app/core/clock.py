@@ -1,33 +1,25 @@
-"""One answer to "what time is it".
+"""One answer to "what time is it" (ADR-0001 rules 5b and 5c).
 
-Before this module there were five coexisting implementations of the current instant, and the
-naive-UTC rule that ties them together lived only as prose in three docstrings — so every write
-site re-derived it and ``ty`` could not see the difference (aware and naive are both
-``datetime``). The concrete breakage that follows from that: ``confirmed_at`` is WRITTEN aware
-(``api/v1/transactions.py``, ``api/v1/imports.py``) and READ BACK NAIVE from SQLite, so any
-sub-day comparison written as ``datetime.now(UTC) - txn.confirmed_at`` raises ``TypeError`` on
-real data while passing every test that never re-reads the column.
+Three functions, and the rule for which one to call:
 
-Two functions, because the DB genuinely holds both shapes today:
+* :func:`naive_utcnow` — the current instant as naive UTC. **The only thing written to a
+  ``DateTime`` column**, and the only shape Python compares against one (SQLite hands every
+  column back naive). Aware is not portable: the columns are ``TIMESTAMP WITHOUT TIME ZONE``
+  on Postgres, which assignment-casts an aware bind through the server's ``TimeZone`` and
+  stores local wall-clock — SQLite silently drops the offset, so no SQLite test would see it.
+  :func:`app.models.base.utcnow_default` writes ``created_at`` / ``updated_at`` / both
+  ``last_used`` columns through it; ``confirmed_at``, ``archived_at`` and the ``sessions``
+  arithmetic in :mod:`app.services.auth_service` call it directly. The gate is
+  ``tests/services/test_datetime_boundary.py`` (and the aware-write guard every API test's
+  route session carries); ``ty`` cannot help, since aware and naive are both ``datetime``.
+* :func:`utcnow` — the same instant, timezone-AWARE. Only for values that never reach a
+  column: a JWT claim, a filename, a JSON string.
+* :func:`today` — the IST business date (:data:`BUSINESS_TZ`). Instants stay UTC; only the
+  calendar is Indian.
 
-* :func:`utcnow` — timezone-AWARE UTC. SQLite's ``DATETIME`` bind processor formats the fields
-  and drops the tzinfo, so on SQLite what lands on disk is naive UTC either way. **That is a
-  SQLite-only guarantee**: the same columns are ``TIMESTAMP WITHOUT TIME ZONE`` on Postgres,
-  which assignment-casts an aware bind through the server's ``TimeZone`` setting and stores
-  local wall-clock. So aware is safe only for a column nothing does Python arithmetic on.
-* :func:`naive_utcnow` — the same instant with tzinfo stripped, and therefore
-  dialect-independent. Used by the ``sessions`` table's hand-written arithmetic in
-  :mod:`app.services.auth_service` and by :func:`app.models.base.utcnow_default`, which writes
-  ``created_at`` / ``updated_at`` / both ``last_used`` columns. Prefer it for anything Python
-  reads back and computes on.
-
-``naive_utcnow`` delegates to ``utcnow`` deliberately: patching ``clock.utcnow`` in a test moves
-the JWT clock and the session clock TOGETHER. That was impossible before — the two seams were
-private symbols in different modules with opposite tz conventions, so patching the one that
-advertised itself as the seam proved nothing about ``rotate_session``.
-
-It is also expected to be TRANSITIONAL. Remediation steps 11-13 move the DB-side arithmetic and
-settle the naive/aware convention; ``naive_utcnow`` should not be read as the settled answer.
+``naive_utcnow`` and ``today`` both delegate to ``utcnow`` deliberately: patching
+``clock.utcnow`` in a test moves the JWT clock, the session clock and the business date
+TOGETHER.
 
 Import the MODULE, not the functions — ``from app.core import clock`` then ``clock.utcnow()``.
 A ``from``-import binds the name into each consumer's namespace, which would force a test to
@@ -50,7 +42,13 @@ DELIBERATELY NOT OWNED HERE, so the "one answer" claim stays honest:
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
+
+# The business timezone, Asia/Kolkata, as a fixed +05:30 offset (ADR-0001 rule 5c). India has
+# observed no DST since 1945, so the offset is exact for every date the app holds and needs no
+# IANA database (``tzdata`` is absent from slim containers and Windows). A constant, not a
+# setting: the app's calendar (business date, financial year) is Indian by definition.
+BUSINESS_TZ = timezone(timedelta(hours=5, minutes=30), "IST")
 
 
 def utcnow() -> datetime:
@@ -59,21 +57,23 @@ def utcnow() -> datetime:
 
 
 def today() -> date:
-    """Today's date in UTC — never the server's local date.
+    """The business date: today in India (IST), whatever the host's timezone.
 
-    ``date.today()`` reads the *host's* timezone, so the native (IST) and Docker (UTC)
-    deployments reported different staleness numbers for identical data at the same instant.
-    Every date fed to an ``as_of`` anchor comes from here so the two agree.
+    Instants stay UTC; only the *date* is Indian. Between 18:30 and 24:00 UTC the UTC date
+    is still yesterday in India, which would misdate NAV stamps, holdings ``as_of`` anchors
+    and the financial-year boundary on 1 April. ``date.today()`` is no answer either: it
+    reads the *host's* timezone, so the native (IST) and Docker (UTC) deployments disagreed
+    on the same data. Every date fed to an ``as_of`` anchor comes from here.
 
     Delegates to :func:`utcnow`, so patching ``clock.utcnow`` freezes this too.
     """
-    return utcnow().date()
+    return utcnow().astimezone(BUSINESS_TZ).date()
 
 
 def naive_utcnow() -> datetime:
     """The current instant as naive UTC — tzinfo stripped, never local time.
 
-    Only for hand-written comparisons against columns SQLite hands back naive. Delegates to
-    :func:`utcnow` so one patch moves both clocks.
+    What every ``DateTime`` column write and comparison uses (ADR-0001 rule 5b). Delegates
+    to :func:`utcnow` so one patch moves both clocks.
     """
     return utcnow().replace(tzinfo=None)

@@ -61,8 +61,9 @@ class MerchantLabelMap(Base, TimestampMixin):
     # (unchecked on NULL) and the same-user isolation would collapse.
     user_id: Mapped[uuid.UUID] = mapped_column()
     # 512 to match transactions.merchant_normalized / merchant_tag_map (see
-    # migration 0020): normalize_merchant is length-unbounded, so a long parsed
-    # merchant must not overflow on Postgres (SQLite ignores the cap).
+    # migration 0020). Every write boundary refuses a merchant that normalizes past
+    # this width, never truncating (ADR-0006 rule 3b; services.merchant.MERCHANT_MAX_CHARS);
+    # SQLite ignores the cap.
     merchant_normalized: Mapped[str] = mapped_column(String(512))
     label_id: Mapped[int] = mapped_column()
     hit_count: Mapped[int] = mapped_column(default=1, server_default=text("1"))

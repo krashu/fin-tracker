@@ -14,6 +14,7 @@ describe("accounts helpers", () => {
       opening_balance_paise: 0,
       parent_account_id: null,
       archived_at: null,
+      statement_import_supported: false,
     };
     expect(accountLabel(accWithLast4)).toBe("HDFC Regalia ··4321");
 

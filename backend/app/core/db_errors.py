@@ -7,21 +7,22 @@ Centralising the *algorithm* — not the per-constraint index/column data, which
 inherent — means a future hardening (a new dialect's error format, say) lands once.
 
 :func:`savepoint_insert` centralises the ``begin_nested()`` insert-race dance the
-merchant-map / label upserts each hand-rolled, so the Postgres v2 ``ON CONFLICT``
-cutover (and any flush-timing fix) is a single edit.
+rule-pin writes (``pin_tag`` / ``pin_label``) share.
 
 :func:`insert_skip_existing` centralises the dialect-aware ``ON CONFLICT DO NOTHING``
 bulk insert the external-source backfills (``fx_rates``, ``benchmark_nav``) each had
-their own byte-identical copy of. It holds the only runtime
-``if dialect == "sqlite" / elif "postgresql"`` fork in ``app/``, which is precisely
-the code a Postgres cutover must revisit — see ADR-0001.
+their own byte-identical copy of; :func:`insert_or_increment` is the single-statement
+``ON CONFLICT DO UPDATE`` counter bump behind ``record_tag`` / ``record_label``
+(ADR-0004 rule 7). Both build their statement through :func:`_dialect_insert`, the only
+runtime ``if dialect == "sqlite" / elif "postgresql"`` fork in ``app/`` — precisely the
+code a Postgres cutover must revisit (ADR-0001 rule 6).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
-from sqlalchemy import Insert
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Session
 
@@ -63,25 +64,19 @@ def savepoint_insert(
     ``False`` on a recognised unique-conflict (the caller then refetches the
     winner). Re-raise any other ``IntegrityError``.
 
-    Centralises the ``begin_nested()`` insert-race dance the merchant→category /
-    merchant→label upserts each repeated. The SAVEPOINT's ``__exit__`` flush
-    surfaces the ``IntegrityError`` here (not at the outer commit); on the
-    recognised conflict the savepoint rolls back ONLY the failed INSERT, leaving
-    the parent transaction — and the caller's other pending state — intact.
+    Centralises the ``begin_nested()`` insert-race dance the rule pins repeat. The
+    SAVEPOINT's ``__exit__`` flush surfaces the ``IntegrityError`` here (not at the
+    outer commit); on the recognised conflict the savepoint rolls back ONLY the
+    failed INSERT, leaving the parent transaction — and the caller's other pending
+    state — intact.
     ``is_conflict`` is the per-constraint predicate (built on
     :func:`is_unique_violation`), so anything else — an FK failure, a future
     second constraint — re-raises rather than being silently swallowed.
 
-    Postgres v2 is **not** one edit here, despite what this docstring used to claim.
-    Scoping it honestly: (a) a native ``INSERT ... ON CONFLICT DO UPDATE`` needs the
-    SET expression passed in, which this ``(session, instance, is_conflict) -> bool``
-    signature has no channel for — the increment is per-model (``hit_count += 1``,
-    ``last_used``); (b) two of the callers want different post-conflict semantics
-    anyway — ``pin_tag`` / ``pin_label`` refetch-and-set ``pinned`` and RAISE on a
-    refetch miss, deliberately not bumping ``hit_count``, while ``record_*`` logs and
-    returns. One edit inside this function cannot produce all three behaviours.
-    (c) The cutover also spans :func:`insert_skip_existing` below and
-    ``import_service``'s occurrence loop. See ADR-0001.
+    Used by ``pin_tag`` / ``pin_label``, which refetch-and-set ``pinned`` after a
+    conflict (and RAISE on a refetch miss), deliberately not bumping ``hit_count``.
+    The counter bumps (``record_tag`` / ``record_label``) are a single
+    :func:`insert_or_increment` statement instead and never reach this helper.
     """
     try:
         with session.begin_nested():
@@ -91,6 +86,23 @@ def savepoint_insert(
         if not is_conflict(e.orig):
             raise
         return False
+
+
+def _dialect_insert(
+    session: Session, model: type[DeclarativeBase], *, label: str
+) -> sqlite.Insert | postgresql.Insert:
+    """The dialect's ``insert(model)`` — the only runtime dialect fork in ``app/``.
+
+    SQLAlchemy offers ``on_conflict_do_*`` only on the dialect-specific ``Insert``, so
+    every upsert goes through here; a third dialect, or the Postgres cutover, lands
+    once. ``label`` names the caller in the unsupported-dialect error.
+    """
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        return sqlite.insert(model)
+    if dialect == "postgresql":
+        return postgresql.insert(model)
+    raise RuntimeError(f"{label} upsert: unsupported dialect {dialect!r}")  # pragma: no cover
 
 
 def insert_skip_existing(
@@ -111,21 +123,40 @@ def insert_skip_existing(
     Portable across the roadmapped SQLite (v1) → Postgres (v2) move. The mapped
     column's bind processor applies to the executemany, so scaled types (``FxRate``
     on ``rate``, ``PriceNative`` on ``nav``) still convert on the way in.
-
-    This is the only runtime dialect fork in ``app/``; a third dialect, a switch to
-    ``DO UPDATE``, or any fix to the bind-processor assumption above lands here once
-    rather than in each caller.
     """
-    dialect = session.get_bind().dialect.name
-    stmt: Insert
-    if dialect == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-        stmt = sqlite_insert(model).on_conflict_do_nothing(index_elements=conflict_cols)
-    elif dialect == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-        stmt = pg_insert(model).on_conflict_do_nothing(index_elements=conflict_cols)
-    else:  # pragma: no cover - only SQLite (v1) / Postgres (v2) are supported
-        raise RuntimeError(f"{label} upsert: unsupported dialect {dialect!r}")
+    stmt = _dialect_insert(session, model, label=label).on_conflict_do_nothing(
+        index_elements=conflict_cols
+    )
     session.execute(stmt, rows)
+
+
+def insert_or_increment[M: DeclarativeBase](
+    session: Session,
+    model: type[M],
+    *,
+    values: Mapping[str, object],
+    conflict_cols: list[str],
+    counter: str,
+    touch: Mapping[str, object],
+    label: str,
+) -> M:
+    """One ``INSERT … ON CONFLICT (conflict_cols) DO UPDATE SET counter = counter + 1 …
+    RETURNING`` for ``model`` — an atomic counter bump with no read-modify-write window.
+
+    ``values`` is the insert branch (so it carries the counter's initial value);
+    ``touch`` is set on the conflict branch alongside the increment. ``touch`` must
+    include ``updated_at``: the column's ``onupdate=`` does not fire for
+    ``ON CONFLICT DO UPDATE``. ``populate_existing`` refreshes an instance already in
+    the identity map, so the caller never reads a stale counter (``autoflush=False``
+    sessions included). Python-side column defaults still apply on the insert branch.
+    """
+    stmt = (
+        _dialect_insert(session, model, label=label)
+        .values(**values)
+        .on_conflict_do_update(
+            index_elements=conflict_cols,
+            set_={counter: getattr(model, counter) + 1, **touch},
+        )
+        .returning(model)
+    )
+    return session.scalars(stmt, execution_options={"populate_existing": True}).one()

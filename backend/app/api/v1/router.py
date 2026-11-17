@@ -25,6 +25,7 @@ from app.api.v1 import (
     labels,
     portfolio,
     rules,
+    tax,
     transactions,
 )
 
@@ -44,4 +45,5 @@ api_router.include_router(investment_transactions.router)
 api_router.include_router(labels.router)
 api_router.include_router(portfolio.router)
 api_router.include_router(rules.router)
+api_router.include_router(tax.router)
 api_router.include_router(transactions.router)

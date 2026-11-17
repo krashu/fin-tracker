@@ -12,6 +12,7 @@ from app.models.label import Label
 from app.models.merchant_alias import MerchantAlias
 from app.models.merchant_label_map import MerchantLabelMap
 from app.models.merchant_tag_map import MerchantTagMap
+from app.models.realised_lot import RealisedLot
 from app.models.session import RefreshSession
 from app.models.transaction import Transaction, TransactionSourceStr, TransactionTypeStr
 from app.models.transaction_label import TransactionLabel
@@ -39,6 +40,7 @@ __all__ = [
     "MerchantAlias",
     "MerchantLabelMap",
     "MerchantTagMap",
+    "RealisedLot",
     "RefreshSession",
     "Transaction",
     "TransactionLabel",

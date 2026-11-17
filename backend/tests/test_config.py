@@ -59,3 +59,17 @@ def test_negative_refresh_ttl_rejected() -> None:
 def test_zero_rate_limit_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(auth_rate_limit_per_minute=0, cors_allowed_origins=_VALID_CORS)
+
+
+def test_zero_idle_timeout_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(session_idle_timeout_minutes=0, cors_allowed_origins=_VALID_CORS)
+
+
+def test_registration_closed_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR-0003 rule 12: past the first user, registration is closed unless the
+    operator opts in. tests/conftest.py forces REGISTRATION_ENABLED=true for the
+    suite, so unset it and skip the dotenv file to read the shipped default."""
+    monkeypatch.delenv("REGISTRATION_ENABLED", raising=False)
+    s = Settings(_env_file=None, cors_allowed_origins=_VALID_CORS)
+    assert s.registration_enabled is False

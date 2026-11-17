@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from typing import Literal, get_args
 
-from sqlalchemy import BigInteger, Enum, ForeignKey, Index, String, text
+from sqlalchemy import BigInteger, Enum, ForeignKey, ForeignKeyConstraint, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -51,6 +51,14 @@ class Account(Base, TimestampMixin):
             unique=True,
             sqlite_where=text("archived_at IS NULL"),
             postgresql_where=text("archived_at IS NULL"),
+        ),
+        # ADR-0003 rule 10: the (id, user_id) target every same-user composite FK into
+        # accounts references, and the composite FK for the self-referencing parent.
+        Index("uq_accounts_id_user", "id", "user_id", unique=True),
+        ForeignKeyConstraint(
+            ["parent_account_id", "user_id"],
+            ["accounts.id", "accounts.user_id"],
+            name="fk_accounts_parent_account_id_accounts",
         ),
     )
 
@@ -88,5 +96,5 @@ class Account(Base, TimestampMixin):
         # and the first Postgres autogenerate would have emitted DROP DEFAULT.
         server_default="INR",
     )
-    parent_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"))
+    parent_account_id: Mapped[int | None] = mapped_column()
     archived_at: Mapped[datetime | None] = mapped_column(default=None)

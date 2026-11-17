@@ -15,7 +15,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, String, UniqueConstraint, false, func, text
+from sqlalchemy import (
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    String,
+    UniqueConstraint,
+    false,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, utcnow_default
@@ -35,16 +44,22 @@ class MerchantTagMap(Base, TimestampMixin):
             "user_id",
             "merchant_normalized",
         ),
+        # ADR-0003 rule 10: a rule can only point at the same user's category.
+        ForeignKeyConstraint(
+            ["category_id", "user_id"],
+            ["categories.id", "categories.user_id"],
+            name="fk_merchant_tag_map_category_id_categories",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     # 512 (not 256) to match transactions.merchant_normalized and stay ≥
-    # merchant_raw's String(512): normalize_merchant is length-unbounded, so a
-    # long parsed merchant must not overflow on Postgres (SQLite ignores the
-    # cap). See migration 0020.
+    # merchant_raw's String(512) (migration 0020). Every write boundary refuses a
+    # merchant that normalizes past this width, never truncating (ADR-0006 rule 3b;
+    # services.merchant.MERCHANT_MAX_CHARS); SQLite ignores the cap.
     merchant_normalized: Mapped[str] = mapped_column(String(512))
-    category_id: Mapped[int] = mapped_column(ForeignKey("categories.id"))
+    category_id: Mapped[int] = mapped_column()
     hit_count: Mapped[int] = mapped_column(default=1, server_default=text("1"))
     # last_used: domain timestamp (when import_service last applied this rule);
     # distinct from updated_at (any row mutation, e.g. manual category re-point).
