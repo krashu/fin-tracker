@@ -30,7 +30,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator, model_validator
 
 from app.models.account import CurrencyStr
-from app.models.instrument import AssetClassStr, ExchangeStr
+from app.models.instrument import AssetClassStr, ExchangeStr, class_currencies
 from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.schemas._common import reject_null_name
 
@@ -68,8 +68,11 @@ class InstrumentCreate(BaseModel):
 
     ``currency`` defaults to INR; USD is accepted (the investment side supports INR + USD —
     PRD §Non-goals). ``us_equity`` / ``us_etf`` must be USD — they're priced in USD (Yahoo), so
-    an INR stamp would value them 1:1 at rollup (the cent↔paise bug); this mirrors the CSV
-    parser's mismatch guard. ``current_nav`` is optional — a fresh instrument may have no price
+    an INR stamp would value them 1:1 at rollup (the cent↔paise bug); backed by the instruments
+    CHECKs, and the CSV parser applies the same tuples. ``indian_equity`` / ``indian_mf`` /
+    ``nps`` must be INR (NPS is a rupee-only scheme): they trade in rupees, and intraday netting
+    (ADR-0015 rule 7) and the F11 statement read their amounts as INR.
+    ``current_nav`` is optional — a fresh instrument may have no price
     yet. When one *is* supplied, ``nav_as_of`` says what date that price is **valid for**
     (defaulting to today) and the route resolves it into ``nav_updated_at``. It is a valuation
     date, not an entry date: type an FD's accrued value off a statement dated 90 days ago and
@@ -102,9 +105,10 @@ class InstrumentCreate(BaseModel):
         return stripped
 
     @model_validator(mode="after")
-    def _check_us_currency(self) -> InstrumentCreate:
-        if self.asset_class in ("us_equity", "us_etf") and self.currency != "USD":
-            raise ValueError("us_equity / us_etf instruments must have currency=USD")
+    def _check_class_currency(self) -> InstrumentCreate:
+        allowed = class_currencies(self.asset_class)
+        if self.currency not in allowed:
+            raise ValueError(f"{self.asset_class} instruments must have currency={allowed[0]}")
         return self
 
     @model_validator(mode="after")
@@ -112,6 +116,13 @@ class InstrumentCreate(BaseModel):
         if self.nav_as_of is not None and self.current_nav is None:
             raise ValueError("nav_as_of requires current_nav — it dates a price, not a row")
         return self
+
+
+class AssetClassCurrencies(BaseModel):
+    """One row of ``GET /instruments/asset-classes``: the currencies a class may carry."""
+
+    asset_class: AssetClassStr
+    currencies: list[CurrencyStr]
 
 
 class InstrumentRead(BaseModel):

@@ -34,8 +34,8 @@ def list_holdings(
     #
     # `as_of` below is NOT that argument. It is only the anchor the per-row valuation age
     # is subtracted from, never a cache-lookup key, so it cannot drop a row the way
-    # `rate_on(on=today)` can — and `clock.today()` is UTC by construction, so it does not
-    # reintroduce the host-timezone split either.
+    # `rate_on(on=today)` can — and `clock.today()` is the IST business date whatever the
+    # host's timezone, so it does not reintroduce the host-timezone split either.
     usd_inr = latest_rate(session)
     holdings = compute_holdings(session, user_id=user_id, usd_inr_rate=usd_inr, as_of=clock.today())
     return HoldingsResponse(holdings=[HoldingRead.model_validate(h) for h in holdings])

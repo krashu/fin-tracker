@@ -130,8 +130,8 @@ def refresh_navs(
     """Fetch + apply current NAVs for the user's active instruments (PRD §F7).
 
     URLs + ``client`` are injected so the route owns config and tests use
-    ``httpx.MockTransport``. ``as_of`` (the route passes ``clock.today()`` — UTC, never the
-    host's local date) anchors the staleness computation deterministically.
+    ``httpx.MockTransport``. ``as_of`` (the route passes ``clock.today()`` — the IST business
+    date, never the host's local date) anchors the staleness computation deterministically.
     """
     instruments = list(
         session.scalars(

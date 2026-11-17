@@ -17,7 +17,8 @@ is authoritative when present, else derived ``units * price``. A row carries INR
 default when the ``currency`` column is absent) or USD — the investment side's two
 currencies; any other currency is skipped with a warning (the rest of the file still
 imports), and a US-class row (``us_equity``/``us_etf``) resolving to INR is skipped (Yahoo
-prices it in USD, so an INR stamp would value it 1:1 — the cent↔paise bug).
+prices it in USD, so an INR stamp would value it 1:1 — the cent↔paise bug), as is an
+INR-only row (``indian_equity``/``indian_mf``/``nps``) resolving to USD.
 
 **Identity.** ``symbol`` is the instrument key — the broker ticker, normalised
 (``strip().upper()``). Dedup keys on the resolved ``instrument_id``, not this string —
@@ -37,7 +38,7 @@ from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import cast, get_args
 
 from app.models.account import CurrencyStr
-from app.models.instrument import AssetClassStr, ExchangeStr
+from app.models.instrument import AssetClassStr, ExchangeStr, class_currencies
 from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.parsers.base import ParserError
 
@@ -56,7 +57,7 @@ HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "exchange": ("exchange",),
     "units": ("units", "quantity", "qty"),
     "price": ("price", "average_price", "price_per_unit"),
-    "amount": ("amount", "value", "net_amount"),
+    "amount": ("amount", "value"),
     "fees": ("fees", "charges"),
     "currency": ("currency",),
 }
@@ -68,9 +69,6 @@ _ALIAS_TO_FIELD: dict[str, str] = {
 }
 
 _ASSET_CLASSES = frozenset(get_args(AssetClassStr))
-# US-priced classes (Yahoo, native USD) — an INR currency on these is a mis-pricing
-# contradiction, not a valid INR holding, so the row is skipped (see ``_parse_row``).
-_US_ASSET_CLASSES = frozenset({"us_equity", "us_etf"})
 _TXN_TYPES = frozenset(get_args(InvestmentTxnTypeStr))
 # In the vocabulary but never importable via CSV (CAS-era / corporate-action history).
 # Mirrors the manual-entry rejection in InvestmentTransactionCreate.
@@ -197,7 +195,8 @@ def _parse_row(
 
     Currency resolves to INR (the default when the ``currency`` column is absent) or USD;
     any other currency is a per-row skip. A US-class row (``us_equity``/``us_etf``) resolving
-    to INR is also skipped — Yahoo prices it in USD, so an INR stamp would value it 1:1.
+    to INR is also skipped — Yahoo prices it in USD, so an INR stamp would value it 1:1 — and
+    so is an INR-only row (``indian_equity``/``indian_mf``/``nps``) resolving to USD.
     """
     raw_symbol = values.get("symbol")
     if not raw_symbol:
@@ -244,8 +243,9 @@ def _parse_row(
     asset_class = (values.get("asset_class") or default_asset_class).lower()
     if asset_class not in _ASSET_CLASSES:
         return f"row {line_no}: unknown asset_class"
-    if asset_class in _US_ASSET_CLASSES and currency != "USD":
-        return f"row {line_no}: {asset_class} requires currency=USD"
+    allowed = class_currencies(cast("AssetClassStr", asset_class))
+    if currency not in allowed:
+        return f"row {line_no}: {asset_class} requires currency={allowed[0]}"
 
     return ParsedInvestmentRow(
         line_no=line_no,

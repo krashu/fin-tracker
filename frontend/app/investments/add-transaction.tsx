@@ -161,6 +161,8 @@ function EntryDialog({ onClose }: { onClose: () => void }) {
       queryClient.invalidateQueries({ queryKey: ["dashboards"] });
       // …and the /portfolio tiles + allocation + per-holding XIRR (PRD §F9).
       queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      // A sell or same-day buy can change the F11 statement.
+      queryClient.invalidateQueries({ queryKey: ["tax"] });
       // Stay open for rapid multi-entry: reset the per-row fields, keep
       // instrument / type / date for the next one.
       setJustAdded(selectedInstrument?.symbol ?? "");

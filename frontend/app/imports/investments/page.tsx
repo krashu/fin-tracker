@@ -6,6 +6,7 @@
  * global chrome (TopBar + persistent Sidebar) comes from `AppShell` in app/layout.tsx.
  */
 import { PageHeader } from "@/components/shell/page-header";
+import { GuestUploadGate } from "@/components/auth/guest-upload-gate";
 import { CsvUploadForm } from "./csv-upload-form";
 
 export default function InvestmentCsvImportPage() {
@@ -15,7 +16,9 @@ export default function InvestmentCsvImportPage() {
         title="Import transactions"
         description="Upload a broker transaction export (e.g. a Zerodha Console tradebook) as CSV. Columns are matched by name — date, type, symbol, units, price (amount/fees/name/exchange optional) — so most raw exports import without renaming."
       />
-      <CsvUploadForm />
+      <GuestUploadGate>
+        <CsvUploadForm />
+      </GuestUploadGate>
     </div>
   );
 }

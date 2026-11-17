@@ -2,6 +2,9 @@
 
 * ``POST /api/v1/instruments`` — create an instrument.
 * ``GET /api/v1/instruments`` — list active (non-archived) instruments, symbol-sorted.
+* ``GET /api/v1/instruments/asset-classes`` — the currencies each asset class may carry, in
+  ``AssetClassStr`` order: the one rule ``InstrumentCreate`` enforces, sent so no client
+  restates it.
 * ``PATCH /api/v1/instruments/{id}`` — rename, update ``current_nav`` and the
   ``nav_as_of`` date it is valid for (the manual NAV refresh), or supply a first
   ``isin``. ``symbol`` / ``asset_class`` / ``currency`` / ``exchange`` are locked at
@@ -22,6 +25,7 @@ The explicit constructor (no ``**model_dump()`` splat) is deliberate.
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import get_args
 
 import httpx
 from fastapi import APIRouter, HTTPException, status
@@ -33,7 +37,14 @@ from app.core import clock
 from app.core.config import get_settings
 from app.core.db_errors import is_unique_violation
 from app.models import Instrument
-from app.schemas import InstrumentCreate, InstrumentRead, InstrumentUpdate, NavRefreshSummary
+from app.models.instrument import AssetClassStr, class_currencies
+from app.schemas import (
+    AssetClassCurrencies,
+    InstrumentCreate,
+    InstrumentRead,
+    InstrumentUpdate,
+    NavRefreshSummary,
+)
 from app.services.nav_snapshot_service import as_valuation_stamp, refresh_navs
 
 router = APIRouter(prefix="/instruments", tags=["instruments"])
@@ -115,6 +126,14 @@ def list_instruments(
         .order_by(Instrument.symbol.asc())
     )
     return list(session.scalars(stmt))
+
+
+@router.get("/asset-classes", response_model=list[AssetClassCurrencies])
+def list_asset_class_currencies(_user_id: CurrentUserId) -> list[AssetClassCurrencies]:
+    return [
+        AssetClassCurrencies(asset_class=c, currencies=list(class_currencies(c)))
+        for c in get_args(AssetClassStr)
+    ]
 
 
 @router.patch("/{instrument_id}", response_model=InstrumentRead)
@@ -252,6 +271,6 @@ def delete_instrument(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="instrument not found",
         ) from None
-    instrument.archived_at = clock.utcnow()
+    instrument.archived_at = clock.naive_utcnow()
     session.commit()
     return None

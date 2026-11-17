@@ -2,10 +2,10 @@
 
 /**
  * Add-instrument dialog (PRD §F7). Registers a scheme/ticker the user holds.
- * Currency isn't a field — it's derived from the asset class: US classes
- * (`us_equity` / `us_etf`) are USD (priced in USD via Yahoo), everything else is
- * INR. That mirrors the backend rule, which *requires* USD for US classes and
- * would 422 an INR stamp on them.
+ * Currency follows the asset class, by the server's rule (`GET /instruments/asset-classes`):
+ * a class with one allowed currency has no field for it, and a class that allows both
+ * (fixed deposit, bond, gold, other) shows a Currency picker. Nothing here restates which
+ * classes are which.
  *
  * Two fields exist to keep this form a first-class registration path rather than a
  * second-class one:
@@ -17,7 +17,7 @@
  *    today, mirroring the server's future-date 422 so the browser catches it first.
  */
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -32,6 +32,7 @@ import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import {
   ApiError,
   createInstrument,
+  listAssetClassCurrencies,
   type AssetClass,
   type Exchange,
   type InstrumentCreate,
@@ -54,9 +55,22 @@ export function AddInstrumentDialog({ onClose }: { onClose: () => void }) {
   const today = toLocalYMD(new Date());
   const [navAsOf, setNavAsOf] = useState(today);
 
-  // Currency follows the asset class — the backend requires USD for US classes.
+  const [pickedCurrency, setPickedCurrency] = useState<
+    InstrumentCreate["currency"] | undefined
+  >(undefined);
+
+  // The server owns the class -> currency rule. `allowed` is empty until it loads.
+  const rules = useQuery({
+    queryKey: ["asset-class-currencies"],
+    queryFn: listAssetClassCurrencies,
+    staleTime: Infinity,
+  });
+  const allowed =
+    rules.data?.find((r) => r.asset_class === assetClass)?.currencies ?? [];
   const currency =
-    assetClass === "us_equity" || assetClass === "us_etf" ? "USD" : "INR";
+    pickedCurrency !== undefined && allowed.includes(pickedCurrency)
+      ? pickedCurrency
+      : allowed[0];
   const navSymbol = currency === "USD" ? "$" : "₹";
   const hasNav = nav.trim() !== "";
 
@@ -84,7 +98,10 @@ export function AddInstrumentDialog({ onClose }: { onClose: () => void }) {
   });
 
   const canSubmit =
-    symbol.trim() !== "" && name.trim() !== "" && !mutation.isPending;
+    symbol.trim() !== "" &&
+    name.trim() !== "" &&
+    currency !== undefined &&
+    !mutation.isPending;
 
   return (
     <Dialog open onOpenChange={(open) => (open ? null : onClose())}>
@@ -119,6 +136,21 @@ export function AddInstrumentDialog({ onClose }: { onClose: () => void }) {
               </PickerButton>
             </Field>
           </div>
+
+          {allowed.length > 1 ? (
+            <Field label="Currency">
+              <PickerButton label={currency ?? ""}>
+                {allowed.map((c) => (
+                  <DropdownMenuItem key={c} onSelect={() => setPickedCurrency(c)}>
+                    {c}
+                  </DropdownMenuItem>
+                ))}
+              </PickerButton>
+            </Field>
+          ) : null}
+          {rules.isError ? (
+            <p className="text-[11.5px] text-neg">Couldn’t load currencies.</p>
+          ) : null}
 
           <Field label="Name">
             <TextInput

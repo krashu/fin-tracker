@@ -164,6 +164,37 @@ def test_us_class_with_inr_currency_skipped() -> None:
     assert all("requires currency=USD" in w and w.startswith("row ") for w in warnings)
 
 
+def test_indian_class_usd_row_skipped() -> None:
+    # indian_* are rupee-traded: a USD row is a contradiction, skipped like the US/INR one.
+    rows, warnings = parse_investment_csv(
+        _csv(
+            "2024-01-01,buy,A,10,100,1000,USD,indian_equity",
+            "2024-01-02,buy,B,10,100,1000,USD,",
+            "2024-01-03,buy,C,10,100,1000,INR,indian_equity",
+            header="date,type,symbol,units,price,amount,currency,asset_class",
+        ),
+        default_asset_class="indian_mf",
+    )
+    assert [r.symbol for r in rows] == ["C"]
+    assert len(warnings) == 2
+    assert all(w.startswith("row ") and "requires currency=INR" in w for w in warnings)
+
+
+def test_nps_usd_row_skipped() -> None:
+    # nps is a rupee-only scheme: pinned INR beside indian_equity / indian_mf (PRD §F7).
+    rows, warnings = parse_investment_csv(
+        _csv(
+            "2024-01-01,buy,NPS1,10,100,1000,USD,nps",
+            "2024-01-02,buy,NPS2,10,100,1000,INR,nps",
+            header="date,type,symbol,units,price,amount,currency,asset_class",
+        ),
+        default_asset_class="indian_mf",
+    )
+    assert [r.symbol for r in rows] == ["NPS2"]
+    assert len(warnings) == 1
+    assert "requires currency=INR" in warnings[0]
+
+
 def test_amount_authoritative_when_present() -> None:
     rows, _ = parse_investment_csv(
         _csv("2024-01-01,buy,INFY,10,100,999"), default_asset_class="other"
@@ -233,3 +264,16 @@ def test_isin_absent_column_is_none() -> None:
         _csv("2024-01-01,buy,INFY,10,100,1000"), default_asset_class="indian_equity"
     )
     assert rows[0].isin is None
+
+
+def test_net_amount_is_not_read_as_the_gross_amount() -> None:
+    """``amount`` is the gross trade value; fees are held separately and subtracted later.
+
+    A ``net_amount`` column would be taken off by the fees a second time, so it is not an
+    alias: with only that column the amount falls back to ``units * price``.
+    """
+    rows, _ = parse_investment_csv(
+        _csv("2024-01-01,buy,INFY,10,100,990", header="date,type,symbol,units,price,net_amount"),
+        default_asset_class="other",
+    )
+    assert rows[0].amount_native_paise == 100000  # 10 * 100, not the 990 net figure

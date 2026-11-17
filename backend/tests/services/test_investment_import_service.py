@@ -11,11 +11,13 @@ every ``_reject_reason`` per-type branch.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import func, select
+import pytest
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 from structlog.testing import capture_logs
 
@@ -24,9 +26,11 @@ from app.models import (
     ImportBatch,
     Instrument,
     InvestmentTransaction,
+    RealisedLot,
     User,
 )
 from app.parsers.investment_csv import ParsedInvestmentRow
+from app.services import investment_import_service
 from app.services.investment_import_service import (
     _fingerprint,
     _reject_reason,
@@ -196,35 +200,31 @@ def test_reimport_of_a_duplicate_pair_stages_nothing(session: Session, user: Use
     assert _count(session, InvestmentTransaction) == 3
 
 
-def test_a_duplicate_row_is_skipped_before_the_oversell_guard_sees_it(
+def test_a_duplicate_row_is_skipped_before_the_fx_reject_sees_it(
     session: Session, user: User
 ) -> None:
-    """Pins the allocator's CALL POSITION: dedup runs ahead of the oversell reject.
+    """Pins the allocator's CALL POSITION: dedup runs ahead of the FX reject.
 
-    Bought because moving ``allocate()`` past the two rejects broke NOTHING in the suite
-    — the ordering was load-bearing prose with no net under it, and hoisting the
-    algorithm into :mod:`app.services.occurrence` turned it from a visible line into a
-    property of the call site, which is what drifts.
+    Moving ``allocate()`` past the FX reject broke nothing in the suite once; the ordering
+    was load-bearing prose with no net under it. The FX reject is the one reject left in
+    the row loop (the coverage refusal runs after it, per instrument).
 
-    Setup: hold 15 units, then import two identical sells of 10. The first persists
-    (10 ≤ 15), the second oversell-rejects (10 > 5). On re-upload the DB already holds
-    one copy, so row 1 must be **skipped as a duplicate** rather than oversell-rejected
-    a second time — ``txns_skipped_dupe`` is what distinguishes the two orderings.
+    Setup: store one USD buy, drop the cached rate, then import ``[R, R]``. The DB holds one
+    copy, so row 1 must be **skipped as a duplicate**; row 2 is the second occurrence, which
+    needs a rate and is FX-rejected. ``txns_skipped_dupe`` tells the two orderings apart.
     """
-    _import(session, user.id, _csv("2024-01-01,buy,INFY,15,100,1500"))
-    sells = ("2024-02-01,sell,INFY,10,120,1200", "2024-02-01,sell,INFY,10,120,1200")
+    _seed_fx(session, "83", date(2024, 1, 1))
+    r = "2024-01-01,buy,AAPL,10,100,1000,USD"
+    _import(session, user.id, _csv(r, header=_USD_HEADER), asset_class="us_equity")
+    assert _count(session, InvestmentTransaction) == 1
+    session.execute(delete(FxRateQuote))
+    session.flush()
 
-    first = _import(session, user.id, _csv(*sells))
-    assert first.txns_imported == 1  # the second sell would leave an impossible position
-    assert first.rows_rejected == 1
-
-    # Identical bytes do NOT short-circuit: a rejected row leaves the batch `failed`.
-    second = _import(session, user.id, _csv(*sells))
-    assert second.already_imported is False
-    assert second.txns_skipped_dupe == 1  # ← 0 if the oversell guard ran first
-    assert second.txns_imported == 0
+    second = _import(session, user.id, _csv(r, r, header=_USD_HEADER), asset_class="us_equity")
+    assert second.txns_skipped_dupe == 1  # ← 0 if the FX reject ran first
     assert second.rows_rejected == 1
-    assert _count(session, InvestmentTransaction) == 2  # the buy + one sell, unchanged
+    assert second.txns_imported == 0
+    assert _count(session, InvestmentTransaction) == 1
 
 
 def test_occurrence_is_assigned_from_max_not_count(session: Session, user: User) -> None:
@@ -401,7 +401,7 @@ def test_dividend_with_units_is_rejected_with_an_actionable_reason(
     """A CSV IDCW-reinvest row names the endpoint that CAN record it.
 
     The batch stays ``completed``, not ``failed``: ``batch.status`` keys off
-    ``reject_warnings`` (FX / oversell), while per-type drops land in
+    FX rejects and refused instruments, while per-type drops land in
     ``validation_warnings``. Flipping that is a behaviour change, not this fix.
     """
     result = _import(session, user.id, _csv("2025-12-19,dividend,INFY,0.8,125,100"))
@@ -494,12 +494,56 @@ def test_usd_row_without_rate_rejected_and_batch_not_completed(
     assert result.txns_imported == 0
     assert result.rows_rejected == 1
     assert result.warnings[0].startswith("row ") and "/fx/refresh" in result.warnings[0]
-    # The instrument is created (orphan until retry), but no transaction lands.
-    assert _count(session, Instrument) == 1
+    # No instrument is left behind (ADR-0016 rule 2), and no transaction lands.
+    assert _count(session, Instrument) == 0
+    assert result.instruments_new == 0
     assert _count(session, InvestmentTransaction) == 0
     # Batch left non-completed so a re-upload after seeding rates reprocesses.
     batch = session.get(ImportBatch, result.batch_id)
     assert batch is not None and batch.status != "completed"
+
+
+def test_instruments_new_counts_only_instruments_that_kept_a_row(
+    session: Session, user: User
+) -> None:
+    # No FX seeded: the USD row is rejected, so AAPL (created only for it) is not kept.
+    result = _import(
+        session,
+        user.id,
+        _csv(
+            "2024-01-01,buy,AAPL,10,100,1000,USD,us_equity",
+            "2024-01-01,buy,INFY,10,100,1000,INR,indian_equity",
+            header="date,type,symbol,units,price,amount,currency,asset_class",
+        ),
+    )
+    assert result.instruments_new == 1
+    assert result.txns_imported == 1
+    assert [i.symbol for i in session.scalars(select(Instrument))] == ["INFY"]
+    batch = session.get(ImportBatch, result.batch_id)
+    assert batch is not None and batch.status == "failed"
+
+
+def test_fx_rejected_rows_leave_an_existing_instrument_alone(session: Session, user: User) -> None:
+    session.add(
+        Instrument(
+            user_id=user.id,
+            symbol="AAPL",
+            name="Apple",
+            asset_class="us_equity",
+            currency="USD",
+            exchange="NASDAQ",
+        )
+    )
+    session.flush()
+    result = _import(
+        session,
+        user.id,
+        _csv("2024-01-01,buy,AAPL,10,100,1000,USD", header=_USD_HEADER),
+        asset_class="us_equity",
+    )
+    assert result.txns_imported == 0
+    assert result.instruments_new == 0
+    assert _count(session, Instrument) == 1
 
 
 def test_fx_rejected_row_is_retryable_after_rate_seeded(session: Session, user: User) -> None:
@@ -646,3 +690,235 @@ def test_short_circuited_reimport_still_emits_telemetry(session: Session, user: 
     assert ev["rows_imported"] == 0
     assert ev["rows_skipped"] == 2
     assert ev["rows_in"] == ev["rows_imported"] + ev["rows_skipped"] + ev["rows_rejected"]
+
+
+def test_rows_persist_in_file_order(session: Session, user: User) -> None:
+    """ADR-0015 rule 3: same-date order is source position, carried by insertion order.
+
+    The rows are deliberately out of date order, with two same-date INFY buys at
+    different prices and another symbol interleaved. Ids must follow the file exactly,
+    so the first-listed same-date lot has the lower id and is consumed first.
+    """
+    file_order = [
+        ("2024-02-01", "INFY", 100_000),
+        ("2024-01-01", "INFY", 45_000),
+        ("2024-01-15", "TCS", 90_000),
+        ("2024-02-01", "INFY", 120_000),
+    ]
+    rows = [
+        f"{d},buy,{sym},{units},{amount / 100 / units},{amount / 100}"
+        for (d, sym, amount), units in zip(file_order, (10, 5, 3, 10), strict=True)
+    ]
+    _import(session, user.id, _csv(*rows))
+
+    stored = session.execute(
+        select(
+            InvestmentTransaction.date,
+            Instrument.symbol,
+            InvestmentTransaction.amount_native_paise,
+        )
+        .join(Instrument, Instrument.id == InvestmentTransaction.instrument_id)
+        .order_by(InvestmentTransaction.id)
+    ).all()
+    assert [(d.isoformat(), s, a) for d, s, a in stored] == file_order
+
+
+def test_import_writes_realised_lots(session: Session, user: User) -> None:
+    result = _import(
+        session,
+        user.id,
+        _csv("2024-01-01,buy,INFY,10,100,1000", "2024-02-01,sell,INFY,4,120,480"),
+    )
+    assert result.txns_imported == 2
+    (row,) = session.scalars(select(RealisedLot)).all()
+    assert (row.units, row.cost_native_paise, row.proceeds_native_paise) == (
+        Decimal("4"),
+        40_000,
+        48_000,
+    )
+
+
+def test_import_rejects_a_sell_that_uncovers_a_later_sell(session: Session, user: User) -> None:
+    """ADR-0015 rule 9 on the import path: the Feb sell is covered by itself, but it would
+    strip the recorded March sell of its lots, so the instrument is refused: nothing the
+    file wrote persists and the stored rows and lots are untouched."""
+    _import(
+        session,
+        user.id,
+        _csv("2024-01-01,buy,INFY,10,100,1000", "2024-03-01,sell,INFY,10,120,1200"),
+    )
+    before = [
+        (r.id, r.sell_txn_id, r.buy_txn_id) for r in session.scalars(select(RealisedLot)).all()
+    ]
+    assert len(before) == 1
+
+    result = _import(session, user.id, _csv("2024-02-01,sell,INFY,5,110,550"))
+    assert result.txns_imported == 0
+    assert result.rows_rejected == 1
+    assert result.warnings == [
+        "row 2: a recorded sell of 10 on 2024-03-01 would be short by 5 units"
+        " \u2014 none of this instrument's rows were imported"
+    ]
+    assert _count(session, InvestmentTransaction) == 2
+    batch = session.scalars(select(ImportBatch).order_by(ImportBatch.id.desc())).first()
+    assert batch is not None and batch.status == "failed"
+    assert [
+        (r.id, r.sell_txn_id, r.buy_txn_id) for r in session.scalars(select(RealisedLot)).all()
+    ] == before
+
+
+def test_import_replays_each_instrument_once(
+    session: Session, user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A53: one coverage replay per instrument per import, not one per sell."""
+    calls: Counter[int] = Counter()
+    real = investment_import_service.rebuild_realised_lots
+
+    def counting(*args, **kw):  # type: ignore[no-untyped-def]
+        calls[kw["instrument_id"]] += 1
+        return real(*args, **kw)
+
+    monkeypatch.setattr(investment_import_service, "rebuild_realised_lots", counting)
+    lines = ["2024-01-01,buy,INFY,100,10,1000", "2024-01-01,buy,TCS,100,10,1000"]
+    for sym in ("INFY", "TCS"):
+        lines += [f"2024-02-{d:02d},sell,{sym},1,11,11" for d in range(1, 21)]
+    first = _import(session, user.id, _csv(*lines))
+    assert first.txns_imported == 42
+    assert first.rows_rejected == 0
+    assert sorted(calls.values()) == [1, 1]
+
+    calls.clear()
+    infy_id = session.scalar(select(Instrument.id).where(Instrument.symbol == "INFY"))
+    second = _import(
+        session,
+        user.id,
+        _csv("2024-03-01,buy,INFY,1,10,10", "2024-01-01,buy,TCS,100,10,1000"),
+    )
+    assert second.txns_imported == 1
+    assert second.txns_skipped_dupe == 1
+    assert dict(calls) == {infy_id: 1}  # the duplicates-only instrument is not replayed
+
+
+def test_import_is_atomic_per_instrument(session: Session, user: User) -> None:
+    """A53 / ADR-0015 rule 9: one uncovered sell refuses the whole instrument, the valid buy
+    and the instrument the file created included; other instruments import normally."""
+    csv = _csv(
+        "2024-01-01,buy,INFY,10,100,1000",
+        "2024-01-01,buy,TCS,5,100,500",
+        "2024-02-01,sell,INFY,15,110,1650",
+        "2024-02-01,sell,TCS,2,110,220",
+    )
+    with capture_logs() as logs:
+        result = _import(session, user.id, csv)
+
+    assert result.txns_imported == 2
+    assert result.rows_rejected == 2
+    assert result.instruments_new == 1
+    assert result.warnings == [
+        "row 4: sell of 15 is short by 5 units at its date"
+        " \u2014 none of this instrument's rows were imported"
+    ]
+    assert session.scalar(select(Instrument).where(Instrument.symbol == "INFY")) is None
+    tcs = session.scalar(select(Instrument).where(Instrument.symbol == "TCS"))
+    assert tcs is not None
+    assert _count(session, InvestmentTransaction) == 2  # TCS only: the INFY buy went with its sell
+    assert _count(session, RealisedLot) == 1
+    batch = session.get(ImportBatch, result.batch_id)
+    assert batch is not None and batch.status == "failed"
+    (ev,) = [e for e in logs if e.get("event") == "investment_import.instrument_refused"]
+    assert ev["rows_refused"] == 2
+    assert ev["uncovered_sells"] == 1
+    assert ev["instrument_created"] is True
+    assert "infy" not in repr(ev).lower()
+
+    # A stored instrument with something to lose: its rows, lots and (null) ISIN survive.
+    _import(
+        session,
+        user.id,
+        _csv("2024-01-01,buy,WIPRO,10,100,1000", "2024-02-01,sell,WIPRO,4,110,440"),
+    )
+    snap = [
+        (r.id, r.sell_txn_id, r.buy_txn_id, r.units, r.cost_native_paise)
+        for r in session.scalars(select(RealisedLot).order_by(RealisedLot.id))
+    ]
+    wipro = session.scalar(select(Instrument).where(Instrument.symbol == "WIPRO"))
+    assert wipro is not None and wipro.isin is None
+    rows_before = _count(session, InvestmentTransaction)
+    lots_before = [
+        r
+        for r in snap
+        if r[1]
+        in session.scalars(
+            select(InvestmentTransaction.id).where(InvestmentTransaction.instrument_id == wipro.id)
+        ).all()
+    ]
+    assert len(lots_before) == 1
+
+    again = _import(
+        session,
+        user.id,
+        _csv(
+            "2024-03-01,buy,WIPRO,INE009A01021,1,100,100",
+            "2024-03-01,sell,WIPRO,INE009A01021,20,110,2200",
+            header=_HEADER_ISIN,
+        ),
+    )
+    assert again.txns_imported == 0
+    session.refresh(wipro)
+    assert wipro.isin is None
+    assert _count(session, InvestmentTransaction) == rows_before
+    assert [
+        (r.id, r.sell_txn_id, r.buy_txn_id, r.units, r.cost_native_paise)
+        for r in session.scalars(select(RealisedLot).order_by(RealisedLot.id))
+    ] == snap
+
+
+def test_import_lists_every_uncovered_sell(session: Session, user: User) -> None:
+    """A53: the one replay reports every uncovered sell, file lines and recorded sells alike."""
+    _import(
+        session,
+        user.id,
+        _csv("2024-01-01,buy,INFY,10,100,1000", "2024-06-01,sell,INFY,10,120,1200"),
+    )
+    stored_ids = [(r.id, r.sell_txn_id) for r in session.scalars(select(RealisedLot))]
+    result = _import(
+        session,
+        user.id,
+        _csv("2024-02-01,sell,INFY,12,110,1320", "2024-04-01,sell,INFY,1,110,110"),
+    )
+    dash = "\u2014 none of this instrument's rows were imported"
+    assert result.txns_imported == 0
+    assert result.rows_rejected == 2
+    assert result.warnings == [
+        f"row 2: sell of 12 is short by 2 units at its date {dash}",
+        f"row 2: a recorded sell of 10 on 2024-06-01 would be short by 10 units {dash}",
+        f"row 3: sell of 1 is short by 1 unit at its date {dash}",
+    ]
+    assert _count(session, InvestmentTransaction) == 2
+    assert [(r.id, r.sell_txn_id) for r in session.scalars(select(RealisedLot))] == stored_ids
+
+
+def test_same_day_sell_before_buy_is_not_an_oversell(session: Session, user: User) -> None:
+    """ADR-0015 rule 8: the import's replay nets the day first, so a same-day sell listed
+    before its buy in the file is covered, for an ``indian_equity`` instrument only."""
+    csv = _csv("2024-03-01,sell,INFY,10,110,1100", "2024-03-01,buy,INFY,10,100,1000")
+    result = _import(session, user.id, csv)
+    assert result.txns_imported == 2
+    assert result.rows_rejected == 0
+    (lot,) = session.scalars(select(RealisedLot)).all()
+    assert lot.kind == "intraday"
+    assert (lot.units, lot.cost_native_paise, lot.proceeds_native_paise) == (
+        Decimal("10"),
+        100_000,
+        110_000,
+    )
+
+    mf = _csv("2024-03-01,sell,PPFCF,10,110,1100", "2024-03-01,buy,PPFCF,10,100,1000")
+    refused = _import(session, user.id, mf, asset_class="indian_mf")
+    assert refused.txns_imported == 0
+    assert refused.rows_rejected == 2
+    assert refused.warnings == [
+        "row 2: sell of 10 is short by 10 units at its date"
+        " \u2014 none of this instrument's rows were imported"
+    ]
+    assert session.scalar(select(Instrument).where(Instrument.symbol == "PPFCF")) is None

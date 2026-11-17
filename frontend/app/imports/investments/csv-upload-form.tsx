@@ -9,7 +9,7 @@
  */
 import { useState } from "react";
 import Link from "next/link";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
 import { IconDoc, IconUpload } from "@/components/icons";
@@ -17,6 +17,8 @@ import { Field } from "@/components/form/fields";
 import {
   ApiError,
   createInvestmentCsvImport,
+  listAssetClassCurrencies,
+  type AssetClassCurrencies,
   type AssetClass,
   type InvestmentCsvImportSummary,
 } from "@/lib/api/client";
@@ -30,8 +32,35 @@ import { cn } from "@/lib/utils";
 // silently had no option here while tsc caught it in the Record.
 const ASSET_CLASSES = Object.keys(ASSET_CLASS_LABELS) as AssetClass[];
 
+/** "Some classes must be priced in one currency: Indian equity, Indian MF and NPS rows in INR;
+ * US equity and US ETF rows in USD." Built from the server's rule: the classes with one currency, grouped by currency
+ * in server order. Empty until the rule loads (or if it fails). */
+function fixedCurrencyNote(rules: AssetClassCurrencies[] | undefined): string {
+  const byCurrency = new Map<string, string[]>();
+  for (const r of rules ?? []) {
+    if (r.currencies.length !== 1) continue;
+    const labels = byCurrency.get(r.currencies[0]) ?? [];
+    labels.push(ASSET_CLASS_LABELS[r.asset_class]);
+    byCurrency.set(r.currencies[0], labels);
+  }
+  const clauses = [...byCurrency].map(([currency, labels]) => {
+    const list =
+      labels.length > 1
+        ? `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`
+        : labels[0];
+    return `${list} rows in ${currency}`;
+  });
+  if (clauses.length === 0) return "";
+  return `Some classes must be priced in one currency: ${clauses.join("; ")}.`;
+}
+
 export function CsvUploadForm() {
   const queryClient = useQueryClient();
+  const rules = useQuery({
+    queryKey: ["asset-class-currencies"],
+    queryFn: listAssetClassCurrencies,
+    staleTime: Infinity,
+  });
   const [file, setFile] = useState<File | null>(null);
   const [assetClass, setAssetClass] = useState<AssetClass>("indian_equity");
   const [summary, setSummary] = useState<InvestmentCsvImportSummary | null>(
@@ -55,6 +84,8 @@ export function CsvUploadForm() {
         queryClient.invalidateQueries({ queryKey: ["holdings"] });
         queryClient.invalidateQueries({ queryKey: ["portfolio"] });
         queryClient.invalidateQueries({ queryKey: ["dashboards"] });
+        // A sell or same-day buy can change the F11 statement.
+        queryClient.invalidateQueries({ queryKey: ["tax"] });
       }
     },
   });
@@ -107,7 +138,7 @@ export function CsvUploadForm() {
       <p className="-mt-2 text-[11.5px] text-muted-foreground">
         Applied to rows without an asset-class column. Prices in INR or USD
         import; a row in any other currency is skipped with a warning (the rest
-        of the file still imports). US stocks/ETFs must be priced in USD.
+        of the file still imports). {fixedCurrencyNote(rules.data)}
       </p>
 
       {mutation.isError ? (
@@ -135,7 +166,7 @@ export function CsvUploadForm() {
   );
 }
 
-function CsvSummary({ summary }: { summary: InvestmentCsvImportSummary }) {
+export function CsvSummary({ summary }: { summary: InvestmentCsvImportSummary }) {
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border bg-muted/40 px-3 py-2.5 text-[12.5px]">
       {summary.already_imported ? (
@@ -165,8 +196,8 @@ function CsvSummary({ summary }: { summary: InvestmentCsvImportSummary }) {
       {summary.warnings.length > 0 ? (
         <div className="flex flex-col gap-1">
           <p className="font-medium text-foreground">
-            {summary.warnings.length} row
-            {summary.warnings.length === 1 ? "" : "s"} skipped:
+            {summary.warnings.length} warning
+            {summary.warnings.length === 1 ? "" : "s"}:
           </p>
           <ul className="ml-3 list-disc text-muted-foreground">
             {summary.warnings.map((w, i) => (

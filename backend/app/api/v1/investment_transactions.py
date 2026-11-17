@@ -42,7 +42,7 @@ from app.schemas import (
     ReinvestmentRead,
 )
 from app.services.fx_service import resolve_fx_rate_to_inr
-from app.services.holdings_service import UNIT_SIGN, available_units
+from app.services.holdings_service import OversellError, rebuild_realised_lots
 
 router = APIRouter(prefix="/investment-transactions", tags=["investment-transactions"])
 
@@ -130,20 +130,6 @@ def create_investment_transaction(
         session, user_id=user_id, instrument_id=payload.instrument_id, on=payload.date
     )
 
-    # Oversell guard: a unit-removing type (sell / switch_out, per ``UNIT_SIGN``) may
-    # not exceed the units currently held.
-    # The read-model (_consume_fifo) clamps bad *stored* data so it never crashes,
-    # but a manual entry must be rejected at the boundary so holdings / XIRR aren't
-    # built on an impossible position. Strict `>` — selling the exact holding is
-    # valid (position → 0).
-    if UNIT_SIGN.get(payload.transaction_type, 0) < 0:
-        held = available_units(session, user_id=user_id, instrument_id=payload.instrument_id)
-        if payload.units > held:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="sell/switch_out exceeds available units for this instrument",
-            )
-
     txn = InvestmentTransaction(
         user_id=user_id,
         instrument_id=payload.instrument_id,
@@ -158,6 +144,17 @@ def create_investment_transaction(
         pair_id=None,
     )
     session.add(txn)
+    # ADR-0015 rules 5 and 9: rebuild the instrument's realised lots, and refuse the write
+    # if any sell/switch_out (this one, or a later one it strips of lots) is left uncovered.
+    # Strict: selling exactly what is held is valid (position goes to 0).
+    try:
+        rebuild_realised_lots(session, user_id=user_id, instrument_id=payload.instrument_id)
+    except OversellError:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="sell/switch_out exceeds available units for this instrument",
+        ) from None
     session.commit()
     session.refresh(txn)
     return txn
@@ -178,10 +175,11 @@ def create_reinvestment(
     Mirrors ``POST /transactions/transfer``: one atomic call writes both legs, so the
     pair invariant is enforceable and ``pair_id`` never becomes client-settable.
 
-    No oversell guard — neither leg consumes units (the dividend is unit-neutral, the
-    buy adds). No ``IntegrityError`` handling either, unlike ``create_transfer``: manual
-    investment rows carry ``fingerprint = NULL`` and NULLs are distinct under the unique
-    index, and the only other vector — the instrument FK — is pre-flighted below.
+    Neither leg consumes units (the dividend is unit-neutral, the buy adds), so the
+    rule 9 coverage check inside the rebuild cannot fail here. No ``IntegrityError`` handling
+    either, unlike ``create_transfer``: manual investment rows carry ``fingerprint = NULL``
+    and NULLs are distinct under the unique index, and the only other vector — the
+    instrument FK — is pre-flighted below.
 
     Reinvestment is economically two events on one date, and XIRR sees them net to zero
     (``+amount`` for the payout, ``-amount`` for the acquisition), which is correct: no
@@ -214,8 +212,8 @@ def create_reinvestment(
         units=payload.units,
         price_per_unit_native=payload.price_per_unit_native,
     )
-    # Dividend added first so it takes the lower id: the FIFO replay's same-date
-    # tie-break is id-ascending, so a date-ordered listing reads income → acquisition.
+    # Dividend added first so it takes the lower id: same-date order is source order,
+    # carried by insertion order (ADR-0015 rule 3), so a listing reads income → acquisition.
     session.add_all([dividend, buy])
     session.flush()  # assign ids
 
@@ -226,6 +224,15 @@ def create_reinvestment(
     buy.pair_id = dividend.id
     session.flush()  # composite same-user FK + no-self-pair CHECK validate here
 
+    # Adds a dividend and a buy, so it cannot uncover a sell; same refusal path regardless.
+    try:
+        rebuild_realised_lots(session, user_id=user_id, instrument_id=payload.instrument_id)
+    except OversellError:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="sell/switch_out exceeds available units for this instrument",
+        ) from None
     session.commit()
     session.refresh(dividend)
     session.refresh(buy)
@@ -307,6 +314,21 @@ def delete_investment_transaction(
         if partner is not None:
             partner.pair_id = None
 
+    instrument_id = txn.instrument_id
     session.delete(txn)
+    # The rebuild flushes first, so the partner UPDATE and this DELETE go out (and the DB
+    # cascade clears this row's realised lots) before the replay. Deleting an acquisition
+    # can strip a later sell of its lots (ADR-0015 rule 9): refuse, nothing persists.
+    try:
+        rebuild_realised_lots(session, user_id=user_id, instrument_id=instrument_id)
+    except OversellError:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "deleting this transaction would leave a sell/switch_out "
+                "without enough units at its date"
+            ),
+        ) from None
     session.commit()
     return None

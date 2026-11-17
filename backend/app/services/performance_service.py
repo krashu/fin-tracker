@@ -77,7 +77,8 @@ def compute_portfolio_performance(
     """Scalar alpha of the user's portfolio vs ``benchmark_id``, valued at ``as_of``.
 
     The route resolves ``benchmark_id`` (default + 404); this assumes it names an active
-    benchmark. ``as_of`` (the route passes ``clock.today()`` — UTC) anchors both terminals.
+    benchmark. ``as_of`` (the route passes ``clock.today()``, the IST business date) anchors both
+    terminals.
     """
     benchmark = session.get(Benchmark, benchmark_id)
     if benchmark is None:  # pragma: no cover - route guarantees existence

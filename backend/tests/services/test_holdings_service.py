@@ -4,14 +4,13 @@ Exercises ``app.services.holdings_service.compute_holdings`` directly against an
 in-memory session — no TestClient, no router (services tests don't pick up the
 api/conftest.py rig). This is the coverage-gated module for the slice, so every
 branch of the FIFO replay is hit: buy/sip lots, partial-sell proportional cost
-release, the same-date id-ascending tie-break, bonus (free units), dividend
-(no-op), NAV-None, oversell clamp, the deferred split/switch no-op, and the per-row
+release, the same-date insertion-order tie-break (ADR-0015 rule 3), bonus (free units),
+dividend (no-op), NAV-None, oversell clamp, the deferred split/switch no-op, and the per-row
 valuation age.
 """
 
 from __future__ import annotations
 
-import uuid
 from collections import deque
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -27,7 +26,6 @@ from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.services.holdings_service import (
     UNIT_SIGN,
     _apply,
-    available_units,
     compute_holdings,
     max_staleness_days,
     summarize_holdings,
@@ -453,7 +451,7 @@ def test_reinvest_lot_acquisition_date_orders_between_neighbours(
 def test_switch_in_adds_and_switch_out_consumes_fifo(session: Session, user: User) -> None:
     inst = _instrument(session, user.id)
     _txn(session, user.id, inst.id, txn_type="buy", units=Decimal("10"), amount_paise=100_000)
-    # switch_in acquires units like a buy (PRD §F7 248-251).
+    # switch_in acquires units like a buy (ADR-0015 rule 1).
     _txn(
         session,
         user.id,
@@ -675,76 +673,6 @@ def test_summarize_mixed_currency_rolls_up_to_inr(session: Session, user: User) 
     assert rollup.invested_paise == 100_000 + 100_000 * 80
 
 
-# ---------- available_units (the write-time oversell guard) -------------------
-#
-# Zero tests referenced this function before, and coverage reported the whole
-# unit-subtracting branch as never executed — while it has TWO production callers:
-# the manual-sell 422 in api/v1/investment_transactions.py and the CSV importer's
-# per-instrument oversell prefetch in investment_import_service.py.
-#
-# It is also the ONLY place where `bonus` counts toward sellable units. The four
-# hand-mirrored spellings of that rule are now one `UNIT_SIGN` map (A2.7/A4.1), so the
-# divergence these tests were bought to catch can no longer be introduced by editing
-# one site — but they still pin the *value* of the rule (bonus is sellable), which no
-# consolidation can prove on its own. The two exhaustiveness tests below are what keep
-# `UNIT_SIGN` and `_apply` bound to each other.
-
-
-def test_available_units_counts_bonus_as_sellable(session: Session, user: User) -> None:
-    """buy(10) + bonus(5) → 15 sellable. Bonus units ARE sellable."""
-    inst = _instrument(session, user.id)
-    _txn(session, user.id, inst.id, txn_type="buy", units=Decimal("10"), amount_paise=100_000)
-    _txn(session, user.id, inst.id, txn_type="bonus", units=Decimal("5"))
-
-    assert available_units(session, user_id=user.id, instrument_id=inst.id) == Decimal("15")
-
-
-def test_available_units_subtracts_sell_and_switch_out(session: Session, user: User) -> None:
-    """The subtract branch: buy(10) − sell(4) → 6, and switch_out subtracts too."""
-    inst = _instrument(session, user.id)
-    _txn(session, user.id, inst.id, txn_type="buy", units=Decimal("10"), amount_paise=100_000)
-    _txn(session, user.id, inst.id, txn_type="sell", units=Decimal("4"), amount_paise=50_000)
-
-    assert available_units(session, user_id=user.id, instrument_id=inst.id) == Decimal("6")
-
-    _txn(session, user.id, inst.id, txn_type="switch_out", units=Decimal("2"), amount_paise=25_000)
-    assert available_units(session, user_id=user.id, instrument_id=inst.id) == Decimal("4")
-
-
-def test_available_units_ignores_unit_neutral_types(session: Session, user: User) -> None:
-    """dividend is cash and split is deferred — neither moves the sellable balance."""
-    inst = _instrument(session, user.id)
-    _txn(session, user.id, inst.id, txn_type="buy", units=Decimal("10"), amount_paise=100_000)
-    _txn(session, user.id, inst.id, txn_type="dividend", amount_paise=5_000)
-    _txn(session, user.id, inst.id, txn_type="split", units=Decimal("90"))
-
-    assert available_units(session, user_id=user.id, instrument_id=inst.id) == Decimal("10")
-
-
-def test_available_units_is_user_and_instrument_scoped(session: Session, user: User) -> None:
-    """Another user's rows, and another instrument's rows, never leak in."""
-    other = User(id=uuid.uuid4())
-    session.add(other)
-    session.flush()
-
-    mine = _instrument(session, user.id, symbol="INF_MINE")
-    theirs = _instrument(session, other.id, symbol="INF_THEIRS")
-    sibling = _instrument(session, user.id, symbol="INF_SIBLING")
-
-    _txn(session, user.id, mine.id, txn_type="buy", units=Decimal("10"), amount_paise=100_000)
-    _txn(session, other.id, theirs.id, txn_type="buy", units=Decimal("99"), amount_paise=100_000)
-    _txn(session, user.id, sibling.id, txn_type="buy", units=Decimal("77"), amount_paise=100_000)
-
-    assert available_units(session, user_id=user.id, instrument_id=mine.id) == Decimal("10")
-
-
-def test_available_units_zero_for_instrument_with_no_transactions(
-    session: Session, user: User
-) -> None:
-    inst = _instrument(session, user.id)
-    assert available_units(session, user_id=user.id, instrument_id=inst.id) == Decimal("0")
-
-
 # ---------- UNIT_SIGN exhaustiveness (the CI gate that replaced four spellings) ----
 #
 # `UNIT_SIGN` is deliberately read with `.get(t, 0)` everywhere and `_apply` has no
@@ -758,9 +686,8 @@ def test_unit_sign_covers_every_member() -> None:
     """A 9th member of the Literal must be given a sign, not silently default to 0.
 
     Without this, widening the enum makes the new type unit-neutral everywhere:
-    compute_holdings drops the instrument (net_units <= 0) while available_units counts
-    its units anyway, so the oversell guard permits selling a position /holdings says
-    does not exist.
+    compute_holdings drops the instrument (net_units <= 0) while the sign-less replay
+    still folds its units, so the two disagree about a position.
     """
     assert set(UNIT_SIGN) == set(get_args(InvestmentTxnTypeStr))
 
@@ -869,3 +796,69 @@ def test_valuation_age_is_none_without_an_as_of_or_a_nav(session: Session, user:
         for h in compute_holdings(session, user_id=user.id, as_of=as_of)
     }
     assert anchored == {"INF001": 5, "INF002": None}
+
+
+@pytest.mark.parametrize("sell_first", [False, True], ids=["buy_first", "sell_first"])
+def test_same_day_buy_and_sell_net_before_fifo(
+    session: Session, user: User, sell_first: bool
+) -> None:
+    """ADR-0015 rule 7: on one day the lesser of buys and sells is intraday and touches no
+    lot, so the day's sell does not consume the old lot beyond its residual 30 units."""
+    inst = _instrument(session, user.id, asset_class="indian_equity", exchange="NSE")
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("100"),
+        amount_paise=1_000_000,
+        on=date(2025, 6, 2),
+    )
+    day = [
+        ("buy", Decimal("50"), 600_000),
+        ("sell", Decimal("80"), 1_040_000),
+    ]
+    if sell_first:
+        day.reverse()
+    for kind, units, amount in day:
+        _txn(
+            session,
+            user.id,
+            inst.id,
+            txn_type=kind,  # type: ignore[arg-type]
+            units=units,
+            amount_paise=amount,
+            price=Decimal("1"),
+        )
+
+    (h,) = compute_holdings(session, user_id=user.id)
+    assert h.net_units == Decimal("70")
+    assert h.invested_native_paise == 700_000  # plain FIFO would leave 800_000
+
+
+def test_same_day_trades_in_an_mf_are_not_netted(session: Session, user: User) -> None:
+    """Rule 7's scope: only ``indian_equity`` nets. The same trades in an MF consume FIFO."""
+    inst = _instrument(session, user.id, asset_class="indian_mf")
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("100"),
+        amount_paise=1_000_000,
+        on=date(2025, 6, 2),
+    )
+    _txn(session, user.id, inst.id, txn_type="buy", units=Decimal("50"), amount_paise=600_000)
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="sell",
+        units=Decimal("80"),
+        amount_paise=1_040_000,
+        price=Decimal("1"),
+    )
+
+    (h,) = compute_holdings(session, user_id=user.id)
+    assert h.net_units == Decimal("70")
+    assert h.invested_native_paise == 800_000

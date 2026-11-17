@@ -79,13 +79,14 @@ def test_summary_wire_shape_after_buy(
     assert hx["xirr"] is None or isinstance(hx["xirr"], (int, float))
 
 
-def test_summary_as_of_comes_from_the_utc_clock(
+def test_summary_as_of_comes_from_the_app_clock(
     client: TestClient,
     seeded_user: User,
     session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The route's ``as_of`` is ``clock.today()`` (UTC), not the host's local date.
+    """The route's ``as_of`` is ``clock.today()`` (the IST business date), not the host's
+    local date.
 
     Proven through the FX read: the only cached USD→INR rate is dated on the *pinned*
     clock's date, and ``rate_on`` is ``date <= as_of``. If the route still read

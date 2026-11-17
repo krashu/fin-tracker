@@ -10,10 +10,12 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import FxRateQuote, Instrument, User
+from app.models import FxRateQuote, Instrument, RealisedLot, User
 
 
 def _buy(instrument_id: int, **over: object) -> dict[str, object]:
@@ -88,9 +90,9 @@ def test_reinvestment_writes_both_pair_directions(
 
     Both directions must be set: the delete path keys on ``txn.pair_id``, so a
     one-directional link would leave a dangling composite FK when the pointed-at row
-    is deleted first. ``div.id < buy.id`` is also load-bearing — the FIFO replay's
-    same-date tie-break is id-ascending, so a date-ordered listing reads
-    income → acquisition.
+    is deleted first. ``div.id < buy.id`` is also load-bearing — same-date order is
+    source order, carried by insertion order (ADR-0015 rule 3), so a date-ordered listing
+    reads income → acquisition.
     """
     body = _post_reinvestment(client, instrument.id)
     div, buy = body["dividend"], body["buy"]
@@ -123,33 +125,21 @@ def test_list_exposes_non_null_pair_id_on_both_legs(
     assert by_id[body["dividend"]["id"]]["pair_id"] == body["buy"]["id"]
 
 
-def test_delete_dividend_leg_nulls_the_buy_pointer(
-    client: TestClient, seeded_user: User, instrument: Instrument
+@pytest.mark.parametrize("leg", ["dividend", "buy"])
+def test_delete_one_leg_unlinks_partner(
+    client: TestClient, seeded_user: User, instrument: Instrument, leg: str
 ) -> None:
+    """ADR-0002 rule 5: deleting one leg nulls the partner's ``pair_id``.
+
+    With FK enforcement ON, a missing null-out raises IntegrityError (the composite
+    same-user FK) rather than corrupting quietly, so this is a real guard.
+    """
     body = _post_reinvestment(client, instrument.id)
-    assert (
-        client.delete(f"/api/v1/investment-transactions/{body['dividend']['id']}").status_code
-        == 204
-    )
+    other = "buy" if leg == "dividend" else "dividend"
+    assert client.delete(f"/api/v1/investment-transactions/{body[leg]['id']}").status_code == 204
 
     remaining = client.get("/api/v1/investment-transactions").json()
-    assert len(remaining) == 1
-    assert remaining[0]["id"] == body["buy"]["id"]
-    assert remaining[0]["pair_id"] is None
-
-
-def test_delete_buy_leg_nulls_the_dividend_pointer(
-    client: TestClient, seeded_user: User, instrument: Instrument
-) -> None:
-    """The mirror case. With FK enforcement ON, a missing null-out raises
-    IntegrityError rather than corrupting quietly — so this is a real guard, not
-    symmetry for its own sake."""
-    body = _post_reinvestment(client, instrument.id)
-    assert client.delete(f"/api/v1/investment-transactions/{body['buy']['id']}").status_code == 204
-
-    remaining = client.get("/api/v1/investment-transactions").json()
-    assert len(remaining) == 1
-    assert remaining[0]["id"] == body["dividend"]["id"]
+    assert [r["id"] for r in remaining] == [body[other]["id"]]
     assert remaining[0]["pair_id"] is None
 
 
@@ -336,11 +326,9 @@ def test_sell_may_draw_on_bonus_units(
 ) -> None:
     """buy(10) + bonus(5) → a sell of 12 is ACCEPTED. Bonus units are sellable.
 
-    This is the only production path where that matters. It was bought as the net under
-    a queued unit-sign consolidation, which has since landed: the four hand-mirrored
-    spellings are now one ``holdings_service.UNIT_SIGN`` map (A2.7/A4.1), and picking
-    the wrong one for ``bonus`` would 422 this legitimate sell through both
-    ``available_units`` callers.
+    Bonus units open a zero-cost lot in the ADR-0015 replay that every write runs; getting
+    ``bonus`` wrong in ``holdings_service.UNIT_SIGN`` or ``_apply`` would 422 this
+    legitimate sell.
     """
     client.post("/api/v1/investment-transactions", json=_buy(instrument.id, units="10"))
     bonus = client.post(
@@ -464,3 +452,126 @@ def test_delete_hard(client: TestClient, seeded_user: User, instrument: Instrume
     assert client.delete(f"/api/v1/investment-transactions/{tid}").status_code == 204
     assert client.delete(f"/api/v1/investment-transactions/{tid}").status_code == 404
     assert client.get("/api/v1/investment-transactions").json() == []
+
+
+def _post(client: TestClient, body: dict[str, object]) -> dict:
+    resp = client.post("/api/v1/investment-transactions", json=body)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def _lots(session: Session) -> list[RealisedLot]:
+    session.expire_all()
+    return list(session.scalars(select(RealisedLot).order_by(RealisedLot.id)))
+
+
+def test_sell_writes_realised_lots(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    buy = _post(client, _buy(instrument.id, units="10"))
+    sell = _post(client, _sell(instrument.id, units="4"))
+    (row,) = _lots(session)
+    assert (row.sell_txn_id, row.buy_txn_id, row.units) == (sell["id"], buy["id"], Decimal("4"))
+    assert row.cost_native_paise == 40_000
+    assert row.proceeds_native_paise == 150_000
+
+
+def test_back_dated_sell_uncovered_at_its_date_422(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    """ADR-0015 rule 9: units held today are not the test; the sell's own date is."""
+    _post(client, _buy(instrument.id, date="2026-03-01", units="10"))
+    resp = client.post(
+        "/api/v1/investment-transactions", json=_sell(instrument.id, "10", date="2026-02-01")
+    )
+    assert resp.status_code == 422
+    listed = client.get("/api/v1/investment-transactions").json()
+    assert [r["transaction_type"] for r in listed] == ["buy"]
+    assert _lots(session) == []
+
+
+def test_sell_that_uncovers_a_later_sell_422(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    _post(client, _buy(instrument.id, date="2026-01-01", units="10"))
+    _post(client, _sell(instrument.id, "10", date="2026-03-01"))
+    # The Feb sell is covered by itself, but strips the March sell of its lots.
+    resp = client.post(
+        "/api/v1/investment-transactions", json=_sell(instrument.id, "5", date="2026-02-01")
+    )
+    assert resp.status_code == 422
+    assert len(client.get("/api/v1/investment-transactions").json()) == 2
+    assert len(_lots(session)) == 1
+
+
+def test_delete_consumed_buy_422_when_the_sell_would_be_uncovered(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    buy = _post(client, _buy(instrument.id, date="2026-01-01", units="10"))
+    _post(client, _sell(instrument.id, "10", date="2026-02-01"))
+    resp = client.delete(f"/api/v1/investment-transactions/{buy['id']}")
+    assert resp.status_code == 422
+    assert "without enough units" in resp.json()["detail"]
+    assert len(client.get("/api/v1/investment-transactions").json()) == 2
+    assert len(_lots(session)) == 1
+
+
+def test_delete_consumed_buy_204_when_other_lots_cover_the_sell(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    first = _post(client, _buy(instrument.id, date="2026-01-01", units="10"))
+    second = _post(client, _buy(instrument.id, date="2026-02-01", units="10"))
+    _post(client, _sell(instrument.id, "10", date="2026-03-01"))
+    assert [r.buy_txn_id for r in _lots(session)] == [first["id"]]
+
+    assert client.delete(f"/api/v1/investment-transactions/{first['id']}").status_code == 204
+    assert [r.buy_txn_id for r in _lots(session)] == [second["id"]]
+
+
+def _equity(session: Session, seeded_user: User) -> Instrument:
+    inst = Instrument(
+        user_id=seeded_user.id,
+        symbol="INFY",
+        name="Infosys",
+        asset_class="indian_equity",
+        currency="INR",
+        exchange="NSE",
+    )
+    session.add(inst)
+    session.commit()
+    return inst
+
+
+def test_reinvestment_buy_leg_nets_intraday_on_indian_equity(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """The reinvestment endpoint has no asset-class guard, so its ``buy`` leg is a buy like
+    any other: against a same-day sell on an equity it nets intraday (ADR-0015 rule 7)."""
+    inst = _equity(session, seeded_user)
+    buy1 = _post(client, _buy(inst.id, units="10"))
+    sell = _post(client, _sell(inst.id, units="4", date="2026-06-02", amount_native_paise=150_000))
+    resp = client.post(
+        "/api/v1/investment-transactions/reinvestment", json=_reinvest(inst.id, date="2026-06-02")
+    )
+    assert resp.status_code == 201, resp.text
+    reinvest_buy = resp.json()["buy"]
+
+    assert [
+        (r.kind, r.sell_txn_id, r.buy_txn_id, r.units, r.cost_native_paise, r.proceeds_native_paise)
+        for r in _lots(session)
+    ] == [
+        ("intraday", sell["id"], reinvest_buy["id"], Decimal("0.8"), 10_000, 30_000),
+        ("fifo", sell["id"], buy1["id"], Decimal("3.2"), 32_000, 120_000),
+    ]
+
+
+def test_same_day_sell_posted_before_its_buy_422(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    """ADR-0015 rule 8: manual entry writes one row at a time, so a sell posted before its
+    same-day buy is refused: the buy does not exist yet. Once it does, the sell is accepted."""
+    inst = _equity(session, seeded_user)
+    sell = _sell(inst.id, "4", date="2026-06-01")
+    assert client.post("/api/v1/investment-transactions", json=sell).status_code == 422
+    _post(client, _buy(inst.id, units="10"))
+    _post(client, sell)

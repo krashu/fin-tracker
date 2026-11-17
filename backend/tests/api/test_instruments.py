@@ -18,11 +18,14 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.models import User
+from app.schemas import InstrumentCreate
 from app.services.nav_snapshot_service import refresh_navs
 
 _MINIMAL = {
@@ -113,6 +116,72 @@ def test_us_equity_requires_usd_currency(client: TestClient, seeded_user: User) 
         },
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("asset_class", ["indian_equity", "indian_mf", "nps"])
+def test_create_indian_class_requires_inr(
+    client: TestClient, seeded_user: User, asset_class: str
+) -> None:
+    # Rupee-traded classes: intraday netting and the F11 statement read their amounts as INR,
+    # so a USD stamp is rejected at create (symmetric to the us_* rule).
+    resp = client.post(
+        "/api/v1/instruments",
+        json={
+            "symbol": "X",
+            "name": "X",
+            "asset_class": asset_class,
+            "exchange": "NSE",
+            "currency": "USD",
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_asset_class_currency_rule(client: TestClient, seeded_user: User) -> None:
+    """PRD §F7: the server says which currencies each class may carry, in Literal order, so
+    no client restates the rule (B19)."""
+    resp = client.get("/api/v1/instruments/asset-classes")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == [
+        {"asset_class": "indian_equity", "currencies": ["INR"]},
+        {"asset_class": "indian_mf", "currencies": ["INR"]},
+        {"asset_class": "us_equity", "currencies": ["USD"]},
+        {"asset_class": "us_etf", "currencies": ["USD"]},
+        {"asset_class": "fd", "currencies": ["INR", "USD"]},
+        {"asset_class": "bond", "currencies": ["INR", "USD"]},
+        {"asset_class": "nps", "currencies": ["INR"]},
+        {"asset_class": "gold", "currencies": ["INR", "USD"]},
+        {"asset_class": "other", "currencies": ["INR", "USD"]},
+    ]
+
+
+def test_asset_class_rule_agrees_with_instrument_create(
+    client: TestClient, seeded_user: User
+) -> None:
+    """The served rule and ``InstrumentCreate`` cannot drift: a currency is accepted exactly
+    when the endpoint lists it for the class."""
+    served = {
+        row["asset_class"]: row["currencies"]
+        for row in client.get("/api/v1/instruments/asset-classes").json()
+    }
+    assert served
+
+    for asset_class, currencies in served.items():
+        for currency in ("INR", "USD"):
+            body = {
+                "symbol": "X",
+                "name": "X",
+                "asset_class": asset_class,
+                "exchange": "OTHER",
+                "currency": currency,
+            }
+            try:
+                InstrumentCreate.model_validate(body)
+                accepted = True
+            except ValidationError:
+                accepted = False
+            assert accepted == (currency in currencies), (asset_class, currency)
 
 
 def test_duplicate_active_symbol_conflicts(client: TestClient, seeded_user: User) -> None:

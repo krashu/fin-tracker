@@ -73,9 +73,9 @@ def test_usd_row_without_fx_rate_rejected_in_summary(client: TestClient, seeded_
 
 
 def test_import_oversell_row_rejected(client: TestClient, seeded_user: User) -> None:
-    # An in-file buy 10 then sell 15 for the same instrument: the buy imports, the
-    # sell is rejected (oversell) — the running net is seeded from DB (0 here) and
-    # updated only on the persisted buy, so the sell validates against 10.
+    # An in-file buy 10 then sell 15 for the same instrument: the one coverage replay per
+    # instrument (ADR-0015 rule 9) finds the sell short, so NONE of the instrument's rows
+    # import (the buy included) and the instrument the file would have created is not kept.
     resp = _post(
         client,
         "date,type,symbol,units,price,amount\n"
@@ -84,10 +84,13 @@ def test_import_oversell_row_rejected(client: TestClient, seeded_user: User) -> 
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["txns_imported"] == 1
-    assert body["rows_rejected"] == 1
-    assert body["warnings"] and body["warnings"][0].startswith("row ")
-    assert "exceeds available units" in body["warnings"][0]
+    assert body["txns_imported"] == 0
+    assert body["rows_rejected"] == 2
+    assert body["instruments_new"] == 0
+    assert body["warnings"] == [
+        "row 3: sell of 15 is short by 5 units at its date"
+        " \u2014 none of this instrument's rows were imported"
+    ]
 
 
 def test_import_partial_sell_ok(client: TestClient, seeded_user: User) -> None:
@@ -130,3 +133,13 @@ def test_warnings_are_pii_safe(client: TestClient, seeded_user: User) -> None:
     assert body["rows_rejected"] == 1
     assert all(w.startswith("row ") for w in body["warnings"])
     assert token not in resp.text
+
+
+def test_over_cap_upload_is_413(client: TestClient, seeded_user: User) -> None:
+    resp = client.post(
+        _URL,
+        files={"file": ("tradebook.csv", b"\0" * (11 * 1024 * 1024), "text/csv")},
+        data={"asset_class": "indian_equity"},
+    )
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "file too large"

@@ -27,12 +27,14 @@ Decisions locked for this slice:
   :func:`app.services.fx_service.resolve_fx_rate_to_inr` (INR → exact 1, the byte-identical
   no-op; USD → the historical ``rate_on(date)``). A USD row with **no** cached rate at-or-before
   its date is **rejected** (a counted warning), never stamped 1 — mis-stamping would silently
-  corrupt the INR rollup.
-* **Idempotent re-import, retryable on FX-reject.** Identical re-upload short-circuits on
-  ``source_file_hash`` — but an import with any **rejected row** does not mark the batch
-  ``completed`` (the state the short-circuit matches). Note the status keys on *rejections*
-  only: parse and validation warnings do not block ``completed``, so a batch can be
-  ``completed`` and still carry warnings. If any row was FX-rejected the batch is left
+  corrupt the INR rollup — and an instrument the file created only for rejected rows is not
+  kept.
+* **Idempotent re-import, retryable on FX-reject or a refused instrument.** Identical
+  re-upload short-circuits on ``source_file_hash`` — but an import with any **rejected row**
+  or **refused instrument** does not mark the batch ``completed`` (the state the
+  short-circuit matches). Note the status keys on those only: parse and validation warnings
+  do not block ``completed``, so a batch can be ``completed`` and still carry warnings. If
+  any row was FX-rejected, or an instrument refused (below), the batch is left
   ``failed`` (its "needs user attention" sense) so a re-upload after ``POST /fx/refresh``
   reprocesses; per-row
   ``fingerprint`` dedup makes the already-imported rows no-ops. The fingerprint hashes the
@@ -58,11 +60,21 @@ Decisions locked for this slice:
   reinvestment is a linked dividend+buy pair and this format cannot express the link: rows dedup
   independently (:func:`_fingerprint` has no notion of a sibling), so a re-upload after a partial
   failure could persist one leg without the other, undetectably.
+* **Coverage is checked once per instrument, and refused per instrument** (ADR-0015 rule 9).
+  The whole file is inserted in one flush (ids follow file order, rule 3), then each
+  instrument that gained rows is replayed once through
+  :func:`~app.services.holdings_service.rebuild_realised_lots`. If the replay leaves any sell
+  uncovered, none of that instrument's rows from the file persist (nor an instrument the
+  file created), every uncovered sell is listed, and the file's other instruments import
+  normally. Whatever drops a created instrument's rows — an FX reject or a refusal — the
+  instrument itself is not kept: one sweep after the coverage check removes every instrument
+  the file created that kept no row (ADR-0016 rule 2).
 """
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
 from typing import cast
@@ -76,7 +88,7 @@ from app.models import ImportBatch, Instrument, InvestmentTransaction
 from app.models.instrument import AssetClassStr
 from app.parsers import ParsedInvestmentRow, parse_investment_csv
 from app.services.fx_service import resolve_fx_rate_to_inr
-from app.services.holdings_service import UNIT_SIGN, available_units
+from app.services.holdings_service import OversellError, rebuild_realised_lots
 from app.services.occurrence import OccurrenceAllocator
 
 logger = get_logger(__name__)
@@ -86,6 +98,10 @@ _PARSER_NAME = "investment_csv"
 
 @dataclass(frozen=True, slots=True)
 class InvestmentImportResult:
+    """``rows_rejected`` is a **row** count (parse skips, per-type validation, FX rejects and
+    every row of a refused instrument); ``warnings`` may be fewer, since a refused
+    instrument gets one warning per uncovered sell, not one per row."""
+
     batch_id: int
     instruments_new: int
     txns_imported: int
@@ -137,7 +153,8 @@ def persist_investment_rows(
 
     Shared by every parser (CSV today, INDmoney next). ``parse_warnings`` are the caller's
     parser's per-row skips, merged into the returned warnings. ``rows_rejected`` is the total
-    rows dropped (parse skips + per-type validation + FX-unavailable) — a user-facing total,
+    rows dropped (parse skips + per-type validation + FX-unavailable + every row of a refused
+    instrument) — a user-facing row count, not ``len(warnings)``,
     deliberately NOT the ``rows_rejected`` in the ``import_completed`` event below, which
     excludes the parse skips so its counts satisfy ``rows_in == imported + skipped + rejected``.
     """
@@ -189,31 +206,96 @@ def persist_investment_rows(
     session.flush()
 
     # Validate per-type BEFORE upsert so a dropped row doesn't create a dangling
-    # instrument (unlike CAS, the rows are the only instrument source here).
+    # instrument (unlike CAS, the rows are the only instrument source here). FX rejects
+    # and refusals are swept after the coverage check instead.
     valid_rows, validation_warnings = _validate_rows(rows)
-    instruments_new, instruments_by_key = _upsert_instruments(
+    created, instruments_by_key, isin_fills = _upsert_instruments(
         session, user_id=user_id, rows=valid_rows
     )
-    imported, skipped_dupe, reject_warnings = _persist_txns(
+    imported, skipped_dupe, fx_rejected, new_rows = _persist_txns(
         session,
         user_id=user_id,
         batch_id=batch.id,
         rows=valid_rows,
         instruments_by_key=instruments_by_key,
     )
+    # One flush for the whole file, so ids follow file order (ADR-0015 rule 3).
+    session.flush()
+
+    # The coverage check, once per instrument this file added rows to (ADR-0015 rule 9). An
+    # instrument with no new rows had no write, so its realised_lots are current; replaying
+    # it would cost a full replay per instrument on every re-upload.
+    #
+    # INVARIANT: per-instrument writes other than the rows and instrument creation happen
+    # only after this check (the ISIN fill is the precedent), because _refuse_instrument
+    # undoes exactly the rows and the sweep below undoes the creation. A new per-instrument
+    # side effect must follow the same pattern.
+    refused_rows = 0
+    refused_ids: set[int] = set()
+    refusal_warnings: list[tuple[int, str]] = []
+    key_of = {inst.id: key for key, inst in instruments_by_key.items()}
+    for instrument_id in sorted(new_rows):
+        key = key_of[instrument_id]
+        inst = instruments_by_key[key]
+        try:
+            rebuild_realised_lots(session, user_id=user_id, instrument_id=instrument_id)
+        except OversellError as e:
+            inst_rows = new_rows[instrument_id]
+            # Logged before the refusal deletes this instrument's rows.
+            logger.info(
+                "investment_import.instrument_refused",
+                import_batch_id=batch.id,
+                instrument_id=instrument_id,
+                rows_refused=len(inst_rows),
+                uncovered_sells=len(e.uncovered),
+                instrument_created=key in created,
+            )
+            refusal_warnings.extend(
+                _refuse_instrument(
+                    session,
+                    inst=inst,
+                    rows=inst_rows,
+                    uncovered=e.uncovered,
+                )
+            )
+            refused_rows += len(inst_rows)
+            imported -= len(inst_rows)
+            refused_ids.add(instrument_id)
+            continue
+        _fill_isin(inst, isin_fills.get(key))
+    for key, inst in instruments_by_key.items():
+        if inst.id not in new_rows:
+            _fill_isin(inst, isin_fills.get(key))
+
+    # An import keeps no instrument it created for rows that did not persist: every row
+    # FX-rejected (ADR-0016 rule 2) or the instrument refused (ADR-0015 rule 9).
+    # No relationship cascade; investment_transactions is the only FK into instruments.
+    dropped = [
+        key
+        for key in created
+        if (iid := instruments_by_key[key].id) not in new_rows or iid in refused_ids
+    ]
+    for key in dropped:
+        session.delete(instruments_by_key[key])
+    if dropped:
+        session.flush()
+    instruments_new = len(created) - len(dropped)
+
+    reject_warnings = [m for _, m in sorted([*fx_rejected, *refusal_warnings], key=lambda r: r[0])]
 
     batch.imported_count = imported
     batch.skipped_count = skipped_dupe
-    # Keys on ``reject_warnings`` ALONE: ``parse_warnings`` / ``validation_warnings`` do NOT
-    # block ``completed``, so a batch can be ``completed`` and still carry warnings. Only a
-    # *rejected row* (a row that produced no transaction) is treated as needing attention.
-    # A rejected row leaves the batch ``failed`` — its documented "needs user attention" sense —
-    # and the next upload of the same file reprocesses (per-row fingerprint dedup makes the
-    # already-imported rows no-ops). An FX-reject is transient (fixable by POST /fx/refresh); an
-    # oversell reject needs a corrected CSV, but the reprocess-on-reupload handling is the same.
+    # Keys on FX rejects and refused instruments ALONE: ``parse_warnings`` /
+    # ``validation_warnings`` do NOT block ``completed``, so a batch can be ``completed`` and
+    # still carry warnings. A row rejected for FX, or an instrument refused for an uncovered
+    # sell, is what needs attention. Either leaves the batch ``failed`` (its documented "needs
+    # user attention" sense) and the next upload of the fixed file reprocesses (per-row
+    # fingerprint dedup makes the already-imported rows no-ops). An FX-reject is transient
+    # (fixable by POST /fx/refresh); a refused instrument needs a corrected CSV, but the
+    # reprocess-on-reupload handling is the same.
     # No dedicated "partial" status: it would cost a CHECK-altering table rebuild for a field that
     # is purely informational, and a retry leaves a lingering non-completed batch either way.
-    batch.status = "failed" if reject_warnings else "completed"
+    batch.status = "failed" if fx_rejected or refused_rows else "completed"
     # Flush (not commit — the route owns commit) so the batch, instruments, and txn
     # rows are visible to a subsequent read or a second import in the same session.
     session.flush()
@@ -223,11 +305,11 @@ def persist_investment_rows(
     # middleware's contextvars when called via the API (absent for any non-HTTP caller).
     #
     # rows_rejected counts only what THIS function dropped — a row that failed per-type
-    # validation or FX resolution — so that rows_in == imported + skipped + rejected holds
-    # and a reader can sanity-check the event. That is deliberately NOT
-    # InvestmentImportResult.rows_rejected, which also folds in ``parse_warnings``: those
-    # rows never reached ``rows``, so counting them here would break the arithmetic. They
-    # get their own key instead.
+    # validation or FX resolution, or belonged to a refused instrument — so that
+    # rows_in == imported + skipped + rejected holds and a reader can sanity-check the
+    # event. That is deliberately NOT InvestmentImportResult.rows_rejected, which also folds
+    # in ``parse_warnings``: those rows never reached ``rows``, so counting them here would
+    # break the arithmetic. They get their own key instead.
     logger.info(
         "import_completed",
         import_batch_id=batch.id,
@@ -235,7 +317,7 @@ def persist_investment_rows(
         rows_in=len(rows),
         rows_imported=imported,
         rows_skipped=skipped_dupe,
-        rows_rejected=len(validation_warnings) + len(reject_warnings),
+        rows_rejected=len(validation_warnings) + len(fx_rejected) + refused_rows,
         rows_parse_skipped=len(parse_warnings),
         status=batch.status,
         already_imported=False,
@@ -247,7 +329,9 @@ def persist_investment_rows(
         instruments_new=instruments_new,
         txns_imported=imported,
         txns_skipped_dupe=skipped_dupe,
-        rows_rejected=len(warnings),
+        rows_rejected=(
+            len(parse_warnings) + len(validation_warnings) + len(fx_rejected) + refused_rows
+        ),
         warnings=warnings,
         already_imported=False,
     )
@@ -318,13 +402,15 @@ def _reject_reason(r: ParsedInvestmentRow) -> str | None:
 
 def _upsert_instruments(
     session: Session, *, user_id: UUID, rows: list[ParsedInvestmentRow]
-) -> tuple[int, dict[tuple[str, str], Instrument]]:
+) -> tuple[set[tuple[str, str]], dict[tuple[str, str], Instrument], dict[tuple[str, str], str]]:
     """Resolve each row's ``(symbol, currency)`` to an instrument, creating missing ones.
 
     Tracks this-run creations so a ``(symbol, currency)`` repeated across rows maps to one
     instrument (the first row's name / asset_class / exchange win). A same symbol across an
     INR and a USD row resolves to two distinct instruments. Returns
-    ``(created_count, {(symbol, currency): instrument})``.
+    ``(created_keys, {(symbol, currency): instrument}, isin_fills)``. ``isin_fills`` holds the
+    fill-if-null ISIN for an *existing* instrument: the caller applies it only after the
+    coverage check, so a refused instrument is left untouched.
     """
     existing: dict[tuple[str, str], Instrument] = {
         (inst.symbol, inst.currency): inst
@@ -336,7 +422,8 @@ def _upsert_instruments(
         )
     }
     resolved: dict[tuple[str, str], Instrument] = {}
-    created = 0
+    created: set[tuple[str, str]] = set()
+    isin_fills: dict[tuple[str, str], str] = {}
     for row in rows:
         key = (row.symbol, row.currency)
         if key in resolved:
@@ -355,12 +442,12 @@ def _upsert_instruments(
                 nav_updated_at=None,
             )
             session.add(inst)
-            created += 1
-        elif inst.isin is None and row.isin is not None:
-            inst.isin = row.isin  # fill-if-null; never overwrite an existing value (single-user)
+            created.add(key)
+        elif inst.isin is None and row.isin is not None and key not in isin_fills:
+            isin_fills[key] = row.isin  # fill-if-null; never overwrite an existing value
         resolved[key] = inst
     session.flush()  # assign ids for the FK on transaction rows
-    return created, resolved
+    return created, resolved, isin_fills
 
 
 def _persist_txns(
@@ -370,15 +457,20 @@ def _persist_txns(
     batch_id: int,
     rows: list[ParsedInvestmentRow],
     instruments_by_key: dict[tuple[str, str], Instrument],
-) -> tuple[int, int, list[str]]:
-    """Dedup + stamp FX + oversell-guard + insert pre-validated rows.
+) -> tuple[
+    int,
+    int,
+    list[tuple[int, str]],
+    dict[int, list[tuple[InvestmentTransaction, ParsedInvestmentRow]]],
+]:
+    """Dedup + stamp FX + insert pre-validated rows.
 
-    Returns ``(imported, skipped_dupe, rejected)`` where ``rejected`` collects both
-    FX-unavailable and oversell row warnings. The dedup check runs **before** FX
-    resolution so an already-imported row is a clean ``skipped_dupe`` even when rates
-    are currently unavailable (it was stamped on its first, successful import). The
-    oversell check runs **after** dedup + FX (only rows that would actually persist),
-    against a running per-instrument net that is mutated only on the persist branch.
+    Returns ``(imported, skipped_dupe, fx_rejected, new_rows)``. ``fx_rejected`` is
+    ``(line_no, warning)`` per FX-unavailable row; ``new_rows`` maps instrument id to the
+    rows added for it, in file order, for the per-instrument coverage check the caller runs
+    after one flush. The dedup check runs **before** FX resolution so an already-imported row
+    is a clean ``skipped_dupe`` even when rates are currently unavailable (it was stamped on
+    its first, successful import).
     """
     # Prefetch, per (instrument_id, fingerprint), HOW MANY rows already exist and the
     # highest occurrence in use — the row loop then does a multiset difference
@@ -389,9 +481,9 @@ def _persist_txns(
     # instrument_id, so a re-upload (same instrument, same row) hashes identically →
     # skipped; different instruments can't collide.
     #
-    # Unwindowed by date, unlike import_service (which windows by the statement
-    # period): the instrument scope is already the narrow axis here, and a CSV
-    # carries no bounded period.
+    # Unwindowed by date, like import_service (which scopes to the file's fingerprint
+    # set, not a date window): the instrument scope is already the narrow axis here,
+    # and a CSV carries no bounded period.
     #
     # ``IS NOT NULL`` is load-bearing, not an optimisation — it keeps NULL-fingerprint
     # manual rows out of the map entirely. A NULL group would otherwise become a
@@ -421,28 +513,19 @@ def _persist_txns(
     allocator = OccurrenceAllocator(existing_counts)
     imported = 0
     skipped_dupe = 0
-    rejected: list[str] = []
-    # Running net units per instrument, seeded from committed DB state (the batch's
-    # own rows aren't added yet). Mutated ONLY when a row actually persists, so a
-    # deduped or FX-rejected row never moves it and a later same-instrument sell
-    # validates against the true balance. Rows are walked in parser-emitted (file)
-    # order — never date-sorted — so an in-file buy→sell passes and an in-file
-    # oversell is caught; a sell listed before its funding buy in the same file may
-    # false-reject (documented — re-order the CSV or split the import).
-    running: dict[int, Decimal] = {
-        iid: available_units(session, user_id=user_id, instrument_id=iid) for iid in instrument_ids
-    }
+    fx_rejected: list[tuple[int, str]] = []
+    new_rows: dict[int, list[tuple[InvestmentTransaction, ParsedInvestmentRow]]] = {}
     for row in rows:
         inst = instruments_by_key[(row.symbol, row.currency)]
         fp = _fingerprint(instrument_id=inst.id, row=row)
-        # CALL POSITION IS LOAD-BEARING: allocate() must run HERE, ahead of both the
-        # FX reject and the oversell reject below, because it is what increments the
-        # allocator's per-file tally. Move it onto the persist branch and a rejected
-        # row leaves the tally at 0, so a re-upload after the reject is fixed
-        # re-imports a copy the DB already holds. The cost is that a rejected row can
-        # leave an occurrence gap, which the MAX-based assignment tolerates by design.
-        # Pinned by test_a_duplicate_row_is_skipped_before_the_oversell_guard_sees_it,
-        # which was RED when allocate() was moved past both rejects.
+        # CALL POSITION IS LOAD-BEARING: allocate() must run HERE, ahead of the FX
+        # reject below (the only reject in this loop; the coverage refusal runs after
+        # it, per instrument), because it is what increments the allocator's per-file
+        # tally. Move it onto the persist branch and a rejected row leaves the tally at
+        # 0, so a re-upload after the reject is fixed re-imports a copy the DB already
+        # holds. The cost is that a rejected row can leave an occurrence gap, which the
+        # MAX-based assignment tolerates by design.
+        # Pinned by test_a_duplicate_row_is_skipped_before_the_fx_reject_sees_it.
         #
         # `is None` — occurrence 0 is a valid first sighting (see the allocator).
         occurrence = allocator.allocate((inst.id, fp))
@@ -452,42 +535,94 @@ def _persist_txns(
         rate = resolve_fx_rate_to_inr(session, currency=inst.currency, on=row.date)
         if rate is None:
             # USD row with no cached rate at-or-before its date — reject, don't mis-stamp.
-            rejected.append(
-                f"row {row.line_no}: no USD/INR rate on or before "
-                f"{row.date.isoformat()} — run POST /fx/refresh and retry"
+            fx_rejected.append(
+                (
+                    row.line_no,
+                    f"row {row.line_no}: no USD/INR rate on or before "
+                    f"{row.date.isoformat()} — run POST /fx/refresh and retry",
+                )
             )
             continue
-        if UNIT_SIGN.get(row.txn_type, 0) < 0 and row.units > running[inst.id]:
-            # Oversell — would leave an impossible position. Skip (don't persist,
-            # don't touch running), mirroring the FX-reject warning shape. The
-            # read-model FIFO stays the authority for bad *stored* data.
-            rejected.append(
-                f"row {row.line_no}: sell of {row.units} exceeds available units — skipped"
+        txn = InvestmentTransaction(
+            user_id=user_id,
+            instrument_id=inst.id,
+            date=row.date,
+            transaction_type=row.txn_type,
+            units=row.units,
+            price_per_unit_native=row.price,
+            amount_native_paise=row.amount_native_paise,
+            fees_native_paise=row.fees_native_paise,
+            fx_rate_to_inr=rate,
+            import_batch_id=batch_id,
+            fingerprint=fp,
+            occurrence=occurrence,
+            pair_id=None,
+        )
+        session.add(txn)
+        new_rows.setdefault(inst.id, []).append((txn, row))
+        imported += 1
+    return imported, skipped_dupe, fx_rejected, new_rows
+
+
+def _fmt(u: Decimal) -> str:
+    """Units without the parser's 8-dp trailing zeros (``15.00000000`` -> ``15``)."""
+    return format(u.normalize(), "f")
+
+
+def _units(u: Decimal) -> str:
+    return f"{_fmt(u)} unit{'' if u == 1 else 's'}"
+
+
+def _fill_isin(inst: Instrument, isin: str | None) -> None:
+    """Fill-if-null; an existing ISIN is never overwritten."""
+    if isin is not None and inst.isin is None:
+        inst.isin = isin
+
+
+def _refuse_instrument(
+    session: Session,
+    *,
+    inst: Instrument,
+    rows: list[tuple[InvestmentTransaction, ParsedInvestmentRow]],
+    uncovered: Sequence[tuple[int, Decimal]],
+) -> list[tuple[int, str]]:
+    """Undo one instrument's share of the import (ADR-0015 rule 9) and word the warnings.
+
+    Deletes the file's rows; the sweep in ``persist_investment_rows`` drops the instrument if
+    the file created it. The
+    rows have no ``realised_lots`` (the rebuild raised before writing) and no ``pair_id``;
+    stored rows and their lots are untouched. Returns one ``(line_no, warning)`` per
+    uncovered sell, in replay order: a sell from this file is named by its line, a sell
+    already recorded by date and anchored to the instrument's first file line.
+    """
+    by_id = {t.id: row for t, row in rows}
+    first_line = min(row.line_no for _, row in rows)
+    tail = "\u2014 none of this instrument's rows were imported"
+    warnings: list[tuple[int, str]] = []
+    for sell_id, short in uncovered:
+        row = by_id.get(sell_id)
+        if row is not None:
+            warnings.append(
+                (
+                    row.line_no,
+                    f"row {row.line_no}: sell of {_fmt(row.units)} is short by {_units(short)} "
+                    f"at its date {tail}",
+                )
             )
             continue
-        session.add(
-            InvestmentTransaction(
-                user_id=user_id,
-                instrument_id=inst.id,
-                date=row.date,
-                transaction_type=row.txn_type,
-                units=row.units,
-                price_per_unit_native=row.price,
-                amount_native_paise=row.amount_native_paise,
-                fees_native_paise=row.fees_native_paise,
-                fx_rate_to_inr=rate,
-                import_batch_id=batch_id,
-                fingerprint=fp,
-                occurrence=occurrence,
-                pair_id=None,
+        recorded = session.get(InvestmentTransaction, sell_id)
+        assert recorded is not None  # the replay just read it
+        warnings.append(
+            (
+                first_line,
+                f"row {first_line}: a recorded sell of {_fmt(recorded.units)} on "
+                f"{recorded.date.isoformat()} would be short by {_units(short)} {tail}",
             )
         )
-        imported += 1
-        # Sign comes from the one authority, holdings_service.UNIT_SIGN — the same map
-        # available_units and _apply read, so this projection can no longer drift from
-        # the read-model. Persist branch only.
-        running[inst.id] += UNIT_SIGN.get(row.txn_type, 0) * row.units
-    return imported, skipped_dupe, rejected
+    for txn, _ in rows:
+        session.delete(txn)
+    session.flush()
+    return warnings
 
 
 def _fingerprint(*, instrument_id: int, row: ParsedInvestmentRow) -> str:

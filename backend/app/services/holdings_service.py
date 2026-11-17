@@ -5,38 +5,51 @@ query-time aggregates, no snapshot cache). :func:`compute_holdings` replays ever
 investment transaction for a user through a per-instrument FIFO lot queue and
 returns the live position per instrument.
 
-FIFO (PRD §F7): the first lot bought is the first sold. Lots are consumed in
-``(date, id)`` order — the ``id``-ascending tie-break for same-date lots is the
-locked decision (mirrors the index ``ix_investment_transactions_user_instrument_date``).
-On a partial sell, the touched lot releases a *proportional* share of its remaining
-cost basis, so ``invested_native_paise`` is the acquisition cost of the units still
-held.
+FIFO (ADR-0015): the first lot bought is the first sold. Same-date order is source
+position, then id (rule 3), carried by insertion order, so the stored replay key is
+``(date, id)`` (:data:`_REPLAY_ORDER`, mirroring the index
+``ix_investment_transactions_user_instrument_date``). On a partial sell, the touched lot
+releases a *proportional* share of its remaining cost basis (rule 2), so
+``invested_native_paise`` is the acquisition cost of the units still held.
 
 This handles ``buy`` / ``sip`` / ``sell`` / ``dividend`` / ``bonus`` plus the
 ``switch`` legs: ``switch_out`` releases units FIFO like a ``sell`` and ``switch_in``
-acquires them like a ``buy`` (PRD §F7 248-251). ``split`` stays a deferred no-op. No
+acquires them like a ``buy`` (ADR-0015 rules 1-2). ``split`` stays a deferred no-op. No
 importer currently produces ``split`` / ``switch_*`` rows (the CSV importer rejects
 them; manual entry rejects them too), so those branches are unreachable today — kept
 for when a corporate-action source lands. All money math is integer paise; ``units``
 stays ``Decimal``. No float.
+
+For an ``indian_equity`` instrument the replay first nets each date's buys against its
+sells as intraday trades (rule 7, :func:`_apply_day`): the lesser of the day's bought and
+sold units opens no lot and consumes none, and only the residual reaches FIFO. Other asset
+classes replay row by row.
+
+The same replay also emits the lot match (which lot each sell consumed, with the cost
+released and the sell's proceeds and fee shares, and an intraday match per netted buy).
+:func:`rebuild_realised_lots` persists it per instrument on every investment write (rule 5)
+and refuses a write that leaves a sell uncovered (rule 9); holdings and the persisted match
+therefore cannot disagree (rule 4).
 """
 
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
+from itertools import groupby
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.log_config import get_logger
-from app.models import Instrument, InvestmentTransaction, InvestmentTxnTypeStr
+from app.models import Instrument, InvestmentTransaction, InvestmentTxnTypeStr, RealisedLot
 from app.models.account import CurrencyStr
 from app.models.instrument import AssetClassStr
+from app.models.realised_lot import RealisedLotKindStr
 from app.services.fx_math import to_inr_paise
 
 logger = get_logger(__name__)
@@ -136,6 +149,72 @@ class _Lot:
     units: Decimal
     cost_paise: int
     fx_rate_to_inr: Decimal
+    txn_id: int
+    acquired_on: date
+
+
+@dataclass(frozen=True, slots=True)
+class LotMatch:
+    """The part of one lot a sell consumed (what ``realised_lots`` stores), all native."""
+
+    sell_txn_id: int
+    buy_txn_id: int
+    units: Decimal
+    cost_native_paise: int
+    proceeds_native_paise: int
+    sell_fees_native_paise: int
+    buy_date: date
+    sell_date: date
+    kind: RealisedLotKindStr
+
+
+@dataclass(slots=True)
+class _SellLeft:
+    """A sell's unmatched units, gross and fees, carried across the intraday and FIFO phases
+    so rule 5's allocation still sums exactly to the sell's totals."""
+
+    txn: InvestmentTransaction
+    units: Decimal
+    gross: int
+    fees: int
+
+    @classmethod
+    def of(cls, txn: InvestmentTransaction) -> _SellLeft:
+        return cls(
+            txn=txn, units=txn.units, gross=txn.amount_native_paise, fees=txn.fees_native_paise
+        )
+
+
+@dataclass(slots=True)
+class _ReplayOut:
+    """Sink for what a replay matched: the lot matches, and any sell units no lot covered
+    as ``(sell txn id, units left unmatched)``."""
+
+    matches: list[LotMatch]
+    uncovered: list[tuple[int, Decimal]]
+
+
+class OversellError(Exception):
+    """A replay left sells without enough units at their dates (ADR-0015 rule 9).
+
+    ``uncovered`` is every short sell as ``(sell txn id, units short)`` in replay order.
+    Carries ids and units only, no PII.
+    """
+
+    def __init__(self, *, instrument_id: int, uncovered: Sequence[tuple[int, Decimal]]) -> None:
+        super().__init__(f"instrument {instrument_id}: {len(uncovered)} sell(s) not covered")
+        self.instrument_id = instrument_id
+        self.uncovered = tuple(uncovered)
+
+
+# One replay order for holdings and the rebuild (ADR-0015 rules 3-4).
+_REPLAY_ORDER = (InvestmentTransaction.date, InvestmentTransaction.id)
+
+# Rule 7's scope: only these asset classes net same-day trades, and only these types net
+# (the reinvestment ``buy`` leg is a ``buy``; bonus, dividend, split and switches never net).
+_NETS_INTRADAY: frozenset[AssetClassStr] = frozenset({"indian_equity"})
+_NETTED_BUYS = frozenset({"buy", "sip"})
+_NETTED_SELLS = frozenset({"sell"})
 
 
 def compute_holdings(
@@ -148,8 +227,8 @@ def compute_holdings(
     """Return current positions (``net_units > 0``) for ``user_id``, symbol-sorted.
 
     Two queries: active instruments, then every investment transaction ordered
-    ``(instrument_id, date, id)`` so the per-instrument replay is FIFO with the
-    id tie-break. Instruments with no NAV yield ``None`` for current value / P&L.
+    ``(instrument_id, *_REPLAY_ORDER)`` so the per-instrument replay is FIFO in the
+    ADR-0015 rule 3 order. Instruments with no NAV yield ``None`` for current value / P&L.
 
     ``usd_inr_rate`` is the as-of USD→INR rate used to convert a USD holding's current value
     to INR (``None`` ⇒ no rate cached ⇒ that holding's ``current_value_inr_paise`` is ``None``).
@@ -175,19 +254,15 @@ def compute_holdings(
     txns = session.scalars(
         select(InvestmentTransaction)
         .where(InvestmentTransaction.user_id == user_id)
-        .order_by(
-            InvestmentTransaction.instrument_id,
-            InvestmentTransaction.date,
-            InvestmentTransaction.id,
-        )
+        .order_by(InvestmentTransaction.instrument_id, *_REPLAY_ORDER)
     )
 
     lots_by_instrument: dict[int, deque[_Lot]] = {iid: deque() for iid in by_id}
-    for txn in txns:
-        lots = lots_by_instrument.get(txn.instrument_id)
-        if lots is None:
-            continue  # txn against an archived/foreign instrument — skip
-        _apply(lots, txn)
+    for iid, group in groupby(txns, key=lambda t: t.instrument_id):
+        if iid in by_id:  # a txn against an archived/foreign instrument is skipped
+            lots_by_instrument[iid] = _replay(
+                group, nets_intraday=by_id[iid].asset_class in _NETS_INTRADAY
+            )
 
     holdings: list[Holding] = []
     for inst in instruments:
@@ -320,34 +395,18 @@ UNIT_SIGN: dict[InvestmentTxnTypeStr, int] = {
 }
 
 
-def available_units(session: Session, *, user_id: UUID, instrument_id: int) -> Decimal:
-    """Net units currently held for one instrument — the write-time oversell guard's
-    source of truth (a ``sell`` / ``switch_out`` may not exceed this).
-
-    Sums units the same way :func:`_apply` folds them — both read the sign from
-    ``UNIT_SIGN`` — reading each row's ``units`` as an exact ``Decimal``. The
-    ``Units`` column round-trips through a scaled int, so this sums in Python over
-    the selected column (where the decorator unscales) rather than via a SQL
-    aggregate (which would sum the raw scaled ints without unscaling). Returns
-    ``Decimal("0")`` for an instrument with no transactions.
-
-    Scope note: this is the *current total* net, not the net as-of a given date, so
-    a back-dated sell is validated against today's balance — the accepted v1
-    simplification (a true as-of-date FIFO check would duplicate ``_consume_fifo``).
-    """
-    rows = session.execute(
-        select(InvestmentTransaction.transaction_type, InvestmentTransaction.units).where(
-            InvestmentTransaction.user_id == user_id,
-            InvestmentTransaction.instrument_id == instrument_id,
-        )
-    ).all()
-    net = Decimal("0")
-    for txn_type, units in rows:
-        net += UNIT_SIGN.get(txn_type, 0) * units
-    return net
+def _open_lot(txn: InvestmentTransaction) -> _Lot:
+    """The lot an acquisition with cost opens: ``buy`` / ``sip`` / ``switch_in``."""
+    return _Lot(
+        units=txn.units,
+        cost_paise=txn.amount_native_paise + txn.fees_native_paise,
+        fx_rate_to_inr=txn.fx_rate_to_inr,
+        txn_id=txn.id,
+        acquired_on=txn.date,
+    )
 
 
-def _apply(lots: deque[_Lot], txn: InvestmentTransaction) -> None:
+def _apply(lots: deque[_Lot], txn: InvestmentTransaction, out: _ReplayOut | None = None) -> None:
     """Fold one transaction into an instrument's FIFO lot queue (in place).
 
     The *sign* of each branch below comes from ``UNIT_SIGN``; the branches exist
@@ -355,60 +414,218 @@ def _apply(lots: deque[_Lot], txn: InvestmentTransaction) -> None:
     opens a zero-cost lot while ``buy`` / ``sip`` / ``switch_in`` carry acquisition
     cost. So this cannot be collapsed into a single signed expression, and
     ``test_apply_unit_effect_matches_unit_sign`` is what keeps the two bound.
+
+    ``out`` collects the lot matches a sell makes (see :class:`_ReplayOut`); the read path
+    passes none.
     """
     t = txn.transaction_type
     if t in ("buy", "sip", "switch_in"):
         # switch_in is the acquire-side of a CAS scheme switch: units enter at the
-        # switched-in cost, exactly like a buy/sip (PRD §F7 248-251).
+        # switched-in cost, exactly like a buy/sip (ADR-0015 rule 1).
+        lots.append(_open_lot(txn))
+    elif t == "bonus":
+        # Free units, zero cost — fx is moot (to_inr_paise(0, rate) == 0) but carried for shape.
         lots.append(
             _Lot(
                 units=txn.units,
-                cost_paise=txn.amount_native_paise + txn.fees_native_paise,
+                cost_paise=0,
                 fx_rate_to_inr=txn.fx_rate_to_inr,
+                txn_id=txn.id,
+                acquired_on=txn.date,
             )
         )
-    elif t == "bonus":
-        # Free units, zero cost — fx is moot (to_inr_paise(0, rate) == 0) but carried for shape.
-        lots.append(_Lot(units=txn.units, cost_paise=0, fx_rate_to_inr=txn.fx_rate_to_inr))
     elif t in ("sell", "switch_out"):
         # switch_out is the release-side of a switch: units leave the source scheme
-        # FIFO, exactly like a sell (PRD §F7 248-251).
-        _consume_fifo(lots, txn.units, txn)
+        # FIFO, exactly like a sell (ADR-0015 rule 1).
+        _consume_fifo(lots, _SellLeft.of(txn), out)
     # dividend: cash payout, no lot effect.
-    # split: deferred (PRD §F7 244-247 = rescale prior lots). No importer produces a
-    # `split` row today (the CSV importer and manual entry both reject it), so this
-    # branch is unreachable — kept for when a corporate-action source lands.
+    # split: deferred (ADR-0015 rule 1: a split rescales earlier lots in place and keeps
+    # their dates; not built). No importer produces a `split` row today (the CSV importer
+    # and manual entry both reject it), so this branch is unreachable — kept for when a
+    # corporate-action source lands.
     # TODO(F7): implement rescale if a need lands.
     elif t == "split":
         logger.warning("holdings.unsupported_type_ignored", txn_type=t, txn_id=txn.id)
 
 
-def _consume_fifo(lots: deque[_Lot], qty: Decimal, txn: InvestmentTransaction) -> None:
-    """Remove ``qty`` units from the front of the lot queue, releasing cost basis.
+def _share(remaining: int, units: Decimal, units_remaining: Decimal) -> int:
+    """Half-even proportional share of ``remaining`` for ``units`` of ``units_remaining``."""
+    return int(
+        (Decimal(remaining) * units / units_remaining).to_integral_value(rounding=ROUND_HALF_EVEN)
+    )
 
-    Whole lots are popped; the boundary lot releases a proportional share of its
-    remaining cost. An oversell (more units than held) clamps at empty and logs —
-    the read-model never crashes on bad data; write-time validation is deferred.
+
+def _consume(
+    lots: deque[_Lot], sell: _SellLeft, out: _ReplayOut | None, kind: RealisedLotKindStr
+) -> None:
+    """Remove ``sell.units`` from the front of ``lots``, releasing cost basis.
+
+    Whole lots are popped; the boundary lot releases a proportional share of its remaining
+    cost. With ``out``, each consumed piece is also recorded as a :class:`LotMatch` marked
+    ``kind``: the sell's gross amount and fees are allocated across the pieces in replay
+    order, each the half-even proportional share of what remains by units, the last piece
+    taking the remainder (ADR-0015 rule 5). ``sell`` is updated in place with what is left.
+    Handles no shortfall; :func:`_consume_fifo` does.
     """
-    remaining = qty
-    while remaining > 0 and lots:
+    txn = sell.txn
+    while sell.units > 0 and lots:
         lot = lots[0]
-        if lot.units <= remaining:
-            remaining -= lot.units
+        if lot.units <= sell.units:
+            matched, released = lot.units, lot.cost_paise
             lots.popleft()
         else:
-            released = int(
-                (Decimal(lot.cost_paise) * remaining / lot.units).to_integral_value(
-                    rounding=ROUND_HALF_EVEN
+            matched = sell.units
+            released = _share(lot.cost_paise, sell.units, lot.units)
+            lot.cost_paise -= released
+            lot.units -= sell.units
+        if out is not None:
+            if matched == sell.units:
+                proceeds, fees = sell.gross, sell.fees
+            else:
+                proceeds = _share(sell.gross, matched, sell.units)
+                fees = _share(sell.fees, matched, sell.units)
+            sell.gross -= proceeds
+            sell.fees -= fees
+            out.matches.append(
+                LotMatch(
+                    sell_txn_id=txn.id,
+                    buy_txn_id=lot.txn_id,
+                    units=matched,
+                    cost_native_paise=released,
+                    proceeds_native_paise=proceeds,
+                    sell_fees_native_paise=fees,
+                    buy_date=lot.acquired_on,
+                    sell_date=txn.date,
+                    kind=kind,
                 )
             )
-            lot.cost_paise -= released
-            lot.units -= remaining
-            remaining = Decimal("0")
-    if remaining > 0:
-        logger.warning(
-            "holdings.oversell_clamped",
-            instrument_id=txn.instrument_id,
-            txn_id=txn.id,
-            unmatched_units=str(remaining),
+        sell.units -= matched
+
+
+def _consume_fifo(lots: deque[_Lot], sell: _SellLeft, out: _ReplayOut | None) -> None:
+    """Consume the sell's remaining units from the oldest lots first (ADR-0015 rule 2).
+
+    Units no lot covers go to ``out.uncovered``. With no ``out`` (the read path) an oversell
+    clamps at empty and logs: the read-model never crashes on bad stored data.
+    """
+    _consume(lots, sell, out, "fifo")
+    if sell.units > 0:
+        txn = sell.txn
+        if out is not None:
+            out.uncovered.append((txn.id, sell.units))
+        else:
+            logger.warning(
+                "holdings.oversell_clamped",
+                instrument_id=txn.instrument_id,
+                txn_id=txn.id,
+                unmatched_units=str(sell.units),
+            )
+
+
+def _apply_day(lots: deque[_Lot], day: list[InvestmentTransaction], out: _ReplayOut | None) -> None:
+    """Fold one date's rows (id order) for an instrument that nets intraday (rule 7).
+
+    The day's sells take the day's buys in source order as ``intraday`` matches; those buys
+    open no lot. What is left is rule 3's: a residual buy opens a lot, a residual sell
+    consumes FIFO, and every other row is applied as usual, all in source order. Only one
+    side of a day can have a remainder, so no (sell, buy) pair is ever both kinds.
+    """
+    day_buys = deque(_open_lot(t) for t in day if t.transaction_type in _NETTED_BUYS)
+    sells = {t.id: _SellLeft.of(t) for t in day if t.transaction_type in _NETTED_SELLS}
+    if not day_buys or not sells:
+        for t in day:
+            _apply(lots, t, out)
+        return
+    for sell in sells.values():
+        _consume(day_buys, sell, out, "intraday")
+        if not day_buys:
+            break
+    residual = {lot.txn_id: lot for lot in day_buys}
+    for t in day:
+        if t.transaction_type in _NETTED_BUYS:
+            if (lot := residual.get(t.id)) is not None:
+                lots.append(lot)
+        elif t.transaction_type in _NETTED_SELLS:
+            _consume_fifo(lots, sells[t.id], out)  # a no-op when the day netted it fully
+        else:
+            _apply(lots, t, out)
+
+
+def _replay(
+    txns: Iterable[InvestmentTransaction],
+    *,
+    nets_intraday: bool,
+    out: _ReplayOut | None = None,
+) -> deque[_Lot]:
+    """The one replay holdings and the rebuild share (ADR-0015 rule 4).
+
+    ``txns`` is one instrument's rows in ``(date, id)`` order. Without netting each row is
+    applied in turn; with it, each date goes through :func:`_apply_day`. Returns the open lots.
+    """
+    lots: deque[_Lot] = deque()
+    if not nets_intraday:
+        for txn in txns:
+            _apply(lots, txn, out)
+        return lots
+    for _, day in groupby(txns, key=lambda t: t.date):
+        _apply_day(lots, list(day), out)
+    return lots
+
+
+def rebuild_realised_lots(session: Session, *, user_id: UUID, instrument_id: int) -> None:
+    """Replace one instrument's ``realised_lots`` with a fresh replay (ADR-0015 rules 4, 5, 7, 9).
+
+    The replay nets same-day trades first for an ``indian_equity`` instrument (rule 7), so the
+    rows carry both ``fifo`` matches and ``intraday`` matches, marked by ``kind``.
+
+    Call after every write to the instrument's investment transactions, in the same DB
+    transaction. Raises :class:`OversellError`, before writing anything, if the replay
+    leaves a sell uncovered; the caller owns the rollback. Never commits. Ignores
+    ``archived_at``: an archived instrument keeps its rows.
+    """
+    session.flush()  # sessions here are autoflush=False; the replay must see pending rows
+    txns = session.scalars(
+        select(InvestmentTransaction)
+        .where(
+            InvestmentTransaction.user_id == user_id,
+            InvestmentTransaction.instrument_id == instrument_id,
         )
+        .order_by(*_REPLAY_ORDER)
+    )
+    asset_class = session.scalar(
+        select(Instrument.asset_class).where(
+            Instrument.id == instrument_id, Instrument.user_id == user_id
+        )
+    )
+    out = _ReplayOut(matches=[], uncovered=[])
+    _replay(txns, nets_intraday=asset_class in _NETS_INTRADAY, out=out)
+    if out.uncovered:
+        raise OversellError(instrument_id=instrument_id, uncovered=out.uncovered)
+
+    session.execute(
+        delete(RealisedLot).where(
+            RealisedLot.user_id == user_id,
+            RealisedLot.sell_txn_id.in_(
+                select(InvestmentTransaction.id).where(
+                    InvestmentTransaction.user_id == user_id,
+                    InvestmentTransaction.instrument_id == instrument_id,
+                )
+            ),
+        )
+    )
+    session.add_all(
+        RealisedLot(
+            user_id=user_id,
+            sell_txn_id=m.sell_txn_id,
+            buy_txn_id=m.buy_txn_id,
+            units=m.units,
+            cost_native_paise=m.cost_native_paise,
+            proceeds_native_paise=m.proceeds_native_paise,
+            sell_fees_native_paise=m.sell_fees_native_paise,
+            buy_date=m.buy_date,
+            sell_date=m.sell_date,
+            kind=m.kind,
+        )
+        for m in out.matches
+    )
+    session.flush()

@@ -55,7 +55,8 @@ def compute_portfolio_summary(session: Session, *, user_id: UUID, as_of: date) -
     """Roll up tiles + allocations + XIRR for ``user_id``, valued at ``as_of`` — INR.
 
     ``as_of`` dates the terminal (current-value) cashflow of every XIRR; the route
-    passes ``clock.today()`` (UTC). NAV-bearing = ``current_value_inr_paise is not None``.
+    passes ``clock.today()`` (the IST business date). NAV-bearing =
+    ``current_value_inr_paise is not None``.
     The USD→INR rate is resolved at ``as_of`` (``rate_on``, carry-forward) so a
     backfill/test values a past portfolio at that date's rate, not today's — which is why
     this keeps ``rate_on`` where ``/holdings`` and the overview tile use ``latest_rate``:
