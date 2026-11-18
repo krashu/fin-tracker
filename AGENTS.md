@@ -96,6 +96,7 @@ Behind a TLS-inspecting corporate proxy the investment price feeds fail with
 | [0015](docs/adr/0015-fifo-lot-matching.md) | FIFO lot matching after same-day `indian_equity` trades net out as intraday; same-date order is date → source position → id |
 | [0016](docs/adr/0016-fx-stamped-at-transaction-date.md) | `fx_rate_to_inr` is server-stamped at the transaction date and never rewritten; a missing rate refuses the row |
 | [0017](docs/adr/0017-peer-debt-khatabook-ledger.md) | Peer debts & Khatabook balances are tracked in an auxiliary peer ledger linked to transactions; dynamic balance computation |
+| [0018](docs/adr/0018-foreign-return-waterfall-and-hpr-guard.md) | Foreign return decomposes into asset price and currency gain; returns under 365 days suppress XIRR for HPR |
 
 ## Working rules
 

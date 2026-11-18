@@ -73,3 +73,4 @@ Do *not* write an ADR for:
 | [0015](0015-fifo-lot-matching.md) | Sells consume lots first-in-first-out, after same-day equity trades net out | Accepted | 2026-11-15 |
 | [0016](0016-fx-stamped-at-transaction-date.md) | An investment row's FX rate is stamped at its transaction date and never re-derived | Accepted | 2026-11-15 |
 | [0017](0017-peer-debt-khatabook-ledger.md) | Peer debts and Khatabook balances are tracked in an auxiliary peer ledger linked to transactions | Accepted | 2026-11-18 |
+| [0018](0018-foreign-return-waterfall-and-hpr-guard.md) | Foreign return decomposes into asset price and currency gain; returns under 365 days suppress XIRR for HPR | Accepted | 2026-11-19 |
