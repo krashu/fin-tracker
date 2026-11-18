@@ -1,7 +1,7 @@
 # ADR-0017: Peer debts and Khatabook balances are tracked in an auxiliary peer ledger linked to transactions
 
-**Status**: Proposed
-**Date**: 2026-11-18 (decided) · **Revised**: 2026-11-18
+**Status**: Accepted
+**Date**: 2026-11-18 (decided) · **Revised**: 2026-11-19
 **Scope**: PRD §F3b (new), §Data model · `app/models/peer_contact.py`, `app/models/peer_entry.py`,
 `app/services/peer_service.py`, `app/api/v1/peer_ledger.py`, `frontend/app/friends/`
 **Supersedes / Related**: [ADR-0001](0001-sqlite-postgres-portability.md) (portability & BigInteger) ·

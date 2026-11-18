@@ -18,7 +18,21 @@ A privacy-first, self-hosted personal finance tracker for Indian banks and globa
 
 ## Screenshots
 
-> _Coming soon._
+| Overview & Net Worth | Spending Analysis |
+| :---: | :---: |
+| ![Overview](docs/screenshots/01-dashboard.png) | ![Spending Analysis](docs/screenshots/02-spending.png) |
+
+| Expenses & Custom Labels | Friends & Khata (Peer Ledger) |
+| :---: | :---: |
+| ![Expenses Board](docs/screenshots/03-expenses.png) | ![Friends & Khata](docs/screenshots/04-friends.png) |
+
+| Portfolio Performance & Benchmarks | Investment Holdings |
+| :---: | :---: |
+| ![Portfolio Performance](docs/screenshots/05-portfolio.png) | ![Investment Holdings](docs/screenshots/06-holdings.png) |
+
+| Tax Statement & Capital Gains |
+| :---: |
+| ![Tax Statement](docs/screenshots/07-tax.png) |
 
 ## Key Features
 
@@ -27,13 +41,14 @@ A privacy-first, self-hosted personal finance tracker for Indian banks and globa
 - 🏷️ **Hierarchical 2-Level Categories**: A parent → subcategory tree (ADR-0012) with separate spend and income kinds, one-hop rollup, color inheritance, archiving, and a command-palette (`cmdk`) category selector.
 - 🤖 **Smart Auto-Tagging & Merchant Aliases**: Learns merchant→category mappings and canonical merchant aliases from your own corrections, manageable under **Settings → Rules**.
 - ✍️ **Expenses Board & Manual Entry**: Fast transaction management with manual entry, multi-select batch edits, custom transaction labels, and one-click balance masking for over-the-shoulder privacy.
+- 👥 **Peer Ledger & Friends Dues (Khatabook)**: Track money fronted for friends on credit cards, split restaurant bills, and personal loans (`/friends`). Supports upfront card discount/cashback offsets, dynamic running balances ("You will get" / "You will give"), atomic full settlements, personal spend isolation on dashboard tiles ("Card Used by Friends"), and CSV export of contact ledgers.
 - 📊 **Spending Analytics**:
   - Spend-by-category overview with parent → subcategory drilldown, plus weekly/monthly spend bars.
   - Category trend (`CategoryTrendBar`: top six parents, drilldown, year markers).
   - Summary strip with yearly/monthly spend and income, month-over-month change, and a 14-week sparkline.
   - Net worth from bank/cash balances plus portfolio value.
 - 📈 **Investments & Portfolio Tracking**:
-  - Canonical transaction-CSV import for MFs & equities (header aliases are seeded with Zerodha Console's tradebook, so most broker exports import without renaming).
+  - Canonical transaction-CSV and Excel (`.xlsx`) import for MFs & equities (header aliases are seeded with Zerodha Console's tradebook, so most broker exports import without renaming).
   - US stocks/ETFs via INDmoney transaction export, with FX stamped at each transaction date.
   - INR home currency with USD investment rollup.
   - Manually triggered NAV/price refresh (AMFI NAVAll for mutual funds, a public quote feed for Indian equities).
