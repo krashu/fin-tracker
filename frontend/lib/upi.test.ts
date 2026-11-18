@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
 
-import { generateQrMatrix, QrCodeSvg } from "./qr";
 import { buildUpiUri, formatWhatsAppBreakdown } from "./upi";
 
-describe("QR Code & UPI Utilities (lib/qr.tsx & lib/upi.ts)", () => {
-  it("builds standard NPCI UPI URI", () => {
+describe("UPI Utilities (lib/upi.ts)", () => {
+  it("builds standard NPCI UPI URI with positive magnitude", () => {
     const uri = buildUpiUri({
       upiId: "alice@upi",
       name: "Alice Smith",
@@ -16,9 +14,19 @@ describe("QR Code & UPI Utilities (lib/qr.tsx & lib/upi.ts)", () => {
     expect(uri).toBe(
       "upi://pay?pa=alice@upi&pn=Alice%20Smith&am=1500.00&cu=INR&tn=Dinner%20split",
     );
+
+    // Negative magnitude is normalized to positive
+    const negUri = buildUpiUri({
+      upiId: "bob@upi",
+      name: "Bob",
+      amountPaise: -250000,
+    });
+    expect(negUri).toBe(
+      "upi://pay?pa=bob@upi&pn=Bob&am=2500.00&cu=INR&tn=Settlement",
+    );
   });
 
-  it("formats WhatsApp breakdown message cleanly", () => {
+  it("formats WhatsApp breakdown message cleanly when friend owes user", () => {
     const mockContact = {
       id: 1,
       name: "Bob",
@@ -67,41 +75,43 @@ describe("QR Code & UPI Utilities (lib/qr.tsx & lib/upi.ts)", () => {
     expect(text).toContain("• 2026-03-01: Weekend trip hotel — +₹3,000.00");
     expect(text).toContain("• 2026-03-02: Cab share — -₹500.00");
     expect(text).toContain("Total Outstanding: ₹2,500.00 (owes you)");
-    expect(text).toContain("upi://pay?pa=bob@upi&pn=Bob&am=2500.00&cu=INR&tn=Settlement");
+    // Must NOT contain an inverted payment link telling Bob to pay himself
+    expect(text).not.toContain("upi://pay");
   });
 
-  it("generates QR matrix with valid dimensions and finder patterns", () => {
-    const upiUri = "upi://pay?pa=alice@upi&pn=Alice&am=100.00&cu=INR&tn=Settlement";
-    const matrix = generateQrMatrix(upiUri);
+  it("formats WhatsApp breakdown with UPI ID when user owes friend", () => {
+    const mockContact = {
+      id: 2,
+      name: "Charlie",
+      phone: null,
+      upi_id: "charlie@okaxis",
+      notes: null,
+      archived_at: null,
+      created_at: "2026-03-01T00:00:00Z",
+      balance_paise: -150000,
+      total_gave_paise: 0,
+      total_got_paise: 150000,
+      active_entries_count: 1,
+    };
 
-    expect(matrix.length).toBeGreaterThanOrEqual(21);
-    expect(matrix[0].length).toBe(matrix.length);
+    const text = formatWhatsAppBreakdown({
+      contact: mockContact,
+      entries: [
+        {
+          id: 3,
+          contact_id: 2,
+          transaction_id: null,
+          date: "2026-03-05",
+          amount_paise: 150000,
+          direction: "you_got" as const,
+          is_settlement: false,
+          notes: "Movie tickets fronted",
+          created_at: "2026-03-05T00:00:00Z",
+        },
+      ],
+    });
 
-    // Top-left finder pattern check
-    // Row 0 should have 7 consecutive dark modules at cols 0..6
-    for (let c = 0; c < 7; c++) {
-      expect(matrix[0][c]).toBe(true);
-    }
-    // Row 1 should have dark at 0 and 6, white at 1..5
-    expect(matrix[1][0]).toBe(true);
-    expect(matrix[1][6]).toBe(true);
-    for (let c = 1; c <= 5; c++) {
-      expect(matrix[1][c]).toBe(false);
-    }
-  });
-
-  it("renders QrCodeSvg component with accessible title and svg elements", () => {
-    render(
-      <QrCodeSvg
-        value="upi://pay?pa=test@upi&pn=Test&am=50.00&cu=INR&tn=Test"
-        size={200}
-        title="Payment QR"
-      />,
-    );
-
-    const svg = screen.getByRole("img", { name: "Payment QR" });
-    expect(svg).toBeInTheDocument();
-    expect(svg).toHaveAttribute("width", "200");
-    expect(svg).toHaveAttribute("height", "200");
+    expect(text).toContain("Total Outstanding: ₹1,500.00 (you owe)");
+    expect(text).toContain("UPI ID: charlie@okaxis");
   });
 });

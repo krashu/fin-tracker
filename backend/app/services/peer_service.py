@@ -40,6 +40,16 @@ def _is_contact_name_dup(orig: BaseException | None) -> bool:
     )
 
 
+def _sanitize_csv_cell(val: str | None) -> str:
+    """Sanitize cell value against CSV formula injection (CWE-1236)."""
+    if not val:
+        return ""
+    s = str(val).strip()
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return f"'{s}"
+    return s
+
+
 def create_contact(
     session: Session,
     *,
@@ -326,10 +336,12 @@ def create_entry(
 
     if data.transaction_id is not None:
         txn = session.scalar(
-            select(Transaction).where(
+            select(Transaction)
+            .where(
                 Transaction.id == data.transaction_id,
                 Transaction.user_id == user_id,
             )
+            .with_for_update()
         )
         if txn is None:
             raise HTTPException(
@@ -466,7 +478,19 @@ def settle_contact(
 
     Raises 400 if balance is already 0.
     """
-    get_contact(session, user_id=user_id, contact_id=contact_id)
+    contact = session.scalar(
+        select(PeerContact)
+        .where(
+            PeerContact.id == contact_id,
+            PeerContact.user_id == user_id,
+        )
+        .with_for_update()
+    )
+    if contact is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contact not found",
+        )
 
     balance_paise = (
         session.scalar(
@@ -651,9 +675,10 @@ def export_contact_statement_csv(
         else:
             running_balance_paise -= entry.amount_paise
 
-        desc = (
+        raw_desc = (
             entry.notes or merchant_raw or ("Settlement" if entry.is_settlement else "Ledger entry")
         )
+        desc = _sanitize_csv_cell(raw_desc)
         status_str = "Settlement" if entry.is_settlement else "Regular"
         amount_inr = f"{entry.amount_paise / 100:.2f}"
         balance_inr = f"{running_balance_paise / 100:.2f}"

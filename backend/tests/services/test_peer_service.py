@@ -649,3 +649,26 @@ def test_export_contact_statement_csv(session: Session, user: User) -> None:
             session, user_id=other_user_id, contact_id=contact.id
         )
     assert exc.value.status_code == 404
+
+
+def test_export_contact_statement_csv_formula_sanitization(session: Session, user: User) -> None:
+    """CSV export sanitizes cells starting with formula prefixes (=, +, -, @)."""
+    contact = peer_service.create_contact(
+        session, user_id=user.id, data=PeerContactCreate(name="Formula Contact")
+    )
+    peer_service.create_entry(
+        session,
+        user_id=user.id,
+        data=PeerEntryCreate(
+            contact_id=contact.id,
+            date=date(2026, 3, 1),
+            amount_paise=1000,
+            direction="you_gave",
+            notes="=cmd|' /C calc'!A0",
+        ),
+    )
+    csv_data = peer_service.export_contact_statement_csv(
+        session, user_id=user.id, contact_id=contact.id
+    )
+    lines = [line.strip() for line in csv_data.strip().splitlines()]
+    assert "'=cmd|' /C calc'!A0" in lines[1]

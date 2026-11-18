@@ -21,7 +21,7 @@ export function buildUpiUri({
   amountPaise,
   notes = "Settlement",
 }: BuildUpiUriOptions): string {
-  const balanceInRupees = (amountPaise / 100).toFixed(2);
+  const balanceInRupees = (Math.abs(amountPaise) / 100).toFixed(2);
   const encodedName = encodeURIComponent(name);
   const encodedNotes = encodeURIComponent(notes);
   return `upi://pay?pa=${upiId}&pn=${encodedName}&am=${balanceInRupees}&cu=INR&tn=${encodedNotes}`;
@@ -58,17 +58,11 @@ export function formatWhatsAppBreakdown({
   const balanceINR = formatINR(Math.abs(contact.balance_paise));
   if (contact.balance_paise > 0) {
     lines.push(`Total Outstanding: ${balanceINR} (owes you)`);
-    if (contact.upi_id) {
-      const upiUri = buildUpiUri({
-        upiId: contact.upi_id,
-        name: contact.name,
-        amountPaise: contact.balance_paise,
-      });
-      lines.push("");
-      lines.push(`Pay via UPI: ${upiUri}`);
-    }
   } else if (contact.balance_paise < 0) {
     lines.push(`Total Outstanding: ${balanceINR} (you owe)`);
+    if (contact.upi_id) {
+      lines.push(`UPI ID: ${contact.upi_id}`);
+    }
   } else {
     lines.push("Total Outstanding: ₹0 (All settled up!)");
   }

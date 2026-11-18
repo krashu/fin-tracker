@@ -324,34 +324,25 @@ describe("FriendsDashboard (app/friends/friends-dashboard.tsx)", () => {
     });
 
     // On ContactCard for Aman (balance_paise: 250000, upi_id: "aman@upi")
-    const cardCopyUpiBtn = await screen.findByRole("button", {
+    const cardCopyUpiBtns = await screen.findAllByRole("button", {
       name: /copy upi/i,
     });
+    const cardCopyUpiBtn = cardCopyUpiBtns[0];
     expect(cardCopyUpiBtn).toBeInTheDocument();
 
-    // Click card Copy UPI
+    // Click card Copy UPI -> copies UPI ID
     fireEvent.click(cardCopyUpiBtn);
     await waitFor(() => {
-      expect(writeTextSpy).toHaveBeenCalledWith(
-        expect.stringContaining("upi://pay?pa=aman@upi&pn=Aman%20Verma&am=2500.00&cu=INR"),
-      );
+      expect(writeTextSpy).toHaveBeenCalledWith("aman@upi");
     });
 
     // Open Ledger Dialog
     await user.click(await screen.findByText("Aman Verma"));
 
-    // Verify QR code rendered
-    const qrSvg = await screen.findByRole("img", {
-      name: /upi qr for aman verma/i,
-    });
-    expect(qrSvg).toBeInTheDocument();
-
-    // Copy UPI Link inside dialog
-    const copyUpiBtn = screen.getByRole("button", { name: /copy upi link/i });
+    // Copy UPI ID inside dialog
+    const copyUpiBtn = screen.getByRole("button", { name: /copy upi id/i });
     await user.click(copyUpiBtn);
-    expect(writeTextSpy).toHaveBeenCalledWith(
-      expect.stringContaining("upi://pay?pa=aman@upi&pn=Aman%20Verma&am=2500.00&cu=INR"),
-    );
+    expect(writeTextSpy).toHaveBeenCalledWith("aman@upi");
 
     // Copy WhatsApp breakdown inside dialog
     const copyWhatsAppBtn = screen.getByRole("button", {

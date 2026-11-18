@@ -100,7 +100,7 @@ amounts or fingerprints, and does not hijack inter-account transfer pairs.
 
 ## Out of bounds
 
-- No automated SMS or WhatsApp payment reminder gateways; manual UPI payment link / QR generation only.
+- No automated SMS or WhatsApp payment reminder gateways; manual WhatsApp text breakdown and UPI ID copy only.
 - No multi-currency peer ledgers; all peer entries are in INR paise.
 - No multi-party debt-simplification graph algorithms (e.g. Splitwise group debt minimization). Debts are
   strictly pairwise between the authenticated user and each contact.
