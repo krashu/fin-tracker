@@ -11,7 +11,6 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app.models import Instrument, User
-from app.schemas.performance import STALENESS_WARN_DAYS
 
 
 def test_empty(client: TestClient, seeded_user: User) -> None:
