@@ -452,3 +452,200 @@ def test_cross_tenant_isolation(session: Session, user: User) -> None:
             ),
         )
     assert exc.value.status_code == 422
+
+
+def test_incoming_repayment_linking_and_allocation_guard(session: Session, user: User) -> None:
+    """ADR-0017 Rule 6: An incoming credit transaction (amount_paise > 0)
+    links as a settlement credit (direction='you_got', is_settlement=True).
+    Allocation guard enforces sum <= transaction magnitude."""
+    account = Account(
+        user_id=user.id,
+        name="Bank Account",
+        type="bank",
+        issuer="hdfc",
+        last4="1234",
+    )
+    session.add(account)
+    session.flush()
+
+    # Incoming UPI credit of ₹2,500
+    incoming_txn = Transaction(
+        user_id=user.id,
+        account_id=account.id,
+        date=date(2026, 3, 12),
+        amount_paise=250000,
+        transaction_type="transfer",
+        merchant_raw="UPI / Repayment from Alice",
+        merchant_normalized="upi repayment from alice",
+        fingerprint="cc" * 32,
+        source="manual",
+    )
+    session.add(incoming_txn)
+    session.flush()
+
+    contact = peer_service.create_contact(
+        session, user_id=user.id, data=PeerContactCreate(name="Alice Repayer")
+    )
+
+    # 1. Reject direction='you_gave' with 422
+    with pytest.raises(HTTPException) as exc:
+        peer_service.create_entry(
+            session,
+            user_id=user.id,
+            data=PeerEntryCreate(
+                contact_id=contact.id,
+                transaction_id=incoming_txn.id,
+                amount_paise=100000,
+                direction="you_gave",
+            ),
+        )
+    assert exc.value.status_code == 422
+    assert "direction 'you_got'" in exc.value.detail
+
+    # 2. Reject allocation exceeding transaction amount (300000 > 250000)
+    with pytest.raises(HTTPException) as exc_overflow:
+        peer_service.create_entry(
+            session,
+            user_id=user.id,
+            data=PeerEntryCreate(
+                contact_id=contact.id,
+                transaction_id=incoming_txn.id,
+                amount_paise=300000,
+                direction="you_got",
+            ),
+        )
+    assert exc_overflow.value.status_code == 422
+    assert "exceeds transaction amount" in exc_overflow.value.detail
+
+    # 3. Valid repayment link of ₹1,500 (150000 paise)
+    entry1 = peer_service.create_entry(
+        session,
+        user_id=user.id,
+        data=PeerEntryCreate(
+            contact_id=contact.id,
+            transaction_id=incoming_txn.id,
+            amount_paise=150000,
+            direction="you_got",
+            notes="Partial repayment for dinner",
+        ),
+    )
+    assert entry1.direction == "you_got"
+    assert entry1.is_settlement is True
+    assert entry1.amount_paise == 150000
+
+    # 4. Allocation guard on second entry: remaining is 100000 paise
+    with pytest.raises(HTTPException) as exc_second_overflow:
+        peer_service.create_entry(
+            session,
+            user_id=user.id,
+            data=PeerEntryCreate(
+                contact_id=contact.id,
+                transaction_id=incoming_txn.id,
+                amount_paise=150000,
+                direction="you_got",
+            ),
+        )
+    assert exc_second_overflow.value.status_code == 422
+    assert "exceeds transaction amount" in exc_second_overflow.value.detail
+
+    # 5. Link remaining ₹1,000 (100000 paise)
+    entry2 = peer_service.create_entry(
+        session,
+        user_id=user.id,
+        data=PeerEntryCreate(
+            contact_id=contact.id,
+            transaction_id=incoming_txn.id,
+            amount_paise=100000,
+            direction="you_got",
+        ),
+    )
+    assert entry2.is_settlement is True
+    assert entry2.amount_paise == 100000
+
+    bal = peer_service.get_contact_with_balance(session, user_id=user.id, contact_id=contact.id)
+    assert bal.total_got_paise == 250000
+    assert bal.balance_paise == -250000
+
+
+def test_export_contact_statement_csv(session: Session, user: User) -> None:
+    """Itemised CSV statement contains chronological history, descriptions,
+    direction, amounts, settlement status, and running balances."""
+    account = _make_account(session, user)
+    txn = _make_transaction(session, user, account, amount_paise=-300000)
+
+    contact = peer_service.create_contact(
+        session, user_id=user.id, data=PeerContactCreate(name="Bob Exporter")
+    )
+
+    # Entry 1: Linked spend (User gave ₹3,000)
+    peer_service.create_entry(
+        session,
+        user_id=user.id,
+        data=PeerEntryCreate(
+            contact_id=contact.id,
+            transaction_id=txn.id,
+            amount_paise=300000,
+            direction="you_gave",
+            notes="Team dinner fronted",
+        ),
+    )
+
+    # Entry 2: Standalone repayment (Bob gave ₹1,000)
+    peer_service.create_entry(
+        session,
+        user_id=user.id,
+        data=PeerEntryCreate(
+            contact_id=contact.id,
+            date=date(2026, 3, 12),
+            amount_paise=100000,
+            direction="you_got",
+            notes="Cash partial return",
+        ),
+    )
+
+    # Entry 3: Settle the remaining ₹2,000
+    peer_service.settle_contact(
+        session,
+        user_id=user.id,
+        contact_id=contact.id,
+        settle_date=date(2026, 3, 15),
+        notes="Final settlement via UPI",
+    )
+
+    csv_data = peer_service.export_contact_statement_csv(
+        session, user_id=user.id, contact_id=contact.id
+    )
+
+    lines = [line.strip() for line in csv_data.strip().splitlines()]
+    assert lines[0] == (
+        "Date,Description,Direction,Amount (INR),Settlement Status,Running Balance (INR)"
+    )
+    assert len(lines) == 4  # Header + 3 entries
+
+    # Row 1: 2026-03-10, Team dinner fronted, you_gave, 3000.00, Regular, 3000.00
+    assert "2026-03-10" in lines[1]
+    assert "Team dinner fronted" in lines[1]
+    assert "you_gave" in lines[1]
+    assert "3000.00" in lines[1]
+    assert "Regular" in lines[1]
+
+    # Row 2: 2026-03-12, Cash partial return, you_got, 1000.00, Regular, 2000.00
+    assert "2026-03-12" in lines[2]
+    assert "Cash partial return" in lines[2]
+    assert "you_got" in lines[2]
+    assert "1000.00" in lines[2]
+    assert "2000.00" in lines[2]
+
+    # Row 3: 2026-03-15, Final settlement via UPI, you_got, 2000.00, Settlement, 0.00
+    assert "2026-03-15" in lines[3]
+    assert "Final settlement via UPI" in lines[3]
+    assert "Settlement" in lines[3]
+    assert "0.00" in lines[3]
+
+    # Cross-tenant: other user gets 404
+    other_user_id = uuid.uuid4()
+    with pytest.raises(HTTPException) as exc:
+        peer_service.export_contact_statement_csv(
+            session, user_id=other_user_id, contact_id=contact.id
+        )
+    assert exc.value.status_code == 404

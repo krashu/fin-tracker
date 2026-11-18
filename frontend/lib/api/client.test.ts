@@ -8,6 +8,7 @@ import {
   createPeerEntry,
   deleteAccount,
   deletePeerEntry,
+  exportPeerContactStatement,
   getAuthConfig,
   getOverview,
   getPeerContact,
@@ -566,6 +567,24 @@ describe("API Client (lib/api/client.ts)", () => {
       const delRes = await deletePeerEntry(51);
       expect(delRes).toBeUndefined();
       expect(deletedEntryId).toBe(51);
+    });
+
+    it("exports contact statement CSV via exportPeerContactStatement()", async () => {
+      server.use(
+        http.get("*/api/v1/friends/contacts/:id/export", () => {
+          return new HttpResponse("Date,Description,Direction,Amount (INR),Settlement Status,Running Balance (INR)\n2026-03-01,Test,you_gave,10.00,Regular,10.00", {
+            headers: {
+              "content-type": "text/csv; charset=utf-8",
+              "content-disposition": 'attachment; filename="peer_contact_5_statement.csv"',
+            },
+          });
+        }),
+      );
+
+      const res = await exportPeerContactStatement(5);
+      expect(res.filename).toBe("peer_contact_5_statement.csv");
+      expect(res.csvText).toContain("Date,Description,Direction");
+      expect(res.csvText).toContain("2026-03-01,Test,you_gave,10.00,Regular,10.00");
     });
   });
 

@@ -647,3 +647,59 @@ export function IconUsers(props: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
+
+export function IconCopy(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      aria-hidden="true"
+      {...props}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+      <path d="M10.5 5.5V3.5a1.5 1.5 0 0 0-1.5-1.5h-5A1.5 1.5 0 0 0 2.5 3.5v5A1.5 1.5 0 0 0 4 10h1.5" />
+    </svg>
+  );
+}
+
+export function IconQr(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      aria-hidden="true"
+      {...props}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="2" y="2" width="4" height="4" rx="0.5" />
+      <rect x="10" y="2" width="4" height="4" rx="0.5" />
+      <rect x="2" y="10" width="4" height="4" rx="0.5" />
+      <path d="M10 10h1v1h-1zM13 10h1v1h-1zM10 13h1v1h-1zM13 13h1v1h-1z" />
+    </svg>
+  );
+}
+
+export function IconDownload(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      aria-hidden="true"
+      {...props}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M8 2.5v8m0 0-3-3m3 3 3-3" />
+      <path d="M2.5 13.5h11" />
+    </svg>
+  );
+}

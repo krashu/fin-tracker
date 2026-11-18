@@ -1,6 +1,6 @@
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 import { FriendsDashboard } from "./friends-dashboard";
 import { server } from "@/tests/mocks/server";
@@ -305,5 +305,108 @@ describe("FriendsDashboard (app/friends/friends-dashboard.tsx)", () => {
 
     await waitFor(() => expect(archivedContactId).toBe(1));
     expect(confirmedWithBalance).toBe(true);
+  });
+
+  it("renders UPI payment link and dynamic QR code on ledger dialog, copying UPI and WhatsApp breakdown", async () => {
+    const writeTextSpy = vi
+      .spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+
+    server.use(
+      http.get("*/api/v1/friends/summary", () => HttpResponse.json(mockSummary)),
+      http.get("*/api/v1/friends/contacts", () => HttpResponse.json(mockContacts)),
+      http.get("*/api/v1/friends/contacts/1", () => HttpResponse.json(mockContacts[0])),
+      http.get("*/api/v1/friends/contacts/1/entries", () => HttpResponse.json(mockAmanEntries)),
+    );
+
+    const { user } = renderWithProviders(<FriendsDashboard />, {
+      initialBalanceHidden: false,
+    });
+
+    // On ContactCard for Aman (balance_paise: 250000, upi_id: "aman@upi")
+    const cardCopyUpiBtn = await screen.findByRole("button", {
+      name: /copy upi/i,
+    });
+    expect(cardCopyUpiBtn).toBeInTheDocument();
+
+    // Click card Copy UPI
+    fireEvent.click(cardCopyUpiBtn);
+    await waitFor(() => {
+      expect(writeTextSpy).toHaveBeenCalledWith(
+        expect.stringContaining("upi://pay?pa=aman@upi&pn=Aman%20Verma&am=2500.00&cu=INR"),
+      );
+    });
+
+    // Open Ledger Dialog
+    await user.click(await screen.findByText("Aman Verma"));
+
+    // Verify QR code rendered
+    const qrSvg = await screen.findByRole("img", {
+      name: /upi qr for aman verma/i,
+    });
+    expect(qrSvg).toBeInTheDocument();
+
+    // Copy UPI Link inside dialog
+    const copyUpiBtn = screen.getByRole("button", { name: /copy upi link/i });
+    await user.click(copyUpiBtn);
+    expect(writeTextSpy).toHaveBeenCalledWith(
+      expect.stringContaining("upi://pay?pa=aman@upi&pn=Aman%20Verma&am=2500.00&cu=INR"),
+    );
+
+    // Copy WhatsApp breakdown inside dialog
+    const copyWhatsAppBtn = screen.getByRole("button", {
+      name: /copy breakdown for whatsapp/i,
+    });
+    await user.click(copyWhatsAppBtn);
+    expect(writeTextSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Hi Aman Verma, here is the breakdown of shared expenses:"),
+    );
+  });
+
+  it("exports contact ledger statement via Export Statement button", async () => {
+    let exportRequested = false;
+
+    server.use(
+      http.get("*/api/v1/friends/summary", () => HttpResponse.json(mockSummary)),
+      http.get("*/api/v1/friends/contacts", () => HttpResponse.json(mockContacts)),
+      http.get("*/api/v1/friends/contacts/1", () => HttpResponse.json(mockContacts[0])),
+      http.get("*/api/v1/friends/contacts/1/entries", () => HttpResponse.json(mockAmanEntries)),
+      http.get("*/api/v1/friends/contacts/1/export", () => {
+        exportRequested = true;
+        return new HttpResponse(
+          "Date,Description,Direction,Amount (INR),Settlement Status,Running Balance (INR)\n2026-05-10,Groceries split,you_gave,1500.00,Regular,1500.00",
+          {
+            headers: {
+              "content-type": "text/csv; charset=utf-8",
+              "content-disposition": 'attachment; filename="peer_contact_1_statement.csv"',
+            },
+          },
+        );
+      }),
+    );
+
+    // Mock createObjectURL & revokeObjectURL
+    const createObjectURLMock = vi.fn().mockReturnValue("blob:mock-url");
+    const revokeObjectURLMock = vi.fn();
+    window.URL.createObjectURL = createObjectURLMock;
+    window.URL.revokeObjectURL = revokeObjectURLMock;
+
+    const { user } = renderWithProviders(<FriendsDashboard />, {
+      initialBalanceHidden: false,
+    });
+
+    await user.click(await screen.findByText("Aman Verma"));
+
+    const exportBtn = await screen.findByRole("button", {
+      name: /export statement/i,
+    });
+    expect(exportBtn).toBeInTheDocument();
+
+    await user.click(exportBtn);
+
+    await waitFor(() => {
+      expect(exportRequested).toBe(true);
+      expect(createObjectURLMock).toHaveBeenCalled();
+    });
   });
 });

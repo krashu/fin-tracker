@@ -49,8 +49,9 @@ import { CardBillLinkField } from "./card-bill-link-field";
 import { RefundOriginalField } from "./refund-original-field";
 import { Field, PickerButton, TextInput } from "@/components/form/fields";
 import { CategorySelector } from "@/components/categories/category-selector";
-import { IconUsers } from "@/components/icons";
+import { IconCheck, IconUsers } from "@/components/icons";
 import { SplitDialog } from "@/components/friends/split-dialog";
+import { LinkRepaymentDialog } from "@/components/friends/link-repayment-dialog";
 import {
   ApiError,
   patchTransaction,
@@ -116,6 +117,7 @@ export function TransactionDialog({
   const [categoryId, setCategoryId] = useState<number | null>(txn.category_id);
   const [labels, setLabels] = useState<string[]>(txn.labels.map((l) => l.name));
   const [splitOpen, setSplitOpen] = useState(false);
+  const [repaymentOpen, setRepaymentOpen] = useState(false);
 
   function invalidateBoard() {
     queryClient.invalidateQueries({ queryKey: ["transactions"] });
@@ -362,26 +364,49 @@ export function TransactionDialog({
 
           <LabelInput label="Tags" value={labels} onChange={setLabels} />
 
-          <div className="flex items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2">
-            <div className="flex flex-col">
-              <span className="text-[12px] font-medium text-foreground">
-                Split / Front for friend
-              </span>
-              <span className="text-[11px] text-muted-foreground">
-                Track who owes you or whom you owe for this transaction.
-              </span>
+          {txn.amount_paise > 0 ? (
+            <div className="flex items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2">
+              <div className="flex flex-col">
+                <span className="text-[12px] font-medium text-foreground">
+                  Friend Repayment
+                </span>
+                <span className="text-[11px] text-muted-foreground">
+                  Link this incoming credit as a friend repayment.
+                </span>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 shrink-0 gap-1.5 px-2 text-[12px]"
+                onClick={() => setRepaymentOpen(true)}
+              >
+                <IconCheck className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+                Link as Friend Repayment
+              </Button>
             </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 shrink-0 gap-1.5 px-2 text-[12px]"
-              onClick={() => setSplitOpen(true)}
-            >
-              <IconUsers className="size-3.5" />
-              Split with Friend
-            </Button>
-          </div>
+          ) : (
+            <div className="flex items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2">
+              <div className="flex flex-col">
+                <span className="text-[12px] font-medium text-foreground">
+                  Split / Front for friend
+                </span>
+                <span className="text-[11px] text-muted-foreground">
+                  Track who owes you or whom you owe for this transaction.
+                </span>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 shrink-0 gap-1.5 px-2 text-[12px]"
+                onClick={() => setSplitOpen(true)}
+              >
+                <IconUsers className="size-3.5" />
+                Split with Friend
+              </Button>
+            </div>
+          )}
 
           {isRefund(txn) ? <RefundOriginalField txn={txn} /> : null}
           {txn.card_bill_link_offered ? (
@@ -423,6 +448,13 @@ export function TransactionDialog({
         transaction={txn}
         open={splitOpen}
         onClose={() => setSplitOpen(false)}
+      />
+    ) : null}
+    {repaymentOpen ? (
+      <LinkRepaymentDialog
+        transaction={txn}
+        open={repaymentOpen}
+        onClose={() => setRepaymentOpen(false)}
       />
     ) : null}
     </>

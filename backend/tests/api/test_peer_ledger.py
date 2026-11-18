@@ -457,3 +457,147 @@ def test_cashback_offset_on_peer_entry(
     r_bal2 = client.get(f"/api/v1/friends/contacts/{contact_id}")
     assert r_bal2.json()["balance_paise"] == 950000
     assert r_bal2.json()["total_got_paise"] == 50000
+
+
+def test_incoming_bank_repayment_linking(
+    client: TestClient,
+    session: Session,
+    seeded_user: User,
+) -> None:
+    """ADR-0017 Rule 6: An incoming credit transaction (e.g. transfer/income credit)
+    can be linked as a friend repayment (direction='you_got', is_settlement=True).
+    Allocation guard prevents allocating more than transaction amount."""
+    # 1. Create peer contact Dave
+    r_c = client.post("/api/v1/friends/contacts", json={"name": "Dave Miller"})
+    assert r_c.status_code == 201
+    contact_id = r_c.json()["id"]
+
+    # 2. Front ₹4,000 for Dave
+    card_txn = _make_card_txn(session, seeded_user, amount_paise=-400000)
+    r_front = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": card_txn.id,
+            "amount_paise": 400000,
+            "direction": "you_gave",
+        },
+    )
+    assert r_front.status_code == 201
+
+    # 3. Create incoming bank credit of ₹4,000 (+400000 paise, transfer)
+    account = Account(
+        user_id=seeded_user.id,
+        name="Salary Account",
+        type="bank",
+        issuer="sbi",
+        last4="5555",
+    )
+    session.add(account)
+    session.flush()
+
+    credit_txn = Transaction(
+        user_id=seeded_user.id,
+        account_id=account.id,
+        date=date(2026, 3, 20),
+        amount_paise=400000,
+        transaction_type="transfer",
+        merchant_raw="UPI / Repayment Dave",
+        merchant_normalized="upi repayment dave",
+        fingerprint=uuid.uuid4().hex * 2,
+        source="import",
+    )
+    session.add(credit_txn)
+    session.commit()
+
+    # 4. Allocation guard test: 500000 > 400000 fails 422
+    r_bad = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": credit_txn.id,
+            "amount_paise": 500000,
+            "direction": "you_got",
+        },
+    )
+    assert r_bad.status_code == 422
+    assert "exceeds transaction amount" in r_bad.json()["detail"]
+
+    # 5. Link valid repayment of ₹4,000
+    r_ok = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": credit_txn.id,
+            "amount_paise": 400000,
+            "direction": "you_got",
+            "notes": "Full repayment via UPI",
+        },
+    )
+    assert r_ok.status_code == 201
+    entry = r_ok.json()
+    assert entry["is_settlement"] is True
+    assert entry["direction"] == "you_got"
+    assert entry["amount_paise"] == 400000
+
+    # 6. Contact balance is now 0 (fully settled)
+    r_bal = client.get(f"/api/v1/friends/contacts/{contact_id}")
+    assert r_bal.json()["balance_paise"] == 0
+
+
+def test_contact_ledger_export_endpoint(
+    client: TestClient,
+    session: Session,
+    seeded_user: User,
+) -> None:
+    """GET /api/v1/friends/contacts/{id}/export returns CSV with Content-Disposition
+    and correct ledger rows; multi-tenant isolation returns 404 for other user."""
+    # 1. Create contact
+    r_c = client.post(
+        "/api/v1/friends/contacts",
+        json={"name": "Emma Watson", "upi_id": "emma@upi"},
+    )
+    assert r_c.status_code == 201
+    contact_id = r_c.json()["id"]
+
+    # 2. Add an entry
+    r_e = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "date": "2026-03-01",
+            "amount_paise": 150000,
+            "direction": "you_gave",
+            "notes": "Concert ticket",
+        },
+    )
+    assert r_e.status_code == 201
+
+    # 3. Request export
+    r_exp = client.get(f"/api/v1/friends/contacts/{contact_id}/export")
+    assert r_exp.status_code == 200
+    assert r_exp.headers["content-type"].startswith("text/csv")
+    expected_fn = f'filename="peer_contact_{contact_id}_statement.csv"'
+    assert expected_fn in r_exp.headers["content-disposition"]
+
+    csv_text = r_exp.text
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == (
+        "Date,Description,Direction,Amount (INR),Settlement Status,Running Balance (INR)"
+    )
+    assert len(lines) == 2
+    assert "2026-03-01,Concert ticket,you_gave,1500.00,Regular,1500.00" in lines[1]
+
+    # 4. Multi-tenant isolation: User B gets 404
+    b_user_id = uuid.uuid4()
+    b_user = User(
+        id=b_user_id,
+        email="user_b_export@example.com",
+        password_hash=_demo_password_hash(),
+    )
+    session.add(b_user)
+    session.commit()
+
+    _act_as(client, b_user_id)
+    r_b_exp = client.get(f"/api/v1/friends/contacts/{contact_id}/export")
+    assert r_b_exp.status_code == 404

@@ -614,4 +614,37 @@ describe("TransactionDialog (app/expenses/transaction-dialog.tsx)", () => {
     await user.click(splitBtn);
     expect(await screen.findByText("Split with Friend / Khata")).toBeInTheDocument();
   });
+
+  it("offers 'Link as Friend Repayment' button on incoming credit and opens repayment dialog", async () => {
+    server.use(
+      http.get("*/api/v1/friends/contacts", () => {
+        return HttpResponse.json([]);
+      }),
+    );
+
+    const creditTxn = buildTransaction({
+      id: 71,
+      amount_paise: 350000,
+      transaction_type: "transfer",
+      merchant_raw: "UPI / Repayment from Bob",
+    });
+
+    const { user } = renderWithProviders(
+      <TransactionDialog
+        txn={creditTxn}
+        categories={mockCategories}
+        accounts={mockAccounts}
+        accountLabelText="Salary Account"
+        onClose={vi.fn()}
+      />,
+    );
+
+    const repayBtn = screen.getByRole("button", { name: /link as friend repayment/i });
+    expect(repayBtn).toBeInTheDocument();
+
+    await user.click(repayBtn);
+    expect(
+      await screen.findByRole("heading", { name: "Link as Friend Repayment" }),
+    ).toBeInTheDocument();
+  });
 });

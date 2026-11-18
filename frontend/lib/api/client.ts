@@ -2191,3 +2191,17 @@ export function deletePeerEntry(id: number): Promise<void> {
 export function getPeerSummary(): Promise<PeerLedgerSummary> {
   return request<PeerLedgerSummary>("/friends/summary");
 }
+
+export async function exportPeerContactStatement(id: number): Promise<{
+  csvText: string;
+  filename: string;
+}> {
+  const res = await sendWithRefresh(`/friends/contacts/${id}/export`);
+  if (!res.ok) throw await toApiError(res);
+  const disposition = res.headers.get("content-disposition") ?? "";
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return {
+    csvText: await res.text(),
+    filename: match?.[1] ?? `peer_contact_${id}_statement.csv`,
+  };
+}

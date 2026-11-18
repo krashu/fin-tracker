@@ -67,6 +67,24 @@ def get_contact_with_balance(
     return peer_service.get_contact_with_balance(session, user_id=user_id, contact_id=contact_id)
 
 
+@router.get("/contacts/{contact_id}/export")
+def export_contact_statement(
+    contact_id: int,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> Response:
+    """Export contact ledger statement as an itemised CSV."""
+    csv_content = peer_service.export_contact_statement_csv(
+        session, user_id=user_id, contact_id=contact_id
+    )
+    filename = f"peer_contact_{contact_id}_statement.csv"
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.patch("/contacts/{contact_id}", response_model=PeerContactRead)
 def update_contact(
     contact_id: int,

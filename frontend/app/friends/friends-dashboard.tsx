@@ -29,7 +29,10 @@ import {
 import { Field, PickerButton, TextInput } from "@/components/form/fields";
 import {
   IconCheck,
+  IconCopy,
+  IconDownload,
   IconPlus,
+  IconQr,
   IconSearch,
   IconUsers,
   IconX,
@@ -42,6 +45,7 @@ import {
   createPeerContact,
   createPeerEntry,
   deletePeerEntry,
+  exportPeerContactStatement,
   getPeerContact,
   getPeerSummary,
   listPeerContacts,
@@ -52,6 +56,8 @@ import {
   type PeerEntry,
 } from "@/lib/api/client";
 import { invalidateFriends } from "@/lib/queries/invalidate";
+import { buildUpiUri, formatWhatsAppBreakdown } from "@/lib/upi";
+import { QrCodeSvg } from "@/lib/qr";
 import { cn } from "@/lib/utils";
 
 export function FriendsDashboard() {
@@ -276,10 +282,32 @@ function ContactCard({
   contact: PeerContactWithBalance;
   onClick: () => void;
 }) {
+  const [copiedUpi, setCopiedUpi] = useState(false);
   const isArchived = contact.archived_at != null;
   const owesUser = contact.balance_paise > 0;
   const userOwes = contact.balance_paise < 0;
   const settled = contact.balance_paise === 0;
+
+  const upiUri =
+    owesUser && contact.upi_id
+      ? buildUpiUri({
+          upiId: contact.upi_id,
+          name: contact.name,
+          amountPaise: contact.balance_paise,
+        })
+      : null;
+
+  const handleCopyUpi = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!upiUri) return;
+    try {
+      await navigator.clipboard.writeText(upiUri);
+      setCopiedUpi(true);
+      setTimeout(() => setCopiedUpi(false), 2000);
+    } catch {
+      // ignore
+    }
+  };
 
   return (
     <Card
@@ -318,20 +346,44 @@ function ContactCard({
           <span className="text-[11px] text-muted-foreground">
             {owesUser ? "Owes you" : userOwes ? "You owe" : "Status"}
           </span>
-          <span
-            className={cn(
-              "font-mono font-medium text-[13px]",
-              owesUser && "text-emerald-600 dark:text-emerald-400",
-              userOwes && "text-amber-600 dark:text-amber-400",
-              settled && "text-muted-foreground",
-            )}
-          >
-            {settled ? (
-              "Settled up"
-            ) : (
-              <Sensitive>{formatINR(Math.abs(contact.balance_paise))}</Sensitive>
-            )}
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className={cn(
+                "font-mono font-medium text-[13px]",
+                owesUser && "text-emerald-600 dark:text-emerald-400",
+                userOwes && "text-amber-600 dark:text-amber-400",
+                settled && "text-muted-foreground",
+              )}
+            >
+              {settled ? (
+                "Settled up"
+              ) : (
+                <Sensitive>{formatINR(Math.abs(contact.balance_paise))}</Sensitive>
+              )}
+            </span>
+            {upiUri ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-6 gap-1 px-2 text-[11px]"
+                onClick={handleCopyUpi}
+                title="Copy UPI Payment Link"
+              >
+                {copiedUpi ? (
+                  <>
+                    <IconCheck className="size-3 text-emerald-600 dark:text-emerald-400" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <IconCopy className="size-3" />
+                    <span>Copy UPI</span>
+                  </>
+                )}
+              </Button>
+            ) : null}
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -478,6 +530,11 @@ function ContactLedgerDialog({
   const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
   const [entryToDelete, setEntryToDelete] = useState<PeerEntry | null>(null);
 
+  const [copiedUpi, setCopiedUpi] = useState(false);
+  const [copiedWhatsApp, setCopiedWhatsApp] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
   // Ledger entries query
   const entriesQuery = useQuery({
     queryKey: ["friends", "contacts", contact.id, "entries"],
@@ -496,6 +553,68 @@ function ContactLedgerDialog({
   const owesUser = currentContact.balance_paise > 0;
   const userOwes = currentContact.balance_paise < 0;
   const settled = currentContact.balance_paise === 0;
+
+  const upiUri =
+    owesUser && currentContact.upi_id
+      ? buildUpiUri({
+          upiId: currentContact.upi_id,
+          name: currentContact.name,
+          amountPaise: currentContact.balance_paise,
+        })
+      : null;
+
+  const handleCopyUpi = async (uri: string) => {
+    try {
+      await navigator.clipboard.writeText(uri);
+      setCopiedUpi(true);
+      setTimeout(() => setCopiedUpi(false), 2000);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleCopyWhatsApp = async () => {
+    try {
+      const text = formatWhatsAppBreakdown({
+        contact: currentContact,
+        entries,
+      });
+      await navigator.clipboard.writeText(text);
+      setCopiedWhatsApp(true);
+      setTimeout(() => setCopiedWhatsApp(false), 2000);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleExportStatement = async () => {
+    try {
+      setExporting(true);
+      setExportError(null);
+      const { csvText, filename } = await exportPeerContactStatement(
+        currentContact.id,
+      );
+      const blob = new Blob([csvText], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", filename);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(
+        err instanceof ApiError
+          ? err.detail
+          : err instanceof Error
+            ? err.message
+            : "Failed to export statement",
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
 
   // Archive mutation
   const archiveMutation = useMutation({
@@ -614,8 +733,104 @@ function ContactLedgerDialog({
           </DialogHeader>
 
           {/* Timeline of Entries */}
-          <div className="flex-1 overflow-y-auto p-6 space-y-3">
-            <h4 className="text-[12px] font-semibold text-muted-foreground uppercase tracking-wider">
+          <div className="flex-1 overflow-y-auto p-6 space-y-4">
+            {/* UPI QR & WhatsApp sharing card */}
+            {owesUser && currentContact.upi_id && upiUri ? (
+              <div className="flex flex-col sm:flex-row items-center gap-4 rounded-lg border border-border bg-muted/20 p-3.5">
+                <div className="shrink-0 bg-white p-2 rounded-md shadow-xs border border-border">
+                  <QrCodeSvg
+                    value={upiUri}
+                    size={110}
+                    title={`UPI QR for ${currentContact.name}`}
+                  />
+                </div>
+                <div className="flex flex-col gap-1 min-w-0 text-center sm:text-left flex-1">
+                  <div className="flex items-center justify-center sm:justify-start gap-1.5">
+                    <IconQr className="size-3.5 text-primary" />
+                    <span className="text-[11px] font-semibold uppercase text-muted-foreground tracking-wider">
+                      UPI Payment Request
+                    </span>
+                  </div>
+                  <p className="text-[12.5px] font-medium text-foreground truncate">
+                    {currentContact.upi_id}
+                  </p>
+                  <p className="text-[12px] text-muted-foreground font-mono">
+                    Payable:{" "}
+                    <Sensitive>
+                      {formatINR(currentContact.balance_paise)}
+                    </Sensitive>
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2 pt-1">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleCopyUpi(upiUri)}
+                      className="h-7 gap-1.5 px-2 text-[11.5px]"
+                    >
+                      {copiedUpi ? (
+                        <>
+                          <IconCheck className="size-3 text-emerald-600 dark:text-emerald-400" />
+                          Copied UPI Link
+                        </>
+                      ) : (
+                        <>
+                          <IconCopy className="size-3" />
+                          Copy UPI Link
+                        </>
+                      )}
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleCopyWhatsApp}
+                      className="h-7 gap-1.5 px-2 text-[11.5px]"
+                    >
+                      {copiedWhatsApp ? (
+                        <>
+                          <IconCheck className="size-3 text-emerald-600 dark:text-emerald-400" />
+                          Copied Breakdown
+                        </>
+                      ) : (
+                        <>
+                          <IconCopy className="size-3" />
+                          Copy Breakdown for WhatsApp
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between rounded-lg border border-border bg-muted/15 px-3 py-2">
+                <span className="text-[11.5px] text-muted-foreground">
+                  Share unsettled ledger breakdown with {currentContact.name}
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCopyWhatsApp}
+                  className="h-7 gap-1.5 px-2 text-[11.5px]"
+                >
+                  {copiedWhatsApp ? (
+                    <>
+                      <IconCheck className="size-3 text-emerald-600 dark:text-emerald-400" />
+                      Copied Breakdown
+                    </>
+                  ) : (
+                    <>
+                      <IconCopy className="size-3" />
+                      Copy Breakdown for WhatsApp
+                    </>
+                  )}
+                </Button>
+              </div>
+            )}
+
+            <h4 className="text-[12px] font-semibold text-muted-foreground uppercase tracking-wider pt-1">
               Ledger Timeline
             </h4>
 
@@ -698,7 +913,23 @@ function ContactLedgerDialog({
             )}
           </div>
 
-          <DialogFooter className="p-4 border-t border-border bg-muted/10">
+          <DialogFooter className="flex flex-row items-center justify-between p-4 border-t border-border bg-muted/10">
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleExportStatement}
+                disabled={exporting}
+                className="h-8 gap-1.5 text-[12px]"
+              >
+                <IconDownload className="size-3.5" />
+                {exporting ? "Exporting…" : "Export Statement"}
+              </Button>
+              {exportError ? (
+                <span className="text-[11px] text-neg">{exportError}</span>
+              ) : null}
+            </div>
             <Button
               type="button"
               variant="outline"

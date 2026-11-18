@@ -6,6 +6,8 @@ allocation guard against transactions, settlement entries, and overall summary.
 
 from __future__ import annotations
 
+import csv
+import io
 from datetime import date as date_t
 from uuid import UUID
 
@@ -355,15 +357,16 @@ def create_entry(
                 ),
             )
 
-        # ADR-0017 Rule 8: Delayed cashback rebate (spend-kind Cashback row) linking.
-        # Positive spend transactions (amount_paise > 0) are credit rebates: they must
+        # ADR-0017 Rule 6 & Rule 8: Delayed cashback rebate (spend-kind Cashback row)
+        # or incoming repayment credit linking.
+        # Positive transactions (amount_paise > 0) are credit settlements: they must
         # be linked to peer contacts as credit settlement entries (direction = 'you_got').
         if txn.amount_paise > 0:
             if direction == "you_gave":
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=(
-                        "Cashback rebate transactions must be credited "
+                        "Cashback rebate / credit transactions must be credited "
                         "to contact with direction 'you_got'"
                     ),
                 )
@@ -596,3 +599,73 @@ def get_peer_summary(
         net_balance_paise=receivable - payable,
         active_contacts_count=active_count,
     )
+
+
+def export_contact_statement_csv(
+    session: Session,
+    *,
+    user_id: UUID,
+    contact_id: int,
+) -> str:
+    """Generate an itemised CSV statement for a contact's ledger entries.
+
+    Columns: Date, Description, Direction, Amount (INR), Settlement Status, Running Balance (INR).
+    404 if contact does not exist or belongs to another user (ADR-0003).
+    """
+    get_contact(session, user_id=user_id, contact_id=contact_id)
+
+    stmt = (
+        select(PeerEntry, Transaction.merchant_raw)
+        .outerjoin(
+            Transaction,
+            and_(
+                Transaction.id == PeerEntry.transaction_id,
+                Transaction.user_id == user_id,
+            ),
+        )
+        .where(
+            PeerEntry.contact_id == contact_id,
+            PeerEntry.user_id == user_id,
+        )
+        .order_by(PeerEntry.date.asc(), PeerEntry.id.asc())
+    )
+    rows = session.execute(stmt).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Date",
+            "Description",
+            "Direction",
+            "Amount (INR)",
+            "Settlement Status",
+            "Running Balance (INR)",
+        ]
+    )
+
+    running_balance_paise = 0
+    for entry, merchant_raw in rows:
+        if entry.direction == "you_gave":
+            running_balance_paise += entry.amount_paise
+        else:
+            running_balance_paise -= entry.amount_paise
+
+        desc = (
+            entry.notes or merchant_raw or ("Settlement" if entry.is_settlement else "Ledger entry")
+        )
+        status_str = "Settlement" if entry.is_settlement else "Regular"
+        amount_inr = f"{entry.amount_paise / 100:.2f}"
+        balance_inr = f"{running_balance_paise / 100:.2f}"
+        writer.writerow(
+            [
+                entry.date.isoformat(),
+                desc,
+                entry.direction,
+                amount_inr,
+                status_str,
+                balance_inr,
+            ]
+        )
+
+    return output.getvalue()
