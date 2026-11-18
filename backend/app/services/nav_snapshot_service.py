@@ -308,15 +308,21 @@ def _apply_mf_nav(inst: Instrument, index: MfIndex, warnings: list[str]) -> str:
     return "updated"
 
 
-def _yahoo_ticker(symbol: str, exchange: str) -> str | None:
-    """Map a holding to its Yahoo ticker: ``NSE → .NS``, ``BSE → .BO``, ``NASDAQ`` / ``NYSE`` →
-    the bare symbol; an exchange with no quote source → ``None`` (skip).
+def _yahoo_ticker(symbol: str, exchange: str, asset_class: str = "") -> str | None:
+    """Map a holding to its Yahoo ticker: ``NSE → .NS``, ``BSE → .BO``, US equities/ETFs →
+    the bare symbol (with '.' converted to '-' for share classes like BRK-B); an Indian exchange
+    with no quote source → ``None`` (skip).
 
     Tests ``is not None``, not truthiness: a US exchange maps to an empty (``""``) suffix, which
     is falsy but valid — ``f"{symbol}"`` is the correct bare US ticker.
     """
+    cleaned = symbol.strip().upper()
+    if not cleaned:
+        return None
+    if asset_class in ("us_equity", "us_etf"):
+        return cleaned.replace(".", "-")
     suffix = _EXCHANGE_SUFFIX.get(exchange)
-    return f"{symbol}{suffix}" if suffix is not None else None
+    return f"{cleaned}{suffix}" if suffix is not None else None
 
 
 def _fetch_equity_quote(
@@ -340,8 +346,16 @@ def _fetch_equity_quote(
     if not results:
         return None, "empty quote result"
     meta = results[0].get("meta") or {}
-    price = meta.get("regularMarketPrice")
+    price = (
+        meta.get("regularMarketPrice")
+        or meta.get("previousClose")
+        or meta.get("chartPreviousClose")
+    )
     ts = meta.get("regularMarketTime")
+    if ts is None:
+        timestamps = results[0].get("timestamp")
+        if timestamps:
+            ts = timestamps[-1]
     if price is None or ts is None:
         return None, "no price/timestamp in payload"
     try:
@@ -360,7 +374,7 @@ def _apply_equity_quote(
     source for the exchange (config issue, won't change on retry); ``fetch_error`` =
     network / no-price (retry may help) — the split lets the user tell them apart.
     """
-    ticker = _yahoo_ticker(inst.symbol, inst.exchange)
+    ticker = _yahoo_ticker(inst.symbol, inst.exchange, inst.asset_class)
     if ticker is None:
         warnings.append(f"instrument {inst.id}: exchange {inst.exchange} has no quote source")
         return "unmatched"

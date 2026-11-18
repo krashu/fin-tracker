@@ -87,4 +87,19 @@ describe("AddInstrumentDialog currency (B19)", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
   });
+
+  it("defaults exchange to NASDAQ when US equity is selected", async () => {
+    const captured = captureCreate();
+    const { user } = renderWithProviders(
+      <AddInstrumentDialog onClose={vi.fn()} />,
+    );
+
+    await fillAndPick(user, "US equity");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => {
+      expect(captured.body?.asset_class).toBe("us_equity");
+      expect(captured.body?.exchange).toBe("NASDAQ");
+    });
+  });
 });

@@ -14,7 +14,7 @@ text file (``portal.amfiindia.com/spages/NAVAll.txt``). The layout is hierarchic
     <blank>
     119551;INF209KA12Z1;INF209KA13Z9;... ;105.9219;19-Jun-2026   <- data row (6 ';' fields)
 
-A **data row** is the only thing we keep: exactly six ``;``-separated fields whose first
+A **data row** is the only thing we keep: a ``;``-separated line (6 or 8 fields) whose first
 field is a numeric scheme code. The header, blank lines, category headers, and AMC-name
 headers all fail that test and are skipped — no fragile section-state machine needed.
 
@@ -80,15 +80,31 @@ def parse_navall(raw: bytes) -> tuple[list[AmfiNavRow], list[str]]:
     warnings: list[str] = []
     for line in text.splitlines():
         fields = line.split(";")
-        # A data row is exactly 6 ';'-fields with a numeric scheme code. The header
-        # ("Scheme Code;..."), blank lines, category headers and AMC names all fail this.
-        if len(fields) != 6:
+        # A data row is 6 or 8 ';'-fields with a numeric scheme code. AMFI publishes
+        # both layouts (historical 6 fields: Scheme Code, ISIN Growth, ISIN Reinvest,
+        # Scheme Name, NAV, Date; newer 8 fields: Scheme Code, ISIN Growth, ISIN Reinvest,
+        # Scheme Name, Plan, Option, NAV, Date). The header, blank lines, category
+        # headers and AMC names all fail this.
+        if len(fields) not in (6, 8):
             continue
         scheme_code = fields[0].strip()
         if not scheme_code.isdigit():
             continue
 
-        nav_raw = fields[4].strip().replace(",", "")
+        if len(fields) == 6:
+            scheme_name = fields[3].strip()
+            nav_raw = fields[4].strip().replace(",", "")
+            date_raw = fields[5].strip()
+        else:
+            parts = [
+                p.strip()
+                for p in (fields[3], fields[4], fields[5])
+                if p.strip() and p.strip() != "-"
+            ]
+            scheme_name = " - ".join(parts) if parts else fields[3].strip()
+            nav_raw = fields[6].strip().replace(",", "")
+            date_raw = fields[7].strip()
+
         try:
             nav = Decimal(nav_raw)
         except InvalidOperation:
@@ -96,7 +112,7 @@ def parse_navall(raw: bytes) -> tuple[list[AmfiNavRow], list[str]]:
             continue
 
         try:
-            nav_date = datetime.strptime(fields[5].strip(), _NAV_DATE_FORMAT).date()
+            nav_date = datetime.strptime(date_raw, _NAV_DATE_FORMAT).date()
         except ValueError:
             warnings.append(f"scheme {scheme_code}: unparseable date")
             continue
@@ -106,7 +122,7 @@ def parse_navall(raw: bytes) -> tuple[list[AmfiNavRow], list[str]]:
                 scheme_code=scheme_code,
                 isin_growth=_isin_or_none(fields[1]),
                 isin_reinvest=_isin_or_none(fields[2]),
-                scheme_name=fields[3].strip(),
+                scheme_name=scheme_name,
                 nav=nav,
                 nav_date=nav_date,
             )

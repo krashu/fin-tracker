@@ -101,6 +101,34 @@ def test_bad_encoding_raises() -> None:
         parse_navall(b"\xff\xfe;not;utf8;bytes;here;now")
 
 
+def test_eight_column_amfi_layout() -> None:
+    header = (
+        "Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;"
+        "Scheme Name;Plan;Option;Net Asset Value;Date"
+    )
+    raw = (
+        f"{header}\n"
+        "135762;INF846K01WO1;-;Axis Children's Fund;Direct Plan;Growth Option;"
+        "31.0558;18-Nov-2026\n"
+        "135763;INF846K01WS2;INF846K01WQ6;Axis Children's Fund;Direct Plan;"
+        "IDCW Option;28.6621;18-Nov-2026\n"
+    ).encode()
+    rows, warnings = parse_navall(raw)
+    assert warnings == []
+    assert len(rows) == 2
+    assert rows[0].scheme_code == "135762"
+    assert rows[0].isin_growth == "INF846K01WO1"
+    assert rows[0].isin_reinvest is None
+    assert rows[0].scheme_name == "Axis Children's Fund - Direct Plan - Growth Option"
+    assert str(rows[0].nav) == "31.0558"
+    assert rows[0].nav_date.isoformat() == "2026-11-18"
+
+    assert rows[1].scheme_code == "135763"
+    assert rows[1].isin_growth == "INF846K01WS2"
+    assert rows[1].isin_reinvest == "INF846K01WQ6"
+    assert rows[1].scheme_name == "Axis Children's Fund - Direct Plan - IDCW Option"
+
+
 def test_empty_body_raises() -> None:
     with pytest.raises(AmfiParseError, match="no NAV rows"):
         parse_navall(f"{_HEADER}\n\nSome AMC Mutual Fund\n".encode())

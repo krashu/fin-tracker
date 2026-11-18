@@ -271,6 +271,36 @@ def test_us_equity_priced_from_yahoo(session: Session, user: User) -> None:
     assert voo.current_nav == _YAHOO_PRICE
 
 
+def test_us_equity_non_us_exchange_priced_from_yahoo(session: Session, user: User) -> None:
+    # US equities/ETFs with exchange="OTHER" (e.g. from CSV import) or "MFCentral"
+    # (default in Add dialog) still price from Yahoo using the bare ticker.
+    spy = Instrument(
+        user_id=user.id,
+        symbol="SPY",
+        name="SPDR S&P 500 ETF",
+        asset_class="us_etf",
+        currency="USD",
+        exchange="OTHER",
+    )
+    msft = Instrument(
+        user_id=user.id,
+        symbol="MSFT",
+        name="Microsoft",
+        asset_class="us_equity",
+        currency="USD",
+        exchange="MFCentral",
+    )
+    session.add_all([spy, msft])
+    session.flush()
+
+    result = _run(session, user.id, _equity_ok)
+
+    assert result.equity_updated == 2
+    assert result.unmatched == 0
+    assert spy.current_nav == _YAHOO_PRICE
+    assert msft.current_nav == _YAHOO_PRICE
+
+
 def test_duplicate_isin_differing_nav_is_dropped(session: Session, user: User) -> None:
     # Same ISIN in two schemes with different NAVs → ambiguous → withheld (no coin-flip);
     # a holding matching it lands unmatched, not coin-flip-priced. The warning is scoped
@@ -381,6 +411,10 @@ def test_yahoo_ticker_mapping() -> None:
     assert _yahoo_ticker("INFY", "NSE") == "INFY.NS"
     assert _yahoo_ticker("RELIANCE", "BSE") == "RELIANCE.BO"
     assert _yahoo_ticker("X", "OTHER") is None
+    assert _yahoo_ticker("AAPL", "NASDAQ", "us_equity") == "AAPL"
+    assert _yahoo_ticker("VOO", "OTHER", "us_etf") == "VOO"
+    assert _yahoo_ticker("AAPL", "MFCentral", "us_equity") == "AAPL"
+    assert _yahoo_ticker("BRK.B", "NYSE", "us_equity") == "BRK-B"
 
 
 def test_rerun_does_not_advance_nav_updated_at(session: Session, user: User) -> None:

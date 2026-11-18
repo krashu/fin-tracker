@@ -129,7 +129,23 @@ export function AddInstrumentDialog({ onClose }: { onClose: () => void }) {
             <Field label="Asset class">
               <PickerButton label={ASSET_CLASS_LABELS[assetClass]}>
                 {ASSET_CLASSES.map((a) => (
-                  <DropdownMenuItem key={a} onSelect={() => setAssetClass(a)}>
+                  <DropdownMenuItem
+                    key={a}
+                    onSelect={() => {
+                      setAssetClass(a);
+                      if (a === "us_equity" || a === "us_etf") {
+                        if (exchange !== "NASDAQ" && exchange !== "NYSE") {
+                          setExchange("NASDAQ");
+                        }
+                      } else if (a === "indian_equity") {
+                        if (exchange !== "NSE" && exchange !== "BSE") {
+                          setExchange("NSE");
+                        }
+                      } else if (a === "indian_mf") {
+                        setExchange("MFCentral");
+                      }
+                    }}
+                  >
                     {ASSET_CLASS_LABELS[a]}
                   </DropdownMenuItem>
                 ))}
