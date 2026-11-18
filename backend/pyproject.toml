@@ -2,7 +2,7 @@
 name = "fin-tracker-backend"
 version = "0.0.0"
 description = "Personal finance tracker — FastAPI backend"
-requires-python = ">=3.13,<3.15"
+requires-python = ">=3.14,<3.15"
 # Version policy (PRD §Maintenance posture): bounded ranges — floor = current
 # (no regress), ceiling = next breaking boundary (minor for 0.x, major for >=1.x).
 # uv.lock pins exact + is committed; ranges only cap `uv lock --upgrade`.
@@ -40,9 +40,8 @@ dev = [
     # Type checker (see docs/adr/0005-type-checker-ty.md). Pre-1.0: behaviour can shift
     # between 0.0.x releases, so the ceiling is the next minor per §Maintenance posture
     # and uv.lock pins exact — upgrades are deliberate (`uv lock --upgrade`).
-    # Floor is 0.0.63 (not the newer 0.0.64) because the 3-day `exclude-newer` cooldown
-    # below filters anything younger; both were verified clean on app/.
-    "ty>=0.0.63,<0.1",
+    # Floor is 0.0.101 matching the locked version (ADR-0005 rule 7).
+    "ty>=0.0.101,<0.1",
     "pytest>=9.0.3,<10",
     "pytest-asyncio>=1.3.0,<2",
     "pytest-cov>=7.1.0,<8",

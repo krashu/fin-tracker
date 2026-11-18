@@ -11,7 +11,7 @@
 #   Node  <- .nvmrc
 #   pnpm  <- frontend/package.json "packageManager"
 # Python 3.14 comes from the base image (matches backend/Dockerfile and CI; pyproject
-# allows >=3.13,<3.15). UV_PYTHON_DOWNLOADS=never makes uv use it instead of fetching.
+# allows >=3.14,<3.15). UV_PYTHON_DOWNLOADS=never makes uv use it instead of fetching.
 # Keep the base tag in step with backend/.python-version: with downloads off, uv fails
 # if that file asks for a minor the image doesn't have.
 FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim

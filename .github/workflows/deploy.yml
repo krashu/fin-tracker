@@ -39,7 +39,7 @@ jobs:
         run: docker compose build --pull
 
   test-backend:
-    name: Test Backend (Python 3.13)
+    name: Test Backend (Python 3.14)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
