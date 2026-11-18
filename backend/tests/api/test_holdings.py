@@ -129,4 +129,4 @@ def test_holding_manually_priced_class_supports_price_feed_false(
     )
     (h,) = client.get("/api/v1/holdings").json()["holdings"]
     assert h["supports_price_feed"] is False
-    assert h["nav_staleness_days"] >= STALENESS_WARN_DAYS
+    assert h["nav_staleness_days"] is None
