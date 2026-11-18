@@ -550,6 +550,23 @@ export const handlers = [
   }),
 
   // --- Dashboard Endpoints ---
+  http.get("*/api/v1/dashboards/overview", () => {
+    return HttpResponse.json({
+      period: "2026-03",
+      net_worth_paise: 50000000,
+      portfolio_value_paise: 30000000,
+      fx_unavailable_count: 0,
+      income_paise: 20000000,
+      expense_paise: -700000,
+      net_paise: 19300000,
+      accounts: [],
+      gross_spend_paise: 700000,
+      fronted_peer_entries_paise: 300000,
+      net_personal_spend_paise: 400000,
+      fronted_card_usage_paise: 500000,
+    });
+  }),
+
   http.get("*/api/v1/dashboards/tagging-stats", () => {
     return HttpResponse.json({
       total_auto_tagged: 45,

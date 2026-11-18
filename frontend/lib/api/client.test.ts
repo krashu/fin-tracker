@@ -9,6 +9,7 @@ import {
   deleteAccount,
   deletePeerEntry,
   getAuthConfig,
+  getOverview,
   getPeerContact,
   getPeerSummary,
   invalidIdsFromError,
@@ -39,6 +40,14 @@ describe("API Client (lib/api/client.ts)", () => {
     it("fetches accounts list", async () => {
       const accounts = await listAccounts();
       expect(accounts).toEqual(mockAccounts);
+    });
+
+    it("fetches overview with spend isolation metrics via getOverview()", async () => {
+      const overview = await getOverview({ month: "2026-03" });
+      expect(overview.gross_spend_paise).toBe(700000);
+      expect(overview.fronted_peer_entries_paise).toBe(300000);
+      expect(overview.net_personal_spend_paise).toBe(400000);
+      expect(overview.fronted_card_usage_paise).toBe(500000);
     });
 
     it("creates an account via POST", async () => {

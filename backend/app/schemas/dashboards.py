@@ -533,6 +533,15 @@ class OverviewResponse(BaseModel):
       period's totals, identical in meaning to ``PeriodTotalsResponse``
       (``expense_paise`` is the signed Σ(spend) ≤ 0; ``net = income +
       expense``).
+    * ``gross_spend_paise`` — unsigned gross debit spend in the period
+      (``transaction_type == 'spend'`` and ``amount_paise < 0``). Excludes
+      transfers (ADR-0017 Rule 7).
+    * ``fronted_peer_entries_paise`` — sum of ``peer_entries`` (``direction == 'you_gave'``)
+      linked to confirmed spend transactions in the period.
+    * ``net_personal_spend_paise`` — ``gross_spend_paise - fronted_peer_entries_paise``.
+      Isolates personal spend from fronted debt.
+    * ``fronted_card_usage_paise`` — monthly sum of credit card debits linked to
+      ``peer_entries`` (``direction == 'you_gave'``) for the active user (ADR-0017 Rule 7).
     """
 
     period: str
@@ -543,6 +552,10 @@ class OverviewResponse(BaseModel):
     expense_paise: int
     net_paise: int
     accounts: list[AccountBalanceRow]
+    gross_spend_paise: int = 0
+    fronted_peer_entries_paise: int = 0
+    net_personal_spend_paise: int = 0
+    fronted_card_usage_paise: int = 0
 
 
 class CategoryTrendSubcategory(BaseModel):

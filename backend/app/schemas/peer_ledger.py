@@ -77,7 +77,7 @@ class PeerEntryCreate(BaseModel):
     transaction_id: int | None = None
     date: date_t | None = None
     amount_paise: int = Field(gt=0)
-    direction: PeerDirectionStr
+    direction: PeerDirectionStr | None = None
     is_settlement: bool = False
     notes: str | None = None
     original_paise: int | None = None
@@ -85,8 +85,11 @@ class PeerEntryCreate(BaseModel):
 
     @model_validator(mode="after")
     def _validate_entry(self) -> Self:
-        if self.transaction_id is None and self.date is None:
-            raise ValueError("date is required for standalone entries")
+        if self.transaction_id is None:
+            if self.date is None:
+                raise ValueError("date is required for standalone entries")
+            if self.direction is None:
+                raise ValueError("direction is required for standalone entries")
         if self.original_paise is not None or self.discount_paise is not None:
             if self.original_paise is None or self.discount_paise is None:
                 raise ValueError("original_paise and discount_paise must be provided together")

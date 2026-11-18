@@ -319,6 +319,9 @@ def create_entry(
         )
 
     entry_date = data.date
+    direction = data.direction
+    is_settlement = data.is_settlement
+
     if data.transaction_id is not None:
         txn = session.scalar(
             select(Transaction).where(
@@ -352,12 +355,34 @@ def create_entry(
                 ),
             )
 
+        # ADR-0017 Rule 8: Delayed cashback rebate (spend-kind Cashback row) linking.
+        # Positive spend transactions (amount_paise > 0) are credit rebates: they must
+        # be linked to peer contacts as credit settlement entries (direction = 'you_got').
+        if txn.amount_paise > 0:
+            if direction == "you_gave":
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=(
+                        "Cashback rebate transactions must be credited "
+                        "to contact with direction 'you_got'"
+                    ),
+                )
+            direction = "you_got"
+            is_settlement = True
+        elif direction is None:
+            direction = "you_gave"
+
         if entry_date is None:
             entry_date = txn.date
     elif entry_date is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="date is required for standalone entries",
+        )
+    elif direction is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="direction is required for standalone entries",
         )
 
     entry = PeerEntry(
@@ -366,8 +391,8 @@ def create_entry(
         transaction_id=data.transaction_id,
         date=entry_date,
         amount_paise=data.amount_paise,
-        direction=data.direction,
-        is_settlement=data.is_settlement,
+        direction=direction,
+        is_settlement=is_settlement,
         notes=data.notes,
     )
     session.add(entry)

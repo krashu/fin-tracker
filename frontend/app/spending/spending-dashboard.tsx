@@ -29,6 +29,7 @@ import { CashflowBar } from "@/components/dashboard/cashflow-bar";
 import { CategoryTrendBar } from "@/components/dashboard/category-trend-bar";
 import { PeriodPicker } from "@/components/dashboard/period-picker";
 import { SpendByCategory } from "@/components/dashboard/spend-by-category";
+import { SpendIsolationCard } from "@/components/dashboard/spend-isolation-card";
 import { SpendByPeriodBar } from "@/components/dashboard/spend-by-period-bar";
 import { SpendByTag } from "@/components/dashboard/spend-by-tag";
 import { SpendByTagHeatmap } from "@/components/dashboard/spend-by-tag-heatmap";
@@ -108,6 +109,7 @@ export function SpendingDashboard() {
       </div>
 
       <SpendByCategory labelId={labelId} year={selectedYear} month={monthParam} />
+      <SpendIsolationCard period={period} />
       {labels.length > 0 ? <SpendByTag year={selectedYear} month={monthParam} /> : null}
       <TopMerchants labelId={labelId} year={selectedYear} month={monthParam} />
       <CashflowBar tagActive={labelId != null} year={selectedYear} />

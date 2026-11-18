@@ -1590,6 +1590,10 @@ export type OverviewResponse = {
   expense_paise: number;
   net_paise: number;
   accounts: AccountBalanceRow[];
+  gross_spend_paise: number;
+  fronted_peer_entries_paise: number;
+  net_personal_spend_paise: number;
+  fronted_card_usage_paise: number;
 };
 
 export function getOverview(params: {
@@ -2099,7 +2103,7 @@ export type PeerEntryCreatePayload = {
   transaction_id?: number | null;
   date?: string;
   amount_paise: number;
-  direction: PeerDirection;
+  direction?: PeerDirection;
   is_settlement?: boolean;
   notes?: string | null;
   original_paise?: number;

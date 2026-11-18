@@ -42,6 +42,8 @@ from app.models import (
     Label,
     MerchantAlias,
     MerchantTagMap,
+    PeerContact,
+    PeerEntry,
     Transaction,
     TransactionLabel,
     User,
@@ -2479,6 +2481,10 @@ def test_overview_empty_no_accounts(client: TestClient, seeded_user: User) -> No
         "expense_paise": 0,
         "net_paise": 0,
         "accounts": [],
+        "gross_spend_paise": 0,
+        "fronted_peer_entries_paise": 0,
+        "net_personal_spend_paise": 0,
+        "fronted_card_usage_paise": 0,
     }
 
 
@@ -5898,3 +5904,172 @@ def test_category_trend_label_filter_scopes_series(
     assert body["label_id"] == label.id
     assert [p["parent_id"] for p in body["parents"]] == [world.trips.id]
     assert sum(body["parents"][0]["totals_paise"]) == -4000
+
+
+def test_fronted_card_usage_calculation(
+    client: TestClient,
+    session: Session,
+    seeded_user: User,
+    axis_account: Account,
+) -> None:
+    """ADR-0017 Rule 7: Monthly Fronted Card Usage and Net Personal Spend Isolation.
+
+    - fronted_card_usage_paise: monthly sum of credit card debits linked to peer_entries
+      (direction = 'you_gave').
+    - net_personal_spend_paise = gross_spend_paise - fronted_peer_entries_paise.
+    - transactions flagged as unpaired 'transfer' remain excluded from personal spend.
+    - bank debit peer entries do not count towards card usage.
+    - unconfirmed/pending rows are excluded.
+    - tenant isolation: other users' rows do not leak.
+    """
+    uid = seeded_user.id
+    bank_account = Account(user_id=uid, name="HDFC Bank", type="bank")
+    session.add(bank_account)
+    session.flush()
+
+    contact = PeerContact(user_id=uid, name="Bob Friend")
+    session.add(contact)
+    session.flush()
+
+    # 1. Confirmed Credit Card Spend: ₹5,000 debit (-500,000 paise)
+    card_spend = _make_txn(
+        user_id=uid,
+        account_id=axis_account.id,
+        txn_date=date(2026, 3, 5),
+        amount_paise=-500000,
+        fingerprint="fp-card-spend-1",
+        transaction_type="spend",
+    )
+    # 2. Confirmed Bank Spend: ₹2,000 debit (-200,000 paise)
+    bank_spend = _make_txn(
+        user_id=uid,
+        account_id=bank_account.id,
+        txn_date=date(2026, 3, 8),
+        amount_paise=-200000,
+        fingerprint="fp-bank-spend-1",
+        transaction_type="spend",
+    )
+    # 3. Confirmed Credit Card 100% fronted transfer: ₹3,000 debit (-300,000 paise)
+    card_transfer = _make_txn(
+        user_id=uid,
+        account_id=axis_account.id,
+        txn_date=date(2026, 3, 12),
+        amount_paise=-300000,
+        fingerprint="fp-card-transfer-1",
+        transaction_type="transfer",
+    )
+    session.add_all([card_spend, bank_spend, card_transfer])
+    session.flush()
+
+    # 4. Peer entries:
+    # - Split ₹2,000 of card spend for Bob
+    pe_card_spend = PeerEntry(
+        user_id=uid,
+        contact_id=contact.id,
+        transaction_id=card_spend.id,
+        date=date(2026, 3, 5),
+        amount_paise=200000,
+        direction="you_gave",
+    )
+    # - Split ₹1,000 of bank spend for Bob
+    pe_bank_spend = PeerEntry(
+        user_id=uid,
+        contact_id=contact.id,
+        transaction_id=bank_spend.id,
+        date=date(2026, 3, 8),
+        amount_paise=100000,
+        direction="you_gave",
+    )
+    # - 100% fronted ₹3,000 on card transfer for Bob
+    pe_card_transfer = PeerEntry(
+        user_id=uid,
+        contact_id=contact.id,
+        transaction_id=card_transfer.id,
+        date=date(2026, 3, 12),
+        amount_paise=300000,
+        direction="you_gave",
+    )
+    session.add_all([pe_card_spend, pe_bank_spend, pe_card_transfer])
+
+    # 5. Pending (unconfirmed) transaction with peer entry: must NOT count
+    pending_txn = _make_txn(
+        user_id=uid,
+        account_id=axis_account.id,
+        txn_date=date(2026, 3, 20),
+        amount_paise=-100000,
+        fingerprint="fp-pending-card",
+        transaction_type="spend",
+        confirmed_at=None,
+    )
+    session.add(pending_txn)
+    session.flush()
+    pe_pending = PeerEntry(
+        user_id=uid,
+        contact_id=contact.id,
+        transaction_id=pending_txn.id,
+        date=date(2026, 3, 20),
+        amount_paise=100000,
+        direction="you_gave",
+    )
+    session.add(pe_pending)
+
+    # 6. Another user's card transaction + peer entry: must NOT leak into active user's stats
+    other_user = User(id=uuid.UUID("00000000-0000-0000-0000-000000000088"))
+    session.add(other_user)
+    session.flush()
+    other_card = Account(
+        user_id=other_user.id, name="Other CC", type="credit_card", issuer="axis", last4="8888"
+    )
+    session.add(other_card)
+    session.flush()
+    other_contact = PeerContact(user_id=other_user.id, name="Other Contact")
+    session.add(other_contact)
+    session.flush()
+    other_txn = _make_txn(
+        user_id=other_user.id,
+        account_id=other_card.id,
+        txn_date=date(2026, 3, 15),
+        amount_paise=-999000,
+        fingerprint="fp-other-card",
+        transaction_type="spend",
+    )
+    session.add(other_txn)
+    session.flush()
+    other_pe = PeerEntry(
+        user_id=other_user.id,
+        contact_id=other_contact.id,
+        transaction_id=other_txn.id,
+        date=date(2026, 3, 15),
+        amount_paise=999000,
+        direction="you_gave",
+    )
+    session.add(other_pe)
+
+    session.commit()
+
+    # Query March 2026 overview
+    resp = client.get(f"{_OVERVIEW_URL}?month=2026-03")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # fronted_card_usage_paise:
+    # Card spend debit (200,000) + Card transfer debit (300,000) = 500,000 paise (₹5,000).
+    # Bank spend debit (100,000) is on a bank account, so not in card usage.
+    # Pending txn (100,000) is excluded because confirmed_at is None.
+    # Other user (999,000) is excluded by user_id isolation.
+    assert data["fronted_card_usage_paise"] == 500000
+
+    # gross_spend_paise:
+    # Card spend (500,000) + Bank spend (200,000) = 700,000 paise (₹7,000).
+    # Card transfer (300,000) is excluded because transaction_type == 'transfer'.
+    # Pending is excluded.
+    assert data["gross_spend_paise"] == 700000
+
+    # fronted_peer_entries_paise:
+    # Fronted card spend (200,000) + Fronted bank spend (100,000) = 300,000 paise.
+    # Fronted transfer (300,000) is excluded because transaction is transfer, not spend.
+    assert data["fronted_peer_entries_paise"] == 300000
+
+    # net_personal_spend_paise:
+    # gross_spend_paise (700,000) - fronted_peer_entries_paise (300,000) = 400,000 paise (₹4,000).
+    assert data["net_personal_spend_paise"] == 400000

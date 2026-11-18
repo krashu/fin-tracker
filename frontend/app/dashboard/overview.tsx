@@ -51,6 +51,7 @@ import { Sensitive } from "@/components/balance-visibility";
 import { MONO } from "@/components/ui/table";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SummaryStrip } from "@/components/dashboard/summary-strip";
+import { SpendIsolationCard } from "@/components/dashboard/spend-isolation-card";
 import { PeriodPicker } from "@/components/dashboard/period-picker";
 import { useAvailableYears } from "@/components/dashboard/use-available-years";
 
@@ -150,6 +151,7 @@ export function Overview() {
       <h1 className="sr-only">Overview</h1>
       <NetWorthHero data={data} />
       <SummaryStrip year={year} allDates />
+      <SpendIsolationCard overview={data} period={period} ready={data !== undefined} />
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <AccountsCard
           accounts={data?.accounts ?? []}

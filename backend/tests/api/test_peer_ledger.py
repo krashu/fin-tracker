@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.core.security import ACCESS_COOKIE_NAME, create_access_token
-from app.models import Account, Transaction, User
+from app.models import Account, Category, Transaction, User
+from app.services.category_service import CASHBACK_CATEGORY_NAME
 from tests.api.conftest import _demo_password_hash
 
 
@@ -352,3 +353,107 @@ def test_cross_tenant_isolation(
         },
     )
     assert r_b_post_foreign_txn.status_code == 422
+
+
+def test_cashback_offset_on_peer_entry(
+    client: TestClient,
+    session: Session,
+    seeded_user: User,
+) -> None:
+    """ADR-0017 Rule 8: Delayed statement cashback rebate (spend-kind Cashback)
+    can be linked to a peer contact as a settlement credit (direction = 'you_got').
+    Allocating with direction = 'you_gave' is rejected (422), as is allocating
+    more than the rebate amount (422)."""
+    # 1. Create a peer contact (e.g. Grace)
+    r_c = client.post("/api/v1/friends/contacts", json={"name": "Grace Hopper"})
+    assert r_c.status_code == 201
+    contact_id = r_c.json()["id"]
+
+    # 2. User fronted ₹10,000 on a credit card for Grace
+    card_txn = _make_card_txn(session, seeded_user, amount_paise=-1000000)
+    r_front = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": card_txn.id,
+            "amount_paise": 1000000,
+            "direction": "you_gave",
+        },
+    )
+    assert r_front.status_code == 201
+    r_bal1 = client.get(f"/api/v1/friends/contacts/{contact_id}")
+    assert r_bal1.json()["balance_paise"] == 1000000
+
+    # 3. Create cashback category and delayed cashback rebate transaction (+50000 paise, spend)
+    cashback_cat = Category(
+        user_id=seeded_user.id,
+        name=CASHBACK_CATEGORY_NAME,
+        kind="spend",
+        color="#22c55e",
+    )
+    session.add(cashback_cat)
+    session.flush()
+
+    cashback_txn = Transaction(
+        user_id=seeded_user.id,
+        account_id=card_txn.account_id,
+        date=date(2026, 3, 15),
+        amount_paise=50000,
+        transaction_type="spend",
+        category_id=cashback_cat.id,
+        merchant_raw="Amazon ICICI Cashback",
+        merchant_normalized="amazon icici cashback",
+        fingerprint=uuid.uuid4().hex * 2,
+        source="import",
+    )
+    session.add(cashback_txn)
+    session.commit()
+
+    # 4. Attempting to link cashback with direction='you_gave' fails 422
+    r_bad_dir = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": cashback_txn.id,
+            "amount_paise": 50000,
+            "direction": "you_gave",
+        },
+    )
+    assert r_bad_dir.status_code == 422
+    assert "direction 'you_got'" in r_bad_dir.json()["detail"]
+
+    # 5. Attempting to allocate more than rebate amount (e.g. 60000) fails 422
+    r_overflow = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": cashback_txn.id,
+            "amount_paise": 60000,
+            "direction": "you_got",
+        },
+    )
+    assert r_overflow.status_code == 422
+    assert "exceeds transaction amount" in r_overflow.json()["detail"]
+
+    # 6. Linking delayed cashback rebate with direction='you_got' marks is_settlement=True
+    r_ok = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": cashback_txn.id,
+            "amount_paise": 50000,
+            "direction": "you_got",
+            "notes": "Amazon 5% cashback rebate offset",
+        },
+    )
+    assert r_ok.status_code == 201
+    entry = r_ok.json()
+    assert entry["direction"] == "you_got"
+    assert entry["is_settlement"] is True
+    assert entry["amount_paise"] == 50000
+    assert entry["transaction_id"] == cashback_txn.id
+
+    # 7. Contact balance reduced by rebate: 1000000 - 50000 = 950000 paise
+    r_bal2 = client.get(f"/api/v1/friends/contacts/{contact_id}")
+    assert r_bal2.json()["balance_paise"] == 950000
+    assert r_bal2.json()["total_got_paise"] == 50000

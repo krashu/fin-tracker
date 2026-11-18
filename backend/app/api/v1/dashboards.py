@@ -31,7 +31,15 @@ from sqlalchemy.orm import Session, aliased
 from app.api.deps import CurrentUserId, SessionDep
 from app.core import clock
 from app.core.fiscal_year import parse_year
-from app.models import Account, Category, Label, MerchantTagMap, Transaction, TransactionLabel
+from app.models import (
+    Account,
+    Category,
+    Label,
+    MerchantTagMap,
+    PeerEntry,
+    Transaction,
+    TransactionLabel,
+)
 from app.schemas import (
     NET_WORTH_EXCLUDED_TYPES,
     AccountBalanceRow,
@@ -1019,6 +1027,88 @@ def overview(
     )
     portfolio_value_paise = portfolio_rollup.current_value_paise
 
+    # Spend isolation & fronted peer debt metrics (ADR-0017 Rule 7).
+    # gross_spend_paise: unsigned gross debit spend in the period (transaction_type == 'spend'
+    # and amount_paise < 0). Unpaired transfers remain excluded from spend from day one.
+    gross_spend_stmt = select(
+        func.coalesce(
+            func.sum(
+                case(
+                    (
+                        and_(
+                            Transaction.transaction_type == "spend",
+                            Transaction.amount_paise < 0,
+                        ),
+                        -Transaction.amount_paise,
+                    ),
+                    else_=0,
+                )
+            ),
+            0,
+        )
+    ).where(
+        Transaction.user_id == user_id,
+        Transaction.date >= first,
+        Transaction.date <= last,
+    )
+    gross_spend_stmt = confirmed_only(gross_spend_stmt)
+    gross_spend_paise = int(session.scalar(gross_spend_stmt) or 0)
+
+    # fronted_peer_entries_paise: portion of gross debit spend fronted for peers
+    # (direction == 'you_gave') linked to confirmed spend transactions in this window.
+    # Unpaired transfers are not spend, so entries linked to them do not reduce gross spend.
+    fronted_peer_stmt = (
+        select(func.coalesce(func.sum(PeerEntry.amount_paise), 0))
+        .join(
+            Transaction,
+            and_(
+                PeerEntry.transaction_id == Transaction.id,
+                Transaction.user_id == user_id,
+            ),
+        )
+        .where(
+            PeerEntry.user_id == user_id,
+            PeerEntry.direction == "you_gave",
+            Transaction.transaction_type == "spend",
+            Transaction.amount_paise < 0,
+            Transaction.date >= first,
+            Transaction.date <= last,
+        )
+    )
+    fronted_peer_stmt = confirmed_only(fronted_peer_stmt)
+    fronted_peer_entries_paise = int(session.scalar(fronted_peer_stmt) or 0)
+    net_personal_spend_paise = max(0, gross_spend_paise - fronted_peer_entries_paise)
+
+    # Monthly Fronted Card Usage (ADR-0017 Rule 7):
+    # Sum of all credit card debits linked to peer_entries (direction = 'you_gave') in the period.
+    fronted_card_stmt = (
+        select(func.coalesce(func.sum(PeerEntry.amount_paise), 0))
+        .join(
+            Transaction,
+            and_(
+                PeerEntry.transaction_id == Transaction.id,
+                Transaction.user_id == user_id,
+            ),
+        )
+        .join(
+            Account,
+            and_(
+                Transaction.account_id == Account.id,
+                Account.user_id == user_id,
+            ),
+        )
+        .where(
+            PeerEntry.user_id == user_id,
+            PeerEntry.direction == "you_gave",
+            Account.type == "credit_card",
+            Transaction.amount_paise < 0,
+            Transaction.date >= first,
+            Transaction.date <= last,
+        )
+    )
+    fronted_card_stmt = confirmed_only(fronted_card_stmt)
+    fronted_card_usage_paise = int(session.scalar(fronted_card_stmt) or 0)
+
     return OverviewResponse(
         period=window.key,
         net_worth_paise=net_worth_accounts + portfolio_value_paise,
@@ -1028,6 +1118,10 @@ def overview(
         expense_paise=expense_paise,
         net_paise=income_paise + expense_paise,
         accounts=accounts,
+        gross_spend_paise=gross_spend_paise,
+        fronted_peer_entries_paise=fronted_peer_entries_paise,
+        net_personal_spend_paise=net_personal_spend_paise,
+        fronted_card_usage_paise=fronted_card_usage_paise,
     )
 
 
