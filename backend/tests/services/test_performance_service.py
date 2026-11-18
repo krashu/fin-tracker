@@ -567,15 +567,21 @@ def test_a_friday_nav_is_three_days_old_on_monday_and_four_on_tuesday(
     _nav(session, b.id, _BUY_ON, "100")
     _nav(session, b.id, friday, "200")
 
-    def age_on(as_of: date) -> int | None:
+    def perf_on(as_of: date):
         return compute_portfolio_performance(
             session, user_id=user.id, benchmark_id=b.id, as_of=as_of
-        ).nav_staleness_days
+        )
 
-    assert age_on(monday) == 3
-    assert age_on(monday) < STALENESS_WARN_DAYS  # an ordinary Monday must stay quiet
-    assert age_on(tuesday) == 4
-    assert age_on(tuesday) >= STALENESS_WARN_DAYS  # Tuesday after a Monday holiday warns
+    perf_mon = perf_on(monday)
+    assert perf_mon.nav_staleness_days == 3
+    assert perf_mon.nav_staleness_days < STALENESS_WARN_DAYS  # an ordinary Monday must stay quiet
+    assert perf_mon.benchmark_cache_stale is False  # ordinary Monday (3d lag) stays quiet
+
+    perf_tue = perf_on(tuesday)
+    assert perf_tue.nav_staleness_days == 4
+    # Tuesday after a Monday holiday warns on both holdings and benchmark
+    assert perf_tue.nav_staleness_days >= STALENESS_WARN_DAYS
+    assert perf_tue.benchmark_cache_stale is True
 
 
 def test_is_multi_asset_flag(session: Session, user: User) -> None:

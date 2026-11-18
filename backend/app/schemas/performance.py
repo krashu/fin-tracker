@@ -6,7 +6,7 @@ fractions (0.12 = 12%; alpha is the difference in fraction-points, e.g. 0.03 = +
 ``null`` when unsolvable. Money is INR paise. The honesty flags are PRD-required, not
 decoration: ``is_fund_post_ter`` (the benchmark is a post-expense *fund*, not the raw
 index), ``partial`` (history doesn't cover the earliest cashflow), ``benchmark_cache_stale``
-(a cashflow / the terminal fell past the cached NAVs and was clamped), ``is_multi_asset``
+(a cashflow fell past the cache, or terminal age >= STALENESS_WARN_DAYS), ``is_multi_asset``
 (a multi-asset portfolio vs a single-asset index), ``nav_staleness_days`` (the portfolio's
 valuation age) + ``null_nav_count``. The FX layer adds two more: ``fx_staleness_days`` (age of
 the USD→INR rate used, ``null`` for an all-INR portfolio) and ``fx_unavailable_count`` (USD
@@ -25,8 +25,10 @@ MFs needs an exchange-holiday calendar the PRD does not ask for, and without one
 after a Monday holiday is wrong anyway. Accepted cost, stated rather than hidden: a
 genuinely 3-day-stale NAV mid-week goes unwarned.
 
-Nothing server-side *gates* on the constant — the API reports the raw age and the client
-decides — but it lives here, next to the fields it qualifies, so the TS mirror in
+The threshold gates benchmark terminal staleness server-side
+(:func:`app.services.performance_service._benchmark_leg`), while for holdings and FX
+the API reports the raw age and the client decides — but it lives here, next to the
+fields it qualifies, so the TS mirror in
 ``frontend/lib/investments.ts`` can point at one definition instead of re-deriving the
 calendar. Re-deriving it in a comment is what produced the off-by-one.
 """

@@ -30,17 +30,17 @@ amounts or fingerprints, and does not hijack inter-account transfer pairs.
    `(user_id, LOWER(TRIM(name)))` (`WHERE archived_at IS NULL`). No user-facing path hard-deletes a
    contact. User teardown (`services/user_teardown.py`) empties `peer_entries` in Phase 2 and
    `peer_contacts` in Phase 4. — *Enforced by*: DB FK + partial index + service teardown ·
-   *Locked by*: `tests/models/test_models.py::test_peer_contact_cross_user_fk_rejected` (planned),
-   `tests/api/test_auth_isolation.py` (planned)
+   *Locked by*: `tests/models/test_models.py::test_peer_contact_cross_user_fk_rejected`,
+   `tests/api/test_auth_isolation.py::test_peer_ledger_tenant_isolation`
 2. **Strictly positive magnitude**: `peer_entries.amount_paise` is a `BigInteger` strictly `> 0`. Zero
    is rejected at all write paths. — *Enforced by*: DB CHECK `ck_peer_entries_amount_positive` + schema
-   validation · *Locked by*: `tests/api/test_peer_ledger.py::test_peer_entry_zero_amount_rejected` (planned)
+   validation · *Locked by*: `tests/models/test_models.py::test_peer_entry_amount_positive_check`
 3. **Direction semantics**: `peer_entries.direction` is an `Enum('you_gave', 'you_got', name='peer_direction', native_enum=False, create_constraint=True)`:
    - `'you_gave'`: User paid or lent money (Receivable: Contact owes user). Positive contribution to balance.
    - `'you_got'`: Contact paid or lent to user (Payable: User owes contact). Negative contribution to balance.
    The contact net balance is `Σ(you_gave) − Σ(you_got)`. Positive means they owe the user; negative means
    the user owes them. Balance flips naturally if a settlement overshoots. — *Enforced by*: DB CHECK +
-   service · *Locked by*: `tests/services/test_peer_service.py::test_contact_balance_sum` (planned)
+   service · *Locked by*: `tests/services/test_peer_service.py::test_contact_dynamic_balance_calculation`
 4. **Transaction association (1:N & partial splits)**: `peer_entries.transaction_id` is a nullable
    composite same-user FK `(transaction_id, user_id) → (id, user_id)` to `transactions` with `ON DELETE NO ACTION`.
    - A single transaction may link to multiple `peer_entries` (e.g. splitting a ₹3,000 restaurant swipe
@@ -51,19 +51,19 @@ amounts or fingerprints, and does not hijack inter-account transfer pairs.
      and is never synced if the transaction date edits. Standalone entries take the user-provided date.
    - Standalone entries (`transaction_id IS NULL`) are permitted for off-bank/cash debts or when a friend
      swiped their card on the user's behalf. — *Enforced by*: DB FK + service ·
-   *Locked by*: `tests/api/test_peer_ledger.py::test_peer_entry_sum_cannot_exceed_transaction_amount` (planned)
+   *Locked by*: `tests/services/test_peer_service.py::test_transaction_allocation_guard`
 5. **Deleting a transaction preserves debt history**: Deleting an underlying `transaction` sets
    `peer_entries.transaction_id = NULL` via service-level update in `services/transaction_delete.py::delete_owned_transactions`
    inside the same DB transaction boundary (matching `refund_of_id` and `transfer_pair_id`). The debt entry
    survives as an unlinked record. — *Enforced by*: service (`delete_owned_transactions`) ·
-   *Locked by*: `tests/api/test_transactions.py::test_delete_transaction_nulls_peer_entry_link` (planned)
+   *Locked by*: `tests/models/test_models.py::test_delete_transaction_nulls_peer_entry_link`
 6. **Settlement entries**: A repayment is recorded as a `peer_entries` row with `is_settlement = TRUE`
    and `direction = 'you_got'`. To prevent double-counting against personal income/spend, a settlement
    is either recorded as a standalone entry (`transaction_id IS NULL`) or links to an incoming bank
    repayment whose `transaction_type` is set to `transfer` (or a positive `spend` refund in `Shared Expenses & Splits`).
    `POST /friends/contacts/{id}/settle` records an atomic full settlement entry for the exact current
    balance in a serialized transaction. — *Enforced by*: service ·
-   *Locked by*: `tests/api/test_peer_ledger.py::test_settle_contact_balance` (planned)
+   *Locked by*: `tests/api/test_peer_ledger.py::test_settle_contact_flow`, `tests/services/test_peer_service.py::test_settle_positive_balance`
 7. **Spend Isolation & Friend Card Usage Reporting**:
    - **Option B Spend Isolation**: When fronting an expense for a friend on a card:
      - 100% fronted: User may flag transaction as an unpaired `transfer` (ADR-0002 rule 7d), excluding it
@@ -73,7 +73,7 @@ amounts or fingerprints, and does not hijack inter-account transfer pairs.
    - **Monthly Card Usage Tile**: A dedicated dashboard metric sums all credit card debits linked to
      `peer_entries` in that month, giving the user exact visibility into *"Card Used by Friends this month"*. —
      *Enforced by*: dashboard service ·
-     *Locked by*: `tests/api/test_dashboards.py::test_fronted_card_usage_calculation` (planned)
+     *Locked by*: `tests/api/test_dashboards.py::test_fronted_card_usage_calculation`
 8. **Cashback & Discount Offsetting**:
    - **Upfront Cashback / Discount Pass-Through**: When creating a peer entry from a card transaction with
      cashback or instant card discount (e.g. 5% Amazon ICICI), the split UI calculates the net amount:
@@ -82,11 +82,11 @@ amounts or fingerprints, and does not hijack inter-account transfer pairs.
    - **Statement Cashback Linking**: When a delayed cashback rebate arrives (ADR-0013 spend-kind Cashback
      row), the user may link it to a peer contact as a settlement credit (`direction = 'you_got'`). —
      *Enforced by*: service ·
-     *Locked by*: `tests/api/test_peer_ledger.py::test_cashback_offset_on_peer_entry` (planned)
+     *Locked by*: `tests/api/test_peer_ledger.py::test_cashback_offset_on_peer_entry`
 9. **Soft archive**: Archiving a contact (`archived_at IS NOT NULL`) hides the contact from active pickers
    while preserving ledger history and past transaction links. A contact with a non-zero balance requires
    explicit user confirmation to archive. — *Enforced by*: service + partial index ·
-   *Locked by*: `tests/api/test_peer_ledger.py::test_archive_contact_with_balance_requires_confirmation` (planned)
+   *Locked by*: `tests/api/test_peer_ledger.py::test_archive_contact_with_balance_confirmation`
 10. **Query Efficiency & No Stored Balance Counter**:
     - The running balance of a contact is always computed via `SUM(CASE WHEN direction = 'you_gave' THEN amount_paise ELSE -amount_paise END)`
       over `peer_entries`. No materialized balance column exists on `peer_contacts` (preventing cache drift).
@@ -96,7 +96,7 @@ amounts or fingerprints, and does not hijack inter-account transfer pairs.
       - `ix_peer_entries_user_txn` on `(user_id, transaction_id)`
       - `ix_peer_entries_user_date` on `(user_id, date)`
       - `ix_peer_contacts_user_archived` on `(user_id, archived_at)`. —
-      *Enforced by*: DB indexes · *Locked by*: `tests/test_migration_parity.py` (planned)
+      *Enforced by*: DB indexes · *Locked by*: `tests/test_migration_parity.py`
 
 ## Out of bounds
 
@@ -142,3 +142,4 @@ to bank and card transactions.
 ## History
 
 - 2026-11-18 — Proposed. Designed for friend card usage, split bills, cashback offsets, and Khatabook-style peer balance tracking. Revised following Senior Staff Opus review with allocation guards, teardown integration, and service nulling.
+- 2026-11-19 — Accepted. Implemented across Phases 1–5: schema & migrations (`0048_peer_ledger`), dynamic balance calculations, transaction allocation guard, full atomic settlements, `/friends` frontend dashboard, spend isolation on dashboards, and CSV export.

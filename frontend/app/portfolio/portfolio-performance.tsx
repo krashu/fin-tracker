@@ -241,7 +241,7 @@ function honestyNotes(perf: {
     );
   if (perf.benchmark_cache_stale)
     notes.push(
-      "⚠ Some cashflows fall outside the cached NAV range — refresh benchmark NAVs for an exact comparison.",
+      "⚠ Benchmark NAV history lags recent activity — refresh benchmark NAVs for an exact comparison.",
     );
   if (perf.is_multi_asset)
     notes.push(

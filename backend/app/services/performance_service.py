@@ -56,7 +56,11 @@ from sqlalchemy.orm import Session
 
 from app.core.log_config import get_logger
 from app.models import Benchmark, BenchmarkNav, Instrument
-from app.schemas.performance import BenchmarkUnavailableReason, PortfolioPerformance
+from app.schemas.performance import (
+    STALENESS_WARN_DAYS,
+    BenchmarkUnavailableReason,
+    PortfolioPerformance,
+)
 from app.services.fx_service import latest_rate_date
 from app.services.holdings_service import max_staleness_days
 from app.services.portfolio_service import (
@@ -239,7 +243,7 @@ def _benchmark_leg(
     if term_idx < 0:
         # as_of predates the whole cache — no priceable terminal.
         return 0, None, "as_of_before_inception", partial, cache_stale
-    if as_of > last_date:
+    if (as_of - last_date).days >= STALENESS_WARN_DAYS:
         cache_stale = True
     nav_terminal = navs[term_idx]
 
