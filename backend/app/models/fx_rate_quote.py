@@ -2,7 +2,7 @@
 
 A ``fx_rates`` row is one currency-pair rate on one date — **global reference data,
 no ``user_id``** (the rate for a date is the same for every user), like ``benchmarks``.
-Backfilled from a free provider (``frankfurter.app``) by ``fx_service.refresh_fx_rates``
+Backfilled from a free provider (``api.frankfurter.dev``) by ``fx_service.refresh_fx_rates``
 and *read* on the holdings / portfolio / ingest paths — never fetched there.
 
 Used for: (a) stamping ``investment_transactions.fx_rate_to_inr`` at the transaction date

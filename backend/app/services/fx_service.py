@@ -1,8 +1,9 @@
 """FX rate backfill + lookup (PRD §F7 FX layer) — fill/read ``fx_rates`` (USD→INR).
 
 ``refresh_fx_rates`` is the seed-time / manual-trigger **cold** path: it fetches USD→INR
-from frankfurter.app and caches new dates. ``rate_on`` / ``latest_rate`` are the **hot**
-reads (ingest stamping + portfolio rollup) — they touch only the cached rows, never the network.
+from Frankfurter (``api.frankfurter.dev``) and caches new dates.
+``rate_on`` / ``latest_rate`` are the **hot** reads (ingest stamping + portfolio rollup) —
+they touch only the cached rows, never the network.
 
 Resilient like ``benchmark_service`` / ``nav_snapshot_service``: a fetch/parse failure is
 counted + warned (with the trimmed cause — an SSL/cert error behind a corporate proxy is the
@@ -94,11 +95,7 @@ def refresh_fx_rates(
 
 
 def _build_url(base_url: str, start: date | None, end: date | None) -> str:
-    """frankfurter endpoint for latest / single-date / range, all USD→INR.
-
-    Supports Frankfurter v2 (active API, /rate/{base}/{quote} or /rates)
-    and legacy v1 (when base_url targets v1, /latest or /<range>).
-    """
+    """Frankfurter endpoint for latest / single-date / range, all USD→INR."""
     base = base_url.rstrip("/")
     if "/v1" in base or base.endswith("v1"):
         query = f"?from={_FROM_CCY}&to={_TO_CCY}"

@@ -637,7 +637,7 @@ would produce wrong totals.
   is `amount − fees`.
 - **`fx_rates`** — daily INR↔USD rate snapshots, keyed by date. Used for:
   (a) stamping `fx_rate_to_inr` on new investment transactions, (b) converting
-  `current_nav` to INR for portfolio rollups. Populated from `frankfurter.app` at
+  `current_nav` to INR for portfolio rollups. Populated from Frankfurter (`api.frankfurter.dev/v2`) at
   seed time or by manual trigger — **synchronous, no scheduler in v1** (`api/v1/fx.py`),
   and the endpoint currently has no in-app caller, so nothing advances the cache while
   the app runs. Reads carry the last-known rate forward with no age cap, which is why
@@ -1028,7 +1028,7 @@ benchmark_nav (id, benchmark_id, nav_date, nav)   -- column is nav_date, NOT dat
 | PDF parsing | **pdfplumber 0.11.9** (Jan 2026) + **pikepdf 10.6.0** (Mar 2026) | See "PDF parsing library choice" below for rationale.     |
 | CSV parsing | stdlib `csv` + per-issuer column map                   | Trivial.                                                  |
 | XIRR        | **pyxirr**                                             | Faster + more accurate than home-grown brentq.            |
-| FX rates    | **`frankfurter.app`** or **`exchangerate.host`** (free, no key) | Daily INR↔USD rates. Cached in `fx_rates` table; fallback to last-known if API down. |
+| FX rates    | **`api.frankfurter.dev` (v2)** or **`exchangerate.host`** (free, no key) | Daily INR↔USD rates. Cached in `fx_rates` table; fallback to last-known if API down. |
 | Drive sync  | **google-api-python-client** + **google-auth-oauthlib**| Official Google libs. `drive.file` scope = least privilege.|
 | Token store | **cryptography (Fernet)** over a local file            | Encrypts the OAuth refresh token at rest.                 |
 | Frontend    | **Next.js 16.3.0 LTS (App Router) + React 19 + TypeScript 7.x + Tailwind CSS 4.x** | Portfolio-grade, learning-aligned, real-time-friendly. See "Frontend stack rationale" below. |
@@ -1186,7 +1186,7 @@ to see in a serious Python+TypeScript repo are committed scope, not "nice to hav
   - `investment_csv.py` — canonical investment-transaction CSV parser (broker / AMC
     exports; `HEADER_ALIASES` column map; standalone, not a `StatementParser`)
   - `indmoney_us.py` — INDmoney US transaction export
-- `backend/app/services/fx_service.py` — fetch + cache INR↔USD rates from `frankfurter.app`.
+- `backend/app/services/fx_service.py` — fetch + cache INR↔USD rates from Frankfurter (`api.frankfurter.dev/v2`).
 - `backend/app/services/import_service.py` — orchestrates parse → dedupe → auto-tag →
   persist.
 - Merchant normalisation + tag lookup/upsert ship as three modules, not one
@@ -1781,7 +1781,7 @@ End-to-end test once built:
   Confirmed: well within SQLite's comfort zone.
 - FX rate at transaction date: for INR investment rows (the v1 CSV path) the rate doesn't matter
   (everything is INR). For INDmoney rows we stamp the date's official RBI / market
-  rate via `frankfurter.app`. If you'd prefer to use INDmoney's *own* booked rate
+  rate via Frankfurter (`api.frankfurter.dev/v2`). If you'd prefer to use INDmoney's *own* booked rate
   (which includes their FX markup), the parser can be tuned to extract it from the
   export. Default: market rate. An **FX-markup tracker** (cumulative ₹ lost to INDmoney's
   spread = booked − market rate, summed over US buys) would build on extracting that booked

@@ -1,4 +1,4 @@
-"""Parser tests for the frankfurter.app FX-rate parser (PRD §F7 FX layer).
+"""Parser tests for the Frankfurter FX-rate parser (PRD §F7 FX layer).
 
 Pure-parser coverage: the single-observation and date-range response shapes, exact-Decimal
 rate parsing (no float round-trip), per-row skip warnings (malformed / non-numeric /

@@ -1,22 +1,16 @@
-"""frankfurter FX-rate parser (PRD §F7 FX layer).
+"""Frankfurter FX-rate parser (PRD §F7 FX layer).
 
 Pure: ``bytes`` → ``list[FxRateRow]`` + per-row skip warnings. No DB, no logging, no
 network — the caller (``fx_service``) fetches the JSON and owns I/O.
 
-Supports Frankfurter v2 (active official API) and v1 (legacy):
+Parses Frankfurter API responses (https://api.frankfurter.dev/v2):
 
-v2 (api.frankfurter.dev/v2):
     GET /v2/rate/USD/INR
         → {"date":"2026-11-18","base":"USD","quote":"INR","rate":93.35}
     GET /v2/rate/USD/INR?date=2026-01-02
         → {"date":"2026-01-02","base":"USD","quote":"INR","rate":83.1}
     GET /v2/rates?base=USD&quotes=INR&from=2026-01-01&to=2026-01-10
         → [{"date":"2026-01-02","base":"USD","quote":"INR","rate":83.1}, ...]
-
-v1 legacy (api.frankfurter.app / api.frankfurter.dev/v1):
-    GET /latest?from=USD&to=INR       → {"date":"2026-06-23","rates":{"INR":83.5}}
-    GET /2026-01-02?from=USD&to=INR   → {"date":"2026-01-02","rates":{"INR":83.1}}
-    GET /2026-01-01..2026-01-10?...   → {"start_date":...,"rates":{"2026-01-02":{"INR":83.1}, ...}}
 
 Numbers are parsed exactly via ``json.loads(parse_float=Decimal)`` (no float
 round-trip — the same precision discipline as the scaled-int money columns). A non-numeric
@@ -54,7 +48,7 @@ class FxRateRow:
 def parse_frankfurter_rates(
     raw: bytes, *, to_currency: str = "INR"
 ) -> tuple[list[FxRateRow], list[str]]:
-    """Parse a frankfurter response (v2 or legacy v1, single or range) into rows + skip warnings.
+    """Parse a Frankfurter response (single or range) into rows + skip warnings.
 
     Warnings are ``"frankfurter <raw-date>: <reason>"`` (dates/rates are public reference data).
 

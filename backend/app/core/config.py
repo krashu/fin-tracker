@@ -339,8 +339,7 @@ class Settings(BaseSettings):
         default="https://api.frankfurter.dev/v2",
         validation_alias="FRANKFURTER_BASE_URL",
         description=(
-            "frankfurter base URL for USD→INR FX rates (PRD §F7 FX layer). Public, no key; "
-            "v2 endpoint at api.frankfurter.dev (v1 supported for backwards compatibility). "
+            "Frankfurter base URL for USD→INR FX rates (PRD §F7 FX layer). Public, no key; "
             "exchangerate.host is the documented drop-in fallback (swap the URL, no code change). "
             "fx_service queries /rate/USD/INR or /rates series. Seed-time backfill "
             "only — the holdings/portfolio/ingest reads touch only the cached fx_rates rows."
