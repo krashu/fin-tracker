@@ -2,14 +2,8 @@ name: Deploy Full-Stack (FastAPI Cloud)
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "backend/**"
-      - "frontend/**"
-      - "docker-compose*.yml"
-      - ".github/workflows/deploy.yml"
-  schedule:
-    - cron: "17 3 * * *"
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
 
 concurrency:
@@ -206,3 +200,15 @@ jobs:
           FASTAPI_CLOUD_TOKEN: ${{ secrets.FASTAPI_CLOUD_TOKEN }}
           FASTAPI_CLOUD_APP_ID: ${{ secrets.FASTAPI_CLOUD_APP_ID }}
         run: uv run fastapi deploy
+
+      - name: Verify Live Deployment Health
+        run: |
+          echo "Waiting 15 seconds for FastAPI Cloud deployment initialization..."
+          sleep 15
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://fin-tracker-demo.fastapicloud.dev/api/v1/auth/config)
+          echo "Health check endpoint returned HTTP $STATUS"
+          if [ "$STATUS" -ne 200 ]; then
+            echo "::error::Deployment health check failed (HTTP $STATUS). Container may have failed to initialize."
+            exit 1
+          fi
+          echo "Live demo instance is healthy and responding."

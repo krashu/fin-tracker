@@ -11,7 +11,7 @@ In this deployment configuration:
 - **Ephemeral Multi-Visitor Sandboxes (`POST /api/v1/auth/demo-session`)**: Each visitor clicking **"Try the demo"** is provisioned their own isolated guest tenant with sample accounts, transactions, and categories in **< 25ms** (omitting Argon2 hashing for guest sessions). Multiple visitors can test adding, editing, or deleting transactions simultaneously with zero cross-tenant contamination.
 - **SQLite Concurrency Hardening**: Configured with `PRAGMA journal_mode=WAL;`, `PRAGMA busy_timeout=5000;`, and `PRAGMA synchronous=NORMAL;` for non-blocking concurrent reads and write queueing.
 - **Automatic TTL Pruning**: A background async sweeper runs every 15 minutes in the FastAPI application lifespan to cleanly delete expired guest sandboxes (2-hour TTL) using a deterministic 6-phase topological teardown.
-- **Daily Automated Deployments**: GitHub Actions automatically rebuilds and redeploys the container daily at 03:17 UTC, anchoring rolling 90-day transaction windows to `clock.today()`.
+- **Tag-Driven & On-Demand Deployments**: GitHub Actions deploys the container on semantic version release tags (`v*.*.*`) or on-demand via `workflow_dispatch`. (Guest sandboxes anchor rolling 90-day transaction windows on-the-fly via `clock.today()` on every session creation, eliminating the need for daily cron redeploys).
 - **User Registration is Closed** (`REGISTRATION_ENABLED=false`, the default) once the first user exists, preventing unauthorized permanent user accounts on the public showcase. The first user can always register, so **register the operator account right after the first deploy** (see §4 step 4): on a guest-only deploy any visitor could otherwise claim that first account.
 - **Zero CORS / Cookie Friction**: Because the UI and API reside on the same origin, auth cookies work natively without cross-origin configuration.
 
@@ -114,24 +114,24 @@ The repository includes a dedicated workflow [`.github/workflows/deploy.yml`](..
 
 ### Setting Up GitHub Secrets via GitHub CLI (`gh`)
 
-You can set the required repository secrets directly using the GitHub CLI:
+Generate a dedicated CI deploy token (or copy it from the FastAPI Cloud dashboard) and set the secrets using `--body` to prevent CRLF newline corruption:
 
 ```powershell
-# Extract your active token from local CLI config
-$token = (Get-Content "$env:APPDATA\fastapi-cli\auth.json" | ConvertFrom-Json).access_token
+# Create a dedicated deploy token via CLI
+fastapi cloud tokens create --name "github-actions-ci"
 
-# Set GitHub Secrets
-$token | gh secret set FASTAPI_CLOUD_TOKEN --repo krashu/fin-tracker
-"8a2313e9-ac17-4761-add4-20a4b23a0655" | gh secret set FASTAPI_CLOUD_APP_ID --repo krashu/fin-tracker
+# Set GitHub Secrets with clean body input
+gh secret set FASTAPI_CLOUD_TOKEN --body "<your-deploy-token>" --repo krashu/fin-tracker
+gh secret set FASTAPI_CLOUD_APP_ID --body "8a2313e9-ac17-4761-add4-20a4b23a0655" --repo krashu/fin-tracker
 ```
 
 ### How the Workflow Operates
 
-- **Push Triggers**: Runs on pushes to `main` modifying `backend/**`, `frontend/**`, or `.github/workflows/deploy.yml`.
-- **Scheduled Cron**: Runs daily (`cron: "17 3 * * *"`) at 03:17 UTC to ensure rolling demo dates stay anchored to current dates.
-- **Manual Trigger**: Can be dispatched on demand via `gh workflow run deploy.yml`.
-- **Automated Frontend Build**: Compiles Next.js with `NEXT_PUBLIC_API_BASE_URL="/api/v1"` and stages assets into `backend/frontend_dist/`.
-- **Pre-Deploy Quality Gates**: Runs `ruff check .` and `ty check app` before initiating `fastapi deploy`.
+- **Release Tag Triggers**: Deploys on git release tags matching `v*.*.*` (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+- **Manual Trigger**: Can be dispatched on demand via GitHub Actions UI or `gh workflow run deploy.yml`.
+- **Quality Gates**: Runs full docker validation, backend test suite, frontend test suite, security redaction checks, and pre-deploy lint/typecheck before initiating deployment.
+- **Automated Frontend Build**: Compiles Next.js with `NEXT_PUBLIC_API_BASE_URL="/api/v1"` and stages static assets into `backend/frontend_dist/`.
+- **Post-Deploy Health Check**: Automatically probes `GET /api/v1/auth/config` to verify the deployment booted successfully.
 
 ---
 
