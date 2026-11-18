@@ -2,19 +2,29 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  archivePeerContact,
   createAccount,
+  createPeerContact,
+  createPeerEntry,
   deleteAccount,
+  deletePeerEntry,
   getAuthConfig,
+  getPeerContact,
+  getPeerSummary,
   invalidIdsFromError,
   listAccounts,
   listCategories,
   listCategoryTree,
+  listPeerContacts,
+  listPeerEntries,
   listTransactions,
   login,
   logout,
   me,
   patchAccount,
   setAuthFailureHandler,
+  settlePeerContact,
+  updatePeerContact,
 } from "./client";
 import { server } from "@/tests/mocks/server";
 import { mockAccounts, mockUser } from "@/tests/mocks/handlers";
@@ -325,6 +335,228 @@ describe("API Client (lib/api/client.ts)", () => {
 
       await expect(login("test@example.com", "wrongpass")).rejects.toThrow(ApiError);
       expect(refreshCalls).toBe(0); // Did not trigger refresh
+    });
+  });
+
+  describe("Friends & Khata / Peer Ledger Endpoints", () => {
+    it("fetches peer summary via getPeerSummary()", async () => {
+      server.use(
+        http.get("*/api/v1/friends/summary", () => {
+          return HttpResponse.json({
+            total_receivable_paise: 150000,
+            total_payable_paise: 50000,
+            net_balance_paise: 100000,
+            active_contacts_count: 2,
+          });
+        }),
+      );
+
+      const summary = await getPeerSummary();
+      expect(summary.total_receivable_paise).toBe(150000);
+      expect(summary.total_payable_paise).toBe(50000);
+      expect(summary.net_balance_paise).toBe(100000);
+      expect(summary.active_contacts_count).toBe(2);
+    });
+
+    it("lists peer contacts with query params via listPeerContacts()", async () => {
+      let interceptedUrl = "";
+      server.use(
+        http.get("*/api/v1/friends/contacts", ({ request }) => {
+          interceptedUrl = request.url;
+          return HttpResponse.json([
+            {
+              id: 1,
+              name: "Aman",
+              phone: "9876543210",
+              upi_id: "aman@upi",
+              notes: null,
+              archived_at: null,
+              created_at: "2026-01-01T00:00:00Z",
+              balance_paise: 5000,
+              total_gave_paise: 5000,
+              total_got_paise: 0,
+              active_entries_count: 1,
+            },
+          ]);
+        }),
+      );
+
+      const contacts = await listPeerContacts(true);
+      expect(contacts).toHaveLength(1);
+      expect(contacts[0].name).toBe("Aman");
+      expect(interceptedUrl).toContain("include_archived=true");
+    });
+
+    it("fetches single peer contact via getPeerContact()", async () => {
+      server.use(
+        http.get("*/api/v1/friends/contacts/:id", ({ params }) => {
+          return HttpResponse.json({
+            id: Number(params.id),
+            name: "Rohit",
+            phone: null,
+            upi_id: null,
+            notes: "Friend",
+            archived_at: null,
+            created_at: "2026-01-01T00:00:00Z",
+            balance_paise: -2000,
+            total_gave_paise: 0,
+            total_got_paise: 2000,
+            active_entries_count: 1,
+          });
+        }),
+      );
+
+      const contact = await getPeerContact(42);
+      expect(contact.id).toBe(42);
+      expect(contact.name).toBe("Rohit");
+      expect(contact.balance_paise).toBe(-2000);
+    });
+
+    it("creates, updates, and archives a peer contact", async () => {
+      let createdPayload: unknown;
+      let updatePayload: unknown;
+      let archiveUrl = "";
+
+      server.use(
+        http.post("*/api/v1/friends/contacts", async ({ request }) => {
+          createdPayload = await request.json();
+          return HttpResponse.json({
+            id: 10,
+            name: "Vikas",
+            phone: "9999999999",
+            upi_id: null,
+            notes: null,
+            archived_at: null,
+            created_at: "2026-01-01T00:00:00Z",
+          });
+        }),
+        http.patch("*/api/v1/friends/contacts/:id", async ({ request }) => {
+          updatePayload = await request.json();
+          return HttpResponse.json({
+            id: 10,
+            name: "Vikas K",
+            phone: "9999999999",
+            upi_id: null,
+            notes: null,
+            archived_at: null,
+            created_at: "2026-01-01T00:00:00Z",
+          });
+        }),
+        http.delete("*/api/v1/friends/contacts/:id", ({ request }) => {
+          archiveUrl = request.url;
+          return HttpResponse.json({
+            id: 10,
+            name: "Vikas K",
+            phone: "9999999999",
+            upi_id: null,
+            notes: null,
+            archived_at: "2026-01-02T00:00:00Z",
+            created_at: "2026-01-01T00:00:00Z",
+          });
+        }),
+      );
+
+      const created = await createPeerContact({ name: "Vikas", phone: "9999999999" });
+      expect(created.id).toBe(10);
+      expect(createdPayload).toEqual({ name: "Vikas", phone: "9999999999" });
+
+      const updated = await updatePeerContact(10, { name: "Vikas K" });
+      expect(updated.name).toBe("Vikas K");
+      expect(updatePayload).toEqual({ name: "Vikas K" });
+
+      const archived = await archivePeerContact(10, true);
+      expect(archived.archived_at).toBeTruthy();
+      expect(archiveUrl).toContain("confirm_with_balance=true");
+    });
+
+    it("settles a contact via settlePeerContact()", async () => {
+      let settleBody: unknown;
+      server.use(
+        http.post("*/api/v1/friends/contacts/:id/settle", async ({ request, params }) => {
+          settleBody = await request.json();
+          return HttpResponse.json({
+            id: 101,
+            contact_id: Number(params.id),
+            transaction_id: null,
+            date: "2026-01-05",
+            amount_paise: 5000,
+            direction: "you_got",
+            is_settlement: true,
+            notes: "Settlement",
+            created_at: "2026-01-05T00:00:00Z",
+          });
+        }),
+      );
+
+      const entry = await settlePeerContact(5, { notes: "Paid via UPI" });
+      expect(entry.id).toBe(101);
+      expect(entry.is_settlement).toBe(true);
+      expect(settleBody).toEqual({ notes: "Paid via UPI" });
+    });
+
+    it("creates, lists, and deletes peer entries", async () => {
+      let createdEntryPayload: unknown;
+      let deletedEntryId = 0;
+
+      server.use(
+        http.get("*/api/v1/friends/contacts/:id/entries", ({ params }) => {
+          return HttpResponse.json([
+            {
+              id: 50,
+              contact_id: Number(params.id),
+              transaction_id: 12,
+              date: "2026-01-01",
+              amount_paise: 120000,
+              direction: "you_gave",
+              is_settlement: false,
+              notes: "Dinner split",
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          ]);
+        }),
+        http.post("*/api/v1/friends/entries", async ({ request }) => {
+          createdEntryPayload = await request.json();
+          return HttpResponse.json({
+            id: 51,
+            contact_id: 2,
+            transaction_id: 12,
+            date: "2026-01-01",
+            amount_paise: 120000,
+            direction: "you_gave",
+            is_settlement: false,
+            notes: "Dinner split",
+            created_at: "2026-01-01T00:00:00Z",
+          });
+        }),
+        http.delete("*/api/v1/friends/entries/:id", ({ params }) => {
+          deletedEntryId = Number(params.id);
+          return new HttpResponse(null, { status: 204 });
+        }),
+      );
+
+      const entries = await listPeerEntries(2);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].amount_paise).toBe(120000);
+
+      const created = await createPeerEntry({
+        contact_id: 2,
+        transaction_id: 12,
+        amount_paise: 120000,
+        direction: "you_gave",
+        notes: "Dinner split",
+      });
+      expect(created.id).toBe(51);
+      expect(createdEntryPayload).toEqual({
+        contact_id: 2,
+        transaction_id: 12,
+        amount_paise: 120000,
+        direction: "you_gave",
+        notes: "Dinner split",
+      });
+
+      const delRes = await deletePeerEntry(51);
+      expect(delRes).toBeUndefined();
+      expect(deletedEntryId).toBe(51);
     });
   });
 

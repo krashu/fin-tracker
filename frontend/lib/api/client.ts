@@ -2039,3 +2039,151 @@ export function listIntradayTrades(year: number): Promise<IntradayTradesResponse
 export function listTaxYears(): Promise<AvailableYearsResponse> {
   return request<AvailableYearsResponse>("/tax/available-years");
 }
+
+// --- Friends & Khata / Peer ledger (PRD §F3b, ADR-0017) -----------------------
+
+export type PeerDirection = "you_gave" | "you_got";
+
+export type PeerContact = {
+  id: number;
+  name: string;
+  phone: string | null;
+  upi_id: string | null;
+  notes: string | null;
+  archived_at: string | null;
+  created_at: string;
+};
+
+export type PeerContactWithBalance = PeerContact & {
+  balance_paise: number;
+  total_gave_paise: number;
+  total_got_paise: number;
+  active_entries_count: number;
+};
+
+export type PeerEntry = {
+  id: number;
+  contact_id: number;
+  transaction_id: number | null;
+  date: string;
+  amount_paise: number;
+  direction: PeerDirection;
+  is_settlement: boolean;
+  notes: string | null;
+  created_at: string;
+};
+
+export type PeerLedgerSummary = {
+  total_receivable_paise: number;
+  total_payable_paise: number;
+  net_balance_paise: number;
+  active_contacts_count: number;
+};
+
+export type PeerContactCreatePayload = {
+  name: string;
+  phone?: string | null;
+  upi_id?: string | null;
+  notes?: string | null;
+};
+
+export type PeerContactUpdatePayload = {
+  name?: string;
+  phone?: string | null;
+  upi_id?: string | null;
+  notes?: string | null;
+};
+
+export type PeerEntryCreatePayload = {
+  contact_id: number;
+  transaction_id?: number | null;
+  date?: string;
+  amount_paise: number;
+  direction: PeerDirection;
+  is_settlement?: boolean;
+  notes?: string | null;
+  original_paise?: number;
+  discount_paise?: number;
+};
+
+export type PeerSettlePayload = {
+  date?: string;
+  notes?: string | null;
+};
+
+export function listPeerContacts(
+  includeArchived = false,
+): Promise<PeerContactWithBalance[]> {
+  const qs = new URLSearchParams();
+  if (includeArchived) qs.set("include_archived", "true");
+  const q = qs.toString();
+  return request<PeerContactWithBalance[]>(`/friends/contacts${q ? `?${q}` : ""}`);
+}
+
+export function getPeerContact(id: number): Promise<PeerContactWithBalance> {
+  return request<PeerContactWithBalance>(`/friends/contacts/${id}`);
+}
+
+export function createPeerContact(
+  payload: PeerContactCreatePayload,
+): Promise<PeerContact> {
+  return request<PeerContact>("/friends/contacts", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updatePeerContact(
+  id: number,
+  payload: PeerContactUpdatePayload,
+): Promise<PeerContact> {
+  return request<PeerContact>(`/friends/contacts/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function archivePeerContact(
+  id: number,
+  confirmWithBalance = false,
+): Promise<PeerContact> {
+  const qs = new URLSearchParams();
+  if (confirmWithBalance) qs.set("confirm_with_balance", "true");
+  const q = qs.toString();
+  return request<PeerContact>(`/friends/contacts/${id}${q ? `?${q}` : ""}`, {
+    method: "DELETE",
+  });
+}
+
+export function settlePeerContact(
+  id: number,
+  payload?: PeerSettlePayload,
+): Promise<PeerEntry> {
+  return request<PeerEntry>(`/friends/contacts/${id}/settle`, {
+    method: "POST",
+    body: payload ? JSON.stringify(payload) : "{}",
+  });
+}
+
+export function listPeerEntries(contactId: number): Promise<PeerEntry[]> {
+  return request<PeerEntry[]>(`/friends/contacts/${contactId}/entries`);
+}
+
+export function createPeerEntry(
+  payload: PeerEntryCreatePayload,
+): Promise<PeerEntry> {
+  return request<PeerEntry>("/friends/entries", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deletePeerEntry(id: number): Promise<void> {
+  return request<void>(`/friends/entries/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export function getPeerSummary(): Promise<PeerLedgerSummary> {
+  return request<PeerLedgerSummary>("/friends/summary");
+}

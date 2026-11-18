@@ -627,3 +627,23 @@ export function IconRefresh(props: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
+
+export function IconUsers(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      aria-hidden="true"
+      {...props}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="6" cy="5" r="2.5" />
+      <path d="M1.5 13.5a4.5 4.5 0 0 1 9 0" />
+      <path d="M10.5 3a2.2 2.2 0 0 1 0 4.4" />
+      <path d="M12.5 13.5a3.8 3.8 0 0 0-3-3.7" />
+    </svg>
+  );
+}

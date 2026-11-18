@@ -25,3 +25,17 @@ export function invalidateRules(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ["dashboards", "tagging-stats"] });
   qc.invalidateQueries({ queryKey: ["candidates"] });
 }
+
+/**
+ * Invalidate every cache that a peer contact or peer entry mutation can change:
+ * the friends contacts list, contact ledger entries, friends summary
+ * (`/friends`), and any dashboard metrics that reflect fronted card usage or
+ * net personal spend (`["dashboards"]`).
+ *
+ * Call this from every mutation that creates, edits, archives, settles, or deletes
+ * peer contacts or peer entries, or deletes transactions that may have had linked peer entries.
+ */
+export function invalidateFriends(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: ["friends"] });
+  qc.invalidateQueries({ queryKey: ["dashboards"] });
+}

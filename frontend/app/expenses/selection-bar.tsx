@@ -46,7 +46,7 @@ import {
   buildCategoryTree,
 } from "@/lib/categories";
 import { CategoryDot } from "@/components/category-dot";
-import { invalidateRules } from "@/lib/queries/invalidate";
+import { invalidateFriends, invalidateRules } from "@/lib/queries/invalidate";
 import { cn } from "@/lib/utils";
 
 export function SelectionBar({
@@ -78,6 +78,8 @@ export function SelectionBar({
     // Bulk categorise teaches (learn_merchant_memory), so ["rules"] and
     // ["candidates"] go stale as they would for one row (invalidate.ts contract).
     invalidateRules(queryClient);
+    // Deleting transactions nulls linked peer entries and updates card usage.
+    invalidateFriends(queryClient);
   }
 
   const overCap = ids.length > BULK_MAX;

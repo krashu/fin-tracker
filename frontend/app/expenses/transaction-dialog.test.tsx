@@ -584,4 +584,34 @@ describe("TransactionDialog (app/expenses/transaction-dialog.tsx)", () => {
       ).toBeInTheDocument();
     });
   });
+
+  it("offers 'Split with Friend' button and opens the split dialog", async () => {
+    server.use(
+      http.get("*/api/v1/friends/contacts", () => {
+        return HttpResponse.json([]);
+      }),
+    );
+
+    const txn = buildTransaction({
+      id: 70,
+      amount_paise: -250000,
+      merchant_raw: "Swiggy Dineout",
+    });
+
+    const { user } = renderWithProviders(
+      <TransactionDialog
+        txn={txn}
+        categories={mockCategories}
+        accounts={mockAccounts}
+        accountLabelText="Salary Account"
+        onClose={vi.fn()}
+      />,
+    );
+
+    const splitBtn = screen.getByRole("button", { name: /split with friend/i });
+    expect(splitBtn).toBeInTheDocument();
+
+    await user.click(splitBtn);
+    expect(await screen.findByText("Split with Friend / Khata")).toBeInTheDocument();
+  });
 });

@@ -27,6 +27,7 @@ import {
   IconTag,
   IconTrend,
   IconUpload,
+  IconUsers,
   IconWallet,
 } from "@/components/icons";
 
@@ -52,6 +53,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Spending",
     items: [
       { href: "/expenses", label: "Expenses", icon: IconList },
+      { href: "/friends", label: "Friends & Khata", icon: IconUsers },
       { href: "/spending", label: "Analysis", icon: IconChart },
       // Date-range reports + month-wise pivot — Part 3.
       { href: "/reports", label: "Reports", icon: IconDoc, disabled: true },

@@ -1,6 +1,6 @@
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
-import { invalidateRules } from "./invalidate";
+import { invalidateFriends, invalidateRules } from "./invalidate";
 
 describe("TanStack Query Invalidation Contract (lib/queries/invalidate.ts)", () => {
   it("invalidates rules, tagging-stats, and all candidates cache keys", () => {
@@ -60,5 +60,38 @@ describe("TanStack Query Invalidation Contract (lib/queries/invalidate.ts)", () 
     // Verified: Completely unrelated queries remain untouched
     expect(getQuery(["accounts"])?.isStale()).toBe(false);
     expect(getQuery(["categories"])?.isStale()).toBe(false);
+  });
+
+  it("invalidates friends and dashboards queries via invalidateFriends", () => {
+    const qc = new QueryClient({
+      defaultOptions: {
+        queries: {
+          staleTime: 60_000,
+        },
+      },
+    });
+
+    qc.setQueryData(["friends", "summary"], { net_balance_paise: 50000 });
+    qc.setQueryData(["friends", "contacts"], [{ id: 1, name: "Rahul" }]);
+    qc.setQueryData(["friends", "contacts", 1, "entries"], [{ id: 10 }]);
+    qc.setQueryData(["dashboards", "summary"], { net_worth_paise: 100000 });
+    qc.setQueryData(["accounts"], [{ id: 1 }]);
+
+    const cache = qc.getQueryCache();
+    const getQuery = (queryKey: unknown[]) => cache.find({ queryKey });
+
+    expect(getQuery(["friends", "summary"])?.isStale()).toBe(false);
+    expect(getQuery(["friends", "contacts"])?.isStale()).toBe(false);
+    expect(getQuery(["friends", "contacts", 1, "entries"])?.isStale()).toBe(false);
+    expect(getQuery(["dashboards", "summary"])?.isStale()).toBe(false);
+    expect(getQuery(["accounts"])?.isStale()).toBe(false);
+
+    invalidateFriends(qc);
+
+    expect(getQuery(["friends", "summary"])?.isStale()).toBe(true);
+    expect(getQuery(["friends", "contacts"])?.isStale()).toBe(true);
+    expect(getQuery(["friends", "contacts", 1, "entries"])?.isStale()).toBe(true);
+    expect(getQuery(["dashboards", "summary"])?.isStale()).toBe(true);
+    expect(getQuery(["accounts"])?.isStale()).toBe(false);
   });
 });

@@ -49,6 +49,8 @@ import { CardBillLinkField } from "./card-bill-link-field";
 import { RefundOriginalField } from "./refund-original-field";
 import { Field, PickerButton, TextInput } from "@/components/form/fields";
 import { CategorySelector } from "@/components/categories/category-selector";
+import { IconUsers } from "@/components/icons";
+import { SplitDialog } from "@/components/friends/split-dialog";
 import {
   ApiError,
   patchTransaction,
@@ -113,6 +115,7 @@ export function TransactionDialog({
   const [accountId, setAccountId] = useState(txn.account_id);
   const [categoryId, setCategoryId] = useState<number | null>(txn.category_id);
   const [labels, setLabels] = useState<string[]>(txn.labels.map((l) => l.name));
+  const [splitOpen, setSplitOpen] = useState(false);
 
   function invalidateBoard() {
     queryClient.invalidateQueries({ queryKey: ["transactions"] });
@@ -238,7 +241,8 @@ export function TransactionDialog({
   const errored = mutation.isError ? mutation.error : unlink.error;
 
   return (
-    <Dialog open onOpenChange={(open) => (open ? null : onClose())}>
+    <>
+      <Dialog open onOpenChange={(open) => (open ? null : onClose())}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Edit transaction</DialogTitle>
@@ -358,6 +362,27 @@ export function TransactionDialog({
 
           <LabelInput label="Tags" value={labels} onChange={setLabels} />
 
+          <div className="flex items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2">
+            <div className="flex flex-col">
+              <span className="text-[12px] font-medium text-foreground">
+                Split / Front for friend
+              </span>
+              <span className="text-[11px] text-muted-foreground">
+                Track who owes you or whom you owe for this transaction.
+              </span>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 shrink-0 gap-1.5 px-2 text-[12px]"
+              onClick={() => setSplitOpen(true)}
+            >
+              <IconUsers className="size-3.5" />
+              Split with Friend
+            </Button>
+          </div>
+
           {isRefund(txn) ? <RefundOriginalField txn={txn} /> : null}
           {txn.card_bill_link_offered ? (
             <CardBillLinkField txn={txn} accounts={accounts} onLinked={onClose} />
@@ -393,5 +418,13 @@ export function TransactionDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+    {splitOpen ? (
+      <SplitDialog
+        transaction={txn}
+        open={splitOpen}
+        onClose={() => setSplitOpen(false)}
+      />
+    ) : null}
+    </>
   );
 }
