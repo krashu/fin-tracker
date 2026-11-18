@@ -38,17 +38,44 @@ def _range_body(sel: dict[str, object]) -> bytes:
     return json.dumps({"rates": {d: {"INR": r} for d, r in sel.items()}}).encode("utf-8")
 
 
-def _serving(rates: dict[str, object], *, down: bool = False):  # type: ignore[no-untyped-def]
-    """MockTransport handler that serves /latest, /<date>, and /<start>..<end> from ``rates``.
+def _v2_single_body(rate_date: str, inr: object) -> bytes:
+    return json.dumps({"date": rate_date, "base": "USD", "quote": "INR", "rate": inr}).encode(
+        "utf-8"
+    )
 
-    Date strings are ISO so lexicographic comparison matches chronological. The single-date
-    branch emulates frankfurter's "echo the nearest business day ≤ requested" behaviour.
+
+def _v2_range_body(sel: dict[str, object]) -> bytes:
+    items = [{"date": d, "base": "USD", "quote": "INR", "rate": r} for d, r in sel.items()]
+    return json.dumps(items).encode("utf-8")
+
+
+def _serving(rates: dict[str, object], *, down: bool = False):  # type: ignore[no-untyped-def]
+    """MockTransport handler that serves v2 and v1 frankfurter endpoints from ``rates``.
+
+    Date strings are ISO so lexicographic comparison matches chronological.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
         if down:
             return httpx.Response(503)
-        seg = request.url.path.rsplit("/", 1)[-1]
+        path = request.url.path
+        if path.startswith("/v2/rates") or "/v2/rates" in path:
+            start = request.url.params.get("from", "")
+            end = request.url.params.get("to", "")
+            sel = {d: r for d, r in rates.items() if start <= d <= end}
+            return httpx.Response(200, content=_v2_range_body(sel))
+        if path.startswith("/v2/rate") or "/v2/rate" in path:
+            dt = request.url.params.get("date")
+            if dt:
+                candidates = [d for d in rates if d <= dt]
+                if not candidates:
+                    return httpx.Response(404)
+                d = max(candidates)
+                return httpx.Response(200, content=_v2_single_body(d, rates[d]))
+            d = max(rates)
+            return httpx.Response(200, content=_v2_single_body(d, rates[d]))
+
+        seg = path.rsplit("/", 1)[-1]
         if seg == "latest":
             d = max(rates)
             return httpx.Response(200, content=_single_body(d, rates[d]))
@@ -199,9 +226,22 @@ def test_resolve_usd_without_rate_is_none(session: Session) -> None:
     assert resolve_fx_rate_to_inr(session, currency="USD", on=date(2026, 6, 23)) is None
 
 
-def test_build_url_strips_trailing_slash() -> None:
+def test_build_url_v2_and_v1() -> None:
     from app.services.fx_service import _build_url
 
+    # v2 endpoints (default)
+    assert _build_url("https://api.frankfurter.dev/v2/", None, None) == (
+        "https://api.frankfurter.dev/v2/rate/USD/INR"
+    )
+    assert _build_url("https://api.frankfurter.dev/v2/", date(2026, 6, 23), None) == (
+        "https://api.frankfurter.dev/v2/rate/USD/INR?date=2026-06-23"
+    )
+    assert (
+        _build_url("https://api.frankfurter.dev/v2/", date(2026, 6, 20), date(2026, 6, 23))
+        == "https://api.frankfurter.dev/v2/rates?base=USD&quotes=INR&from=2026-06-20&to=2026-06-23"
+    )
+
+    # v1 backwards compatibility
     assert _build_url("https://api.frankfurter.dev/v1/", None, None) == (
         "https://api.frankfurter.dev/v1/latest?from=USD&to=INR"
     )
@@ -214,6 +254,16 @@ def test_build_url_strips_trailing_slash() -> None:
     )
 
 
+def test_refresh_fx_rates_v1_legacy_compatibility(session: Session) -> None:
+    handler = _serving({"2026-06-23": 83.5})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = refresh_fx_rates(session, client=client, base_url="https://api.frankfurter.dev/v1")
+
+    assert result.rates_inserted == 1
+    assert result.fetch_errors == 0
+    assert _cached(session) == {date(2026, 6, 23): Decimal("83.5")}
+
+
 def test_refresh_fx_rates_follows_redirects(session: Session) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "old.test":
@@ -221,7 +271,7 @@ def test_refresh_fx_rates_follows_redirects(session: Session) -> None:
                 301,
                 headers={"Location": f"https://new.test{request.url.raw_path.decode()}"},
             )
-        return httpx.Response(200, content=_single_body("2026-06-23", 83.5))
+        return httpx.Response(200, content=_v2_single_body("2026-06-23", 83.5))
 
     with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
         result = refresh_fx_rates(session, client=client, base_url="https://old.test")

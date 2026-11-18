@@ -100,7 +100,50 @@ def test_not_json_raises() -> None:
 
 def test_not_object_raises() -> None:
     with pytest.raises(FrankfurterParseError, match="not a JSON object"):
-        parse_frankfurter_rates(b"[1, 2, 3]")
+        parse_frankfurter_rates(b'"just a string"')
+
+
+def test_v2_single_observation() -> None:
+    raw = json.dumps({"date": "2026-11-18", "base": "USD", "quote": "INR", "rate": 93.35}).encode(
+        "utf-8"
+    )
+    rows, warnings = parse_frankfurter_rates(raw)
+
+    assert warnings == []
+    assert len(rows) == 1
+    assert rows[0].rate_date == date(2026, 11, 18)
+    assert rows[0].rate == Decimal("93.35")
+
+
+def test_v2_range_response() -> None:
+    raw = json.dumps(
+        [
+            {"date": "2026-11-10", "base": "USD", "quote": "INR", "rate": 93.79},
+            {"date": "2026-11-11", "base": "USD", "quote": "INR", "rate": 93.75},
+        ]
+    ).encode("utf-8")
+    rows, warnings = parse_frankfurter_rates(raw)
+
+    assert warnings == []
+    assert len(rows) == 2
+    assert rows[0].rate_date == date(2026, 11, 10)
+    assert rows[0].rate == Decimal("93.79")
+    assert rows[1].rate_date == date(2026, 11, 11)
+    assert rows[1].rate == Decimal("93.75")
+
+
+def test_v2_filters_different_quote_currency() -> None:
+    raw = json.dumps(
+        [
+            {"date": "2026-11-10", "base": "USD", "quote": "INR", "rate": 93.79},
+            {"date": "2026-11-10", "base": "USD", "quote": "EUR", "rate": 0.95},
+        ]
+    ).encode("utf-8")
+    rows, warnings = parse_frankfurter_rates(raw, to_currency="INR")
+
+    assert len(rows) == 1
+    assert rows[0].rate_date == date(2026, 11, 10)
+    assert rows[0].rate == Decimal("93.79")
 
 
 def test_no_rates_raises() -> None:

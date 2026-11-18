@@ -1,18 +1,24 @@
-"""frankfurter.app FX-rate parser (PRD §F7 FX layer).
+"""frankfurter FX-rate parser (PRD §F7 FX layer).
 
 Pure: ``bytes`` → ``list[FxRateRow]`` + per-row skip warnings. No DB, no logging, no
 network — the caller (``fx_service``) fetches the JSON and owns I/O.
 
-frankfurter serves a USD→INR rate either as a single observation or a date range::
+Supports Frankfurter v2 (active official API) and v1 (legacy):
 
+v2 (api.frankfurter.dev/v2):
+    GET /v2/rate/USD/INR
+        → {"date":"2026-11-18","base":"USD","quote":"INR","rate":93.35}
+    GET /v2/rate/USD/INR?date=2026-01-02
+        → {"date":"2026-01-02","base":"USD","quote":"INR","rate":83.1}
+    GET /v2/rates?base=USD&quotes=INR&from=2026-01-01&to=2026-01-10
+        → [{"date":"2026-01-02","base":"USD","quote":"INR","rate":83.1}, ...]
+
+v1 legacy (api.frankfurter.app / api.frankfurter.dev/v1):
     GET /latest?from=USD&to=INR       → {"date":"2026-06-23","rates":{"INR":83.5}}
     GET /2026-01-02?from=USD&to=INR   → {"date":"2026-01-02","rates":{"INR":83.1}}
-        (echoes the nearest business day ≤ the requested date in "date")
     GET /2026-01-01..2026-01-10?...   → {"start_date":...,"rates":{"2026-01-02":{"INR":83.1}, ...}}
-        (business days only — weekends/holidays absent)
 
-The two shapes are told apart by the ``rates`` values: a number (single) vs a nested dict
-(range). Numbers are parsed exactly via ``json.loads(parse_float=Decimal)`` (no float
+Numbers are parsed exactly via ``json.loads(parse_float=Decimal)`` (no float
 round-trip — the same precision discipline as the scaled-int money columns). A non-numeric
 or non-positive rate is skipped with a warning (a 0/negative rate would corrupt conversion).
 """
@@ -48,36 +54,63 @@ class FxRateRow:
 def parse_frankfurter_rates(
     raw: bytes, *, to_currency: str = "INR"
 ) -> tuple[list[FxRateRow], list[str]]:
-    """Parse a frankfurter response (single or range) into rows + skip warnings.
+    """Parse a frankfurter response (v2 or legacy v1, single or range) into rows + skip warnings.
 
     Warnings are ``"frankfurter <raw-date>: <reason>"`` (dates/rates are public reference data).
 
     Raises:
-        FrankfurterParseError: the body isn't a JSON object, has no ``rates``, or yielded
+        FrankfurterParseError: the body isn't a JSON object or list, has no rates, or yielded
             no usable rows — the caller treats this as a source failure.
     """
     try:
         payload = json.loads(raw, parse_float=Decimal)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise FrankfurterParseError("frankfurter response is not valid JSON") from e
-    if not isinstance(payload, dict):
-        raise FrankfurterParseError("frankfurter response is not a JSON object")
-    rates = payload.get("rates")
-    if not isinstance(rates, dict) or not rates:
-        raise FrankfurterParseError("frankfurter response has no rates")
+    if not isinstance(payload, (dict, list)):
+        raise FrankfurterParseError("frankfurter response is not a JSON object or list")
 
     rows: list[FxRateRow] = []
     warnings: list[str] = []
-    if to_currency in rates and not isinstance(rates[to_currency], dict):
-        # Single-observation shape: {"date": "...", "rates": {"INR": 83.5}}.
-        _append_row(rows, warnings, str(payload.get("date", "")).strip(), rates.get(to_currency))
-    else:
-        # Range shape: {"rates": {"YYYY-MM-DD": {"INR": 83.1}, ...}}.
-        for date_raw, day in rates.items():
-            if not isinstance(day, dict):
-                warnings.append(f"frankfurter {date_raw}: malformed rate entry")
+
+    if isinstance(payload, list):
+        # Frankfurter v2 range response: [{"date": "...", "rate": ..., ...}, ...]
+        for item in payload:
+            if not isinstance(item, dict):
+                warnings.append("frankfurter: malformed rate entry")
                 continue
-            _append_row(rows, warnings, str(date_raw).strip(), day.get(to_currency))
+            quote = item.get("quote")
+            if quote and str(quote).upper() != to_currency.upper():
+                continue
+            _append_row(rows, warnings, str(item.get("date", "")).strip(), item.get("rate"))
+    elif "rate" in payload:
+        # Frankfurter v2 single rate response: {"date": "...", "rate": ..., ...}
+        quote = payload.get("quote")
+        if quote and str(quote).upper() != to_currency.upper():
+            warnings.append(f"frankfurter {payload.get('date')}: unexpected quote currency {quote}")
+        else:
+            _append_row(rows, warnings, str(payload.get("date", "")).strip(), payload.get("rate"))
+    elif "rates" in payload:
+        # Frankfurter v1 legacy response: {"date": "...", "rates": {"INR": ...}}
+        rates = payload.get("rates")
+        if not isinstance(rates, dict) or not rates:
+            raise FrankfurterParseError("frankfurter response has no rates")
+        if to_currency in rates and not isinstance(rates[to_currency], dict):
+            # Single-observation shape: {"date": "...", "rates": {"INR": 83.5}}.
+            _append_row(
+                rows,
+                warnings,
+                str(payload.get("date", "")).strip(),
+                rates.get(to_currency),
+            )
+        else:
+            # Range shape: {"rates": {"YYYY-MM-DD": {"INR": 83.1}, ...}}.
+            for date_raw, day in rates.items():
+                if not isinstance(day, dict):
+                    warnings.append(f"frankfurter {date_raw}: malformed rate entry")
+                    continue
+                _append_row(rows, warnings, str(date_raw).strip(), day.get(to_currency))
+    else:
+        raise FrankfurterParseError("frankfurter response has no rates")
 
     if not rows:
         raise FrankfurterParseError("no usable rates in frankfurter response")

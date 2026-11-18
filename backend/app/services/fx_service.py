@@ -94,14 +94,29 @@ def refresh_fx_rates(
 
 
 def _build_url(base_url: str, start: date | None, end: date | None) -> str:
-    """frankfurter endpoint for latest / single-date / range, all USD→INR."""
-    query = f"?from={_FROM_CCY}&to={_TO_CCY}"
+    """frankfurter endpoint for latest / single-date / range, all USD→INR.
+
+    Supports Frankfurter v2 (active API, /rate/{base}/{quote} or /rates)
+    and legacy v1 (when base_url targets v1, /latest or /<range>).
+    """
     base = base_url.rstrip("/")
+    if "/v1" in base or base.endswith("v1"):
+        query = f"?from={_FROM_CCY}&to={_TO_CCY}"
+        if start is None:
+            return f"{base}/latest{query}"
+        if end is None:
+            return f"{base}/{start.isoformat()}{query}"
+        return f"{base}/{start.isoformat()}..{end.isoformat()}{query}"
+
+    v2_base = base if base.endswith("/v2") else f"{base}/v2"
     if start is None:
-        return f"{base}/latest{query}"
+        return f"{v2_base}/rate/{_FROM_CCY}/{_TO_CCY}"
     if end is None:
-        return f"{base}/{start.isoformat()}{query}"
-    return f"{base}/{start.isoformat()}..{end.isoformat()}{query}"
+        return f"{v2_base}/rate/{_FROM_CCY}/{_TO_CCY}?date={start.isoformat()}"
+    return (
+        f"{v2_base}/rates?base={_FROM_CCY}&quotes={_TO_CCY}"
+        f"&from={start.isoformat()}&to={end.isoformat()}"
+    )
 
 
 def _fetch_rates(
