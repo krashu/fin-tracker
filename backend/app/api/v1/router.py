@@ -23,6 +23,7 @@ from app.api.v1 import (
     instruments,
     investment_transactions,
     labels,
+    peer_ledger,
     portfolio,
     rules,
     tax,
@@ -43,6 +44,7 @@ api_router.include_router(imports.router)
 api_router.include_router(instruments.router)
 api_router.include_router(investment_transactions.router)
 api_router.include_router(labels.router)
+api_router.include_router(peer_ledger.router)
 api_router.include_router(portfolio.router)
 api_router.include_router(rules.router)
 api_router.include_router(tax.router)

@@ -83,6 +83,16 @@ from app.schemas.investments import (
     ReinvestmentRead,
 )
 from app.schemas.labels import LabelCreate, LabelRead, LabelUpdate
+from app.schemas.peer_ledger import (
+    PeerContactCreate,
+    PeerContactRead,
+    PeerContactUpdate,
+    PeerContactWithBalanceRead,
+    PeerEntryCreate,
+    PeerEntryRead,
+    PeerLedgerSummaryRead,
+    PeerSettleRequest,
+)
 from app.schemas.performance import PortfolioPerformance
 from app.schemas.rules import (
     CategoryRuleCreate,
@@ -172,6 +182,14 @@ __all__ = [
     "NET_WORTH_EXCLUDED_TYPES",
     "NavRefreshSummary",
     "OverviewResponse",
+    "PeerContactCreate",
+    "PeerContactRead",
+    "PeerContactUpdate",
+    "PeerContactWithBalanceRead",
+    "PeerEntryCreate",
+    "PeerEntryRead",
+    "PeerLedgerSummaryRead",
+    "PeerSettleRequest",
     "PendingImportBatch",
     "PeriodTotalsResponse",
     "PortfolioPerformance",
