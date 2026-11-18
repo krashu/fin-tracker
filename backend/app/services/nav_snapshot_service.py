@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from app.core.log_config import get_logger
 from app.models import Instrument
 from app.parsers import AmfiNavRow, AmfiParseError, parse_navall
+from app.services.fx_service import refresh_fx_rates
 from app.services.holdings_service import max_staleness_days
 
 logger = get_logger(__name__)
@@ -52,14 +53,18 @@ _USER_AGENT = (
 )
 
 
-def supports_price_feed(asset_class: str) -> bool:
-    """Whether an asset class has an automated price feed source (AMFI or Yahoo quote)."""
+def supports_price_feed(asset_class: str, exchange: str | None = None) -> bool:
+    """Whether an asset class or exchange-traded instrument has an automated price
+    feed source (AMFI or Yahoo quote).
+    """
+    if exchange in _EXCHANGE_SUFFIX:
+        return True
     return asset_class == _MF_CLASS or asset_class in _QUOTE_CLASSES
 
 
-def is_manually_priced(asset_class: str) -> bool:
-    """Whether an asset class is manually priced by the user (no automated price feed)."""
-    return not supports_price_feed(asset_class)
+def is_manually_priced(asset_class: str, exchange: str | None = None) -> bool:
+    """Whether an instrument is manually priced by the user (no automated price feed)."""
+    return not supports_price_feed(asset_class, exchange)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +141,7 @@ def refresh_navs(
     amfi_url: str,
     yahoo_base_url: str,
     as_of: date,
+    frankfurter_base_url: str | None = None,
 ) -> NavRefreshResult:
     """Fetch + apply current NAVs for the user's active instruments (PRD §F7).
 
@@ -175,7 +181,7 @@ def refresh_navs(
                 stale_skipped += 1
             else:
                 unmatched += 1
-        elif inst.asset_class in _QUOTE_CLASSES:
+        elif inst.asset_class in _QUOTE_CLASSES or inst.exchange in _EXCHANGE_SUFFIX:
             outcome = _apply_equity_quote(inst, client, yahoo_base_url, warnings)
             if outcome == "updated":
                 equity_updated += 1
@@ -186,8 +192,13 @@ def refresh_navs(
             else:
                 unmatched += 1
         else:
-            # fd / bond / nps / gold / other — user-entered (no auto source).
+            # fd / bond / nps / gold / other without quote source — user-entered (no auto source).
             skipped += 1
+
+    if frankfurter_base_url and any(i.currency != "INR" for i in instruments):
+        fx_res = refresh_fx_rates(session, client=client, base_url=frankfurter_base_url)
+        warnings.extend(fx_res.warnings)
+        fetch_errors += fx_res.fetch_errors
 
     null_nav_count = sum(1 for i in instruments if i.current_nav is None)
     # The CATALOGUE population — every active priced instrument, exited ones included.

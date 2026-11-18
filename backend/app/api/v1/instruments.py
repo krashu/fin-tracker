@@ -246,6 +246,7 @@ def refresh_navs_endpoint(
             amfi_url=settings.amfi_navall_url,
             yahoo_base_url=settings.yahoo_quote_base_url,
             as_of=clock.today(),
+            frankfurter_base_url=settings.frankfurter_base_url,
         )
     session.commit()
     return NavRefreshSummary.model_validate(result)

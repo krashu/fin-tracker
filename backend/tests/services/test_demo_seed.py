@@ -719,19 +719,21 @@ def test_partial_sells_book_fifo_lots_in_both_currencies(
     assert lots_by_symbol["AAPL"] == 2  # 3 units from the first buy, 1 from the second
 
 
-def test_seed_writes_no_fx_rate(session: Session, seeded_user: User) -> None:
-    """``fx_rates`` is global, so a made-up rate there would stamp real users' USD rows
-    (ADR-0016 rule 2). Until FX is refreshed the USD holdings show as unvalued in INR."""
+def test_seed_writes_fx_rates(session: Session, seeded_user: User) -> None:
+    """Demo seed populates fx_rates for today and demo USD transactions, so USD holdings
+    value in INR and have %Alloc and XIRR computed in demo mode."""
     seed_demo_data(session, user_id=seeded_user.id)
 
-    assert session.scalar(select(func.count()).select_from(FxRateQuote)) == 0
+    assert session.scalar(select(func.count()).select_from(FxRateQuote)) > 0
+    usd_rate = latest_rate(session)
+    assert usd_rate is not None
     usd = [
         h
-        for h in compute_holdings(session, user_id=seeded_user.id, usd_inr_rate=None)
+        for h in compute_holdings(session, user_id=seeded_user.id, usd_inr_rate=usd_rate)
         if h.currency == "USD"
     ]
     assert {h.symbol for h in usd} == {spec["symbol"] for spec in _usd_specs()}
-    assert all(h.current_value_inr_paise is None for h in usd)
+    assert all(h.current_value_inr_paise is not None for h in usd)
 
 
 def test_usd_holdings_value_in_inr_once_a_rate_is_cached(

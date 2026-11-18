@@ -42,6 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core import clock
+from app.core.db_errors import insert_skip_existing
 from app.core.demo_data import (
     ACCOUNTS,
     AccountKey,
@@ -54,6 +55,7 @@ from app.core.log_config import get_logger
 from app.models import (
     Account,
     Category,
+    FxRateQuote,
     Instrument,
     InvestmentTransaction,
     Label,
@@ -503,6 +505,7 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
         session, user_id=user_id, tag_counts=tag_counts, label_counts=label_counts
     )
 
+    _seed_fx_rates(session, today=today)
     inst_count, inv_txn_count = _seed_investments(session, user_id=user_id, today=today)
 
     session.flush()
@@ -511,6 +514,40 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
         transactions=txn_count,
         instruments=inst_count,
         investment_transactions=inv_txn_count,
+    )
+
+
+def _seed_fx_rates(session: Session, *, today: date_t) -> None:
+    """Seed USD->INR rates for the demo dataset (today's rate + demo txn dates).
+
+    Ensures demo USD holdings (AAPL, VOO) have valid INR conversions for %Alloc and XIRR
+    without requiring an initial external Frankfurter fetch.
+    """
+    rates_by_date: dict[date_t, Decimal] = {
+        today: Decimal("89.50"),
+    }
+    for spec in build_demo_instruments(today):
+        if spec.get("currency") == "USD":
+            for t in spec.get("txns", []):
+                if "date" in t and "fx" in t:
+                    rates_by_date[date_t.fromisoformat(str(t["date"]))] = Decimal(str(t["fx"]))
+
+    rows: list[dict[str, object]] = [
+        {
+            "date": d,
+            "from_currency": "USD",
+            "to_currency": "INR",
+            "rate": rate,
+            "source": "demo_seed",
+        }
+        for d, rate in rates_by_date.items()
+    ]
+    insert_skip_existing(
+        session,
+        FxRateQuote,
+        rows,
+        conflict_cols=["from_currency", "to_currency", "date"],
+        label="fx_rates",
     )
 
 
@@ -539,6 +576,10 @@ def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tupl
             )
         )
         if existing is not None:
+            if existing.nav_updated_at is not None and existing.nav_updated_at < as_valuation_stamp(
+                today
+            ):
+                existing.nav_updated_at = as_valuation_stamp(today)
             continue
         instrument = Instrument(
             user_id=user_id,

@@ -446,3 +446,98 @@ def test_both_write_paths_stamp_nav_updated_at_naive(session: Session, user: Use
     # ...and nothing moved: the offset was dropped, not applied.
     assert mf.nav_updated_at == datetime(_NAV_DATE.year, _NAV_DATE.month, _NAV_DATE.day)
     assert equity.nav_updated_at == _YAHOO_DT.replace(tzinfo=None)
+
+
+def test_gold_etf_on_nse_priced_from_yahoo(session: Session, user: User) -> None:
+    # GOLDBEES (asset_class="gold", exchange="NSE") prices via Yahoo quotes (GOLDBEES.NS)
+    # rather than being skipped as hand-priced.
+    gold_etf = Instrument(
+        user_id=user.id,
+        symbol="GOLDBEES",
+        name="Nippon India Gold BeES",
+        asset_class="gold",
+        currency="INR",
+        exchange="NSE",
+    )
+    session.add(gold_etf)
+    session.flush()
+
+    result = _run(session, user.id, _equity_ok)
+    assert result.equity_updated == 1
+    assert result.skipped == 0
+    assert gold_etf.current_nav == _YAHOO_PRICE
+    assert gold_etf.nav_updated_at == _YAHOO_DT.replace(tzinfo=None)
+
+
+def test_physical_gold_on_other_exchange_is_skipped(session: Session, user: User) -> None:
+    # Gold held off-exchange (exchange="OTHER") has no quote feed and is skipped.
+    gold_bar = Instrument(
+        user_id=user.id,
+        symbol="GOLDBAR",
+        name="Physical Gold 24K",
+        asset_class="gold",
+        currency="INR",
+        exchange="OTHER",
+    )
+    session.add(gold_bar)
+    session.flush()
+
+    result = _run(session, user.id, _equity_ok)
+    assert result.skipped == 1
+    assert result.equity_updated == 0
+    assert gold_bar.current_nav is None
+
+
+def test_refresh_navs_with_frankfurter_refreshes_fx_rates(session: Session, user: User) -> None:
+    from sqlalchemy import select
+
+    from app.models import FxRateQuote
+
+    aapl = Instrument(
+        user_id=user.id,
+        symbol="AAPL",
+        name="Apple Inc",
+        asset_class="us_equity",
+        currency="USD",
+        exchange="NASDAQ",
+    )
+    session.add(aapl)
+    session.flush()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if url_str.startswith(_AMFI_URL):
+            return httpx.Response(200, content=_NAVALL_BODY)
+        if "frankfurter.test" in url_str:
+            return httpx.Response(
+                200,
+                json={
+                    "amount": 1.0,
+                    "base": "USD",
+                    "date": "2026-06-25",
+                    "rates": {"INR": 89.5},
+                },
+            )
+        return httpx.Response(200, json=_yahoo_body())
+
+    with _client(handler) as client:
+        result = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            frankfurter_base_url="https://frankfurter.test",
+        )
+
+    assert result.equity_updated == 1
+    rate_row = session.scalar(
+        select(FxRateQuote).where(
+            FxRateQuote.from_currency == "USD",
+            FxRateQuote.to_currency == "INR",
+            FxRateQuote.date == date(2026, 6, 25),
+        )
+    )
+    assert rate_row is not None
+    assert rate_row.rate == Decimal("89.5")

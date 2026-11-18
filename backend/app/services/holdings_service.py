@@ -322,7 +322,7 @@ def compute_holdings(
                     if as_of is not None and inst.current_nav is not None
                     else None
                 ),
-                supports_price_feed=supports_price_feed(inst.asset_class),
+                supports_price_feed=supports_price_feed(inst.asset_class, inst.exchange),
             )
         )
 

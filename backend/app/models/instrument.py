@@ -77,8 +77,12 @@ PRICE_FEED_ASSET_CLASSES: tuple[AssetClassStr, ...] = (
 )
 
 
-def supports_price_feed(asset_class: str) -> bool:
-    """Whether an asset class has an automated price feed source (AMFI or Yahoo quote)."""
+def supports_price_feed(asset_class: str, exchange: str | None = None) -> bool:
+    """Whether an asset class or exchange-traded instrument has an automated price
+    feed source (AMFI or Yahoo quote).
+    """
+    if exchange in ("NSE", "BSE", "NASDAQ", "NYSE"):
+        return True
     return asset_class in PRICE_FEED_ASSET_CLASSES
 
 
