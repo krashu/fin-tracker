@@ -1291,4 +1291,3 @@ def test_is_cc_payment_word_boundary() -> None:
     assert is_cc_payment("prepayment received") is False
     assert is_cc_payment("overpayment received") is False
     assert is_cc_payment("payment receivedness") is False
-

@@ -67,4 +67,3 @@ def test_string_length_guard_refuses_overflow_on_update() -> None:
         acc.name = "x" * 129
         with pytest.raises(AssertionError, match="string length overflow .*Account.name"):
             session.flush()
-

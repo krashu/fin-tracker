@@ -1,4 +1,4 @@
-name: Deploy Full-Stack (FastAPI Cloud)
+name: Deploy Demo Showcase (FastAPI Cloud)
 
 on:
   push:
