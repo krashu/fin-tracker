@@ -11,7 +11,8 @@ from uuid import UUID
 from sqlalchemy import Table, func, select, update
 from sqlalchemy.orm import Session
 
-from app.models import Base, ImportBatch, Transaction
+from app.core import clock
+from app.models import Base, ImportBatch, PeerContact, PeerEntry, Transaction
 
 # ADR-0003 §Decision: the only tables without an owner. ``users`` is the tenant root itself.
 GLOBAL_TABLES = frozenset({"benchmarks", "benchmark_nav", "fx_rates"})
@@ -63,4 +64,16 @@ def seed_rows_demo_seed_lacks(session: Session, user_id: UUID) -> None:
         .where(Transaction.id == refund, Transaction.user_id == user_id)
         .values(refund_of_id=original)
     )
+    contact = PeerContact(user_id=user_id, name="Test Contact")
+    session.add(contact)
+    session.flush()
+    entry = PeerEntry(
+        user_id=user_id,
+        contact_id=contact.id,
+        transaction_id=first_txn,
+        date=clock.today(),
+        amount_paise=1000,
+        direction="you_gave",
+    )
+    session.add(entry)
     session.flush()

@@ -15,7 +15,7 @@ from uuid import UUID
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
-from app.models import Transaction
+from app.models import PeerEntry, Transaction
 from app.services.reconciliation_service import release_leg
 
 
@@ -43,6 +43,11 @@ def delete_owned_transactions(session: Session, *, user_id: UUID, ids: Collectio
 
     An empty ``ids`` renders ``IN ()`` as false, so the call does nothing.
     """
+    session.execute(
+        update(PeerEntry)
+        .where(PeerEntry.user_id == user_id, PeerEntry.transaction_id.in_(ids))
+        .values(transaction_id=None)
+    )
     session.execute(
         update(Transaction)
         .where(Transaction.user_id == user_id, Transaction.refund_of_id.in_(ids))

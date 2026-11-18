@@ -95,6 +95,7 @@ Behind a TLS-inspecting corporate proxy the investment price feeds fail with
 | [0014](docs/adr/0014-tax-fx-rule-206.md) | *Proposed* — F11 foreign-asset gains convert at SBI's TT buying rate (Rule 206), never the stamped `fx_rate_to_inr`; cost side awaits a CA |
 | [0015](docs/adr/0015-fifo-lot-matching.md) | FIFO lot matching after same-day `indian_equity` trades net out as intraday; same-date order is date → source position → id |
 | [0016](docs/adr/0016-fx-stamped-at-transaction-date.md) | `fx_rate_to_inr` is server-stamped at the transaction date and never rewritten; a missing rate refuses the row |
+| [0017](docs/adr/0017-peer-debt-khatabook-ledger.md) | *Proposed* — Peer debts & Khatabook balances are tracked in an auxiliary peer ledger linked to transactions |
 
 ## Working rules
 

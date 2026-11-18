@@ -37,6 +37,8 @@ from app.models import (
     ImportBatch,
     InvestmentTransaction,
     MerchantTagMap,
+    PeerContact,
+    PeerEntry,
     RealisedLot,
     Transaction,
     User,
@@ -928,3 +930,108 @@ def test_tax_statement_is_isolated_per_user(unauth_client: TestClient) -> None:
     assert other_view["total_profit_paise"] == 0
     years = unauth_client.get("/api/v1/tax/available-years").json()["years"]
     assert years == [fy_start_year(clock.today())]
+
+
+def test_peer_ledger_is_isolated_per_user(unauth_client: TestClient, session: Session) -> None:
+    """ADR-0017 Phase 1: PeerContact and PeerEntry cross-tenant isolation.
+
+    A user can only link entries to their own contacts and transactions.
+    Cross-user foreign links are rejected by the composite same-user FKs.
+    """
+    _register(unauth_client, "peer-owner@example.com")
+    a_user = session.scalars(select(User).where(User.email == "peer-owner@example.com")).one()
+    a_acct = _make_account(unauth_client, "Owner Bank")
+    r_tx = unauth_client.post(
+        "/api/v1/transactions",
+        json={
+            "account_id": a_acct,
+            "date": "2026-03-01",
+            "amount_paise": -500000,
+            "transaction_type": "spend",
+            "merchant_raw": "Dinner with friend",
+        },
+    )
+    assert r_tx.status_code == 201, r_tx.text
+    a_txn_id = r_tx.json()["id"]
+
+    a_contact = PeerContact(user_id=a_user.id, name="Bob")
+    session.add(a_contact)
+    session.flush()
+
+    a_entry = PeerEntry(
+        user_id=a_user.id,
+        contact_id=a_contact.id,
+        transaction_id=a_txn_id,
+        date=date(2026, 3, 1),
+        amount_paise=250000,
+        direction="you_gave",
+    )
+    session.add(a_entry)
+    session.commit()
+
+    # Switch to User B
+    unauth_client.cookies.clear()
+    _register(unauth_client, "peer-intruder@example.com")
+    b_user = session.scalars(select(User).where(User.email == "peer-intruder@example.com")).one()
+    b_acct = _make_account(unauth_client, "Intruder Bank")
+    r_btx = unauth_client.post(
+        "/api/v1/transactions",
+        json={
+            "account_id": b_acct,
+            "date": "2026-03-01",
+            "amount_paise": -100000,
+            "transaction_type": "spend",
+            "merchant_raw": "Coffee",
+        },
+    )
+    assert r_btx.status_code == 201, r_btx.text
+    b_txn_id = r_btx.json()["id"]
+
+    b_contact = PeerContact(user_id=b_user.id, name="Bob")
+    session.add(b_contact)
+    session.commit()
+
+    # B cannot link an entry to A's contact (rejected by composite FK)
+    with pytest.raises(IntegrityError), session.begin_nested():
+        session.add(
+            PeerEntry(
+                user_id=b_user.id,
+                contact_id=a_contact.id,
+                date=date(2026, 3, 1),
+                amount_paise=10000,
+                direction="you_gave",
+            )
+        )
+        session.flush()
+
+    # B cannot link an entry to A's transaction (rejected by composite FK)
+    with pytest.raises(IntegrityError), session.begin_nested():
+        session.add(
+            PeerEntry(
+                user_id=b_user.id,
+                contact_id=b_contact.id,
+                transaction_id=a_txn_id,
+                date=date(2026, 3, 1),
+                amount_paise=10000,
+                direction="you_gave",
+            )
+        )
+        session.flush()
+
+    # B can link their own transaction to their own contact
+    b_entry = PeerEntry(
+        user_id=b_user.id,
+        contact_id=b_contact.id,
+        transaction_id=b_txn_id,
+        date=date(2026, 3, 1),
+        amount_paise=10000,
+        direction="you_gave",
+    )
+    session.add(b_entry)
+    session.commit()
+
+    # B scoped query sees only B's contacts/entries
+    b_contacts = list(session.scalars(select(PeerContact).where(PeerContact.user_id == b_user.id)))
+    assert [c.id for c in b_contacts] == [b_contact.id]
+    b_entries = list(session.scalars(select(PeerEntry).where(PeerEntry.user_id == b_user.id)))
+    assert [e.id for e in b_entries] == [b_entry.id]

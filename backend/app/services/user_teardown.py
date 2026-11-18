@@ -22,6 +22,8 @@ from app.models import (
     MerchantAlias,
     MerchantLabelMap,
     MerchantTagMap,
+    PeerContact,
+    PeerEntry,
     RealisedLot,
     RefreshSession,
     Transaction,
@@ -59,6 +61,7 @@ def teardown_user(session: Session, user_id: UUID) -> None:
     session.execute(delete(MerchantTagMap).where(MerchantTagMap.user_id == user_id))
     session.execute(delete(MerchantAlias).where(MerchantAlias.user_id == user_id))
     session.execute(delete(RealisedLot).where(RealisedLot.user_id == user_id))
+    session.execute(delete(PeerEntry).where(PeerEntry.user_id == user_id))
 
     # Phase 3: Delete transactional records & import batches
     session.execute(delete(Transaction).where(Transaction.user_id == user_id))
@@ -69,6 +72,7 @@ def teardown_user(session: Session, user_id: UUID) -> None:
     session.execute(delete(Label).where(Label.user_id == user_id))
     session.execute(delete(Instrument).where(Instrument.user_id == user_id))
     session.execute(delete(Account).where(Account.user_id == user_id))
+    session.execute(delete(PeerContact).where(PeerContact.user_id == user_id))
 
     # Phase 5: Delete category taxonomy (subcategories first, root parents second)
     session.execute(

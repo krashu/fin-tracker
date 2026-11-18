@@ -27,6 +27,8 @@ from app.models import (
     MerchantAlias,
     MerchantLabelMap,
     MerchantTagMap,
+    PeerContact,
+    PeerEntry,
     RealisedLot,
     Transaction,
     User,
@@ -816,3 +818,170 @@ def test_unpinned_asset_classes_take_either_currency(session: Session, asset_cla
         )
     )
     session.flush()
+
+
+def test_peer_contact_cross_user_fk_rejected(session: Session) -> None:
+    """ADR-0017 / ADR-0003 rule 10: composite FK forbids linking peer entries across users."""
+    u1 = _make_user(session, email="p1@example.com")
+    u2 = _make_user(session, email="p2@example.com")
+    c1 = PeerContact(user_id=u1.id, name="Contact 1")
+    c2 = PeerContact(user_id=u2.id, name="Contact 2")
+    u1_acct = _make_account(session, u1, name="u1-acct")
+    t1 = _make_transaction(session, u1, u1_acct, fingerprint="t1" + "0" * 62)
+    session.commit()
+
+    # u2 trying to link to u1's contact
+    with pytest.raises(IntegrityError), session.begin_nested():
+        session.add(
+            PeerEntry(
+                user_id=u2.id,
+                contact_id=c1.id,
+                date=date(2026, 3, 1),
+                amount_paise=5000,
+                direction="you_gave",
+            )
+        )
+        session.flush()
+
+    # u2 trying to link to u1's transaction
+    with pytest.raises(IntegrityError), session.begin_nested():
+        session.add(
+            PeerEntry(
+                user_id=u2.id,
+                contact_id=c2.id,
+                transaction_id=t1.id,
+                date=date(2026, 3, 1),
+                amount_paise=5000,
+                direction="you_gave",
+            )
+        )
+        session.flush()
+
+
+def test_peer_entry_amount_positive_check(session: Session) -> None:
+    """ADR-0017 rule 2: CHECK ck_peer_entries_amount_positive rejects <= 0."""
+    u = _make_user(session)
+    c = PeerContact(user_id=u.id, name="Alice")
+    session.add(c)
+    session.commit()
+
+    # Zero amount
+    with pytest.raises(IntegrityError, match="amount_positive"), session.begin_nested():
+        session.add(
+            PeerEntry(
+                user_id=u.id,
+                contact_id=c.id,
+                date=date(2026, 3, 1),
+                amount_paise=0,
+                direction="you_gave",
+            )
+        )
+        session.flush()
+
+    # Negative amount
+    with pytest.raises(IntegrityError, match="amount_positive"), session.begin_nested():
+        session.add(
+            PeerEntry(
+                user_id=u.id,
+                contact_id=c.id,
+                date=date(2026, 3, 1),
+                amount_paise=-1000,
+                direction="you_gave",
+            )
+        )
+        session.flush()
+
+    # Positive amount succeeds
+    entry = PeerEntry(
+        user_id=u.id,
+        contact_id=c.id,
+        date=date(2026, 3, 1),
+        amount_paise=1000,
+        direction="you_gave",
+    )
+    session.add(entry)
+    session.flush()
+    assert entry.id is not None
+
+
+def test_peer_entry_direction_check(session: Session) -> None:
+    """ADR-0017 rule 3: Enum direction accepts only 'you_gave' or 'you_got'."""
+    u = _make_user(session)
+    c = PeerContact(user_id=u.id, name="Alice")
+    session.add(c)
+    session.commit()
+
+    # Invalid direction via raw SQL to bypass SQLAlchemy client-side validation
+    with pytest.raises(IntegrityError), session.begin_nested():
+        session.execute(
+            text(
+                "INSERT INTO peer_entries "
+                "(user_id, contact_id, date, amount_paise, direction, is_settlement, "
+                "created_at, updated_at) "
+                "VALUES (:u, :c, :d, :a, :dir, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"u": str(u.id), "c": c.id, "d": "2026-03-01", "a": 1000, "dir": "invalid"},
+        )
+
+
+def test_peer_contact_active_name_case_insensitive_unique(session: Session) -> None:
+    """ADR-0017 rule 1: active contact name unique per user (case/whitespace-insensitive)."""
+    u1 = _make_user(session, email="c1@example.com")
+    u2 = _make_user(session, email="c2@example.com")
+
+    c1 = PeerContact(user_id=u1.id, name="  Alice Smith  ")
+    session.add(c1)
+    session.commit()
+
+    # Same user, different casing and untrimmed whitespace
+    with pytest.raises(IntegrityError), session.begin_nested():
+        session.add(PeerContact(user_id=u1.id, name="alice smith"))
+        session.flush()
+
+    # Different user, same name -> allowed
+    c2 = PeerContact(user_id=u2.id, name="alice smith")
+    session.add(c2)
+    session.commit()
+
+    # Soft-archive u1's contact
+    c1_db = session.get(PeerContact, c1.id)
+    assert c1_db is not None
+    c1_db.archived_at = datetime.now(UTC).replace(tzinfo=None)
+    session.commit()
+
+    # Re-creating with same name now succeeds
+    c1_recreated = PeerContact(user_id=u1.id, name="alice smith")
+    session.add(c1_recreated)
+    session.commit()
+    assert c1_recreated.id != c1.id
+
+
+def test_delete_transaction_nulls_peer_entry_link(session: Session) -> None:
+    """ADR-0017 rule 5: deleting a transaction sets peer_entries.transaction_id = NULL."""
+    from app.services.transaction_delete import delete_owned_transactions
+
+    u = _make_user(session)
+    acct = _make_account(session, u, name="bank-del")
+    txn = _make_transaction(session, u, acct, fingerprint="del" + "0" * 61)
+    contact = PeerContact(user_id=u.id, name="Friend")
+    session.add(contact)
+    session.flush()
+
+    entry = PeerEntry(
+        user_id=u.id,
+        contact_id=contact.id,
+        transaction_id=txn.id,
+        date=date(2026, 3, 1),
+        amount_paise=2000,
+        direction="you_gave",
+    )
+    session.add(entry)
+    session.commit()
+
+    delete_owned_transactions(session, user_id=u.id, ids=[txn.id])
+    session.commit()
+
+    assert session.get(Transaction, txn.id) is None
+    refreshed_entry = session.get(PeerEntry, entry.id)
+    assert refreshed_entry is not None
+    assert refreshed_entry.transaction_id is None

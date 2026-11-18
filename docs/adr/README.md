@@ -72,3 +72,4 @@ Do *not* write an ADR for:
 | [0014](0014-tax-fx-rule-206.md) | Foreign-asset capital gains convert at SBI's TT buying rate under Rule 206, not the stamped rate | Proposed | 2026-11-15 |
 | [0015](0015-fifo-lot-matching.md) | Sells consume lots first-in-first-out, after same-day equity trades net out | Accepted | 2026-11-15 |
 | [0016](0016-fx-stamped-at-transaction-date.md) | An investment row's FX rate is stamped at its transaction date and never re-derived | Accepted | 2026-11-15 |
+| [0017](0017-peer-debt-khatabook-ledger.md) | Peer debts and Khatabook balances are tracked in an auxiliary peer ledger linked to transactions | Proposed | 2026-11-18 |
