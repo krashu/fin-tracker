@@ -67,6 +67,19 @@ AssetClassStr = Literal[
 # (through :func:`class_currencies`), which sends the rule to the frontend.
 USD_ASSET_CLASSES: tuple[AssetClassStr, ...] = ("us_equity", "us_etf")
 INR_ASSET_CLASSES: tuple[AssetClassStr, ...] = ("indian_equity", "indian_mf", "nps")
+# Classes priced via an automated feed (AMFI for MFs, Yahoo quote for equities/ETFs;
+# fd/bond/nps/gold/other are manually priced by the user).
+PRICE_FEED_ASSET_CLASSES: tuple[AssetClassStr, ...] = (
+    "indian_equity",
+    "indian_mf",
+    "us_equity",
+    "us_etf",
+)
+
+
+def supports_price_feed(asset_class: str) -> bool:
+    """Whether an asset class has an automated price feed source (AMFI or Yahoo quote)."""
+    return asset_class in PRICE_FEED_ASSET_CLASSES
 
 
 def class_currencies(asset_class: AssetClassStr) -> tuple[CurrencyStr, ...]:

@@ -439,6 +439,34 @@ def test_extract_word_table_stops_a_headerless_page_at_a_stop_line(
     assert _word_table(pdf)[1] == []
 
 
+def test_extract_word_table_preserves_rows_above_second_header_on_same_page(
+    positioned_pdf_bytes: Callable[[_Pages], bytes],
+) -> None:
+    header_2 = [(x, 650, text) for x, _, text in _HEADER_LINE]
+    pdf = positioned_pdf_bytes(
+        [
+            [
+                *_HEADER_LINE,
+                (40, 686, "01/04/26"),
+                (100, 686, "UPI-ROW-1"),
+                (285, 686, "1,000.00"),
+                (440, 686, "9,000.00"),
+                *header_2,
+                (40, 630, "02/04/26"),
+                (100, 630, "UPI-ROW-2"),
+                (285, 630, "2,000.00"),
+                (440, 630, "7,000.00"),
+            ]
+        ]
+    )
+    rows = _word_table(pdf)[0]
+    assert len(rows) == 4
+    assert rows[0] == list(_HEADER_LABELS)
+    assert rows[1] == ["01/04/26", "UPI-ROW-1", "1,000.00", "", "9,000.00"]
+    assert rows[2] == list(_HEADER_LABELS)
+    assert rows[3] == ["02/04/26", "UPI-ROW-2", "2,000.00", "", "7,000.00"]
+
+
 def test_extract_word_table_corrupt_bytes_raises() -> None:
     with pytest.raises(ParserError, match="failed to extract words"):
         _word_table(b"not a pdf")

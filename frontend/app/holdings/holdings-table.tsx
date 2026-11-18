@@ -37,7 +37,6 @@ import {
 } from "@/lib/format";
 import {
   ASSET_CLASS_LABELS,
-  MANUALLY_PRICED_CLASSES,
   STALENESS_WARN_DAYS,
 } from "@/lib/investments";
 import { cn } from "@/lib/utils";
@@ -168,7 +167,7 @@ function HoldingRow({
   const stale = age != null && age >= STALENESS_WARN_DAYS;
   // For these classes refresh-navs has no source and returns `skipped`, so "refresh
   // prices" is unactionable advice — the user is the price source.
-  const manuallyPriced = MANUALLY_PRICED_CLASSES.has(holding.asset_class);
+  const manuallyPriced = !holding.supports_price_feed;
 
   // xirr is null whenever the summary hasn't resolved or the value is unsolvable
   // — both render "—" (no sign, muted).

@@ -144,15 +144,15 @@ def test_asset_class_currency_rule(client: TestClient, seeded_user: User) -> Non
 
     assert resp.status_code == 200, resp.text
     assert resp.json() == [
-        {"asset_class": "indian_equity", "currencies": ["INR"]},
-        {"asset_class": "indian_mf", "currencies": ["INR"]},
-        {"asset_class": "us_equity", "currencies": ["USD"]},
-        {"asset_class": "us_etf", "currencies": ["USD"]},
-        {"asset_class": "fd", "currencies": ["INR", "USD"]},
-        {"asset_class": "bond", "currencies": ["INR", "USD"]},
-        {"asset_class": "nps", "currencies": ["INR"]},
-        {"asset_class": "gold", "currencies": ["INR", "USD"]},
-        {"asset_class": "other", "currencies": ["INR", "USD"]},
+        {"asset_class": "indian_equity", "currencies": ["INR"], "supports_price_feed": True},
+        {"asset_class": "indian_mf", "currencies": ["INR"], "supports_price_feed": True},
+        {"asset_class": "us_equity", "currencies": ["USD"], "supports_price_feed": True},
+        {"asset_class": "us_etf", "currencies": ["USD"], "supports_price_feed": True},
+        {"asset_class": "fd", "currencies": ["INR", "USD"], "supports_price_feed": False},
+        {"asset_class": "bond", "currencies": ["INR", "USD"], "supports_price_feed": False},
+        {"asset_class": "nps", "currencies": ["INR"], "supports_price_feed": False},
+        {"asset_class": "gold", "currencies": ["INR", "USD"], "supports_price_feed": False},
+        {"asset_class": "other", "currencies": ["INR", "USD"], "supports_price_feed": False},
     ]
 
 

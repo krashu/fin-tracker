@@ -45,7 +45,7 @@ from app.schemas import (
     InstrumentUpdate,
     NavRefreshSummary,
 )
-from app.services.nav_snapshot_service import as_valuation_stamp, refresh_navs
+from app.services.nav_snapshot_service import as_valuation_stamp, refresh_navs, supports_price_feed
 
 router = APIRouter(prefix="/instruments", tags=["instruments"])
 
@@ -131,7 +131,11 @@ def list_instruments(
 @router.get("/asset-classes", response_model=list[AssetClassCurrencies])
 def list_asset_class_currencies(_user_id: CurrentUserId) -> list[AssetClassCurrencies]:
     return [
-        AssetClassCurrencies(asset_class=c, currencies=list(class_currencies(c)))
+        AssetClassCurrencies(
+            asset_class=c,
+            currencies=list(class_currencies(c)),
+            supports_price_feed=supports_price_feed(c),
+        )
         for c in get_args(AssetClassStr)
     ]
 

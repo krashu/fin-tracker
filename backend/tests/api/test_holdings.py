@@ -44,6 +44,7 @@ def test_holding_after_buy(client: TestClient, seeded_user: User, instrument: In
     assert h["current_nav"] == "150"
     assert h["current_value_native_paise"] == 150_000
     assert h["unrealized_pnl_native_paise"] == 50_000
+    assert h["supports_price_feed"] is True
 
 
 def test_holding_without_nav_nulls_value(client: TestClient, seeded_user: User) -> None:
@@ -100,4 +101,32 @@ def test_valuation_age_reaches_the_wire(
     )
     (h,) = client.get("/api/v1/holdings").json()["holdings"]
     assert h["nav_staleness_days"] == 5
+
+
+def test_holding_manually_priced_class_supports_price_feed_false(
+    client: TestClient, seeded_user: User
+) -> None:
+    iid = client.post(
+        "/api/v1/instruments",
+        json={
+            "symbol": "HDFCFD",
+            "name": "HDFC Fixed Deposit",
+            "asset_class": "fd",
+            "currency": "INR",
+            "exchange": "OTHER",
+        },
+    ).json()["id"]
+    client.post(
+        "/api/v1/investment-transactions",
+        json={
+            "date": "2026-06-01",
+            "instrument_id": iid,
+            "transaction_type": "buy",
+            "units": "1",
+            "price_per_unit_native": "100000",
+            "amount_native_paise": 10_000_000,
+        },
+    )
+    (h,) = client.get("/api/v1/holdings").json()["holdings"]
+    assert h["supports_price_feed"] is False
     assert h["nav_staleness_days"] >= STALENESS_WARN_DAYS

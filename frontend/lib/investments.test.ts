@@ -7,7 +7,6 @@ import {
   EXCHANGE_LABELS,
   INVESTMENT_TYPE_LABELS,
   MANUAL_ENTRY_TYPES,
-  MANUALLY_PRICED_CLASSES,
   STALENESS_WARN_DAYS,
   instrumentLabel,
 } from "@/lib/investments";
@@ -15,20 +14,6 @@ import {
 describe("investments metadata & constants", () => {
   it("defines staleness threshold matching backend (4 calendar days)", () => {
     expect(STALENESS_WARN_DAYS).toBe(4);
-  });
-
-  it("identifies manually priced asset classes without auto price feeds", () => {
-    expect(MANUALLY_PRICED_CLASSES.has("fd")).toBe(true);
-    expect(MANUALLY_PRICED_CLASSES.has("bond")).toBe(true);
-    expect(MANUALLY_PRICED_CLASSES.has("nps")).toBe(true);
-    expect(MANUALLY_PRICED_CLASSES.has("gold")).toBe(true);
-    expect(MANUALLY_PRICED_CLASSES.has("other")).toBe(true);
-
-    // Auto-priced classes should not be manual
-    expect(MANUALLY_PRICED_CLASSES.has("indian_equity")).toBe(false);
-    expect(MANUALLY_PRICED_CLASSES.has("indian_mf")).toBe(false);
-    expect(MANUALLY_PRICED_CLASSES.has("us_equity")).toBe(false);
-    expect(MANUALLY_PRICED_CLASSES.has("us_etf")).toBe(false);
   });
 
   it("formats instrument labels consistently", () => {

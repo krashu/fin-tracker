@@ -1280,3 +1280,15 @@ def test_card_bill_link_offered_reads_the_accounts_in_one_query(
         assert statements == []
     finally:
         event.remove(engine, "before_cursor_execute", capture)
+
+
+def test_is_cc_payment_word_boundary() -> None:
+    from app.services.reconciliation_service import is_cc_payment
+
+    assert is_cc_payment("payment received") is True
+    assert is_cc_payment("payment received thank you") is True
+    assert is_cc_payment("thank you for payment") is True
+    assert is_cc_payment("prepayment received") is False
+    assert is_cc_payment("overpayment received") is False
+    assert is_cc_payment("payment receivedness") is False
+

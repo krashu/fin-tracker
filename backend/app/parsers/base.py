@@ -372,7 +372,7 @@ def _extract_word_table(
                         boundaries = [
                             (spans[j][1] + spans[j + 1][0]) / 2 for j in range(len(spans) - 1)
                         ]
-                        page_rows = [[text for _, _, text in spans]]
+                        page_rows.append([text for _, _, text in spans])
                         continue
                     if boundaries is None:
                         continue

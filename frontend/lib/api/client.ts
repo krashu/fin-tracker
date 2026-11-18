@@ -1653,6 +1653,7 @@ export type InstrumentRead = {
 export type AssetClassCurrencies = {
   asset_class: AssetClass;
   currencies: AccountRead["currency"][];
+  supports_price_feed: boolean;
 };
 
 export type InstrumentCreate = {
@@ -1749,6 +1750,9 @@ export type HoldingRead = {
    * a timezone suffix, which `new Date()` would read as local time. Compare against
    * `STALENESS_WARN_DAYS`; never re-derive it. */
   nav_staleness_days: number | null;
+  /** Whether this holding's asset class supports an automated price feed source (AMFI or
+   * Yahoo quote). When false, refresh-navs skips it and the user is the price source. */
+  supports_price_feed: boolean;
 };
 
 export type HoldingsResponse = { holdings: HoldingRead[] };

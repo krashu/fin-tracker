@@ -59,15 +59,15 @@ export const mockStatementIssuers: StatementIssuer[] = [
 
 /** The server's asset-class -> currency rule (`GET /instruments/asset-classes`), in its order. */
 export const mockAssetClassCurrencies: AssetClassCurrencies[] = [
-  { asset_class: "indian_equity", currencies: ["INR"] },
-  { asset_class: "indian_mf", currencies: ["INR"] },
-  { asset_class: "us_equity", currencies: ["USD"] },
-  { asset_class: "us_etf", currencies: ["USD"] },
-  { asset_class: "fd", currencies: ["INR", "USD"] },
-  { asset_class: "bond", currencies: ["INR", "USD"] },
-  { asset_class: "nps", currencies: ["INR"] },
-  { asset_class: "gold", currencies: ["INR", "USD"] },
-  { asset_class: "other", currencies: ["INR", "USD"] },
+  { asset_class: "indian_equity", currencies: ["INR"], supports_price_feed: true },
+  { asset_class: "indian_mf", currencies: ["INR"], supports_price_feed: true },
+  { asset_class: "us_equity", currencies: ["USD"], supports_price_feed: true },
+  { asset_class: "us_etf", currencies: ["USD"], supports_price_feed: true },
+  { asset_class: "fd", currencies: ["INR", "USD"], supports_price_feed: false },
+  { asset_class: "bond", currencies: ["INR", "USD"], supports_price_feed: false },
+  { asset_class: "nps", currencies: ["INR"], supports_price_feed: false },
+  { asset_class: "gold", currencies: ["INR", "USD"], supports_price_feed: false },
+  { asset_class: "other", currencies: ["INR", "USD"], supports_price_feed: false },
 ];
 
 export const mockCategories: CategoryRead[] = [

@@ -48,6 +48,13 @@ _SHARED: list[tuple[str, bool, TxnType]] = [
     # fixture never reached.
     ("CASHBACK SENTINEL", True, "other"),
     ("SENTINEL UNKNOWN CREDIT", True, "other"),
+    # Merchants containing payment or refund substrings on the CREDIT side are `other`,
+    # never false payment/refund (A71).
+    ("SENTINEL PREPAYMENT RECEIVED BLR", True, "other"),
+    ("SENTINEL REFUNDABLE DEPOSIT", True, "other"),
+    ("NON-REFUNDABLE BOOKING SENTINEL", True, "other"),
+    ("REVERSALS UNLIMITED MUMBAI", True, "other"),
+    ("CHARGEBACKS CORP", True, "other"),
     # Non-purchase debits both _NON_PURCHASE_DEBIT_RE patterns share.
     ("FINANCE CHARGE", False, "other"),
     ("INTEREST CHARGES", False, "other"),

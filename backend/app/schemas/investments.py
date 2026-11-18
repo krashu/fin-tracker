@@ -123,6 +123,7 @@ class AssetClassCurrencies(BaseModel):
 
     asset_class: AssetClassStr
     currencies: list[CurrencyStr]
+    supports_price_feed: bool
 
 
 class InstrumentRead(BaseModel):
@@ -424,6 +425,7 @@ class HoldingRead(BaseModel):
     current_value_inr_paise: int | None
     unrealized_pnl_inr_paise: int | None
     nav_staleness_days: int | None
+    supports_price_feed: bool
 
 
 class HoldingsResponse(BaseModel):

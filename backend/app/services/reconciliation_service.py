@@ -76,7 +76,7 @@ log = get_logger(__name__)
 
 # PRD §F4a-1 CC-side classification regex. Pattern is lowercase to match
 # the lowercase output of normalize_merchant.
-_CC_PAYMENT_RE = re.compile(r"payment received|thank you for payment")
+_CC_PAYMENT_RE = re.compile(r"\b(?:payment received|thank you for payment)\b")
 
 
 def is_cc_payment(merchant_normalized: str) -> bool:

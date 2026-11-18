@@ -34,6 +34,7 @@ from app.main import app
 from app.models import Account, Category, Instrument, User
 from app.services.nav_snapshot_service import as_valuation_stamp
 from tests.aware_guard import install_aware_write_guard
+from tests.string_length_guard import install_string_length_guard
 
 # Any allowed CORS origin — set as a default header on test clients so the
 # fail-closed CSRF Origin check (OriginCSRFMiddleware) lets mutations through.
@@ -91,6 +92,7 @@ def session_factory(engine: Engine) -> sessionmaker[Session]:
     """
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     install_aware_write_guard(factory)
+    install_string_length_guard(factory)
     return factory
 
 

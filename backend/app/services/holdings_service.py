@@ -48,7 +48,7 @@ from sqlalchemy.orm import Session
 from app.core.log_config import get_logger
 from app.models import Instrument, InvestmentTransaction, InvestmentTxnTypeStr, RealisedLot
 from app.models.account import CurrencyStr
-from app.models.instrument import AssetClassStr
+from app.models.instrument import AssetClassStr, supports_price_feed
 from app.models.realised_lot import RealisedLotKindStr
 from app.services.fx_math import to_inr_paise
 
@@ -93,6 +93,7 @@ class Holding:
     current_value_inr_paise: int | None
     unrealized_pnl_inr_paise: int | None
     nav_staleness_days: int | None
+    supports_price_feed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +322,7 @@ def compute_holdings(
                     if as_of is not None and inst.current_nav is not None
                     else None
                 ),
+                supports_price_feed=supports_price_feed(inst.asset_class),
             )
         )
 

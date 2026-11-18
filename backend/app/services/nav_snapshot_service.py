@@ -52,6 +52,16 @@ _USER_AGENT = (
 )
 
 
+def supports_price_feed(asset_class: str) -> bool:
+    """Whether an asset class has an automated price feed source (AMFI or Yahoo quote)."""
+    return asset_class == _MF_CLASS or asset_class in _QUOTE_CLASSES
+
+
+def is_manually_priced(asset_class: str) -> bool:
+    """Whether an asset class is manually priced by the user (no automated price feed)."""
+    return not supports_price_feed(asset_class)
+
+
 @dataclass(frozen=True, slots=True)
 class Quote:
     """One equity quote: the latest price + the market time it is valid for."""

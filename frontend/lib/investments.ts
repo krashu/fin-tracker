@@ -37,20 +37,6 @@ export const ASSET_CLASS_LABELS: Record<AssetClass, string> = {
   other: "Other",
 };
 
-/** Asset classes with no automatic price source: `refresh-navs` counts them as `skipped`
- * and a sync press cannot change their NAV however old it is — the user is the price
- * source. Mirrors the "everything else" branch of `nav_snapshot_service`'s routing
- * (`_MF_CLASS` + `_QUOTE_CLASSES` are the ones that DO have a source). Used to keep
- * staleness advice actionable: telling someone to refresh an FD is telling them to press
- * a button that does nothing. */
-export const MANUALLY_PRICED_CLASSES: ReadonlySet<AssetClass> = new Set([
-  "fd",
-  "bond",
-  "nps",
-  "gold",
-  "other",
-]);
-
 export const EXCHANGE_LABELS: Record<Exchange, string> = {
   NSE: "NSE",
   BSE: "BSE",
