@@ -50,4 +50,15 @@ describe("CsvUploadForm currency note (B19)", () => {
 
     expect(await screen.findByText(/NPS rows in INR/)).toBeInTheDocument();
   });
+
+  it("renders transaction file label and placeholder", () => {
+    renderWithProviders(<CsvUploadForm />);
+
+    expect(
+      screen.getByText("Transaction file (CSV or Excel)"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Choose a CSV or Excel file…"),
+    ).toBeInTheDocument();
+  });
 });

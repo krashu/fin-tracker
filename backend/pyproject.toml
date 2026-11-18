@@ -29,6 +29,8 @@ dependencies = [
     # JWT access tokens. Both ship py.typed; bounded per §Maintenance posture.
     "argon2-cffi>=25.1.0,<26",
     "pyjwt>=2.13.0,<3",
+    # Excel parsing (PRD §F7 — broker tradebook imports)
+    "openpyxl>=3.1.5,<4",
 ]
 # Added at later milestones (do not install yet):
 #   v0.7 — google-api-python-client, google-auth-oauthlib, cryptography
@@ -56,6 +58,8 @@ dev = [
     # rate-limiter resets per test, so there was nothing to make parallel-safe. Pulls
     # `execnet` (worker IPC). `-n0` disables it for debugging — see AGENTS.md §Commands.
     "pytest-xdist>=3.8.0,<4",
+    # Type stubs for openpyxl (gates ty check app without # type: ignore)
+    "types-openpyxl>=3.1.5,<4",
 ]
 
 [tool.uv]

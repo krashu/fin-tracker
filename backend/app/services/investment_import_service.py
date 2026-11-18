@@ -140,6 +140,10 @@ def import_investment_csv(
     )
 
 
+# Alias for caller clarity
+import_investment_file = import_investment_csv
+
+
 def persist_investment_rows(
     session: Session,
     *,

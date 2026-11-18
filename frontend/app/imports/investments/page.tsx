@@ -14,7 +14,7 @@ export default function InvestmentCsvImportPage() {
     <div className="mx-auto" style={{ maxWidth: 1240, padding: "0 40px 40px" }}>
       <PageHeader
         title="Import transactions"
-        description="Upload a broker transaction export (e.g. a Zerodha Console tradebook) as CSV. Columns are matched by name — date, type, symbol, units, price (amount/fees/name/exchange optional) — so most raw exports import without renaming."
+        description="Upload a broker transaction export (e.g. a Zerodha Console tradebook or Groww Orders) as CSV or Excel (.xlsx). Columns are matched by name — date, type, symbol, units, price (amount/fees/name/exchange optional) — so most raw exports import without renaming."
       />
       <GuestUploadGate>
         <CsvUploadForm />

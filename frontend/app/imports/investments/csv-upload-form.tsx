@@ -62,6 +62,7 @@ export function CsvUploadForm() {
     staleTime: Infinity,
   });
   const [file, setFile] = useState<File | null>(null);
+  const [xlsNotice, setXlsNotice] = useState(false);
   const [assetClass, setAssetClass] = useState<AssetClass>("indian_equity");
   const [summary, setSummary] = useState<InvestmentCsvImportSummary | null>(
     null,
@@ -91,24 +92,28 @@ export function CsvUploadForm() {
   });
 
   function handleUpload() {
-    if (file == null) return;
+    if (file == null || xlsNotice) return;
     setSummary(null);
     mutation.mutate({ file, asset_class: assetClass });
   }
 
-  const canSubmit = file != null && !mutation.isPending;
+  const canSubmit = file != null && !xlsNotice && !mutation.isPending;
 
   return (
     <div className="flex max-w-xl flex-col gap-4">
-      <Field label="Transaction CSV">
+      <Field label="Transaction file (CSV or Excel)">
         {/* sr-only (not hidden) keeps the file input in the tab order + a11y tree;
             the visible label is the button and shows the focus ring via has-[]. */}
         <label className="flex cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-[12.5px] transition-colors hover:bg-muted/50 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring">
           <input
             type="file"
-            accept=".csv,text/csv"
+            accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
             className="sr-only"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            onChange={(e) => {
+              const selected = e.target.files?.[0] ?? null;
+              setFile(selected);
+              setXlsNotice(Boolean(selected?.name.toLowerCase().endsWith(".xls")));
+            }}
           />
           <IconDoc className="size-3.5 shrink-0 text-muted-foreground" />
           <span
@@ -117,10 +122,16 @@ export function CsvUploadForm() {
               file ? "text-foreground" : "text-muted-foreground",
             )}
           >
-            {file ? file.name : "Choose a CSV…"}
+            {file ? file.name : "Choose a CSV or Excel file…"}
           </span>
         </label>
       </Field>
+
+      {xlsNotice ? (
+        <p className="-mt-2 text-[12px] text-neg">
+          Legacy .xls format is not supported. Please save or export as .xlsx or .csv.
+        </p>
+      ) : null}
 
       <Field label="Asset class for this file">
         <select

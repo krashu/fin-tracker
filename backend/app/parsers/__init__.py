@@ -37,7 +37,13 @@ from app.parsers.frankfurter import FrankfurterParseError, FxRateRow, parse_fran
 from app.parsers.hdfc_bank import HdfcBank
 from app.parsers.icici_bank import IciciBank
 from app.parsers.icici_cc import IciciCC
-from app.parsers.investment_csv import CSVParseError, ParsedInvestmentRow, parse_investment_csv
+from app.parsers.investment_csv import (
+    CSVParseError,
+    ParsedInvestmentRow,
+    UnsupportedFileFormatError,
+    parse_investment_csv,
+    parse_investment_file,
+)
 from app.parsers.mfapi import MfApiNavRow, MfApiParseError, parse_mfapi_navs
 from app.parsers.sbi_bank import SbiBank
 
@@ -65,8 +71,10 @@ __all__ = [
     "StatementParser",
     "StatementSummary",
     "TxnType",
+    "UnsupportedFileFormatError",
     "parse_frankfurter_rates",
     "parse_investment_csv",
+    "parse_investment_file",
     "parse_mfapi_navs",
     "parse_navall",
 ]

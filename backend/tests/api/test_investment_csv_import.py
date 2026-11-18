@@ -8,11 +8,14 @@ and the PII-safety of the per-row warnings. The parsing / dedup logic is unit-te
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.models import User
 
 _URL = "/api/v1/imports/investments"
+_FIXTURES = Path(__file__).parent.parent / "fixtures" / "investment_csv"
 
 
 def _post(client: TestClient, csv: str, asset_class: str = "indian_equity"):  # type: ignore[no-untyped-def]
@@ -143,3 +146,35 @@ def test_over_cap_upload_is_413(client: TestClient, seeded_user: User) -> None:
     )
     assert resp.status_code == 413
     assert resp.json()["detail"] == "file too large"
+
+
+def test_import_excel_file_returns_summary(client: TestClient, seeded_user: User) -> None:
+    excel_bytes = (_FIXTURES / "zerodha_tradebook.xlsx").read_bytes()
+    resp = client.post(
+        _URL,
+        files={
+            "file": (
+                "tradebook.xlsx",
+                excel_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        data={"asset_class": "indian_equity"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["instruments_new"] == 2
+    assert body["txns_imported"] == 3
+    assert body["rows_rejected"] == 0
+    assert body["warnings"] == []
+
+
+def test_import_legacy_xls_returns_actionable_422(client: TestClient, seeded_user: User) -> None:
+    xls_bytes = (_FIXTURES / "legacy_format.xls").read_bytes()
+    resp = client.post(
+        _URL,
+        files={"file": ("tradebook.xls", xls_bytes, "application/vnd.ms-excel")},
+        data={"asset_class": "indian_equity"},
+    )
+    assert resp.status_code == 422
+    assert "legacy .xls format is not supported" in resp.json()["detail"]

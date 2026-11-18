@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from app.parsers import CSVParseError, parse_investment_csv
+from app.parsers import CSVParseError, UnsupportedFileFormatError, parse_investment_csv
 from app.parsers.investment_csv import HEADER_ALIASES
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "investment_csv"
@@ -277,3 +277,62 @@ def test_net_amount_is_not_read_as_the_gross_amount() -> None:
         default_asset_class="other",
     )
     assert rows[0].amount_native_paise == 100000  # 10 * 100, not the 990 net figure
+
+
+def test_zerodha_tradebook_excel_snapshot() -> None:
+    raw = (FIXTURES / "zerodha_tradebook.xlsx").read_bytes()
+    expected = json.loads((FIXTURES / "zerodha_tradebook.expected.json").read_text("utf-8"))
+    rows, warnings = parse_investment_csv(raw, default_asset_class="indian_equity")
+    assert warnings == []
+    assert _serialize(rows) == expected
+
+
+def test_zerodha_tradebook_excel_with_banners() -> None:
+    raw = (FIXTURES / "zerodha_tradebook_with_banners.xlsx").read_bytes()
+    rows, warnings = parse_investment_csv(raw, default_asset_class="indian_equity")
+    assert warnings == []
+    assert len(rows) == 3
+    # Header was row 4; data rows must reflect physical row numbers 5, 6, 7
+    assert [r.line_no for r in rows] == [5, 6, 7]
+    assert [r.symbol for r in rows] == ["INFY", "INFY", "TCS"]
+
+
+def test_groww_orders_excel() -> None:
+    raw = (FIXTURES / "groww_orders.xlsx").read_bytes()
+    rows, warnings = parse_investment_csv(raw, default_asset_class="indian_equity")
+    assert warnings == []
+    assert len(rows) == 2
+    assert rows[0].symbol == "INFY"
+    assert rows[0].date.isoformat() == "2024-03-15"
+    assert rows[0].txn_type == "buy"
+    assert rows[0].amount_native_paise == 1450500
+    assert rows[1].symbol == "TCS"
+    assert rows[1].date.isoformat() == "2024-04-10"
+    assert rows[1].txn_type == "buy"
+    assert rows[1].amount_native_paise == 1900125
+
+
+def test_multisheet_portfolio_excel() -> None:
+    raw = (FIXTURES / "multisheet_portfolio.xlsx").read_bytes()
+    rows, warnings = parse_investment_csv(raw, default_asset_class="indian_equity")
+    assert warnings == []
+    assert len(rows) == 1
+    assert rows[0].symbol == "INFY"
+
+
+def test_legacy_xls_raises_unsupported_format() -> None:
+    raw = (FIXTURES / "legacy_format.xls").read_bytes()
+    with pytest.raises(UnsupportedFileFormatError, match="legacy .xls format is not supported"):
+        parse_investment_csv(raw, default_asset_class="indian_equity")
+
+
+def test_type_vocabulary_synonyms_normalized() -> None:
+    csv_bytes = _csv(
+        "2024-01-01,Purchase,A,10,100,1000",
+        "2024-01-02,b,B,10,100,1000",
+        "2024-01-03,Redemption,C,10,100,1000",
+        "2024-01-04,s,D,10,100,1000",
+    )
+    rows, warnings = parse_investment_csv(csv_bytes, default_asset_class="indian_equity")
+    assert warnings == []
+    assert [r.txn_type for r in rows] == ["buy", "buy", "sell", "sell"]

@@ -96,6 +96,7 @@ from app.models import (
     TransactionLabel,
 )
 from app.models.instrument import AssetClassStr
+from app.parsers import UnsupportedFileFormatError
 from app.parsers.base import InvalidPasswordError, ParserError, RunningBalanceMismatchError
 from app.schemas import (
     BatchReconciliation,
@@ -187,7 +188,11 @@ _INVESTMENT_CSV_UPLOAD_BODY = {
                 "required": ["asset_class", "file"],
                 "properties": {
                     "asset_class": {"type": "string"},
-                    "file": {"type": "string", "format": "binary"},
+                    "file": {
+                        "type": "string",
+                        "format": "binary",
+                        "description": "Investment transaction CSV or Excel (.xlsx) file",
+                    },
                 },
             }
         }
@@ -330,6 +335,11 @@ def create_investment_csv_import(
             default_asset_class=cast("AssetClassStr", upload.asset_class),
             session=session,
         )
+    except UnsupportedFileFormatError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(e),
+        ) from e
     except ParserError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
