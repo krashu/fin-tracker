@@ -238,7 +238,7 @@ def refresh_navs_endpoint(
     source becomes a counted warning, never a request error.
     """
     settings = get_settings()
-    with httpx.Client(timeout=settings.nav_fetch_timeout_secs) as client:
+    with httpx.Client(timeout=settings.nav_fetch_timeout_secs, follow_redirects=True) as client:
         result = refresh_navs(
             session,
             user_id=user_id,

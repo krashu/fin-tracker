@@ -44,7 +44,7 @@ def refresh_fx_endpoint(
     counted warning (the expected outcome behind a corporate TLS proxy).
     """
     settings = get_settings()
-    with httpx.Client(timeout=settings.fx_fetch_timeout_secs) as client:
+    with httpx.Client(timeout=settings.fx_fetch_timeout_secs, follow_redirects=True) as client:
         result = refresh_fx_rates(
             session, client=client, base_url=settings.frankfurter_base_url, start=start, end=end
         )

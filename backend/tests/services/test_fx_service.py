@@ -197,3 +197,35 @@ def test_resolve_usd_uses_cached_rate(session: Session) -> None:
 def test_resolve_usd_without_rate_is_none(session: Session) -> None:
     # No cached rate at-or-before the date → None (the caller rejects / 422s, never mis-stamps).
     assert resolve_fx_rate_to_inr(session, currency="USD", on=date(2026, 6, 23)) is None
+
+
+def test_build_url_strips_trailing_slash() -> None:
+    from app.services.fx_service import _build_url
+
+    assert _build_url("https://api.frankfurter.dev/v1/", None, None) == (
+        "https://api.frankfurter.dev/v1/latest?from=USD&to=INR"
+    )
+    assert _build_url("https://api.frankfurter.dev/v1/", date(2026, 6, 23), None) == (
+        "https://api.frankfurter.dev/v1/2026-06-23?from=USD&to=INR"
+    )
+    assert (
+        _build_url("https://api.frankfurter.dev/v1/", date(2026, 6, 20), date(2026, 6, 23))
+        == "https://api.frankfurter.dev/v1/2026-06-20..2026-06-23?from=USD&to=INR"
+    )
+
+
+def test_refresh_fx_rates_follows_redirects(session: Session) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "old.test":
+            return httpx.Response(
+                301,
+                headers={"Location": f"https://new.test{request.url.raw_path.decode()}"},
+            )
+        return httpx.Response(200, content=_single_body("2026-06-23", 83.5))
+
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+        result = refresh_fx_rates(session, client=client, base_url="https://old.test")
+
+    assert result.rates_inserted == 1
+    assert result.fetch_errors == 0
+    assert _cached(session) == {date(2026, 6, 23): Decimal("83.5")}

@@ -42,7 +42,7 @@ def refresh_benchmarks_endpoint(session: SessionDep, _: CurrentUserId) -> Benchm
     and caches new dates; a slow / unreachable scheme becomes a counted warning.
     """
     settings = get_settings()
-    with httpx.Client(timeout=settings.nav_fetch_timeout_secs) as client:
+    with httpx.Client(timeout=settings.nav_fetch_timeout_secs, follow_redirects=True) as client:
         result = refresh_benchmark_navs(
             session, client=client, mfapi_base_url=settings.mfapi_base_url
         )

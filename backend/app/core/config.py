@@ -336,10 +336,11 @@ class Settings(BaseSettings):
         ),
     )
     frankfurter_base_url: str = Field(
-        default="https://api.frankfurter.app",
+        default="https://api.frankfurter.dev/v1",
         validation_alias="FRANKFURTER_BASE_URL",
         description=(
-            "frankfurter.app base URL for USD→INR FX rates (PRD §F7 FX layer). Public, no key; "
+            "frankfurter base URL for USD→INR FX rates (PRD §F7 FX layer). Public, no key; "
+            "v1 endpoint at api.frankfurter.dev (migrated from api.frankfurter.app). "
             "exchangerate.host is the documented drop-in fallback (swap the URL, no code change). "
             "fx_service appends '/latest', '/<date>', or '/<start>..<end>'. Seed-time backfill "
             "only — the holdings/portfolio/ingest reads touch only the cached fx_rates rows."

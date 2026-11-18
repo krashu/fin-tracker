@@ -96,11 +96,12 @@ def refresh_fx_rates(
 def _build_url(base_url: str, start: date | None, end: date | None) -> str:
     """frankfurter endpoint for latest / single-date / range, all USD→INR."""
     query = f"?from={_FROM_CCY}&to={_TO_CCY}"
+    base = base_url.rstrip("/")
     if start is None:
-        return f"{base_url}/latest{query}"
+        return f"{base}/latest{query}"
     if end is None:
-        return f"{base_url}/{start.isoformat()}{query}"
-    return f"{base_url}/{start.isoformat()}..{end.isoformat()}{query}"
+        return f"{base}/{start.isoformat()}{query}"
+    return f"{base}/{start.isoformat()}..{end.isoformat()}{query}"
 
 
 def _fetch_rates(
