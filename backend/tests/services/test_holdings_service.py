@@ -862,3 +862,140 @@ def test_same_day_trades_in_an_mf_are_not_netted(session: Session, user: User) -
     (h,) = compute_holdings(session, user_id=user.id)
     assert h.net_units == Decimal("70")
     assert h.invested_native_paise == 800_000
+
+
+def test_usd_holding_single_lot_waterfall_balances_exactly(session: Session, user: User) -> None:
+    """ADR-0018: Single USD lot decomposes into currency FX gain and asset price gain."""
+    inst = _usd_instrument(session, user.id, current_nav=Decimal("120"))
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("10"),
+        amount_paise=100_000,
+        price=Decimal("100"),
+        fx_rate=Decimal("80"),
+    )
+
+    (h,) = compute_holdings(session, user_id=user.id, usd_inr_rate=Decimal("85"))
+    assert h.invested_inr_paise == 8_000_000
+    assert h.current_value_inr_paise == 10_200_000
+    assert h.unrealized_pnl_inr_paise == 2_200_000
+    assert h.fx_pnl_inr_paise == 500_000
+    assert h.price_pnl_inr_paise == 1_700_000
+    assert h.price_pnl_inr_paise + h.fx_pnl_inr_paise == h.unrealized_pnl_inr_paise
+
+    rollup = summarize_holdings([h])
+    assert rollup.price_pnl_paise == 1_700_000
+    assert rollup.fx_pnl_paise == 500_000
+    assert rollup.unrealized_pnl_paise == 2_200_000
+    assert rollup.price_pnl_paise + rollup.fx_pnl_paise == rollup.unrealized_pnl_paise
+
+
+def test_usd_holding_multi_lot_different_fx_rates(session: Session, user: User) -> None:
+    """ADR-0018: Lot-level historical FX clock is preserved across multi-lot positions."""
+    inst = _usd_instrument(session, user.id, current_nav=Decimal("150"))
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("5"),
+        amount_paise=50_000,
+        price=Decimal("100"),
+        on=date(2025, 1, 1),
+        fx_rate=Decimal("80"),
+    )
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("5"),
+        amount_paise=60_000,
+        price=Decimal("120"),
+        on=date(2025, 2, 1),
+        fx_rate=Decimal("82"),
+    )
+
+    (h,) = compute_holdings(session, user_id=user.id, usd_inr_rate=Decimal("85"))
+    assert h.net_units == Decimal("10")
+    assert h.invested_inr_paise == 8_920_000
+    assert h.current_value_inr_paise == 12_750_000
+    assert h.unrealized_pnl_inr_paise == 3_830_000
+    assert h.fx_pnl_inr_paise == 430_000
+    assert h.price_pnl_inr_paise == 3_400_000
+    assert h.price_pnl_inr_paise + h.fx_pnl_inr_paise == h.unrealized_pnl_inr_paise
+
+
+def test_usd_holding_opposing_price_and_fx_moves(session: Session, user: User) -> None:
+    """ADR-0018: Opposing sign moves (asset price falls, currency appreciates) balance."""
+    inst = _usd_instrument(session, user.id, current_nav=Decimal("90"))
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("10"),
+        amount_paise=100_000,
+        price=Decimal("100"),
+        fx_rate=Decimal("75"),
+    )
+
+    (h,) = compute_holdings(session, user_id=user.id, usd_inr_rate=Decimal("90"))
+    assert h.invested_inr_paise == 7_500_000
+    assert h.current_value_inr_paise == 8_100_000
+    assert h.unrealized_pnl_inr_paise == 600_000
+    assert h.fx_pnl_inr_paise == 1_500_000  # currency appreciation
+    assert h.price_pnl_inr_paise == -900_000  # company valuation decline
+    assert h.price_pnl_inr_paise + h.fx_pnl_inr_paise == h.unrealized_pnl_inr_paise
+
+
+def test_inr_holding_waterfall_zero_fx(session: Session, user: User) -> None:
+    """ADR-0018 rule 2: Domestic INR holding carries zero FX PnL."""
+    inst = _instrument(session, user.id, current_nav=Decimal("150"))
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("10"),
+        amount_paise=100_000,
+        price=Decimal("100"),
+    )
+
+    (h,) = compute_holdings(session, user_id=user.id)
+    assert h.fx_pnl_inr_paise == 0
+    assert h.price_pnl_inr_paise == 50_000
+    assert h.unrealized_pnl_inr_paise == 50_000
+    assert h.price_pnl_inr_paise + h.fx_pnl_inr_paise == h.unrealized_pnl_inr_paise
+
+
+def test_bonus_shares_zero_cost_basis_waterfall(session: Session, user: User) -> None:
+    """Zero-cost basis bonus shares have 0 FX PnL and full unrealized in price PnL."""
+    inst = _instrument(session, user.id, current_nav=Decimal("100"))
+    _txn(session, user.id, inst.id, txn_type="bonus", units=Decimal("10"))
+
+    (h,) = compute_holdings(session, user_id=user.id)
+    assert h.invested_inr_paise == 0
+    assert h.unrealized_pnl_inr_paise == 100_000
+    assert h.fx_pnl_inr_paise == 0
+    assert h.price_pnl_inr_paise == 100_000
+    assert h.price_pnl_inr_paise + h.fx_pnl_inr_paise == h.unrealized_pnl_inr_paise
+
+
+def test_unpriced_and_missing_fx_rate_waterfall_is_none(session: Session, user: User) -> None:
+    """Priceless or FX-missing holdings have None components."""
+    usd = _usd_instrument(session, user.id, current_nav=Decimal("100"))
+    _txn(session, user.id, usd.id, txn_type="buy", units=Decimal("10"), amount_paise=100_000)
+    unpriced = _instrument(session, user.id, symbol="UNPRICED", current_nav=None)
+    _txn(session, user.id, unpriced.id, txn_type="buy", units=Decimal("10"), amount_paise=100_000)
+
+    # Missing USD/INR rate
+    holdings = compute_holdings(session, user_id=user.id, usd_inr_rate=None)
+    by_sym = {h.symbol: h for h in holdings}
+    assert by_sym["AAPL"].price_pnl_inr_paise is None
+    assert by_sym["AAPL"].fx_pnl_inr_paise is None
+    assert by_sym["UNPRICED"].price_pnl_inr_paise is None
+    assert by_sym["UNPRICED"].fx_pnl_inr_paise is None

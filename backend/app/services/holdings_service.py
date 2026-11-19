@@ -92,6 +92,8 @@ class Holding:
     invested_inr_paise: int
     current_value_inr_paise: int | None
     unrealized_pnl_inr_paise: int | None
+    price_pnl_inr_paise: int | None
+    fx_pnl_inr_paise: int | None
     nav_staleness_days: int | None
     supports_price_feed: bool
 
@@ -111,6 +113,8 @@ class HoldingsValueRollup:
     current_value_paise: int
     invested_paise: int
     unrealized_pnl_paise: int
+    price_pnl_paise: int
+    fx_pnl_paise: int
     holdings_count: int  # NAV-bearing
     null_nav_count: int
     fx_unavailable_count: int
@@ -290,6 +294,8 @@ def compute_holdings(
         unrealized: int | None = None
         current_value_inr: int | None = None
         unrealized_inr: int | None = None
+        price_pnl_inr: int | None = None
+        fx_pnl_inr: int | None = None
         if inst.current_nav is not None:
             current_value = int(
                 (net_units * inst.current_nav * 100).to_integral_value(rounding=ROUND_HALF_EVEN)
@@ -298,6 +304,16 @@ def compute_holdings(
             if fx_rate is not None:
                 current_value_inr = to_inr_paise(current_value, fx_rate)
                 unrealized_inr = current_value_inr - invested_inr_paise
+                if inst.currency == "INR":
+                    fx_pnl_inr = 0
+                    price_pnl_inr = unrealized_inr
+                else:
+                    fx_pnl_inr = sum(
+                        to_inr_paise(lot.cost_paise, fx_rate)
+                        - to_inr_paise(lot.cost_paise, lot.fx_rate_to_inr)
+                        for lot in lots
+                    )
+                    price_pnl_inr = unrealized_inr - fx_pnl_inr
 
         holdings.append(
             Holding(
@@ -315,6 +331,8 @@ def compute_holdings(
                 invested_inr_paise=invested_inr_paise,
                 current_value_inr_paise=current_value_inr,
                 unrealized_pnl_inr_paise=unrealized_inr,
+                price_pnl_inr_paise=price_pnl_inr,
+                fx_pnl_inr_paise=fx_pnl_inr,
                 # A one-element fold, so the per-row age and both portfolio-wide numbers
                 # can never disagree about what "how old" means.
                 nav_staleness_days=(
@@ -342,6 +360,8 @@ def summarize_holdings(holdings: list[Holding]) -> HoldingsValueRollup:
     """
     current_value = 0
     invested = 0
+    price_pnl = 0
+    fx_pnl = 0
     nav_bearing = 0
     null_nav = 0
     fx_unavailable = 0
@@ -357,10 +377,22 @@ def summarize_holdings(holdings: list[Holding]) -> HoldingsValueRollup:
         nav_bearing += 1
         current_value += h.current_value_inr_paise
         invested += h.invested_inr_paise
+        if h.price_pnl_inr_paise is not None:
+            price_pnl += h.price_pnl_inr_paise
+        if h.fx_pnl_inr_paise is not None:
+            fx_pnl += h.fx_pnl_inr_paise
+
+    unrealized_pnl = current_value - invested
+    assert price_pnl + fx_pnl == unrealized_pnl, (
+        f"Waterfall does not balance: price_pnl ({price_pnl}) + fx_pnl ({fx_pnl}) != "
+        f"unrealized_pnl ({unrealized_pnl})"
+    )
     return HoldingsValueRollup(
         current_value_paise=current_value,
         invested_paise=invested,
-        unrealized_pnl_paise=current_value - invested,
+        unrealized_pnl_paise=unrealized_pnl,
+        price_pnl_paise=price_pnl,
+        fx_pnl_paise=fx_pnl,
         holdings_count=nav_bearing,
         null_nav_count=null_nav,
         fx_unavailable_count=fx_unavailable,

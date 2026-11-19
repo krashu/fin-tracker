@@ -247,6 +247,9 @@ def refresh_navs_endpoint(
             yahoo_base_url=settings.yahoo_quote_base_url,
             as_of=clock.today(),
             frankfurter_base_url=settings.frankfurter_base_url,
+            check_cooldown=True,
+            cooldown_minutes=settings.nav_cooldown_minutes,
+            ttl_hours=settings.nav_quote_ttl_hours,
         )
     session.commit()
     return NavRefreshSummary.model_validate(result)

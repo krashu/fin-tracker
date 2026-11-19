@@ -25,7 +25,7 @@ from __future__ import annotations
 from datetime import date as date_t
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator, model_validator
 
@@ -424,6 +424,8 @@ class HoldingRead(BaseModel):
     invested_inr_paise: int
     current_value_inr_paise: int | None
     unrealized_pnl_inr_paise: int | None
+    price_pnl_inr_paise: int | None = None
+    fx_pnl_inr_paise: int | None = None
     nav_staleness_days: int | None
     supports_price_feed: bool
 
@@ -449,13 +451,21 @@ class AssetClassAllocation(BaseModel):
 
 
 class HoldingXirr(BaseModel):
-    """Per-holding money-weighted return, keyed by ``instrument_id`` for a
-    client-side merge into the holdings table. ``xirr`` is an annualized fraction
-    (0.12 = 12%), ``null`` when unsolvable (degenerate cashflows / no NAV).
+    """Per-holding return metric, keyed by ``instrument_id`` for a client-side merge into the
+    holdings table.
+
+    ``rate`` is the canonical return metric: simple HPR for positions held < 1 year (with
+    ``return_type="hpr"``) and annualized XIRR for positions held >= 1 year (with
+    ``return_type="xirr"``). For backward compatibility, ``xirr`` is populated for >= 1 year
+    positions and null for < 1 year.
     """
 
     instrument_id: int
     xirr: float | None
+    rate: float | None = None
+    return_type: Literal["xirr", "hpr"] | None = None
+    hpr: float | None = None
+    duration_days: int | None = None
 
 
 class PortfolioSummary(BaseModel):
@@ -465,14 +475,20 @@ class PortfolioSummary(BaseModel):
     set only (a null-NAV holding contributes ₹0, tallied in ``null_nav_count``).
     ``fx_unavailable_count`` tallies USD holdings that *are* priced but have no cached FX
     rate — excluded from the totals and the XIRR, surfaced so the number isn't silently short.
-    ``xirr`` is the portfolio-wide annualized fraction, ``null`` when unsolvable. All money is
-    INR paise (multi-currency rolled up to INR). See ``portfolio_service`` for caveats.
+    ``xirr`` is the portfolio-wide annualized fraction, ``null`` when unsolvable or < 1 year.
+    All money is INR paise (multi-currency rolled up to INR). See ``portfolio_service`` for caveats.
     """
 
     current_value_paise: int
     invested_paise: int
     unrealized_pnl_paise: int
+    price_pnl_paise: int = 0
+    fx_pnl_paise: int = 0
     xirr: float | None
+    rate: float | None = None
+    return_type: Literal["xirr", "hpr"] | None = None
+    hpr: float | None = None
+    duration_days: int | None = None
     holdings_count: int
     null_nav_count: int
     fx_unavailable_count: int

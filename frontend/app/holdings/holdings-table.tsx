@@ -28,6 +28,7 @@ import {
   getPortfolioSummary,
   listHoldings,
   type HoldingRead,
+  type HoldingXirr,
 } from "@/lib/api/client";
 import {
   formatDecimalMoney,
@@ -64,8 +65,8 @@ export function HoldingsTable() {
     (s, h) => s + (h.current_value_inr_paise ?? 0),
     0,
   );
-  const xirrByInstrument = new Map(
-    (summary.data?.holding_xirr ?? []).map((x) => [x.instrument_id, x.xirr]),
+  const returnByInstrument = new Map(
+    (summary.data?.holding_xirr ?? []).map((x) => [x.instrument_id, x]),
   );
 
   return (
@@ -82,7 +83,7 @@ export function HoldingsTable() {
             <col style={{ width: 130 }} />
             <col style={{ width: 140 }} />
             <col style={{ width: 150 }} />
-            <col style={{ width: 150 }} />
+            <col style={{ width: 170 }} />
             <col style={{ width: 80 }} />
             <col style={{ width: 100 }} />
           </colgroup>
@@ -97,7 +98,9 @@ export function HoldingsTable() {
               <Th align="right">Unrealized P&amp;L</Th>
               <Th align="right">%Alloc</Th>
               <Th align="right" last>
-                XIRR
+                <span title="Annualized XIRR for investments held ≥ 1 year; Absolute Return (HPR) for investments held < 1 year.">
+                  Return
+                </span>
               </Th>
             </tr>
           </thead>
@@ -126,7 +129,7 @@ export function HoldingsTable() {
                   last={i === rows.length - 1}
                   holding={h}
                   pricedTotal={pricedTotal}
-                  xirr={xirrByInstrument.get(h.instrument_id) ?? null}
+                  holdingReturn={returnByInstrument.get(h.instrument_id) ?? null}
                 />
               ))
             )}
@@ -141,12 +144,12 @@ function HoldingRow({
   last,
   holding,
   pricedTotal,
-  xirr,
+  holdingReturn,
 }: {
   last: boolean;
   holding: HoldingRead;
   pricedTotal: number;
-  xirr: number | null;
+  holdingReturn: HoldingXirr | null;
 }) {
   const border = last ? "" : "border-b border-border/70";
   const c = holding.currency;
@@ -169,15 +172,20 @@ function HoldingRow({
   // prices" is unactionable advice — the user is the price source.
   const manuallyPriced = !holding.supports_price_feed;
 
-  // xirr is null whenever the summary hasn't resolved or the value is unsolvable
-  // — both render "—" (no sign, muted).
-  const xirrSign = xirr == null ? "" : xirr > 0 ? "+" : xirr < 0 ? "−" : "";
-  const xirrColor =
-    xirr == null
+  // Return rate (XIRR or HPR) and return type
+  const isZeroCost = holding.invested_native_paise === 0;
+  const rate =
+    holdingReturn?.rate ?? holdingReturn?.xirr ?? holdingReturn?.hpr ?? null;
+  const returnType =
+    holdingReturn?.return_type ?? (holdingReturn?.xirr != null ? "xirr" : null);
+
+  const rateSign = rate == null ? "" : rate > 0 ? "+" : rate < 0 ? "−" : "";
+  const rateColor =
+    rate == null
       ? "text-muted-foreground"
-      : xirr > 0
+      : rate > 0
         ? "text-pos"
-        : xirr < 0
+        : rate < 0
           ? "text-neg"
           : "text-foreground";
 
@@ -256,25 +264,65 @@ function HoldingRow({
         </div>
       </Td>
       <Td align="right" borderClass={border}>
-        <span
-          className={cn(
-            "text-[13px] font-medium",
-            pnl == null
-              ? "text-muted-foreground"
-              : pnl > 0
-                ? "text-pos"
-                : pnl < 0
-                  ? "text-neg"
-                  : "text-foreground",
-          )}
-          style={MONO}
-        >
-          {pnl == null ? (
-            "—"
-          ) : (
-            <Sensitive>{`${sign}${formatMoney(Math.abs(pnl), c)}`}</Sensitive>
-          )}
-        </span>
+        <div className="flex flex-col items-end gap-0.5">
+          <span
+            className={cn(
+              "text-[13px] font-medium",
+              pnl == null
+                ? "text-muted-foreground"
+                : pnl > 0
+                  ? "text-pos"
+                  : pnl < 0
+                    ? "text-neg"
+                    : "text-foreground",
+            )}
+            style={MONO}
+          >
+            {pnl == null ? (
+              "—"
+            ) : (
+              <Sensitive>{`${sign}${formatMoney(Math.abs(pnl), c)}`}</Sensitive>
+            )}
+          </span>
+          {holding.currency !== "INR" &&
+          holding.price_pnl_inr_paise != null &&
+          holding.fx_pnl_inr_paise != null ? (
+            <div
+              className="flex items-center gap-1 text-[11px] leading-tight text-muted-foreground"
+              style={MONO}
+            >
+              <span>Price:</span>
+              <span
+                className={
+                  holding.price_pnl_inr_paise > 0
+                    ? "text-pos"
+                    : holding.price_pnl_inr_paise < 0
+                      ? "text-neg"
+                      : "text-muted-foreground"
+                }
+              >
+                <Sensitive>
+                  {`${holding.price_pnl_inr_paise > 0 ? "+" : holding.price_pnl_inr_paise < 0 ? "−" : ""}${formatMoney(Math.abs(holding.price_pnl_inr_paise), "INR")}`}
+                </Sensitive>
+              </span>
+              <span>·</span>
+              <span>FX:</span>
+              <span
+                className={
+                  holding.fx_pnl_inr_paise > 0
+                    ? "text-pos"
+                    : holding.fx_pnl_inr_paise < 0
+                      ? "text-neg"
+                      : "text-muted-foreground"
+                }
+              >
+                <Sensitive>
+                  {`${holding.fx_pnl_inr_paise > 0 ? "+" : holding.fx_pnl_inr_paise < 0 ? "−" : ""}${formatMoney(Math.abs(holding.fx_pnl_inr_paise), "INR")}`}
+                </Sensitive>
+              </span>
+            </div>
+          ) : null}
+        </div>
       </Td>
       <Td align="right" borderClass={border}>
         <span className="text-[12.5px] text-foreground/80" style={MONO}>
@@ -282,12 +330,43 @@ function HoldingRow({
         </span>
       </Td>
       <Td align="right" last borderClass={border}>
-        <span
-          className={cn("text-[12.5px] font-medium", xirrColor)}
-          style={MONO}
-        >
-          {xirr == null ? "—" : `${xirrSign}${formatPercent(Math.abs(xirr))}`}
-        </span>
+        {isZeroCost ? (
+          <span
+            className="text-[12.5px] font-medium text-muted-foreground"
+            style={MONO}
+            title="100% bonus units / zero cost basis"
+          >
+            —
+          </span>
+        ) : rate == null ? (
+          <span
+            className="text-[12.5px] font-medium text-muted-foreground"
+            style={MONO}
+          >
+            —
+          </span>
+        ) : (
+          <div className="flex flex-col items-end gap-0.5">
+            <span
+              className={cn("text-[12.5px] font-medium", rateColor)}
+              style={MONO}
+            >
+              {`${rateSign}${formatPercent(Math.abs(rate))}`}
+            </span>
+            {returnType === "hpr" ? (
+              <span
+                className="inline-flex items-center rounded bg-muted px-1 text-[10px] font-medium leading-tight text-muted-foreground"
+                title={
+                  holdingReturn?.duration_days != null
+                    ? `Held for ${holdingReturn.duration_days} days (< 1 year). Absolute return (HPR).`
+                    : "Held < 1 year. Absolute return (HPR)."
+                }
+              >
+                HPR
+              </span>
+            ) : null}
+          </div>
+        )}
       </Td>
     </tr>
   );

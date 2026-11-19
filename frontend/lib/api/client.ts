@@ -1749,6 +1749,8 @@ export type HoldingRead = {
   invested_inr_paise: number;
   current_value_inr_paise: number | null;
   unrealized_pnl_inr_paise: number | null;
+  price_pnl_inr_paise: number | null;
+  fx_pnl_inr_paise: number | null;
   /** How old the price behind `current_value` is, in calendar days; null when the
    * holding has no NAV. Server-computed on purpose — `nav_updated_at` serializes without
    * a timezone suffix, which `new Date()` would read as local time. Compare against
@@ -1831,6 +1833,10 @@ export type AssetClassAllocation = {
 export type HoldingXirr = {
   instrument_id: number;
   xirr: number | null;
+  rate?: number | null;
+  return_type?: "xirr" | "hpr" | null;
+  hpr?: number | null;
+  duration_days?: number | null;
 };
 
 /** Response of `GET /portfolio/summary` (PRD §F8 view 6). value / invested /
@@ -1842,7 +1848,13 @@ export type PortfolioSummaryResponse = {
   current_value_paise: number;
   invested_paise: number;
   unrealized_pnl_paise: number;
+  price_pnl_paise: number;
+  fx_pnl_paise: number;
   xirr: number | null;
+  rate: number | null;
+  return_type: "xirr" | "hpr" | null;
+  hpr: number | null;
+  duration_days: number | null;
   holdings_count: number;
   null_nav_count: number;
   fx_unavailable_count: number;
@@ -1876,7 +1888,8 @@ export type BenchmarkUnavailableReason =
   | "as_of_before_inception"
   | "negative_units"
   | "zero_terminal"
-  | "unsolved";
+  | "unsolved"
+  | "duration_too_short";
 
 /** Response of `GET /portfolio/performance` (PRD §F8 view 5) — the scalar alpha.
  * XIRRs / alpha are annualized fractions (0.12 = 12%; alpha in fraction-points),

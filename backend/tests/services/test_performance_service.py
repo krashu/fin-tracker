@@ -690,3 +690,33 @@ def test_usd_holding_no_fx_rate_flagged_not_raised(session: Session, user: User)
     assert perf.benchmark_unavailable_reason == "no_portfolio_cashflows"
     assert perf.alpha is None
     assert perf.fx_staleness_days is None  # no sourced holding to compute against
+
+
+def test_short_duration_portfolio_suppresses_benchmark_alpha(session: Session, user: User) -> None:
+    """ADR-0018 rule 5: Cashflow duration < 365d suppresses benchmark alpha."""
+    as_of = date(2026, 4, 1)
+    bought_on = date(2026, 1, 1)  # 90 days before as_of
+    inst = _instrument(session, user.id, current_nav=Decimal("150"))
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("10"),
+        amount_paise=100_000,
+        price=Decimal("100"),
+        on=bought_on,
+    )
+    b = _benchmark(session)
+    _nav(session, b.id, bought_on, "100")
+    _nav(session, b.id, as_of, "200")
+    session.flush()
+
+    perf = compute_portfolio_performance(session, user_id=user.id, benchmark_id=b.id, as_of=as_of)
+
+    assert perf.portfolio_xirr is None
+    assert perf.benchmark_xirr is None
+    assert perf.alpha is None
+    assert perf.benchmark_unavailable_reason == "duration_too_short"
+    assert perf.portfolio_value_paise == 150_000
+    assert perf.benchmark_value_paise == 200_000

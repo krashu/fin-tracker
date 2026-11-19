@@ -23,7 +23,12 @@ from app.models import FxRateQuote, Instrument, InvestmentTransaction, User
 from app.models.instrument import AssetClassStr
 from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.schemas import AssetClassAllocation, HoldingXirr
-from app.services.portfolio_service import _signed_cashflow, compute_portfolio_summary
+from app.services.portfolio_service import (
+    ReturnResult,
+    _signed_cashflow,
+    compute_portfolio_summary,
+    compute_return,
+)
 
 # A buy one year before the as-of date used by the XIRR arms: a 50% gain over
 # exactly 365 days solves to XIRR 0.5 (see test_golden_xirr).
@@ -285,7 +290,16 @@ def test_zero_nav_holding_is_unsolvable_and_warns_without_amounts(
     assert summary.current_value_paise == 0
     assert summary.holdings_count == 1  # current value 0 is priced, not null-NAV
     assert summary.xirr is None
-    assert summary.holding_xirr == [HoldingXirr(instrument_id=inst.id, xirr=None)]
+    assert summary.holding_xirr == [
+        HoldingXirr(
+            instrument_id=inst.id,
+            xirr=None,
+            rate=None,
+            return_type=None,
+            hpr=-1.0,
+            duration_days=365,
+        )
+    ]
 
     events = [e for e in logs if e["event"] == "portfolio.xirr_unsolved"]
     assert events  # warning fired (holding + portfolio scopes)
@@ -448,3 +462,85 @@ def test_usd_no_fx_rate_excluded_and_flagged(session: Session, user: User) -> No
     assert summary.fx_unavailable_count == 1
     assert summary.null_nav_count == 0
     assert summary.xirr is None  # no priced holding sourced
+
+
+def test_short_duration_holding_suppresses_xirr_returns_hpr() -> None:
+    """ADR-0018 rule 3: Cashflow duration < 365d suppresses XIRR, returning simple HPR."""
+    on = date(2026, 1, 1)
+    as_of = date(2026, 4, 1)  # 90 days duration
+    cashflows = [
+        (on, -100_000),  # invested ₹1000
+        (as_of, 110_000),  # current value ₹1100 (+10%)
+    ]
+
+    ret = compute_return(cashflows, as_of=as_of)
+    assert isinstance(ret, ReturnResult)
+    assert ret.return_type == "hpr"
+    assert ret.rate == 0.1
+    assert ret.xirr is None
+    assert ret.hpr == 0.1
+    assert ret.duration_days == 90
+
+
+def test_mature_holding_calculates_xirr() -> None:
+    """ADR-0018 rule 3: Cashflow duration >= 365d calculates annualized XIRR."""
+    on = date(2025, 6, 19)
+    as_of = date(2026, 6, 19)  # 365 days duration
+    cashflows = [
+        (on, -100_000),
+        (as_of, 150_000),  # +50% over exactly 1 year -> XIRR 0.5
+    ]
+
+    ret = compute_return(cashflows, as_of=as_of)
+    assert ret.return_type == "xirr"
+    assert ret.rate is not None and abs(ret.rate - 0.5) < 0.001
+    assert ret.xirr is not None and abs(ret.xirr - 0.5) < 0.001
+    assert ret.hpr == 0.5
+    assert ret.duration_days == 365
+
+
+def test_zero_invested_cashflows_guarded_against_zerodivision() -> None:
+    """ADR-0018 rule 4: Zero-cost bonus shares return None rates without ZeroDivisionError."""
+    as_of = date(2026, 4, 1)
+    # Only terminal cashflow (no outflows)
+    ret = compute_return([(as_of, 50_000)], as_of=as_of)
+    assert ret.rate is None
+    assert ret.return_type is None
+    assert ret.xirr is None
+    assert ret.hpr is None
+    assert ret.duration_days == 0
+
+    # Empty cashflows
+    empty = compute_return([], as_of=as_of)
+    assert empty.rate is None
+    assert empty.return_type is None
+    assert empty.xirr is None
+    assert empty.hpr is None
+
+
+def test_short_duration_portfolio_summary_suppresses_xirr(session: Session, user: User) -> None:
+    """PortfolioSummary suppresses XIRR when holdings are held for < 365 days."""
+    as_of = date(2026, 4, 1)
+    bought_on = date(2026, 1, 1)  # 90 days before as_of
+    inst = _instrument(session, user.id, current_nav=Decimal("150"))
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("10"),
+        amount_paise=100_000,
+        price=Decimal("100"),
+        on=bought_on,
+    )
+
+    summary = compute_portfolio_summary(session, user_id=user.id, as_of=as_of)
+    assert summary.xirr is None
+    assert summary.return_type == "hpr"
+    assert summary.rate == 0.5
+    assert summary.duration_days == 90
+    assert len(summary.holding_xirr) == 1
+    assert summary.holding_xirr[0].xirr is None
+    assert summary.holding_xirr[0].return_type == "hpr"
+    assert summary.holding_xirr[0].rate == 0.5
+    assert summary.holding_xirr[0].duration_days == 90

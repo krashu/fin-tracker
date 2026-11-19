@@ -353,6 +353,31 @@ class Settings(BaseSettings):
             "source becomes a counted warning rather than a multi-minute hang."
         ),
     )
+    nav_auto_refresh_enabled: bool = Field(
+        default=True,
+        validation_alias="NAV_AUTO_REFRESH_ENABLED",
+        description="Enable periodic background refresh of active instruments' NAVs/prices.",
+    )
+    nav_auto_refresh_interval_minutes: int = Field(
+        default=60,
+        validation_alias="NAV_AUTO_REFRESH_INTERVAL_MINUTES",
+        description="Interval in minutes between periodic automated NAV background refreshes.",
+    )
+    nav_quote_ttl_hours: int = Field(
+        default=4,
+        validation_alias="NAV_QUOTE_TTL_HOURS",
+        description="TTL in hours for cached equity quotes to avoid redundant upstream requests.",
+    )
+    nav_circuit_breaker_hours: int = Field(
+        default=2,
+        validation_alias="NAV_CIRCUIT_BREAKER_HOURS",
+        description="Cooldown duration in hours when upstream returns 429/403.",
+    )
+    nav_cooldown_minutes: int = Field(
+        default=5,
+        validation_alias="NAV_COOLDOWN_MINUTES",
+        description="Debounce cooldown in minutes for manual UI refresh requests.",
+    )
 
     @property
     def cors_origins(self) -> list[str]:

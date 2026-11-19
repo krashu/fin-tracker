@@ -115,11 +115,18 @@ def compute_portfolio_performance(
     )
 
     portfolio_xirr = summary.xirr
-    alpha = (
-        portfolio_xirr - benchmark_xirr
-        if portfolio_xirr is not None and benchmark_xirr is not None
-        else None
-    )
+    if union and (as_of - min(d for d, _ in union)).days < 365:
+        portfolio_xirr = None
+        benchmark_xirr = None
+        alpha = None
+        if reason not in ("no_benchmark_data", "no_portfolio_cashflows", "as_of_before_inception"):
+            reason = "duration_too_short"
+    else:
+        alpha = (
+            portfolio_xirr - benchmark_xirr
+            if portfolio_xirr is not None and benchmark_xirr is not None
+            else None
+        )
 
     logger.info(
         "portfolio_performance_computed",

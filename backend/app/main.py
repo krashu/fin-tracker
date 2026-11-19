@@ -22,12 +22,14 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.api.v1.router import api_router
+from app.core import clock
 from app.core.config import API_V1_PREFIX, Settings, get_settings
 from app.core.db import SessionLocal
 from app.core.log_config import configure_logging, get_logger
@@ -41,6 +43,7 @@ from app.middleware import (
 from app.models import User
 from app.services.demo_seed import seed_demo_data
 from app.services.guest_service import cleanup_expired_guests
+from app.services.nav_snapshot_service import refresh_all_active_navs
 
 logger = get_logger(__name__)
 
@@ -56,6 +59,42 @@ async def _guest_cleanup_loop() -> None:
             break
         except Exception:
             logger.exception("periodic_guest_cleanup_error")
+
+
+def _run_nav_auto_refresh(settings: Settings) -> None:
+    """Run one pass of NAV and FX refresh across active instruments in a worker thread."""
+    with SessionLocal() as session:
+        try:
+            with httpx.Client(
+                timeout=settings.nav_fetch_timeout_secs, follow_redirects=True
+            ) as client:
+                refresh_all_active_navs(
+                    session,
+                    client=client,
+                    amfi_url=settings.amfi_navall_url,
+                    yahoo_base_url=settings.yahoo_quote_base_url,
+                    as_of=clock.today(),
+                    frankfurter_base_url=settings.frankfurter_base_url,
+                    market_hours_only=True,
+                    ttl_hours=settings.nav_quote_ttl_hours,
+                )
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception("nav_auto_refresh_pass_failed")
+
+
+async def _nav_refresh_loop(settings: Settings) -> None:
+    """Periodic background task that refreshes NAVs and FX rates across active instruments."""
+    interval_seconds = max(60, settings.nav_auto_refresh_interval_minutes * 60)
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            await asyncio.to_thread(_run_nav_auto_refresh, settings)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("periodic_nav_refresh_error")
 
 
 @asynccontextmanager
@@ -104,12 +143,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     _maybe_seed_demo(settings)
     _cleanup_guests_on_startup()
     cleanup_task = asyncio.create_task(_guest_cleanup_loop())
+    nav_refresh_task: asyncio.Task[None] | None = None
+    if settings.nav_auto_refresh_enabled:
+        nav_refresh_task = asyncio.create_task(_nav_refresh_loop(settings))
     try:
         yield
     finally:
         cleanup_task.cancel()
+        if nav_refresh_task is not None:
+            nav_refresh_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
+        if nav_refresh_task is not None:
+            with suppress(asyncio.CancelledError):
+                await nav_refresh_task
 
 
 def _cleanup_guests_on_startup() -> None:

@@ -33,7 +33,9 @@ Scope caveats (current-portfolio):
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
+from typing import Literal
 from uuid import UUID
 
 import pyxirr
@@ -49,6 +51,23 @@ from app.services.fx_service import rate_on
 from app.services.holdings_service import Holding, compute_holdings, summarize_holdings
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnResult:
+    """Holding or portfolio return metric with short-holding-period guard (ADR-0018).
+
+    For duration < 365 days, annualized XIRR is suppressed to prevent extreme
+    compounding distortions, falling back to simple Holding Period Return (HPR).
+    For duration >= 365 days, XIRR is computed via pyxirr with HPR as auxiliary context.
+    For zero-invested positions (e.g. 100% bonus shares), percentage rates return None.
+    """
+
+    rate: float | None
+    return_type: Literal["xirr", "hpr"] | None
+    xirr: float | None
+    hpr: float | None
+    duration_days: int | None
 
 
 def compute_portfolio_summary(session: Session, *, user_id: UUID, as_of: date) -> PortfolioSummary:
@@ -85,37 +104,50 @@ def compute_portfolio_summary(session: Session, *, user_id: UUID, as_of: date) -
 
     # XIRR — re-fold investment_transactions for the NAV-bearing instruments only.
     holding_xirr: list[HoldingXirr]
-    portfolio_xirr: float | None
+    portfolio_ret: ReturnResult | None
     if not priced:
         holding_xirr = []
-        portfolio_xirr = None
+        portfolio_ret = None
     else:
         sourced_ids = [h.instrument_id for h, _ in priced]
         cashflows = _source_portfolio_cashflows(session, user_id=user_id, sourced_ids=sourced_ids)
 
         # Per holding: its own flows + a terminal at its current value.
-        holding_xirr = [
-            HoldingXirr(
+        holding_xirr = []
+        for h, value in priced:
+            ret = compute_return(
+                [*cashflows[h.instrument_id], (as_of, value)],
+                as_of=as_of,
+                scope="holding",
                 instrument_id=h.instrument_id,
-                xirr=_safe_xirr(
-                    [*cashflows[h.instrument_id], (as_of, value)],
-                    scope="holding",
-                    instrument_id=h.instrument_id,
-                ),
             )
-            for h, value in priced
-        ]
+            holding_xirr.append(
+                HoldingXirr(
+                    instrument_id=h.instrument_id,
+                    xirr=ret.xirr,
+                    rate=ret.rate,
+                    return_type=ret.return_type,
+                    hpr=ret.hpr,
+                    duration_days=ret.duration_days,
+                )
+            )
 
         # Portfolio-wide: union of every sourced flow + ONE terminal (Σ current value).
         union = [flow for flows in cashflows.values() for flow in flows]
         union.append((as_of, rollup.current_value_paise))
-        portfolio_xirr = _safe_xirr(union, scope="portfolio")
+        portfolio_ret = compute_return(union, as_of=as_of, scope="portfolio")
 
     return PortfolioSummary(
         current_value_paise=rollup.current_value_paise,
         invested_paise=rollup.invested_paise,
         unrealized_pnl_paise=rollup.unrealized_pnl_paise,
-        xirr=portfolio_xirr,
+        price_pnl_paise=rollup.price_pnl_paise,
+        fx_pnl_paise=rollup.fx_pnl_paise,
+        xirr=portfolio_ret.xirr if portfolio_ret is not None else None,
+        rate=portfolio_ret.rate if portfolio_ret is not None else None,
+        return_type=portfolio_ret.return_type if portfolio_ret is not None else None,
+        hpr=portfolio_ret.hpr if portfolio_ret is not None else None,
+        duration_days=portfolio_ret.duration_days if portfolio_ret is not None else None,
         holdings_count=rollup.holdings_count,
         null_nav_count=rollup.null_nav_count,
         fx_unavailable_count=rollup.fx_unavailable_count,
@@ -204,3 +236,48 @@ def _safe_xirr(
         logger.warning("portfolio.xirr_unsolved", scope=scope, instrument_id=instrument_id)
         return None
     return float(result)
+
+
+def compute_return(
+    cashflows: list[tuple[date, int]],
+    *,
+    as_of: date,
+    scope: str = "holding",
+    instrument_id: int | None = None,
+) -> ReturnResult:
+    """Calculate return metric with short-holding-period HPR guard (ADR-0018).
+
+    - If total invested outflows (CF < 0) == 0 (e.g. 100% bonus shares),
+      return rate=None, return_type=None, xirr=None, hpr=None.
+    - If cashflow duration delta_t = (as_of - min(dates)).days < 365:
+      suppress annualized XIRR (xirr=None), calculate simple HPR (Holding Period Return):
+      HPR = (sum(CF > 0) - sum(|CF < 0|)) / sum(|CF < 0|)
+      return ReturnResult(rate=hpr, return_type="hpr", xirr=None, hpr=hpr, duration_days=delta_t).
+    - If delta_t >= 365:
+      solve annualized XIRR via pyxirr.
+      If solvable: ReturnResult(rate=xirr, return_type="xirr", xirr=xirr,
+                                hpr=hpr, duration_days=delta_t).
+      If unsolvable: ReturnResult(rate=None, return_type=None, xirr=None,
+                                  hpr=hpr, duration_days=delta_t).
+    """
+    if not cashflows:
+        return ReturnResult(rate=None, return_type=None, xirr=None, hpr=None, duration_days=0)
+
+    dates = [d for d, _ in cashflows]
+    delta_t = (as_of - min(dates)).days
+
+    invested = sum(-cf for _, cf in cashflows if cf < 0)
+    proceeds = sum(cf for _, cf in cashflows if cf > 0)
+
+    if invested == 0:
+        return ReturnResult(rate=None, return_type=None, xirr=None, hpr=None, duration_days=delta_t)
+
+    hpr = float(proceeds - invested) / float(invested)
+
+    if delta_t < 365:
+        return ReturnResult(rate=hpr, return_type="hpr", xirr=None, hpr=hpr, duration_days=delta_t)
+
+    xirr = _safe_xirr(cashflows, scope=scope, instrument_id=instrument_id)
+    if xirr is None:
+        return ReturnResult(rate=None, return_type=None, xirr=None, hpr=hpr, duration_days=delta_t)
+    return ReturnResult(rate=xirr, return_type="xirr", xirr=xirr, hpr=hpr, duration_days=delta_t)

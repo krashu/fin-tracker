@@ -43,6 +43,8 @@ def test_holding_after_buy(client: TestClient, seeded_user: User, instrument: In
     assert h["current_nav"] == "150"
     assert h["current_value_native_paise"] == 150_000
     assert h["unrealized_pnl_native_paise"] == 50_000
+    assert h["price_pnl_inr_paise"] == 50_000
+    assert h["fx_pnl_inr_paise"] == 0
     assert h["supports_price_feed"] is True
 
 
@@ -71,6 +73,8 @@ def test_holding_without_nav_nulls_value(client: TestClient, seeded_user: User) 
     assert h["current_nav"] is None
     assert h["current_value_native_paise"] is None
     assert h["unrealized_pnl_native_paise"] is None
+    assert h["price_pnl_inr_paise"] is None
+    assert h["fx_pnl_inr_paise"] is None
     assert h["invested_native_paise"] == 100_000
     # No price ⇒ no valuation to be stale. 0 would read as "priced, and current".
     assert h["nav_staleness_days"] is None

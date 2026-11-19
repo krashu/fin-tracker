@@ -13,16 +13,26 @@ no-advance re-run; and that both write paths stamp ``nav_updated_at`` **naive**.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
 import httpx
+import pytest
 from sqlalchemy.orm import Session
 
 from app.models import Instrument, User
-from app.services.nav_snapshot_service import refresh_navs
+from app.services.nav_snapshot_service import refresh_navs, reset_nav_state
+
+
+@pytest.fixture(autouse=True)
+def _clean_nav_state() -> Iterator[None]:
+    reset_nav_state()
+    yield
+    reset_nav_state()
+
 
 _AMFI_URL = "https://amfi.test/NAVAll.txt"
 _NAVALL_BODY = (
@@ -106,12 +116,14 @@ def _equity_404(request: httpx.Request) -> httpx.Response:
 def _equity(  # type: ignore[no-untyped-def]
     session: Session, user_id: UUID, symbol: str, exchange: str = "NSE", **kw
 ) -> Instrument:
+    asset_class = kw.pop("asset_class", "indian_equity")
+    currency = kw.pop("currency", "INR")
     inst = Instrument(
         user_id=user_id,
         symbol=symbol,
         name=symbol,
-        asset_class="indian_equity",
-        currency="INR",
+        asset_class=asset_class,
+        currency=currency,
         exchange=exchange,
         **kw,
     )
@@ -541,3 +553,310 @@ def test_refresh_navs_with_frankfurter_refreshes_fx_rates(session: Session, user
     )
     assert rate_row is not None
     assert rate_row.rate == Decimal("89.5")
+
+
+def test_market_hours_helpers() -> None:
+    from datetime import datetime
+
+    from app.core.clock import BUSINESS_TZ
+    from app.services.nav_snapshot_service import (
+        is_amfi_nav_window_open,
+        is_indian_equity_market_open,
+        is_us_equity_market_open,
+    )
+
+    # 1. Indian equity: Mon 11:30 AM IST (open) vs Mon 08:30 AM IST (closed)
+    # vs Sat 11:30 AM (closed)
+    mon_open = datetime(2026, 6, 22, 11, 30, tzinfo=BUSINESS_TZ)  # Monday
+    mon_early = datetime(2026, 6, 22, 8, 30, tzinfo=BUSINESS_TZ)
+    sat_open = datetime(2026, 6, 27, 11, 30, tzinfo=BUSINESS_TZ)  # Saturday
+    assert is_indian_equity_market_open(mon_open) is True
+    assert is_indian_equity_market_open(mon_early) is False
+    assert is_indian_equity_market_open(sat_open) is False
+
+    # 2. US equity: Mon 20:30 IST (open), Tue 01:30 IST (open), Sat 01:30 IST (open),
+    # Sun 20:30 (closed)
+    mon_night = datetime(2026, 6, 22, 20, 30, tzinfo=BUSINESS_TZ)  # Monday night
+    tue_early = datetime(2026, 6, 23, 1, 30, tzinfo=BUSINESS_TZ)  # Tuesday morning
+    sat_early = datetime(2026, 6, 27, 1, 30, tzinfo=BUSINESS_TZ)  # Saturday 01:30 IST
+    sun_night = datetime(2026, 6, 28, 20, 30, tzinfo=BUSINESS_TZ)  # Sunday night
+    tue_noon = datetime(2026, 6, 23, 12, 0, tzinfo=BUSINESS_TZ)  # Tuesday noon
+    assert is_us_equity_market_open(mon_night) is True
+    assert is_us_equity_market_open(tue_early) is True
+    assert is_us_equity_market_open(sat_early) is True
+    assert is_us_equity_market_open(sun_night) is False
+    assert is_us_equity_market_open(tue_noon) is False
+
+    # 3. AMFI NAV window: Mon 21:30 IST (open) vs Mon 15:00 IST (closed) vs Sat 21:30 IST (closed)
+    mon_amfi_open = datetime(2026, 6, 22, 21, 30, tzinfo=BUSINESS_TZ)
+    mon_amfi_closed = datetime(2026, 6, 22, 15, 0, tzinfo=BUSINESS_TZ)
+    sat_amfi_closed = datetime(2026, 6, 27, 21, 30, tzinfo=BUSINESS_TZ)
+    assert is_amfi_nav_window_open(mon_amfi_open) is True
+    assert is_amfi_nav_window_open(mon_amfi_closed) is False
+    assert is_amfi_nav_window_open(sat_amfi_closed) is False
+
+
+def test_ticker_deduplication_across_users(session: Session, user: User) -> None:
+    import uuid
+
+    from app.services.nav_snapshot_service import refresh_all_active_navs
+
+    # Create second user
+    user2 = User(id=uuid.uuid4(), email="user2@test.com")
+    session.add(user2)
+    session.flush()
+
+    # User 1 holds AAPL, User 2 also holds AAPL
+    aapl1 = Instrument(
+        user_id=user.id,
+        symbol="AAPL",
+        name="Apple Inc",
+        asset_class="us_equity",
+        currency="USD",
+        exchange="NASDAQ",
+    )
+    aapl2 = Instrument(
+        user_id=user2.id,
+        symbol="AAPL",
+        name="Apple Inc",
+        asset_class="us_equity",
+        currency="USD",
+        exchange="NASDAQ",
+    )
+    session.add_all([aapl1, aapl2])
+    session.flush()
+
+    yahoo_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal yahoo_calls
+        if "/AAPL" in str(request.url):
+            yahoo_calls += 1
+            return httpx.Response(200, json=_yahoo_body(price=195.0))
+        return httpx.Response(404)
+
+    with _client(handler) as client:
+        result = refresh_all_active_navs(
+            session,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            market_hours_only=False,
+            pacing_delay_max=0,
+        )
+
+    # AAPL should be fetched only ONCE despite two users holding it
+    assert yahoo_calls == 1
+    assert result.equity_updated == 2
+    assert aapl1.current_nav == Decimal("195.0")
+    assert aapl2.current_nav == Decimal("195.0")
+
+
+def test_quote_ttl_cache(session: Session, user: User) -> None:
+    _equity(session, user.id, "INFY", exchange="NSE")
+    yahoo_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal yahoo_calls
+        yahoo_calls += 1
+        return httpx.Response(200, json=_yahoo_body(price=1600.0))
+
+    with _client(handler) as client:
+        # First call fetches from network
+        res1 = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            ttl_hours=4,
+        )
+        assert res1.equity_updated == 1
+        assert yahoo_calls == 1
+
+        # Second call within TTL reuses cached quote without network call
+        res2 = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            ttl_hours=4,
+        )
+        assert res2.equity_updated == 1
+        assert yahoo_calls == 1
+
+
+def test_frankfurter_db_short_circuit(session: Session, user: User) -> None:
+    from app.models import FxRateQuote
+
+    # Pre-seed today's USD->INR rate in the database
+    today_rate = FxRateQuote(
+        from_currency="USD",
+        to_currency="INR",
+        date=_AS_OF,
+        rate=Decimal("89.75"),
+        source="frankfurter",
+    )
+    session.add(today_rate)
+
+    _equity(session, user.id, "AAPL", exchange="NASDAQ", currency="USD", asset_class="us_equity")
+    session.flush()
+
+    frankfurter_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal frankfurter_calls
+        if "frankfurter" in str(request.url):
+            frankfurter_calls += 1
+            return httpx.Response(200, json={"rates": {"INR": 90.0}})
+        return httpx.Response(200, json=_yahoo_body())
+
+    with _client(handler) as client:
+        result = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            frankfurter_base_url="https://frankfurter.test",
+        )
+
+    assert result.equity_updated == 1
+    # Frankfurter network endpoint was short-circuited because DB already had today's rate
+    assert frankfurter_calls == 0
+
+
+def test_circuit_breaker_on_429(session: Session, user: User) -> None:
+    from app.services.nav_snapshot_service import is_circuit_breaker_tripped
+
+    _equity(session, user.id, "MSFT", exchange="NASDAQ", currency="USD", asset_class="us_equity")
+
+    network_calls = 0
+
+    def rate_limited_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        return httpx.Response(429, json={"error": "Too Many Requests"})
+
+    with _client(rate_limited_handler) as client:
+        res1 = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+        )
+        assert res1.fetch_errors == 1
+        assert is_circuit_breaker_tripped() is True
+        assert network_calls == 1
+
+        # Subsequent call should immediately short-circuit without network attempt
+        res2 = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+        )
+        assert "Circuit breaker active" in res2.warnings[0]
+        assert network_calls == 1
+
+
+def test_cooldown_debounce(session: Session, user: User) -> None:
+    _equity(session, user.id, "RELIANCE", exchange="NSE")
+
+    with _client(lambda req: httpx.Response(200, json=_yahoo_body())) as client:
+        res1 = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            check_cooldown=True,
+            cooldown_minutes=5,
+        )
+        assert res1.equity_updated == 1
+        assert res1.warnings == []
+
+        # Rapid second call within 5 minutes returns cooldown advisory
+        res2 = refresh_navs(
+            session,
+            user_id=user.id,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            check_cooldown=True,
+            cooldown_minutes=5,
+        )
+        assert res2.equity_updated == 0
+        assert "Cooldown active" in res2.warnings[0]
+
+
+def test_refresh_all_active_navs_full(session: Session, user: User) -> None:
+    from app.services.nav_snapshot_service import refresh_all_active_navs
+
+    # Add MF, Indian equity, US equity, and unpriced gold
+    mf = _mf(session, user.id, _GROWTH_ISIN, isin=_GROWTH_ISIN)
+    eq_in = _equity(session, user.id, "TCS", exchange="NSE")
+    eq_us = Instrument(
+        user_id=user.id,
+        symbol="GOOGL",
+        name="Alphabet Inc",
+        asset_class="us_equity",
+        currency="USD",
+        exchange="NASDAQ",
+    )
+    gold = Instrument(
+        user_id=user.id,
+        symbol="GOLD",
+        name="Physical Gold",
+        asset_class="gold",
+        currency="INR",
+        exchange="OTHER",
+    )
+    session.add_all([eq_us, gold])
+    session.flush()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if url_str.startswith(_AMFI_URL):
+            return httpx.Response(200, content=_NAVALL_BODY)
+        if "frankfurter.test" in url_str:
+            return httpx.Response(
+                200,
+                json={
+                    "amount": 1.0,
+                    "base": "USD",
+                    "date": "2026-06-25",
+                    "rates": {"INR": 89.5},
+                },
+            )
+        return httpx.Response(200, json=_yahoo_body(price=2500.0))
+
+    with _client(handler) as client:
+        result = refresh_all_active_navs(
+            session,
+            client=client,
+            amfi_url=_AMFI_URL,
+            yahoo_base_url=_YAHOO_URL,
+            as_of=_AS_OF,
+            frankfurter_base_url="https://frankfurter.test",
+            market_hours_only=False,
+            pacing_delay_max=0,
+        )
+
+    assert result.mf_updated == 1
+    assert result.equity_updated == 2  # TCS + GOOGL
+    assert result.skipped == 1  # gold
+    assert mf.current_nav == _NAV_119551
+    assert eq_in.current_nav == Decimal("2500.0")
+    assert eq_us.current_nav == Decimal("2500.0")

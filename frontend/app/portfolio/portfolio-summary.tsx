@@ -61,7 +61,9 @@ export function PortfolioSummary() {
 
   const pnl = data?.unrealized_pnl_paise ?? 0;
   const invested = data?.invested_paise ?? 0;
-  const xirr = data?.xirr ?? null;
+  const rate = data?.rate ?? data?.xirr ?? data?.hpr ?? null;
+  const returnType =
+    data?.return_type ?? (data?.xirr != null ? "xirr" : null);
 
   // Every holding unpriced: value is ₹0 by the null-NAV rule, so pnl = −invested
   // and pnl/invested = −100% — a misleading "total loss" when we simply can't
@@ -77,18 +79,24 @@ export function PortfolioSummary() {
   // value (all unpriced) — suppress in both cases.
   const pnlPct = ready && invested > 0 && !allUnpriced ? pnl / invested : null;
 
-  const xirrSign = xirr == null ? "" : xirr > 0 ? "+" : xirr < 0 ? "−" : "";
-  const xirrColor =
-    xirr == null
+  const rateSign = rate == null ? "" : rate > 0 ? "+" : rate < 0 ? "−" : "";
+  const rateColor =
+    rate == null
       ? "text-muted-foreground"
-      : xirr > 0
+      : rate > 0
         ? "text-pos"
-        : xirr < 0
+        : rate < 0
           ? "text-neg"
           : "text-foreground";
 
   return (
     <div className="mt-6 flex flex-col gap-5">
+      {ready && data.holdings_count > 0 ? (
+        <div className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
+          <span className="size-1.5 rounded-full bg-emerald-500" />
+          <span>Prices up to date</span>
+        </div>
+      ) : null}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <Tile
           label="Current value"
@@ -127,12 +135,52 @@ export function PortfolioSummary() {
         <Tile
           label="Unrealized P&L"
           sub={
-            pnlPct == null ? null : (
-              <span className={pnlColor}>
-                {pnlSign}
-                {formatPercent(Math.abs(pnlPct))}
-              </span>
-            )
+            ready && !allUnpriced ? (
+              <div className="flex flex-col gap-0.5">
+                {pnlPct == null ? null : (
+                  <span className={pnlColor}>
+                    {pnlSign}
+                    {formatPercent(Math.abs(pnlPct))}
+                  </span>
+                )}
+                {data.fx_pnl_paise !== 0 ? (
+                  <div
+                    className="flex items-center gap-1 text-[10.5px] leading-tight text-muted-foreground"
+                    style={MONO}
+                  >
+                    <span>Asset:</span>
+                    <span
+                      className={
+                        data.price_pnl_paise > 0
+                          ? "text-pos"
+                          : data.price_pnl_paise < 0
+                            ? "text-neg"
+                            : "text-muted-foreground"
+                      }
+                    >
+                      <Sensitive>
+                        {`${data.price_pnl_paise > 0 ? "+" : data.price_pnl_paise < 0 ? "−" : ""}${formatINR(Math.abs(data.price_pnl_paise))}`}
+                      </Sensitive>
+                    </span>
+                    <span>·</span>
+                    <span>FX:</span>
+                    <span
+                      className={
+                        data.fx_pnl_paise > 0
+                          ? "text-pos"
+                          : data.fx_pnl_paise < 0
+                            ? "text-neg"
+                            : "text-muted-foreground"
+                      }
+                    >
+                      <Sensitive>
+                        {`${data.fx_pnl_paise > 0 ? "+" : data.fx_pnl_paise < 0 ? "−" : ""}${formatINR(Math.abs(data.fx_pnl_paise))}`}
+                      </Sensitive>
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+            ) : null
           }
         >
           <span className={cn(FIGURE, pnlColor)} style={MONO}>
@@ -148,23 +196,40 @@ export function PortfolioSummary() {
         </Tile>
 
         <Tile
-          label="XIRR"
+          label={
+            returnType === "hpr" ? (
+              <div className="flex items-center gap-1.5">
+                <span>RETURN (HPR)</span>
+                <span
+                  className="rounded bg-muted px-1 py-0.5 text-[9px] font-medium text-muted-foreground"
+                  title="Portfolio held < 1 year. Annualized XIRR suppressed."
+                >
+                  Holding &lt; 1y
+                </span>
+              </div>
+            ) : (
+              "XIRR"
+            )
+          }
           sub={
-            <span className="text-muted-foreground">on current holdings</span>
+            returnType === "hpr" ? (
+              <span className="text-muted-foreground">
+                {`absolute return${data?.duration_days != null ? ` over ${data.duration_days}d` : ""}`}
+              </span>
+            ) : (
+              <span className="text-muted-foreground">
+                annualized on current holdings
+              </span>
+            )
           }
         >
           <span
-            className={cn(FIGURE, "tabular-nums", xirrColor)}
+            className={cn(FIGURE, "tabular-nums", rateColor)}
             style={TABULAR}
           >
-            {!ready || xirr == null ? (
-              DASH
-            ) : (
-              <>
-                {xirrSign}
-                {formatPercent(Math.abs(xirr))}
-              </>
-            )}
+            {!ready || rate == null
+              ? DASH
+              : `${rateSign}${formatPercent(Math.abs(rate))}`}
           </span>
         </Tile>
       </div>

@@ -50,6 +50,7 @@ BenchmarkUnavailableReason = Literal[
     "negative_units",
     "zero_terminal",
     "unsolved",
+    "duration_too_short",
 ]
 
 

@@ -54,6 +54,8 @@ const REASON_TEXT: Record<BenchmarkUnavailableReason, string> = {
     "Your withdrawals outweigh contributions in this counterfactual — alpha isn't meaningful here.",
   zero_terminal: "Not enough data to value the benchmark counterfactual.",
   unsolved: "The benchmark return couldn't be solved for these cashflows.",
+  duration_too_short:
+    "Benchmark comparison requires at least 1 year of cashflow history.",
 };
 
 export function PortfolioPerformance() {

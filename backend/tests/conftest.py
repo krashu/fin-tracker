@@ -97,6 +97,20 @@ os.environ["SEED_DEMO_ON_STARTUP"] = "false"
 # own ``Settings(_env_file=None, ...)``.
 os.environ["REGISTRATION_ENABLED"] = "true"
 
+# Automated NAV background refresh must not run in the background during tests.
+# Force off here so no periodic loop runs or hits external price endpoints.
+os.environ["NAV_AUTO_REFRESH_ENABLED"] = "false"
+
+
+@pytest.fixture(autouse=True)
+def _reset_nav_state_fixture() -> Iterator[None]:
+    """Clear NAV quote cache and circuit breaker between tests."""
+    from app.services.nav_snapshot_service import reset_nav_state
+
+    reset_nav_state()
+    yield
+    reset_nav_state()
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _configure_structlog_for_tests() -> None:
