@@ -155,6 +155,13 @@ function HoldingRow({
   const c = holding.currency;
   const pnl = holding.unrealized_pnl_native_paise;
   const sign = pnl == null ? "" : pnl > 0 ? "+" : pnl < 0 ? "−" : "";
+  const inrPnl = holding.unrealized_pnl_inr_paise;
+  const inrSign = inrPnl == null ? "" : inrPnl > 0 ? "+" : inrPnl < 0 ? "−" : "";
+  const pricePnl = holding.price_pnl_inr_paise;
+  const priceSign =
+    pricePnl == null ? "" : pricePnl > 0 ? "+" : pricePnl < 0 ? "−" : "";
+  const fxPnl = holding.fx_pnl_inr_paise;
+  const fxSign = fxPnl == null ? "" : fxPnl > 0 ? "+" : fxPnl < 0 ? "−" : "";
 
   // %Alloc uses the INR rollup for this row and the denominator alike (never
   // native — see file docstring). "—" when the priced total is 0 (all-null-NAV /
@@ -284,43 +291,20 @@ function HoldingRow({
               <Sensitive>{`${sign}${formatMoney(Math.abs(pnl), c)}`}</Sensitive>
             )}
           </span>
-          {holding.currency !== "INR" &&
-          holding.price_pnl_inr_paise != null &&
-          holding.fx_pnl_inr_paise != null ? (
-            <div
-              className="flex items-center gap-1 text-[11px] leading-tight text-muted-foreground"
+          {holding.currency !== "INR" && inrPnl != null ? (
+            <span
+              className="cursor-help border-b border-dotted border-muted-foreground/60 text-[11px] leading-tight text-muted-foreground whitespace-nowrap"
               style={MONO}
+              title={
+                pricePnl != null && fxPnl != null
+                  ? `Price: ${priceSign}${formatMoney(Math.abs(pricePnl), "INR")} · FX: ${fxSign}${formatMoney(Math.abs(fxPnl), "INR")}`
+                  : `INR P&L: ${inrSign}${formatMoney(Math.abs(inrPnl), "INR")}`
+              }
             >
-              <span>Price:</span>
-              <span
-                className={
-                  holding.price_pnl_inr_paise > 0
-                    ? "text-pos"
-                    : holding.price_pnl_inr_paise < 0
-                      ? "text-neg"
-                      : "text-muted-foreground"
-                }
-              >
-                <Sensitive>
-                  {`${holding.price_pnl_inr_paise > 0 ? "+" : holding.price_pnl_inr_paise < 0 ? "−" : ""}${formatMoney(Math.abs(holding.price_pnl_inr_paise), "INR")}`}
-                </Sensitive>
-              </span>
-              <span>·</span>
-              <span>FX:</span>
-              <span
-                className={
-                  holding.fx_pnl_inr_paise > 0
-                    ? "text-pos"
-                    : holding.fx_pnl_inr_paise < 0
-                      ? "text-neg"
-                      : "text-muted-foreground"
-                }
-              >
-                <Sensitive>
-                  {`${holding.fx_pnl_inr_paise > 0 ? "+" : holding.fx_pnl_inr_paise < 0 ? "−" : ""}${formatMoney(Math.abs(holding.fx_pnl_inr_paise), "INR")}`}
-                </Sensitive>
-              </span>
-            </div>
+              <Sensitive>
+                {`${inrSign}${formatMoney(Math.abs(inrPnl), "INR")}`}
+              </Sensitive>
+            </span>
           ) : null}
         </div>
       </Td>

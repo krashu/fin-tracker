@@ -122,7 +122,7 @@ describe("HoldingsTable", () => {
       ),
     );
 
-    renderWithProviders(<HoldingsTable />);
+    renderWithProviders(<HoldingsTable />, { initialBalanceHidden: false });
 
     const returnHeader = await screen.findByText("Return");
     expect(returnHeader).toBeInTheDocument();
@@ -142,7 +142,7 @@ describe("HoldingsTable", () => {
       ),
     );
 
-    renderWithProviders(<HoldingsTable />);
+    renderWithProviders(<HoldingsTable />, { initialBalanceHidden: false });
 
     // INFY is mature (duration 500d) -> renders +18.4%
     expect(await screen.findByText("+18.4%")).toBeInTheDocument();
@@ -157,7 +157,7 @@ describe("HoldingsTable", () => {
     );
   });
 
-  it("renders dual price and FX breakdown for USD holdings and hides for INR holdings", async () => {
+  it("renders dual price and FX breakdown tooltip for USD holdings and hides for INR holdings", async () => {
     server.use(
       http.get("*/api/v1/holdings", () =>
         HttpResponse.json({ holdings: mockHoldings }),
@@ -167,15 +167,23 @@ describe("HoldingsTable", () => {
       ),
     );
 
-    renderWithProviders(<HoldingsTable />);
+    renderWithProviders(<HoldingsTable />, { initialBalanceHidden: false });
 
-    // USD holding (AAPL) shows Price: ... · FX: ...
-    expect(await screen.findByText("Price:")).toBeInTheDocument();
-    expect(screen.getByText("FX:")).toBeInTheDocument();
+    // USD holding (AAPL) shows total INR P&L with Price & FX breakdown in title tooltip
+    const breakdownEl = await screen.findByTitle(/Price:.*FX:/);
+    expect(breakdownEl).toBeInTheDocument();
+    expect(breakdownEl).toHaveAttribute(
+      "title",
+      expect.stringContaining("Price:"),
+    );
+    expect(breakdownEl).toHaveAttribute(
+      "title",
+      expect.stringContaining("FX:"),
+    );
+    expect(breakdownEl).toHaveTextContent(/11,300\.00/);
 
-    // Only one Price: / FX: appears in the document (from AAPL, none for INFY or BONUS_SHARE)
-    expect(screen.getAllByText("Price:")).toHaveLength(1);
-    expect(screen.getAllByText("FX:")).toHaveLength(1);
+    // Only one Price: / FX: breakdown tooltip appears (from AAPL, none for INFY or BONUS_SHARE)
+    expect(screen.getAllByTitle(/Price:.*FX:/)).toHaveLength(1);
   });
 
   it("renders dash with zero-cost basis tooltip for bonus share holdings", async () => {
@@ -188,7 +196,7 @@ describe("HoldingsTable", () => {
       ),
     );
 
-    renderWithProviders(<HoldingsTable />);
+    renderWithProviders(<HoldingsTable />, { initialBalanceHidden: false });
 
     const bonusDash = await screen.findByTitle(
       "100% bonus units / zero cost basis",
