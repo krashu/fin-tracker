@@ -132,6 +132,7 @@ from app.services.reconciliation_service import (
     card_bill_transfer_gate,
     is_card_bill_debit_row,
     is_card_payment_row,
+    is_cc_payment,
     reconcile_batch,
     rows_removed_since_import,
 )
@@ -804,8 +805,33 @@ def commit_import_batch(
     # rule 7). Per-row savepoint inside the service.
     # Must run BEFORE pass 3 so any transaction_type flip lands before
     # learn_merchant_memory's should_learn_tag eligibility check.
-    for txn in rows:
-        auto_link_cc_bill(session, user_id=user_id, txn=txn)
+    batch_acct = session.get(Account, batch.account_id) if batch.account_id is not None else None
+    if batch_acct is not None:
+        if batch_acct.type == "credit_card":
+            for txn in rows:
+                if (
+                    txn.amount_paise > 0
+                    and txn.transaction_type in ("income", "transfer")
+                    and is_cc_payment(txn.merchant_normalized)
+                ):
+                    auto_link_cc_bill(session, user_id=user_id, txn=txn)
+        elif batch_acct.type == "bank":
+            has_child_cards = (
+                session.scalar(
+                    select(Account.id)
+                    .where(
+                        Account.user_id == user_id,
+                        Account.parent_account_id == batch_acct.id,
+                        Account.archived_at.is_(None),
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
+            if has_child_cards:
+                for txn in rows:
+                    if txn.amount_paise < 0 and txn.transaction_type in ("spend", "transfer"):
+                        auto_link_cc_bill(session, user_id=user_id, txn=txn)
 
     # Pass 3: emit the F3 (category) + F3a (label) learning signal per row via
     # the shared ``learn_merchant_memory`` — the SAME helper POST/PATCH and the

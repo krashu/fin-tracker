@@ -15,7 +15,7 @@ from collections import deque
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import get_args
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from app.models.instrument import AssetClassStr
 from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.services.holdings_service import (
     UNIT_SIGN,
+    Holding,
     _apply,
     compute_holdings,
     max_staleness_days,
@@ -999,3 +1000,33 @@ def test_unpriced_and_missing_fx_rate_waterfall_is_none(session: Session, user: 
     assert by_sym["AAPL"].fx_pnl_inr_paise is None
     assert by_sym["UNPRICED"].price_pnl_inr_paise is None
     assert by_sym["UNPRICED"].fx_pnl_inr_paise is None
+
+
+def test_summarize_holdings_absorbs_rounding_imbalance() -> None:
+    """ADR-0018: Rollup absorbs minor lot-rounding residual into price_pnl rather than crashing."""
+    h = Holding(
+        instrument_id=uuid4(),
+        symbol="MOCK",
+        name="Mock Asset",
+        asset_class="us_equity",
+        currency="USD",
+        net_units=Decimal("10"),
+        avg_cost_native=Decimal("100"),
+        invested_native_paise=100_000,
+        current_nav=Decimal("150"),
+        current_value_native_paise=150_000,
+        unrealized_pnl_native_paise=50_000,
+        invested_inr_paise=8_000_000,
+        current_value_inr_paise=12_000_001,  # 1 paisa rounding artifact
+        unrealized_pnl_inr_paise=4_000_001,
+        price_pnl_inr_paise=2_500_000,
+        fx_pnl_inr_paise=1_500_000,  # sum is 4_000_000, diff of 1 paisa vs 4_000_001
+        nav_staleness_days=0,
+        supports_price_feed=True,
+    )
+    rollup = summarize_holdings([h])
+    assert rollup.unrealized_pnl_paise == 4_000_001
+    assert rollup.fx_pnl_paise == 1_500_000
+    # price_pnl absorbed the 1 paisa diff to preserve waterfall balance
+    assert rollup.price_pnl_paise == 2_500_001
+    assert rollup.price_pnl_paise + rollup.fx_pnl_paise == rollup.unrealized_pnl_paise

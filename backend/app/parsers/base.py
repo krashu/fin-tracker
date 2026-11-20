@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import re
 import string
+from bisect import bisect_right
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -383,7 +384,7 @@ def _extract_word_table(
                     cells = [""] * (len(boundaries) + 1)
                     for word in line:
                         centre = (word["x0"] + word["x1"]) / 2
-                        col = sum(1 for b in boundaries if b <= centre)
+                        col = bisect_right(boundaries, centre)
                         cells[col] = f"{cells[col]} {word['text']}".strip()
                     page_rows.append(cells)
                 pages.append(page_rows)

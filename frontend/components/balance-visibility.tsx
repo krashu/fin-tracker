@@ -19,7 +19,7 @@
  * frame on every load until the effect resolves — which is harmless: it lands on
  * users who, by definition, don't mind seeing their balances.
  */
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -46,15 +46,18 @@ export function BalanceVisibilityProvider({
     setHidden(window.localStorage.getItem(STORAGE_KEY) === "1");
   }, []);
 
-  const toggle = () =>
+  const toggle = useCallback(() => {
     setHidden((h) => {
       const next = !h;
       window.localStorage.setItem(STORAGE_KEY, next ? "1" : "0");
       return next;
     });
+  }, []);
+
+  const value = useMemo(() => ({ hidden, toggle }), [hidden, toggle]);
 
   return (
-    <BalanceVisibilityContext.Provider value={{ hidden, toggle }}>
+    <BalanceVisibilityContext.Provider value={value}>
       {children}
     </BalanceVisibilityContext.Provider>
   );

@@ -18,7 +18,7 @@
  * a spend magnitude. Render does not key off transaction_type — sign is the
  * contract.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 
@@ -204,23 +204,28 @@ export function ExpensesBoard() {
     queryFn: listLabels,
   });
 
-  const accountsById = new Map<number, AccountRead>(
-    (accountsQuery.data ?? []).map((a) => [a.id, a]),
+  const accountsById = useMemo(
+    () => new Map<number, AccountRead>((accountsQuery.data ?? []).map((a) => [a.id, a])),
+    [accountsQuery.data],
   );
-  const categoriesById = new Map<number, CategoryRead>(
-    (categoriesQuery.data ?? []).map((c) => [c.id, c]),
+  const categoriesById = useMemo(
+    () => new Map<number, CategoryRead>((categoriesQuery.data ?? []).map((c) => [c.id, c])),
+    [categoriesQuery.data],
   );
 
   // Pages append as the sentinel scrolls into view; the flat list is what the
   // table and selection logic see.
-  const rows = txnsQuery.data?.pages.flat() ?? [];
+  const rows = useMemo(() => txnsQuery.data?.pages.flat() ?? [], [txnsQuery.data?.pages]);
   const { fetchNextPage, hasNextPage, isFetchingNextPage } = txnsQuery;
 
   // Effective selection = selected ∩ loaded, recomputed at render (no effect):
   // after a bulk op invalidates + refetches, deleted ids simply drop out, so a
   // stale id can never inflate the count or act on an unloaded row.
-  const loadedIds = new Set(rows.map((t) => t.id));
-  const selectedLoadedIds = [...selectedIds].filter((id) => loadedIds.has(id));
+  const loadedIds = useMemo(() => new Set(rows.map((t) => t.id)), [rows]);
+  const selectedLoadedIds = useMemo(
+    () => [...selectedIds].filter((id) => loadedIds.has(id)),
+    [selectedIds, loadedIds],
+  );
   const allLoadedSelected =
     rows.length > 0 && selectedLoadedIds.length === rows.length;
 
@@ -239,14 +244,14 @@ export function ExpensesBoard() {
     return () => observer.disconnect();
   }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
 
-  function toggleRow(id: number) {
+  const toggleRow = useCallback((id: number) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  }
+  }, []);
 
   return (
     <>

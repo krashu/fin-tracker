@@ -119,6 +119,14 @@ def past_rows_like(
     fallback_id = fallback_category_id(
         session, user_id=user_id, kind=kind_for_type(source.transaction_type)
     )
+    candidate_conditions = [
+        Transaction.merchant_normalized == canonical,
+        Transaction.merchant_normalized == source.merchant_normalized,
+    ]
+    for p_tokens in resolver.patterns_for(canonical):
+        if p_tokens:
+            candidate_conditions.append(Transaction.merchant_normalized.contains(p_tokens[0]))
+
     stmt = confirmed_only(
         select(Transaction).where(
             Transaction.user_id == user_id,
@@ -126,6 +134,7 @@ def past_rows_like(
             Transaction.transaction_type == source.transaction_type,
             Transaction.merchant_normalized != "",
             Transaction.date >= since,
+            or_(*candidate_conditions),
             or_(
                 Transaction.category_id.is_(None),
                 Transaction.category_id == fallback_id,

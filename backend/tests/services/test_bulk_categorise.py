@@ -74,3 +74,24 @@ def test_bulk_categorise_teaches_nothing_for_gateway_handles(session: Session, u
     assert outcome.updated == 2
     assert outcome.taught == 0
     assert session.scalars(select(MerchantTagMap)).all() == []
+
+
+def test_past_rows_like_matches_aliased_and_exact_merchants(session: Session, user: User) -> None:
+    cat, acct = _fixture(session, user)
+    # Source is an aliased merchant (Swiggy Instamart -> Swiggy)
+    source = _board_spend(session, user, acct, "SWIGGY INSTAMART BLR", 10, cat.id)
+    # Similar past row with another variant mapping to same canonical
+    match1 = _board_spend(session, user, acct, "SWIGGY BANGALORE", 11, None)
+    # Unrelated merchant that must NOT be matched
+    _board_spend(session, user, acct, "UBER INDIA", 12, None)
+
+    resolver = build_resolver([("swiggy", "swiggy"), ("swiggy instamart", "swiggy")])
+    rows = past_rows_like(
+        session,
+        user_id=user.id,
+        source=source,
+        resolver=resolver,
+        since=date(2025, 1, 1),
+    )
+    assert len(rows) == 1
+    assert rows[0].id == match1.id

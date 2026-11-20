@@ -246,6 +246,11 @@ def refresh_navs(
         last = _last_refresh_time.get(user_id)
         if last is not None and (now - last) < timedelta(minutes=cooldown_minutes):
             return NavRefreshResult(warnings=["Refreshed recently. Cooldown active."])
+        if len(_last_refresh_time) >= 1000:
+            cutoff = now - timedelta(minutes=cooldown_minutes * 2)
+            for uid, ts in list(_last_refresh_time.items()):
+                if ts < cutoff:
+                    _last_refresh_time.pop(uid, None)
         _last_refresh_time[user_id] = now
 
     if is_circuit_breaker_tripped():
@@ -465,6 +470,7 @@ def _fetch_equity_quote(
         quote, cached_at = cached
         if clock.utcnow() - cached_at < timedelta(hours=ttl_hours):
             return quote, None
+        _quote_cache.pop(ticker, None)
 
     try:
         resp = client.get(f"{base_url}/{ticker}", headers={"User-Agent": _USER_AGENT})
@@ -496,6 +502,9 @@ def _fetch_equity_quote(
     except (InvalidOperation, ValueError, OverflowError, OSError) as e:
         return None, f"unparseable price/timestamp: {str(e)[:120]}"
 
+    if len(_quote_cache) >= 500:
+        oldest_key = min(_quote_cache, key=lambda k: _quote_cache[k][1])
+        _quote_cache.pop(oldest_key, None)
     _quote_cache[ticker] = (quote, clock.utcnow())
     return quote, None
 

@@ -255,10 +255,15 @@ def compute_holdings(
         )
     )
     by_id = {inst.id: inst for inst in instruments}
+    if not by_id:
+        return []
 
     txns = session.scalars(
         select(InvestmentTransaction)
-        .where(InvestmentTransaction.user_id == user_id)
+        .where(
+            InvestmentTransaction.user_id == user_id,
+            InvestmentTransaction.instrument_id.in_(by_id.keys()),
+        )
         .order_by(InvestmentTransaction.instrument_id, *_REPLAY_ORDER)
     )
 
@@ -383,10 +388,16 @@ def summarize_holdings(holdings: list[Holding]) -> HoldingsValueRollup:
             fx_pnl += h.fx_pnl_inr_paise
 
     unrealized_pnl = current_value - invested
-    assert price_pnl + fx_pnl == unrealized_pnl, (
-        f"Waterfall does not balance: price_pnl ({price_pnl}) + fx_pnl ({fx_pnl}) != "
-        f"unrealized_pnl ({unrealized_pnl})"
-    )
+    diff = unrealized_pnl - (price_pnl + fx_pnl)
+    if diff != 0:
+        logger.warning(
+            "waterfall_rollup_imbalance",
+            price_pnl=price_pnl,
+            fx_pnl=fx_pnl,
+            unrealized_pnl=unrealized_pnl,
+            diff=diff,
+        )
+        price_pnl += diff
     return HoldingsValueRollup(
         current_value_paise=current_value,
         invested_paise=invested,

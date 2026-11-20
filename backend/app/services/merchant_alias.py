@@ -186,6 +186,10 @@ class AliasResolver:
         self._memo[merchant_normalized] = resolved
         return resolved
 
+    def patterns_for(self, canonical: str) -> list[tuple[str, ...]]:
+        """Return all pattern token-tuples that resolve to ``canonical``."""
+        return [pattern_tokens for pattern_tokens, c in self._rules if c == canonical]
+
     def pattern_counts(self) -> dict[str, int]:
         """``{canonical: how many patterns resolve to it}``.
 

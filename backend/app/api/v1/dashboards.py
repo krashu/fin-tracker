@@ -204,6 +204,49 @@ class IncomeExpense(NamedTuple):
     expense_paise: int
 
 
+def _period_transaction_metrics(
+    session: Session, *, user_id: UUID, start: date, end: date
+) -> tuple[int, int, int]:
+    """Single query returning (income_paise, expense_paise, gross_spend_paise) confirmed only."""
+    expense_sum = func.sum(
+        case(
+            (
+                Transaction.transaction_type == "spend",
+                Transaction.amount_paise,
+            ),
+            else_=0,
+        )
+    )
+    income_sum = func.sum(
+        case((Transaction.transaction_type == "income", Transaction.amount_paise), else_=0)
+    )
+    gross_spend_sum = func.sum(
+        case(
+            (
+                and_(
+                    Transaction.transaction_type == "spend",
+                    Transaction.amount_paise < 0,
+                ),
+                -Transaction.amount_paise,
+            ),
+            else_=0,
+        )
+    )
+    stmt = select(expense_sum, income_sum, gross_spend_sum).where(
+        Transaction.user_id == user_id,
+        Transaction.transaction_type.in_(("spend", "income")),
+        Transaction.date >= start,
+        Transaction.date <= end,
+    )
+    stmt = confirmed_only(stmt)
+    expense_raw, income_raw, gross_spend_raw = session.execute(stmt).one()
+    return (
+        int(income_raw or 0),
+        int(expense_raw or 0),
+        int(gross_spend_raw or 0),
+    )
+
+
 def _income_expense_sums(
     session: Session, *, user_id: UUID, start: date, end: date
 ) -> IncomeExpense:
@@ -218,28 +261,10 @@ def _income_expense_sums(
     signed-paise values in positional order is a silent-swap hazard that would invert
     income and expense with no type error to catch it.
     """
-    expense_sum = func.sum(
-        case(
-            (
-                Transaction.transaction_type == "spend",
-                Transaction.amount_paise,
-            ),
-            else_=0,
-        )
+    income_paise, expense_paise, _ = _period_transaction_metrics(
+        session, user_id=user_id, start=start, end=end
     )
-    income_sum = func.sum(
-        case((Transaction.transaction_type == "income", Transaction.amount_paise), else_=0)
-    )
-    stmt = select(expense_sum, income_sum).where(
-        Transaction.user_id == user_id,
-        Transaction.transaction_type.in_(("spend", "income")),
-        Transaction.date >= start,
-        Transaction.date <= end,
-    )
-    stmt = confirmed_only(stmt)
-
-    expense_raw, income_raw = session.execute(stmt).one()
-    return IncomeExpense(income_paise=int(income_raw or 0), expense_paise=int(expense_raw or 0))
+    return IncomeExpense(income_paise=income_paise, expense_paise=expense_paise)
 
 
 @router.get("/spend-by-category", response_model=SpendByCategoryResponse)
@@ -1008,9 +1033,8 @@ def overview(
         a.balance_paise for a in accounts if a.type not in NET_WORTH_EXCLUDED_TYPES
     )
 
-    # Period income / expense — the SAME helper period_totals calls, so the landing-page
-    # tile and the drill-down route can no longer disagree for one period.
-    income_paise, expense_paise = _income_expense_sums(
+    # Period income / expense / gross spend:
+    income_paise, expense_paise, gross_spend_paise = _period_transaction_metrics(
         session, user_id=user_id, start=first, end=last
     )
 
@@ -1026,33 +1050,6 @@ def overview(
         compute_holdings(session, user_id=user_id, usd_inr_rate=usd_inr)
     )
     portfolio_value_paise = portfolio_rollup.current_value_paise
-
-    # Spend isolation & fronted peer debt metrics (ADR-0017 Rule 7).
-    # gross_spend_paise: unsigned gross debit spend in the period (transaction_type == 'spend'
-    # and amount_paise < 0). Unpaired transfers remain excluded from spend from day one.
-    gross_spend_stmt = select(
-        func.coalesce(
-            func.sum(
-                case(
-                    (
-                        and_(
-                            Transaction.transaction_type == "spend",
-                            Transaction.amount_paise < 0,
-                        ),
-                        -Transaction.amount_paise,
-                    ),
-                    else_=0,
-                )
-            ),
-            0,
-        )
-    ).where(
-        Transaction.user_id == user_id,
-        Transaction.date >= first,
-        Transaction.date <= last,
-    )
-    gross_spend_stmt = confirmed_only(gross_spend_stmt)
-    gross_spend_paise = int(session.scalar(gross_spend_stmt) or 0)
 
     # fronted_peer_entries_paise: portion of gross debit spend fronted for peers
     # (direction == 'you_gave') linked to confirmed spend transactions in this window.
