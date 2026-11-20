@@ -236,11 +236,17 @@ def test_provision_default_categories_creates_two_level_tree(session: Session, u
     parents = [c for c in cats if c.parent_id is None]
     children = [c for c in cats if c.parent_id is not None]
 
+    expected_parent_names = (
+        {name for name, _, _ in _DEFAULT_SPEND_TAXONOMY}
+        | {name for name, _, _ in _DEFAULT_INCOME_TAXONOMY}
+        | {"system:investment_transfer"}
+    )
     expected_child_names = {sub for _, _, subs in _DEFAULT_SPEND_TAXONOMY for sub in subs} | {
         sub for _, _, subs in _DEFAULT_INCOME_TAXONOMY for sub in subs
     }
 
-    assert len(parents) == len(_DEFAULT_SPEND_TAXONOMY) + len(_DEFAULT_INCOME_TAXONOMY)
+    assert {c.name for c in parents} == expected_parent_names
+    assert len(parents) == len(_DEFAULT_SPEND_TAXONOMY) + len(_DEFAULT_INCOME_TAXONOMY) + 1
     assert {c.name for c in children} == expected_child_names
     assert len(children) == len(expected_child_names)
 

@@ -15,7 +15,7 @@ from uuid import UUID
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
-from app.models import PeerEntry, Transaction
+from app.models import InvestmentTransaction, PeerEntry, Transaction
 from app.services.reconciliation_service import release_leg
 
 
@@ -47,6 +47,14 @@ def delete_owned_transactions(session: Session, *, user_id: UUID, ids: Collectio
         update(PeerEntry)
         .where(PeerEntry.user_id == user_id, PeerEntry.transaction_id.in_(ids))
         .values(transaction_id=None)
+    )
+    session.execute(
+        update(InvestmentTransaction)
+        .where(
+            InvestmentTransaction.user_id == user_id,
+            InvestmentTransaction.linked_spend_txn_id.in_(ids),
+        )
+        .values(linked_spend_txn_id=None)
     )
     session.execute(
         update(Transaction)

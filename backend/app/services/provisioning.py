@@ -335,6 +335,17 @@ def provision_default_categories(session: Session, user_id: UUID) -> None:
                 parent_id=None,
             )
         )
+    # Spend Seam (Milestone 1 Step 3): system:investment_transfer category
+    parent_rows.append(
+        Category(
+            user_id=user_id,
+            name="system:investment_transfer",
+            kind="spend",
+            is_seeded=True,
+            color="#64748b",
+            parent_id=None,
+        )
+    )
     session.add_all(parent_rows)
     session.flush()
 

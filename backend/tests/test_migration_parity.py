@@ -469,9 +469,10 @@ def test_default_categories_seeded() -> None:
             taxonomy = [("spend", entry) for entry in _DEFAULT_SPEND_TAXONOMY] + [
                 ("income", entry) for entry in _DEFAULT_INCOME_TAXONOMY
             ]
-            assert {(c.name, c.kind) for c in parents} == {
-                (name, kind) for kind, (name, _, _) in taxonomy
+            expected_parents = {(name, kind) for kind, (name, _, _) in taxonomy} | {
+                ("system:investment_transfer", "spend")
             }
+            assert {(c.name, c.kind) for c in parents} == expected_parents
 
             # A per-parent child-NAME set, not just a count — a same-count swap between two
             # siblings (e.g. a typo trading "Coffee & Tea" for something else) would still
@@ -3467,6 +3468,7 @@ def test_card_bill_category_migration_archives_a_promoted_seed_with_its_children
 
 _REV_STREAMLINE_CATEGORIES = "0049_streamline_category_taxonomy"
 _REV_INVESTMENT_ACCOUNTS = "0050_investment_accounts_and_attribution"
+_REV_SPEND_SEAM = "0051_spend_seam_and_investment_transfer"
 
 
 @pytest.mark.slow
@@ -3746,6 +3748,67 @@ def test_0050_upgrade_backfills_and_links_default_accounts() -> None:
                 )
             ).scalar_one_or_none()
             assert tbl_exists is None
+
+        # Re-upgrade to head
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0051_upgrade_adds_linked_spend_and_system_category() -> None:
+    """Migration 0051 must add linked_spend_txn_id and seed system:investment_transfer category."""
+    eng = _migration_engine()
+    try:
+        user_id = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_SPEND_SEAM))
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": user_id})
+
+        # Upgrade to 0051
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_SPEND_SEAM)
+
+        with eng.connect() as conn:
+            # Check system:investment_transfer category was seeded
+            cat_row = (
+                conn.execute(
+                    text(
+                        "SELECT id, name, kind, is_seeded, color, parent_id "
+                        "FROM categories WHERE user_id = :u AND name = 'system:investment_transfer'"
+                    ),
+                    {"u": user_id},
+                )
+                .mappings()
+                .one()
+            )
+            assert cat_row["name"] == "system:investment_transfer"
+            assert cat_row["kind"] == "spend"
+            assert cat_row["is_seeded"] == 1
+            assert cat_row["color"] == "#64748b"
+            assert cat_row["parent_id"] is None
+
+            # Check linked_spend_txn_id column exists
+            cols = [c["name"] for c in inspect(conn).get_columns("investment_transactions")]
+            assert "linked_spend_txn_id" in cols
+
+        # Downgrade back to 0050
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_SPEND_SEAM))
+
+        with eng.connect() as conn:
+            cols = [c["name"] for c in inspect(conn).get_columns("investment_transactions")]
+            assert "linked_spend_txn_id" not in cols
+
+            cat_exists = conn.execute(
+                text(
+                    "SELECT id FROM categories "
+                    "WHERE user_id = :u AND name = 'system:investment_transfer'"
+                ),
+                {"u": user_id},
+            ).scalar_one_or_none()
+            assert cat_exists is None
 
         # Re-upgrade to head
         with eng.begin() as conn:

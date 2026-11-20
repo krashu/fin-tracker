@@ -33,13 +33,24 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 
 from app.api.deps import CurrentUserId, SessionDep
-from app.models import Instrument, InvestmentAccount, InvestmentTransaction, InvestmentTxnTypeStr
+from app.models import (
+    Instrument,
+    InvestmentAccount,
+    InvestmentTransaction,
+    InvestmentTxnTypeStr,
+    Transaction,
+)
 from app.schemas import (
     InvestmentTransactionCreate,
+    InvestmentTransactionLink,
     InvestmentTransactionRead,
     InvestmentTransactionUpdate,
     ReinvestmentCreate,
     ReinvestmentRead,
+)
+from app.services.category_service import (
+    get_or_create_fallback_category,
+    get_or_create_investment_transfer_category,
 )
 from app.services.fx_service import resolve_fx_rate_to_inr
 from app.services.holdings_service import OversellError, rebuild_realised_lots
@@ -147,6 +158,76 @@ def _resolve_instrument_and_fx(
     return instrument, fx_rate
 
 
+def _link_spend_transaction(
+    session: SessionDep,
+    *,
+    user_id: UUID,
+    spend_id: int,
+    inv_txn_type: str,
+) -> int:
+    """Validate spend transaction and map it to system:investment_transfer category."""
+    spend_txn = session.scalar(
+        select(Transaction).where(
+            Transaction.id == spend_id,
+            Transaction.user_id == user_id,
+        )
+    )
+    if spend_txn is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="linked spend transaction not found",
+        )
+    if spend_txn.amount_paise >= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="linked spend transaction must be an outgoing debit",
+        )
+    if inv_txn_type not in ("buy", "sip"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="only buy/sip investment transactions can be linked to a spend debit",
+        )
+    inv_cat = get_or_create_investment_transfer_category(session, user_id=user_id)
+    spend_txn.category_id = inv_cat.id
+    return spend_txn.id
+
+
+def _unlink_spend_transaction(
+    session: SessionDep,
+    *,
+    user_id: UUID,
+    inv_txn: InvestmentTransaction,
+) -> None:
+    """Clear spend link on inv_txn and revert spend transaction category to Other if no
+    remaining links."""
+    old_spend_id = inv_txn.linked_spend_txn_id
+    if old_spend_id is None:
+        return
+    inv_txn.linked_spend_txn_id = None
+    # Check if any other investment transaction still links to old_spend_id
+    other_link = session.scalar(
+        select(InvestmentTransaction.id).where(
+            InvestmentTransaction.user_id == user_id,
+            InvestmentTransaction.linked_spend_txn_id == old_spend_id,
+            InvestmentTransaction.id != inv_txn.id,
+        )
+    )
+    if other_link is None:
+        spend_txn = session.scalar(
+            select(Transaction).where(
+                Transaction.id == old_spend_id,
+                Transaction.user_id == user_id,
+            )
+        )
+        if spend_txn is not None:
+            inv_cat = get_or_create_investment_transfer_category(session, user_id=user_id)
+            if spend_txn.category_id == inv_cat.id:
+                fallback_cat = get_or_create_fallback_category(
+                    session, user_id=user_id, kind="spend"
+                )
+                spend_txn.category_id = fallback_cat.id
+
+
 @router.post("", response_model=InvestmentTransactionRead, status_code=status.HTTP_201_CREATED)
 def create_investment_transaction(
     payload: InvestmentTransactionCreate,
@@ -157,6 +238,15 @@ def create_investment_transaction(
         session, user_id=user_id, instrument_id=payload.instrument_id, on=payload.date
     )
     target_account_id = _resolve_account_id(session, user_id=user_id, account_id=payload.account_id)
+
+    linked_spend_id: int | None = None
+    if payload.linked_spend_txn_id is not None:
+        linked_spend_id = _link_spend_transaction(
+            session,
+            user_id=user_id,
+            spend_id=payload.linked_spend_txn_id,
+            inv_txn_type=payload.transaction_type,
+        )
 
     txn = InvestmentTransaction(
         user_id=user_id,
@@ -171,6 +261,7 @@ def create_investment_transaction(
         fx_rate_to_inr=fx_rate,
         note=payload.note,
         pair_id=None,
+        linked_spend_txn_id=linked_spend_id,
     )
     session.add(txn)
     # ADR-0015 rules 5 and 9: rebuild the instrument's realised lots, and refuse the write
@@ -292,8 +383,77 @@ def update_investment_transaction(
     if not updates:
         # Empty body — no DB round-trip, no spurious updated_at bump.
         return txn
+
+    if "linked_spend_txn_id" in updates:
+        target_spend_id = updates.pop("linked_spend_txn_id")
+        if target_spend_id is not None:
+            _link_spend_transaction(
+                session,
+                user_id=user_id,
+                spend_id=target_spend_id,
+                inv_txn_type=txn.transaction_type,
+            )
+            txn.linked_spend_txn_id = target_spend_id
+        else:
+            _unlink_spend_transaction(session, user_id=user_id, inv_txn=txn)
+
     for field, value in updates.items():
         setattr(txn, field, value)
+    session.commit()
+    session.refresh(txn)
+    return txn
+
+
+@router.post("/{transaction_id}/link", response_model=InvestmentTransactionRead)
+def link_investment_transaction(
+    transaction_id: int,
+    payload: InvestmentTransactionLink,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> InvestmentTransaction:
+    """Explicitly link an investment buy/sip transaction to an outgoing bank debit."""
+    txn = session.scalar(
+        select(InvestmentTransaction).where(
+            InvestmentTransaction.id == transaction_id,
+            InvestmentTransaction.user_id == user_id,
+        )
+    )
+    if txn is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="investment transaction not found",
+        )
+    linked_id = _link_spend_transaction(
+        session,
+        user_id=user_id,
+        spend_id=payload.spend_transaction_id,
+        inv_txn_type=txn.transaction_type,
+    )
+    txn.linked_spend_txn_id = linked_id
+    session.commit()
+    session.refresh(txn)
+    return txn
+
+
+@router.post("/{transaction_id}/unlink", response_model=InvestmentTransactionRead)
+def unlink_investment_transaction(
+    transaction_id: int,
+    session: SessionDep,
+    user_id: CurrentUserId,
+) -> InvestmentTransaction:
+    """Explicitly unlink an investment transaction from any linked bank debit."""
+    txn = session.scalar(
+        select(InvestmentTransaction).where(
+            InvestmentTransaction.id == transaction_id,
+            InvestmentTransaction.user_id == user_id,
+        )
+    )
+    if txn is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="investment transaction not found",
+        )
+    _unlink_spend_transaction(session, user_id=user_id, inv_txn=txn)
     session.commit()
     session.refresh(txn)
     return txn
@@ -309,19 +469,7 @@ def delete_investment_transaction(
 
     ``pair_id`` null-out mirrors the spend ``delete_transaction``: if this row is half
     of a pair, null the partner first so the composite FK isn't tripped.
-
-    **Nulls the partner, does not cascade.** ``DELETE /{id}`` means "delete this row";
-    silently hard-deleting a second row the caller never named, with no undo, is a
-    footgun. A surviving lone ``buy`` is still a valid manual buy row and a lone
-    ``dividend`` a valid cash payout — the orphan is an *economic* inconsistency the
-    user can see in the list, not a referential one. The prescribed correction is
-    DELETE both then re-POST, exactly as ``InvestmentTransactionUpdate`` mandates for
-    any FIFO-affecting edit. Same choice as the spend-side ``delete_transaction`` /
-    ``unlink_transfer``.
-
-    Symmetric only because writers set both directions (see the model docstring): this
-    keys on ``txn.pair_id``, so a one-directional link would dangle if the pointed-at
-    row were deleted first.
+    Spend seam link is unlinked before row deletion.
     """
     txn = session.scalar(
         select(InvestmentTransaction).where(
@@ -334,6 +482,8 @@ def delete_investment_transaction(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="investment transaction not found",
         )
+
+    _unlink_spend_transaction(session, user_id=user_id, inv_txn=txn)
 
     if txn.pair_id is not None:
         partner = session.scalar(

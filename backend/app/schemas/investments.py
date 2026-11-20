@@ -265,6 +265,7 @@ class InvestmentTransactionCreate(BaseModel):
     amount_native_paise: int = Field(default=0, ge=0)
     fees_native_paise: int = Field(default=0, ge=0)
     note: str | None = Field(default=None, max_length=1024)
+    linked_spend_txn_id: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _check_by_type(self) -> InvestmentTransactionCreate:
@@ -320,19 +321,29 @@ class InvestmentTransactionRead(BaseModel):
     fx_rate_to_inr: DecimalStr
     note: str | None
     pair_id: int | None
+    linked_spend_txn_id: int | None
 
 
 class InvestmentTransactionUpdate(BaseModel):
     """Partial-update body for ``PATCH /investment-transactions/{id}``.
 
-    ``note`` only. Editing units/amount/type would silently rewrite the FIFO
-    history a holding's cost basis depends on — correct those via DELETE +
-    re-create (the row is hard-deletable). Mirrors the narrow ``AccountUpdate``.
+    Allows updating ``note`` and linking/unlinking ``linked_spend_txn_id``.
+    Editing units/amount/type would silently rewrite FIFO history — correct those
+    via DELETE + re-create (the row is hard-deletable).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     note: str | None = Field(default=None, max_length=1024)
+    linked_spend_txn_id: int | None = Field(default=None)
+
+
+class InvestmentTransactionLink(BaseModel):
+    """POST body for ``/api/v1/investment-transactions/{id}/link``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    spend_transaction_id: int = Field(gt=0)
 
 
 class ReinvestmentCreate(BaseModel):

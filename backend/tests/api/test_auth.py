@@ -86,16 +86,18 @@ def test_register_provisions_default_categories(unauth_client: TestClient) -> No
     parents = [c for c in cats if c["parent_id"] is None]
     children = [c for c in cats if c["parent_id"] is not None]
 
-    expected_parent_names = {name for name, _, _ in _DEFAULT_SPEND_TAXONOMY} | {
-        name for name, _, _ in _DEFAULT_INCOME_TAXONOMY
-    }
+    expected_parent_names = (
+        {name for name, _, _ in _DEFAULT_SPEND_TAXONOMY}
+        | {name for name, _, _ in _DEFAULT_INCOME_TAXONOMY}
+        | {"system:investment_transfer"}
+    )
     expected_child_names = {sub for _, _, subs in _DEFAULT_SPEND_TAXONOMY for sub in subs} | {
         sub for _, _, subs in _DEFAULT_INCOME_TAXONOMY for sub in subs
     }
 
     assert {c["name"] for c in parents} == expected_parent_names
     assert {c["name"] for c in children} == expected_child_names
-    assert len(parents) == len(_DEFAULT_SPEND_TAXONOMY) + len(_DEFAULT_INCOME_TAXONOMY)
+    assert len(parents) == len(_DEFAULT_SPEND_TAXONOMY) + len(_DEFAULT_INCOME_TAXONOMY) + 1
     assert len(children) == len(expected_child_names)
     assert all(c["is_seeded"] for c in cats)  # app defaults, not user-created
     assert all(c["color"] for c in parents)  # parent colors provisioned, none null

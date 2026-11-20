@@ -7,6 +7,7 @@ round-trip), GET (filters + date-range 422), PATCH (note-only), and DELETE (hard
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
 from decimal import Decimal
 
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import FxRateQuote, Instrument, RealisedLot, User
+from app.models import Category, FxRateQuote, Instrument, RealisedLot, Transaction, User
 
 
 def _buy(instrument_id: int, **over: object) -> dict[str, object]:
@@ -575,3 +576,222 @@ def test_same_day_sell_posted_before_its_buy_422(
     assert client.post("/api/v1/investment-transactions", json=sell).status_code == 422
     _post(client, _buy(inst.id, units="10"))
     _post(client, sell)
+
+
+def _make_bank_account_and_debit(
+    client: TestClient,
+    amount_paise: int = -500_000,
+    merchant: str = "HDFC Mutual Fund",
+    account_name: str | None = None,
+) -> tuple[int, int]:
+    name = account_name or f"Bank {uuid.uuid4().hex[:8]}"
+    acc_res = client.post(
+        "/api/v1/accounts",
+        json={"name": name, "type": "bank", "opening_balance_paise": 1_000_000},
+    )
+    assert acc_res.status_code == 201, acc_res.text
+    acc_id = acc_res.json()["id"]
+
+    txn_res = client.post(
+        "/api/v1/transactions",
+        json={
+            "account_id": acc_id,
+            "date": "2026-06-01",
+            "amount_paise": amount_paise,
+            "merchant_raw": merchant,
+            "transaction_type": "spend",
+        },
+    )
+    assert txn_res.status_code == 201, txn_res.text
+    return acc_id, txn_res.json()["id"]
+
+
+def test_create_investment_transaction_with_linked_spend(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    """Spend Seam: Creating an investment transaction with linked_spend_txn_id links the bank debit
+    and updates its category to system:investment_transfer."""
+    _, spend_id = _make_bank_account_and_debit(client, amount_paise=-100_000)
+
+    buy_payload = _buy(instrument.id, linked_spend_txn_id=spend_id)
+    res = client.post("/api/v1/investment-transactions", json=buy_payload)
+    assert res.status_code == 201, res.text
+    data = res.json()
+    assert data["linked_spend_txn_id"] == spend_id
+
+    # Spend transaction's category must now be system:investment_transfer
+    spend_row = session.scalar(select(Transaction).where(Transaction.id == spend_id))
+    assert spend_row is not None
+    cat = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert cat is not None
+    assert cat.name == "system:investment_transfer"
+
+
+def test_link_and_unlink_endpoints(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    """Spend Seam: Explicit POST link and unlink endpoints associate and detach bank debits."""
+    _, spend_id = _make_bank_account_and_debit(client, amount_paise=-100_000)
+
+    # Create unlinked buy
+    res = client.post("/api/v1/investment-transactions", json=_buy(instrument.id))
+    assert res.status_code == 201
+    inv_id = res.json()["id"]
+    assert res.json()["linked_spend_txn_id"] is None
+
+    # Link via dedicated endpoint
+    link_res = client.post(
+        f"/api/v1/investment-transactions/{inv_id}/link",
+        json={"spend_transaction_id": spend_id},
+    )
+    assert link_res.status_code == 200, link_res.text
+    assert link_res.json()["linked_spend_txn_id"] == spend_id
+
+    spend_row = session.scalar(select(Transaction).where(Transaction.id == spend_id))
+    assert spend_row is not None
+    cat = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert cat is not None
+    assert cat.name == "system:investment_transfer"
+
+    # Unlink via dedicated endpoint -> restores category to Other
+    unlink_res = client.post(f"/api/v1/investment-transactions/{inv_id}/unlink")
+    assert unlink_res.status_code == 200, unlink_res.text
+    assert unlink_res.json()["linked_spend_txn_id"] is None
+
+    session.refresh(spend_row)
+    reverted_cat = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert reverted_cat is not None
+    assert reverted_cat.name == "Other"
+
+
+def test_patch_link_and_unlink(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    """Spend Seam: PATCH /investment-transactions/{id} can link and unlink via
+    linked_spend_txn_id."""
+    _, spend_id = _make_bank_account_and_debit(client, amount_paise=-100_000)
+
+    res = client.post("/api/v1/investment-transactions", json=_buy(instrument.id))
+    assert res.status_code == 201
+    inv_id = res.json()["id"]
+
+    # PATCH to link
+    patch_link = client.patch(
+        f"/api/v1/investment-transactions/{inv_id}",
+        json={"linked_spend_txn_id": spend_id},
+    )
+    assert patch_link.status_code == 200
+    assert patch_link.json()["linked_spend_txn_id"] == spend_id
+
+    # PATCH with null to unlink
+    patch_unlink = client.patch(
+        f"/api/v1/investment-transactions/{inv_id}",
+        json={"linked_spend_txn_id": None},
+    )
+    assert patch_unlink.status_code == 200
+    assert patch_unlink.json()["linked_spend_txn_id"] is None
+
+    spend_row = session.scalar(select(Transaction).where(Transaction.id == spend_id))
+    assert spend_row is not None
+    reverted_cat = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert reverted_cat is not None
+    assert reverted_cat.name == "Other"
+
+
+def test_link_validation_rejects_positive_amount_and_non_buy(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    """Spend Seam: Refuses non-debit (positive amount) transactions and non-acquisition
+    investment txns."""
+    # Positive amount spend (e.g. cashback or refund)
+    _, positive_txn_id = _make_bank_account_and_debit(client, amount_paise=50_000)
+
+    buy_res = client.post(
+        "/api/v1/investment-transactions",
+        json=_buy(instrument.id, linked_spend_txn_id=positive_txn_id),
+    )
+    assert buy_res.status_code == 422
+    assert "outgoing debit" in buy_res.json()["detail"]
+
+    # Non-buy investment transaction (dividend)
+    _, debit_id = _make_bank_account_and_debit(client, amount_paise=-50_000)
+    dividend_payload = {
+        "date": "2026-06-01",
+        "instrument_id": instrument.id,
+        "transaction_type": "dividend",
+        "units": "0",
+        "amount_native_paise": 50_000,
+        "linked_spend_txn_id": debit_id,
+    }
+    div_res = client.post("/api/v1/investment-transactions", json=dividend_payload)
+    assert div_res.status_code == 422
+    assert "only buy/sip" in div_res.json()["detail"]
+
+
+def test_delete_investment_transaction_unlinks_spend(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    """Spend Seam: Deleting a linked investment transaction unlinks the spend debit and restores
+    category."""
+    _, spend_id = _make_bank_account_and_debit(client, amount_paise=-100_000)
+    res = client.post(
+        "/api/v1/investment-transactions",
+        json=_buy(instrument.id, linked_spend_txn_id=spend_id),
+    )
+    assert res.status_code == 201
+    inv_id = res.json()["id"]
+
+    del_res = client.delete(f"/api/v1/investment-transactions/{inv_id}")
+    assert del_res.status_code == 204
+
+    spend_row = session.scalar(select(Transaction).where(Transaction.id == spend_id))
+    assert spend_row is not None
+    cat = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert cat is not None
+    assert cat.name == "Other"
+
+
+def test_multiple_investments_can_link_to_same_spend_and_unlink_keeps_category_while_links_remain(
+    client: TestClient, seeded_user: User, instrument: Instrument, session: Session
+) -> None:
+    """Spend Seam: N-to-1 cardinality allows multiple SIP buys to link to a shared auto-debit.
+    Unlinking one keeps the category as system:investment_transfer until the last link is
+    detached."""
+    _, spend_id = _make_bank_account_and_debit(client, amount_paise=-200_000)
+
+    # Buy 1 linked to spend
+    buy1 = client.post(
+        "/api/v1/investment-transactions",
+        json=_buy(
+            instrument.id, units="5", amount_native_paise=100_000, linked_spend_txn_id=spend_id
+        ),
+    ).json()
+
+    # Buy 2 also linked to same spend
+    buy2 = client.post(
+        "/api/v1/investment-transactions",
+        json=_buy(
+            instrument.id, units="5", amount_native_paise=100_000, linked_spend_txn_id=spend_id
+        ),
+    ).json()
+
+    spend_row = session.scalar(select(Transaction).where(Transaction.id == spend_id))
+    assert spend_row is not None
+    cat = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert cat is not None
+    assert cat.name == "system:investment_transfer"
+
+    # Unlink Buy 1 -> Buy 2 is still linked, so spend debit category stays
+    # system:investment_transfer
+    client.post(f"/api/v1/investment-transactions/{buy1['id']}/unlink")
+    session.refresh(spend_row)
+    cat_after_first = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert cat_after_first is not None
+    assert cat_after_first.name == "system:investment_transfer"
+
+    # Unlink Buy 2 -> No links remain, so spend debit category reverts to Other
+    client.post(f"/api/v1/investment-transactions/{buy2['id']}/unlink")
+    session.refresh(spend_row)
+    cat_after_second = session.scalar(select(Category).where(Category.id == spend_row.category_id))
+    assert cat_after_second is not None
+    assert cat_after_second.name == "Other"

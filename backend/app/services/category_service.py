@@ -35,10 +35,14 @@ FALLBACK_CATEGORY_NAME = "Other"
 # cashback credit is staged like any other positive spend.
 CASHBACK_CATEGORY_NAME = "Cashback"
 
+# Spend Seam (Milestone 1 Step 3): system category for bank debits funding investments.
+# Excluded from living expense aggregates in dashboards and overview.
+INVESTMENT_TRANSFER_CATEGORY_NAME = "system:investment_transfer"
+
 # What a category *is* to the app, computed here and sent on the wire as
 # ``CategoryRead.role`` so the frontend never matches names (ADR-0012 rules 6 and 8,
 # ADR-0013).
-CategoryRoleStr = Literal["fallback", "cashback"]
+CategoryRoleStr = Literal["fallback", "cashback", "investment_transfer"]
 
 
 def is_fallback_category(category: Category) -> bool:
@@ -53,12 +57,69 @@ def is_fallback_category(category: Category) -> bool:
     return category.name == FALLBACK_CATEGORY_NAME
 
 
+def is_system_category(category: Category) -> bool:
+    """True for protected system categories like system:investment_transfer."""
+    return category.name == INVESTMENT_TRANSFER_CATEGORY_NAME or category.name.startswith("system:")
+
+
+def get_or_create_investment_transfer_category(session: Session, *, user_id: UUID) -> Category:
+    """Return the system:investment_transfer category for user_id, creating it if absent."""
+    cat = session.scalar(
+        select(Category).where(
+            Category.user_id == user_id,
+            Category.name == INVESTMENT_TRANSFER_CATEGORY_NAME,
+            Category.kind == "spend",
+        )
+    )
+    if cat is not None:
+        return cat
+    cat = Category(
+        user_id=user_id,
+        name=INVESTMENT_TRANSFER_CATEGORY_NAME,
+        kind="spend",
+        is_seeded=True,
+        color="#64748b",
+        parent_id=None,
+    )
+    session.add(cat)
+    session.flush()
+    return cat
+
+
+def get_or_create_fallback_category(
+    session: Session, *, user_id: UUID, kind: CategoryKindStr = "spend"
+) -> Category:
+    """Return the fallback "Other" category for user_id and kind, creating it if absent."""
+    cat = session.scalar(
+        select(Category).where(
+            Category.user_id == user_id,
+            Category.name == FALLBACK_CATEGORY_NAME,
+            Category.kind == kind,
+            Category.archived_at.is_(None),
+        )
+    )
+    if cat is not None:
+        return cat
+    cat = Category(
+        user_id=user_id,
+        name=FALLBACK_CATEGORY_NAME,
+        kind=kind,
+        is_seeded=True,
+        color="#94a3b8",
+        parent_id=None,
+    )
+    session.add(cat)
+    session.flush()
+    return cat
+
+
 def category_role(
     *, name: str, kind: CategoryKindStr, parent_name: str | None
 ) -> CategoryRoleStr | None:
     """The role of one category row; the pure rule behind :func:`category_roles`.
 
-    ``fallback`` is checked first (the two names differ, so they never overlap).
+    ``fallback`` is checked first (the names differ, so they never overlap).
+    ``investment_transfer`` is checked next for system investment transfer category.
     ``cashback`` is the spend-kind "Cashback" or a child of it, whatever the
     parent's archive state: the Python twin of the SQL ``is_cashback`` predicate in
     the credit-card YTD block of :mod:`app.api.v1.dashboards` (ADR-0013 rule 4).
@@ -67,6 +128,8 @@ def category_role(
     """
     if name == FALLBACK_CATEGORY_NAME:
         return "fallback"
+    if name == INVESTMENT_TRANSFER_CATEGORY_NAME:
+        return "investment_transfer"
     if kind == "spend" and CASHBACK_CATEGORY_NAME in (name, parent_name):
         return "cashback"
     return None

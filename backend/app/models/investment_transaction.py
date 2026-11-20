@@ -144,6 +144,18 @@ class InvestmentTransaction(Base, TimestampMixin):
             ["import_batches.id", "import_batches.user_id"],
             name="fk_investment_transactions_import_batch_id_import_batches",
         ),
+        # Spend Seam (Milestone 1 Step 3): composite same-user FK to bank spend debit.
+        ForeignKeyConstraint(
+            ["linked_spend_txn_id", "user_id"],
+            ["transactions.id", "transactions.user_id"],
+            name="fk_investment_transactions_linked_spend_txn_id_transactions",
+            ondelete="SET NULL",
+        ),
+        Index(
+            "ix_investment_transactions_user_linked_spend",
+            "user_id",
+            "linked_spend_txn_id",
+        ),
         # ADR-0019: Account-scoped index for per-account FIFO and broker filtering.
         Index(
             "ix_investment_transactions_user_account_instrument_date",
@@ -200,6 +212,8 @@ class InvestmentTransaction(Base, TimestampMixin):
     # (ADR-0016) — see the module docstring.
     fx_rate_to_inr: Mapped[Decimal] = mapped_column(FxRate())
     note: Mapped[str | None] = mapped_column(String(1024))
+    # Spend Seam (Milestone 1 Step 3): linked outgoing bank debit. Composite FK in __table_args__.
+    linked_spend_txn_id: Mapped[int | None] = mapped_column(nullable=True)
     # FK declared composite-style in __table_args__ (same-user invariant). Do NOT
     # add an inline ForeignKey here — that would create a second single-column FK
     # and drift from the migration (mirrors transactions.transfer_pair_id).

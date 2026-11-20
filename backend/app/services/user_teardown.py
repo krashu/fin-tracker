@@ -50,7 +50,7 @@ def teardown_user(session: Session, user_id: UUID) -> None:
     session.execute(
         update(InvestmentTransaction)
         .where(InvestmentTransaction.user_id == user_id)
-        .values(pair_id=None)
+        .values(pair_id=None, linked_spend_txn_id=None)
     )
     session.execute(
         update(Account).where(Account.user_id == user_id).values(parent_account_id=None)

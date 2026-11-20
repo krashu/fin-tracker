@@ -230,6 +230,10 @@ export function CategorySelector({
                               <span className="shrink-0 text-[11px] text-muted-foreground/70">
                                 · {parent.name}
                               </span>
+                            ) : category.role === "investment_transfer" ? (
+                              <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 text-[10px] text-muted-foreground/70 font-normal">
+                                system
+                              </span>
                             ) : !isSub ? (
                               <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 text-[10px] text-muted-foreground/70 font-normal">
                                 parent
@@ -292,6 +296,11 @@ export function CategorySelector({
                             color={parentColor}
                           />
                           <span className="flex-1 truncate">{parent.name}</span>
+                          {parent.role === "investment_transfer" ? (
+                            <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 text-[10px] text-muted-foreground/70 font-normal">
+                              system
+                            </span>
+                          ) : null}
                           {isParentSelected ? (
                             <IconCheck className="size-3.5 text-primary" />
                           ) : parent.subcategories.length > 0 ? (

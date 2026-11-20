@@ -309,7 +309,7 @@ function ParentCategoryCard({
           >
             Edit
           </Button>
-          {parent.role === "fallback" ? null : (
+          {parent.role === "fallback" || parent.role === "investment_transfer" ? null : (
             <Button
               type="button"
               variant="ghost"
@@ -476,9 +476,10 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
     },
   });
 
-  // The kind's fallback is found by name at import, so it keeps its name and stays a
-  // root; only its colour is editable (ADR-0012 rule 8).
+  // The kind's fallback and system categories cannot be renamed or given a parent.
   const isFallback = category?.role === "fallback";
+  const isSystem = category?.role === "investment_transfer";
+  const isProtected = isFallback || isSystem;
   const trimmed = name.trim();
   const colorChanged =
     props.mode === "edit" && color !== (props.category.color ?? null);
@@ -517,11 +518,15 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
             }
             autoFocus
             maxLength={64}
-            disabled={isFallback}
+            disabled={isProtected}
           />
           {isFallback ? (
             <p className="mt-1.5 text-[11px] text-muted-foreground">
               The fallback category can’t be renamed: imports find it by name.
+            </p>
+          ) : isSystem ? (
+            <p className="mt-1.5 text-[11px] text-muted-foreground">
+              System categories cannot be renamed.
             </p>
           ) : null}
         </Field>
@@ -558,9 +563,11 @@ function CategoryFormDialog(props: CategoryFormDialogProps) {
         {/* Parent Category Selector / Reparenting */}
         <div className="mt-3">
           <Field label="Parent category (optional)">
-            {isFallback ? (
+            {isProtected ? (
               <div className="rounded-md border border-border/80 bg-muted/40 px-3 py-2 text-[12px] text-muted-foreground">
-                The fallback category is always top-level.
+                {isSystem
+                  ? "System categories are always top-level."
+                  : "The fallback category is always top-level."}
               </div>
             ) : isParentWithChildren ? (
               <div className="rounded-md border border-border/80 bg-muted/40 px-3 py-2 text-[12px] text-muted-foreground">

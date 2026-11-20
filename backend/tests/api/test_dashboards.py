@@ -50,7 +50,10 @@ from app.models import (
     TransactionLabel,
     User,
 )
-from app.services.category_service import CASHBACK_CATEGORY_NAME
+from app.services.category_service import (
+    CASHBACK_CATEGORY_NAME,
+    get_or_create_investment_transfer_category,
+)
 from app.services.merchant import normalize_merchant
 from app.services.reconciliation_service import pair_existing_rows
 from tests.fk_bypass import foreign_keys_off
@@ -487,6 +490,50 @@ def test_transfer_rows_excluded(
 
     resp = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
     assert resp.json()["rows"] == []
+
+
+def test_investment_transfer_category_rows_excluded_from_living_expenses(
+    client: TestClient,
+    axis_account: Account,
+    session: Session,
+) -> None:
+    """Spend Seam: system:investment_transfer category rows are excluded from living expense
+    aggregates in dashboards and overview, while bank account balance still reflects the debit."""
+    inv_transfer_cat = get_or_create_investment_transfer_category(
+        session, user_id=axis_account.user_id
+    )
+    session.add(
+        _make_txn(
+            user_id=axis_account.user_id,
+            account_id=axis_account.id,
+            txn_date=date(2026, 5, 10),
+            amount_paise=-50000,
+            fingerprint="fp-inv-transfer-debit",
+            transaction_type="spend",
+            category_id=inv_transfer_cat.id,
+        )
+    )
+    session.commit()
+
+    # 1. spend-by-category excludes it
+    cat_resp = client.get("/api/v1/dashboards/spend-by-category?month=2026-05")
+    assert cat_resp.status_code == 200
+    assert cat_resp.json()["rows"] == []
+
+    # 2. period-totals excludes it from living expenses
+    totals_resp = client.get("/api/v1/dashboards/period-totals?start=2026-05-01&end=2026-05-31")
+    assert totals_resp.status_code == 200
+    totals_data = totals_resp.json()
+    assert totals_data["expense_paise"] == 0
+
+    # 3. overview excludes it from expense_paise, but bank balance reflects the outflow
+    overview_resp = client.get("/api/v1/dashboards/overview?year=2026")
+    assert overview_resp.status_code == 200
+    overview_data = overview_resp.json()
+    assert overview_data["expense_paise"] == 0
+    # Bank account balance must be reduced by 50,000 paise (opening balance + spend)
+    axis_bal = next(a for a in overview_data["accounts"] if a["account_id"] == axis_account.id)
+    assert axis_bal["balance_paise"] == axis_account.opening_balance_paise - 50000
 
 
 def test_pending_rows_excluded(

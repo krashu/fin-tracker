@@ -1100,3 +1100,105 @@ def test_investment_accounts_are_isolated_per_user(unauth_client: TestClient) ->
     )
     assert txn_res.status_code == 422
     assert "investment account not found or inactive" in txn_res.json()["detail"]
+
+
+def test_investment_transaction_linked_spend_is_isolated_per_user(
+    unauth_client: TestClient, session: Session
+) -> None:
+    """ADR-0003 & Spend Seam: Linking a bank spend debit to an investment transaction is strictly
+    isolated.
+
+    Attempting to bind User A's bank debit to User B's investment transaction returns 422
+    via POST create, PATCH, and POST link endpoints, and trips composite same-user FK on
+    direct DB insert.
+    """
+    # User A creates an account and an outgoing debit
+    _register(unauth_client, "user-a-spend@example.com")
+    a_acc_id = _make_account(unauth_client, "A Bank")
+    r = unauth_client.post(
+        "/api/v1/transactions",
+        json={
+            "account_id": a_acc_id,
+            "date": "2026-06-01",
+            "amount_paise": -500000,
+            "merchant_raw": "Mutual Fund AMC",
+            "transaction_type": "spend",
+        },
+    )
+    assert r.status_code == 201, r.text
+    a_spend_id = r.json()["id"]
+
+    # User B registers and attempts to link User A's spend transaction
+    unauth_client.cookies.clear()
+    _register(unauth_client, "user-b-invest@example.com")
+    b_inst_id = _make_instrument(unauth_client, "B-MUTUAL-FUND")
+
+    # 1. POST /investment-transactions with A's spend id -> 422
+    res_post = unauth_client.post(
+        "/api/v1/investment-transactions",
+        json={
+            "instrument_id": b_inst_id,
+            "date": "2026-06-01",
+            "transaction_type": "buy",
+            "units": 100,
+            "price_per_unit_native": 50,
+            "amount_native_paise": 500000,
+            "linked_spend_txn_id": a_spend_id,
+        },
+    )
+    assert res_post.status_code == 422
+    assert "linked spend transaction not found" in res_post.json()["detail"]
+
+    # Create unlinked investment transaction for User B
+    res_valid = unauth_client.post(
+        "/api/v1/investment-transactions",
+        json={
+            "instrument_id": b_inst_id,
+            "date": "2026-06-01",
+            "transaction_type": "buy",
+            "units": 100,
+            "price_per_unit_native": 50,
+            "amount_native_paise": 500000,
+        },
+    )
+    assert res_valid.status_code == 201
+    b_inv_id = res_valid.json()["id"]
+
+    # 2. PATCH /investment-transactions/{b_inv_id} with A's spend id -> 422
+    res_patch = unauth_client.patch(
+        f"/api/v1/investment-transactions/{b_inv_id}",
+        json={"linked_spend_txn_id": a_spend_id},
+    )
+    assert res_patch.status_code == 422
+    assert "linked spend transaction not found" in res_patch.json()["detail"]
+
+    # 3. POST /investment-transactions/{b_inv_id}/link with A's spend id -> 422
+    res_link = unauth_client.post(
+        f"/api/v1/investment-transactions/{b_inv_id}/link",
+        json={"spend_transaction_id": a_spend_id},
+    )
+    assert res_link.status_code == 422
+    assert "linked spend transaction not found" in res_link.json()["detail"]
+
+    # 4. Direct DB insert trips composite same-user FK
+    b_user = session.scalar(select(User).where(User.email == "user-b-invest@example.com"))
+    assert b_user is not None
+    b_acc = session.scalar(select(InvestmentAccount).where(InvestmentAccount.user_id == b_user.id))
+    assert b_acc is not None
+    cross_txn = InvestmentTransaction(
+        user_id=b_user.id,
+        account_id=b_acc.id,
+        instrument_id=b_inst_id,
+        date=date(2026, 6, 1),
+        transaction_type="buy",
+        units=Decimal(10),
+        price_per_unit_native=Decimal(500),
+        amount_native_paise=5000,
+        fees_native_paise=0,
+        fx_rate_to_inr=Decimal(1),
+        linked_spend_txn_id=a_spend_id,
+    )
+    session.add(cross_txn)
+    with pytest.raises(IntegrityError):
+        session.flush()
+    session.rollback()

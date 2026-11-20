@@ -90,8 +90,10 @@ from app.services.category_colors import (
     next_root_color,
 )
 from app.services.category_service import (
+    INVESTMENT_TRANSFER_CATEGORY_NAME,
     category_roles,
     is_fallback_category,
+    is_system_category,
     validate_category_ids,
 )
 from app.services.merchant_alias import load_alias_resolver
@@ -208,6 +210,12 @@ def create_category(
                 detail="category kind must match parent category kind",
             )
 
+    if payload.name.startswith("system:") or payload.name == INVESTMENT_TRANSFER_CATEGORY_NAME:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="system category names are reserved",
+        )
+
     color = payload.color
     if payload.parent_id is None:
         if "color" in payload.model_fields_set and payload.color is None:
@@ -280,6 +288,27 @@ def update_category(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="the fallback category cannot be renamed",
             )
+
+    if is_system_category(category):
+        if updates.get("parent_id") is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="system categories cannot have a parent",
+            )
+        if "name" in updates and updates["name"] != category.name:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="system categories cannot be renamed",
+            )
+
+    if "name" in updates and (
+        updates["name"].startswith("system:")
+        or updates["name"] == INVESTMENT_TRANSFER_CATEGORY_NAME
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="system category names are reserved",
+        )
 
     ends_as_root = (
         updates["parent_id"] is None if "parent_id" in updates else category.parent_id is None
@@ -391,6 +420,11 @@ def delete_category(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="the fallback category cannot be archived",
+        )
+    if is_system_category(category):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="system categories cannot be archived",
         )
     # The set this request archives, computed before any stamping.
     subcategories = session.scalars(

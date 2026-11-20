@@ -142,6 +142,13 @@ def test_list_marks_the_fallback_and_cashback_roles(
             Category(color="#2a78d6", user_id=uid, name="Other", kind="income", is_seeded=True),
             Category(color="#2a78d6", user_id=uid, name="Food", kind="spend"),
             Category(color="#2a78d6", user_id=uid, name="Cashback", kind="income"),
+            Category(
+                color="#64748b",
+                user_id=uid,
+                name="system:investment_transfer",
+                kind="spend",
+                is_seeded=True,
+            ),
         ]
     )
     cashback = Category(color="#2a78d6", user_id=uid, name="Cashback", kind="spend")
@@ -160,6 +167,7 @@ def test_list_marks_the_fallback_and_cashback_roles(
         ("Cashback", "income"): None,
         ("Cashback", "spend"): "cashback",
         ("Card rewards", "spend"): "cashback",
+        ("system:investment_transfer", "spend"): "investment_transfer",
     }
     flat = client.get("/api/v1/categories?tree=false").json()
     assert roles(flat) == expected
@@ -944,6 +952,44 @@ def test_fallback_category_cannot_be_archived_or_parented(
             assert reloaded.archived_at is None
             assert reloaded.parent_id is None
             assert reloaded.name == FALLBACK_CATEGORY_NAME
+
+
+def test_system_category_cannot_be_archived_parented_or_renamed(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    """Spend Seam: system:investment_transfer cannot be archived, renamed, parented,
+    or manually created."""
+    provision_default_categories(session, seeded_user.id)
+    session.commit()
+
+    cats = client.get("/api/v1/categories", params={"kind": "spend"}).json()
+    sys_cat = next(c for c in cats if c["name"] == "system:investment_transfer")
+    root = next(c for c in cats if c["name"] == "Food & Dining")
+
+    # 1. DELETE -> 422
+    del_res = client.delete(f"/api/v1/categories/{sys_cat['id']}")
+    assert del_res.status_code == 422
+    assert del_res.json()["detail"] == "system categories cannot be archived"
+
+    # 2. PATCH parent_id -> 422
+    p_status, p_body = _patch(client, sys_cat["id"], {"parent_id": root["id"]})
+    assert p_status == 422
+    assert p_body["detail"] == "system categories cannot have a parent"
+
+    # 3. PATCH name -> 422
+    r_status, r_body = _patch(client, sys_cat["id"], {"name": "Investment Transfers"})
+    assert r_status == 422
+    assert r_body["detail"] == "system categories cannot be renamed"
+
+    # 4. POST with system: name -> 422
+    create_res = client.post(
+        "/api/v1/categories",
+        json={"name": "system:custom", "kind": "spend"},
+    )
+    assert create_res.status_code == 422
+    assert create_res.json()["detail"] == "system category names are reserved"
 
 
 def test_archived_category_surfaces_its_stored_name_on_transactions(

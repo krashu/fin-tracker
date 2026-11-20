@@ -66,7 +66,7 @@ from app.schemas import (
     TopMerchantsResponse,
 )
 from app.services.category_colors import category_colors
-from app.services.category_service import CASHBACK_CATEGORY_NAME
+from app.services.category_service import CASHBACK_CATEGORY_NAME, INVESTMENT_TRANSFER_CATEGORY_NAME
 from app.services.fx_service import latest_rate
 from app.services.holdings_service import compute_holdings, summarize_holdings
 from app.services.merchant_alias import is_unknown_via, load_alias_resolver
@@ -204,14 +204,30 @@ class IncomeExpense(NamedTuple):
     expense_paise: int
 
 
+def _investment_transfer_category_id(session: Session, *, user_id: UUID) -> int | None:
+    return session.scalar(
+        select(Category.id).where(
+            Category.user_id == user_id,
+            Category.name == INVESTMENT_TRANSFER_CATEGORY_NAME,
+        )
+    )
+
+
 def _period_transaction_metrics(
     session: Session, *, user_id: UUID, start: date, end: date
 ) -> tuple[int, int, int]:
     """Single query returning (income_paise, expense_paise, gross_spend_paise) confirmed only."""
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    living_spend_clauses = [Transaction.transaction_type == "spend"]
+    if inv_cat_id is not None:
+        living_spend_clauses.append(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
+    is_living_spend = and_(*living_spend_clauses)
     expense_sum = func.sum(
         case(
             (
-                Transaction.transaction_type == "spend",
+                is_living_spend,
                 Transaction.amount_paise,
             ),
             else_=0,
@@ -224,7 +240,7 @@ def _period_transaction_metrics(
         case(
             (
                 and_(
-                    Transaction.transaction_type == "spend",
+                    is_living_spend,
                     Transaction.amount_paise < 0,
                 ),
                 -Transaction.amount_paise,
@@ -327,7 +343,15 @@ def spend_by_category(
             Transaction.date >= first,
             Transaction.date <= last,
         )
-        .group_by(Transaction.category_id, Category.name, Category.parent_id, parent.name)
+    )
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    if inv_cat_id is not None:
+        stmt = stmt.where(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
+
+    stmt = (
+        stmt.group_by(Transaction.category_id, Category.name, Category.parent_id, parent.name)
         # Portable NULL-last sort: boolean key first (False < True puts
         # categorized rows above the uncategorized bucket), then most-
         # negative-sum first within the categorized block, then category_id
@@ -408,6 +432,12 @@ def spend_by_tag(
         # for equal totals (deterministic across runs / dialects).
         .order_by(tag_total.asc(), Label.id.asc())
     )
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    if inv_cat_id is not None:
+        grouped = grouped.where(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
+
     grouped = confirmed_only(grouped)
     rows = [
         SpendByTagRow(label_id=lid, label_name=name, total_paise=int(total))
@@ -422,6 +452,10 @@ def spend_by_tag(
         Transaction.date >= first,
         Transaction.date <= last,
     ]
+    if inv_cat_id is not None:
+        month_where.append(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
     total_stmt = confirmed_only(select(func.sum(Transaction.amount_paise)).where(*month_where))
     total_spend_paise = int(session.scalar(total_stmt) or 0)
 
@@ -479,6 +513,9 @@ def top_merchants(
         Transaction.date <= last,
         Transaction.merchant_normalized != "",
     ]
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    if inv_cat_id is not None:
+        where.append(or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id))
     if label_id is not None:
         # EXISTS subquery (see spend_by_category / transactions.py) — no join-row
         # duplication of the grouped sum.
@@ -608,6 +645,11 @@ def spend_by_period(
         Transaction.date >= start,
         Transaction.date <= end,
     )
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    if inv_cat_id is not None:
+        stmt = stmt.where(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
     # Board rows only (confirmed_at IS NOT NULL) — shared with spend_by_category.
     stmt = confirmed_only(stmt)
     # Optional F3a tag filter — EXISTS subquery (see spend_by_category).
@@ -659,10 +701,12 @@ def cashflow_by_period(
     """
     _require_ordered(start, end)
 
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
     stmt = select(
         Transaction.date,
         Transaction.amount_paise,
         Transaction.transaction_type,
+        Transaction.category_id,
     ).where(
         Transaction.user_id == user_id,
         Transaction.transaction_type.in_(("spend", "income")),
@@ -677,11 +721,13 @@ def cashflow_by_period(
     # filter above is ever widened.
     income_totals: dict[str, int] = defaultdict(int)
     expense_totals: dict[str, int] = defaultdict(int)
-    for d, amt, ttype in session.execute(stmt).all():
+    for d, amt, ttype, cat_id in session.execute(stmt).all():
         period = _bucket_of(d, bucket).period
         if ttype == "income":
             income_totals[period] += amt
         elif ttype == "spend":
+            if inv_cat_id is not None and cat_id == inv_cat_id:
+                continue
             # Signed: refunds are the positive spend rows, so they net here.
             expense_totals[period] += amt
 
@@ -778,6 +824,11 @@ def spend_by_tag_by_period(
             Transaction.date <= end,
         )
     )
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    if inv_cat_id is not None:
+        stmt = stmt.where(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
     # Board rows only (confirmed_at IS NOT NULL) — shared with the sibling routes.
     stmt = confirmed_only(stmt)
 
@@ -980,8 +1031,13 @@ def overview(
             Transaction.date >= ytd_first,
             Transaction.date <= last,
         )
-        .group_by(Transaction.account_id)
     )
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    if inv_cat_id is not None:
+        ytd_stmt = ytd_stmt.where(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
+    ytd_stmt = ytd_stmt.group_by(Transaction.account_id)
     ytd_stmt = confirmed_only(ytd_stmt)
     # Three accumulators, not four: `spend_ytd_paise` below is the signed net
     # gross_spend + refund + cashback, derived inline at the point of use rather
@@ -1333,6 +1389,11 @@ def category_trend(
             Transaction.date <= last,
         )
     )
+    inv_cat_id = _investment_transfer_category_id(session, user_id=user_id)
+    if inv_cat_id is not None:
+        stmt = stmt.where(
+            or_(Transaction.category_id.is_(None), Transaction.category_id != inv_cat_id)
+        )
     stmt = confirmed_only(stmt)
     if label_id is not None:
         stmt = stmt.where(Transaction.labels.any(Label.id == label_id))

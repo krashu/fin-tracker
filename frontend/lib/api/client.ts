@@ -189,7 +189,7 @@ export type CategoryColor = string;
  * kind's fallback "Other" (never archived or renamed, ADR-0012 rule 8) or the
  * spend-kind Cashback and its children (ADR-0013). The frontend branches on this
  * and never matches category names. */
-export type CategoryRole = "fallback" | "cashback";
+export type CategoryRole = "fallback" | "cashback" | "investment_transfer";
 
 export type CategoryRead = {
   id: number;
@@ -1679,6 +1679,7 @@ export type InstrumentCreate = {
 export type InvestmentTransactionRead = {
   id: number;
   instrument_id: number;
+  account_id: number;
   date: string;
   transaction_type: InvestmentTransactionType;
   units: string; // decimal string ("0" for dividend)
@@ -1692,17 +1693,20 @@ export type InvestmentTransactionRead = {
    * read-only: neither Create body accepts it. Without it a flat list renders a
    * reinvestment as two unrelated same-date events. */
   pair_id: number | null;
+  linked_spend_txn_id: number | null;
 };
 
 export type InvestmentTransactionCreate = {
   date: string;
   instrument_id: number;
+  account_id?: number | null;
   transaction_type: InvestmentTransactionType;
   units: string;
   price_per_unit_native?: string | null;
   amount_native_paise: number;
   fees_native_paise?: number;
   note?: string | null;
+  linked_spend_txn_id?: number | null;
 };
 
 /** An Indian MF IDCW **reinvestment**: `amount_native_paise` of dividend became
@@ -1831,6 +1835,24 @@ export function createReinvestment(
   return request<ReinvestmentRead>("/investment-transactions/reinvestment", {
     method: "POST",
     body: JSON.stringify(body),
+  });
+}
+
+export function linkInvestmentTransaction(
+  id: number,
+  spendTransactionId: number,
+): Promise<InvestmentTransactionRead> {
+  return request<InvestmentTransactionRead>(`/investment-transactions/${id}/link`, {
+    method: "POST",
+    body: JSON.stringify({ spend_transaction_id: spendTransactionId }),
+  });
+}
+
+export function unlinkInvestmentTransaction(
+  id: number,
+): Promise<InvestmentTransactionRead> {
+  return request<InvestmentTransactionRead>(`/investment-transactions/${id}/unlink`, {
+    method: "POST",
   });
 }
 
