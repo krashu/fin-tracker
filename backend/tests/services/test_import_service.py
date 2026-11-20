@@ -728,8 +728,8 @@ def test_cashback_credit_lands_in_the_cashback_category(
     assert cashback.auto_category_id is None
 
     purchase = rows["SWIGGY BLR"]
-    assert purchase.category_id == spend_ids["Online Food Delivery"]
-    assert purchase.auto_category_id == spend_ids["Online Food Delivery"]
+    assert purchase.category_id == spend_ids["Dining Out & Delivery"]
+    assert purchase.auto_category_id == spend_ids["Dining Out & Delivery"]
 
 
 def test_fingerprint_is_byte_identical_with_full_alias_table_loaded(

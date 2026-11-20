@@ -185,36 +185,44 @@ class _Recurring(NamedTuple):
 # wallet goes below zero, card bills included; tests/test_demo_data.py locks both.
 _RECURRING: list[_Recurring] = [
     # Bank: rent, loan, bills.
-    _Recurring("Rent - NoBroker", "Rent", "bank", 3, 28000),
+    _Recurring("Rent - NoBroker", "Rent & Maintenance", "bank", 3, 28000),
     _Recurring("Society Maintenance", "Rent & Maintenance", "bank", 5, 3500),
-    _Recurring("HDFC Car Loan EMI", "Loan EMIs & Repayments", "bank", 5, 14500),
-    _Recurring("ACT Fibernet", "Mobile & Broadband", "bank", 8, 1179),
-    _Recurring("BESCOM Electricity", "Electricity", "bank", 12, 1800, 25),
-    _Recurring("Indane Gas", "Cooking Gas & LPG", "bank", 16, 1100, 5, months=(1, 3, 5, 7, 9, 11)),
-    _Recurring("LIC Premium", "Health & Life Insurance", "bank", 10, 24000, months=(3,)),
+    _Recurring("HDFC Car Loan EMI", "Loan EMIs", "bank", 5, 14500),
+    _Recurring("ACT Fibernet", "Bills & Utilities", "bank", 8, 1179),
+    _Recurring("BESCOM Electricity", "Bills & Utilities", "bank", 12, 1800, 25),
+    _Recurring("Indane Gas", "Bills & Utilities", "bank", 16, 1100, 5, months=(1, 3, 5, 7, 9, 11)),
+    _Recurring("LIC Premium", "Doctor & Diagnostics", "bank", 10, 24000, months=(3,)),
     # Cash wallet.
-    _Recurring("Maid salary", "Household Help & Domestic Staff", "cash", 1, 4000),
-    _Recurring("Chai stall", "Coffee & Tea", "cash", 6, 60, 30),
+    _Recurring("Maid salary", "Rent & Maintenance", "cash", 1, 4000),
+    _Recurring("Chai stall", "Dining Out & Delivery", "cash", 6, 60, 30),
     _Recurring("Sabzi vendor", "Groceries", "cash", 9, 450, 30),
-    _Recurring("Auto rickshaw", "Ride-Hailing & Taxis", "cash", 14, 120, 30),
+    _Recurring("Auto rickshaw", "Daily Commute", "cash", 14, 120, 30),
     # Axis card: groceries, food, rides, subscriptions. (Coffee and extra orders come
     # from _SPEND_TEMPLATE.)
     _Recurring("Big Basket", "Groceries", "card", 7, 1800, 20),
-    _Recurring("Swiggy", "Online Food Delivery", "card", 6, 600, 35, ("online",)),
-    _Recurring("Zomato", "Online Food Delivery", "card", 13, 750, 30, ("online",)),
-    _Recurring("Swiggy Instamart", "Instant Grocery Delivery", "card", 27, 900, 30, ("online",)),
-    _Recurring("Uber", "Ride-Hailing & Taxis", "card", 11, 380, 30),
-    _Recurring("Netflix", "Digital Subscriptions & Streaming", "card", 20, 649),
-    _Recurring("Spotify", "Digital Subscriptions & Streaming", "card", 21, 149),
+    _Recurring("Swiggy", "Dining Out & Delivery", "card", 6, 600, 35, ("online",)),
+    _Recurring("Zomato", "Dining Out & Delivery", "card", 13, 750, 30, ("online",)),
+    _Recurring("Swiggy Instamart", "Groceries", "card", 27, 900, 30, ("online",)),
+    _Recurring("Uber", "Daily Commute", "card", 11, 380, 30),
+    _Recurring("Netflix", "Streaming & Subscriptions", "card", 20, 649),
+    _Recurring("Spotify", "Streaming & Subscriptions", "card", 21, 149),
     # ICICI Amazon Pay: fuel, phone, transit, pharmacy, outings, Diwali.
-    _Recurring("Indian Oil", "Fuel & Petrol", "card2", 9, 2500, 15),
-    _Recurring("Airtel", "Mobile & Broadband", "card2", 27, 1199),
-    _Recurring("Metro", "Metro & Public Transit", "card2", 15, 500),
-    _Recurring("Apollo Pharmacy", "Health", "card2", 26, 600, 30, months=(1, 3, 5, 7, 9, 11)),
+    _Recurring("Indian Oil", "Vehicle Service & Fuel", "card2", 9, 2500, 15),
+    _Recurring("Airtel", "Bills & Utilities", "card2", 27, 1199),
+    _Recurring("Metro", "Daily Commute", "card2", 15, 500),
     _Recurring(
-        "BookMyShow", "Entertainment", "card2", 23, 900, 25, ("weekend",), (2, 4, 6, 8, 10, 12)
+        "Apollo Pharmacy",
+        "Pharmacy & Medicines",
+        "card2",
+        26,
+        600,
+        30,
+        months=(1, 3, 5, 7, 9, 11),
     ),
-    _Recurring("Tanishq", "Gifts & Celebrations", "card2", 20, 18000, 0, ("festive",), (10,)),
+    _Recurring(
+        "BookMyShow", "Events & Outings", "card2", 23, 900, 25, ("weekend",), (2, 4, 6, 8, 10, 12)
+    ),
+    _Recurring("Tanishq", "Clothing & Personal", "card2", 20, 18000, 0, ("festive",), (10,)),
 ]
 
 # One-off and extra card spends across the 12-slot cycle, on top of _RECURRING.
@@ -224,68 +232,68 @@ _RECURRING: list[_Recurring] = [
 _SPEND_TEMPLATE: list[_SpendTemplate] = [
     # slot 11 (oldest)
     _SpendTemplate(11, 5, "Big Basket", "Groceries", 2800),
-    _SpendTemplate(11, 10, "Swiggy", "Online Food Delivery", 650, ("online",)),
-    _SpendTemplate(11, 14, "Uber", "Ride-Hailing & Taxis", 380),
+    _SpendTemplate(11, 10, "Swiggy", "Dining Out & Delivery", 650, ("online",)),
+    _SpendTemplate(11, 14, "Uber", "Daily Commute", 380),
     _SpendTemplate(11, 24, "Amazon", "Shopping", 1500, ("online",)),
     # slot 10
     _SpendTemplate(10, 6, "Big Basket", "Groceries", 3100),
-    _SpendTemplate(10, 11, "Zomato", "Online Food Delivery", 720, ("online",)),
-    _SpendTemplate(10, 15, "Metro", "Metro & Public Transit", 250),
-    _SpendTemplate(10, 26, "Apollo Pharmacy", "Health", 540),
+    _SpendTemplate(10, 11, "Zomato", "Dining Out & Delivery", 720, ("online",)),
+    _SpendTemplate(10, 15, "Metro", "Daily Commute", 250),
+    _SpendTemplate(10, 26, "Apollo Pharmacy", "Pharmacy & Medicines", 540),
     # slot 9 — deficit slot (spend > salary → net < 0)
     _SpendTemplate(9, 4, "Big Basket", "Groceries", 3600),
-    _SpendTemplate(9, 9, "Swiggy", "Online Food Delivery", 980, ("online",)),
-    _SpendTemplate(9, 12, "MakeMyTrip", "Travel", 32000, ("travel", "goa")),
-    _SpendTemplate(9, 18, "Croma", "Electronics & Gadgets", 18500, ("festive",)),
-    _SpendTemplate(9, 22, "Myntra", "Clothing & Apparel", 6200, ("festive",)),
-    _SpendTemplate(9, 25, "Uber", "Ride-Hailing & Taxis", 720, ("travel",)),
+    _SpendTemplate(9, 9, "Swiggy", "Dining Out & Delivery", 980, ("online",)),
+    _SpendTemplate(9, 12, "MakeMyTrip", "Flights & Trains", 32000, ("travel", "goa")),
+    _SpendTemplate(9, 18, "Croma", "Electronics & Home", 18500, ("festive",)),
+    _SpendTemplate(9, 22, "Myntra", "Clothing & Personal", 6200, ("festive",)),
+    _SpendTemplate(9, 25, "Uber", "Daily Commute", 720, ("travel",)),
     # slot 8
     _SpendTemplate(8, 5, "Big Basket", "Groceries", 2900),
-    _SpendTemplate(8, 9, "Blue Tokai", "Coffee & Tea", 480, ("restaurant",)),
-    _SpendTemplate(8, 14, "Swiggy", "Online Food Delivery", 610, ("online",)),
-    _SpendTemplate(8, 16, "Metro", "Metro & Public Transit", 300),
-    _SpendTemplate(8, 23, "BookMyShow", "Entertainment", 900, ("weekend",)),
+    _SpendTemplate(8, 9, "Blue Tokai", "Dining Out & Delivery", 480, ("restaurant",)),
+    _SpendTemplate(8, 14, "Swiggy", "Dining Out & Delivery", 610, ("online",)),
+    _SpendTemplate(8, 16, "Metro", "Daily Commute", 300),
+    _SpendTemplate(8, 23, "BookMyShow", "Events & Outings", 900, ("weekend",)),
     # slot 7
     _SpendTemplate(7, 6, "Big Basket", "Groceries", 3400),
-    _SpendTemplate(7, 11, "Zomato", "Online Food Delivery", 850, ("online",)),
-    _SpendTemplate(7, 15, "Uber", "Ride-Hailing & Taxis", 560),
+    _SpendTemplate(7, 11, "Zomato", "Dining Out & Delivery", 850, ("online",)),
+    _SpendTemplate(7, 15, "Uber", "Daily Commute", 560),
     _SpendTemplate(7, 19, "Amazon", "Shopping", 3200, ("online", "gifts")),
     # slot 6
     _SpendTemplate(6, 5, "Big Basket", "Groceries", 3000),
-    _SpendTemplate(6, 10, "Swiggy", "Online Food Delivery", 700, ("online",)),
-    _SpendTemplate(6, 14, "Metro", "Metro & Public Transit", 280),
-    _SpendTemplate(6, 25, "Apollo Pharmacy", "Health", 620),
+    _SpendTemplate(6, 10, "Swiggy", "Dining Out & Delivery", 700, ("online",)),
+    _SpendTemplate(6, 14, "Metro", "Daily Commute", 280),
+    _SpendTemplate(6, 25, "Apollo Pharmacy", "Pharmacy & Medicines", 620),
     # slot 5
     _SpendTemplate(5, 6, "Big Basket", "Groceries", 3300),
-    _SpendTemplate(5, 11, "Blue Tokai", "Coffee & Tea", 520, ("restaurant",)),
-    _SpendTemplate(5, 15, "Uber", "Ride-Hailing & Taxis", 410),
+    _SpendTemplate(5, 11, "Blue Tokai", "Dining Out & Delivery", 520, ("restaurant",)),
+    _SpendTemplate(5, 15, "Uber", "Daily Commute", 410),
     _SpendTemplate(5, 19, "Amazon", "Shopping", 2100, ("online",)),
-    _SpendTemplate(5, 8, "Manipal Hospitals", "Health", 9500, (), "card2"),
+    _SpendTemplate(5, 8, "Manipal Hospitals", "Doctor & Diagnostics", 9500, (), "card2"),
     # slot 4
     _SpendTemplate(4, 5, "Big Basket", "Groceries", 3500),
-    _SpendTemplate(4, 10, "Zomato", "Online Food Delivery", 890, ("online",)),
-    _SpendTemplate(4, 14, "Metro", "Metro & Public Transit", 320),
-    _SpendTemplate(4, 18, "Myntra", "Clothing & Apparel", 4200),
+    _SpendTemplate(4, 10, "Zomato", "Dining Out & Delivery", 890, ("online",)),
+    _SpendTemplate(4, 14, "Metro", "Daily Commute", 320),
+    _SpendTemplate(4, 18, "Myntra", "Clothing & Personal", 4200),
     # slot 3
     _SpendTemplate(3, 4, "Big Basket", "Groceries", 3200),
-    _SpendTemplate(3, 9, "Swiggy", "Online Food Delivery", 890, ("online",)),
-    _SpendTemplate(3, 15, "Uber", "Ride-Hailing & Taxis", 450),
+    _SpendTemplate(3, 9, "Swiggy", "Dining Out & Delivery", 890, ("online",)),
+    _SpendTemplate(3, 15, "Uber", "Daily Commute", 450),
     _SpendTemplate(3, 22, "Amazon", "Shopping", 2400, ("online",)),
-    _SpendTemplate(3, 27, "Apollo Pharmacy", "Health", 780),
+    _SpendTemplate(3, 27, "Apollo Pharmacy", "Pharmacy & Medicines", 780),
     # slot 2
-    _SpendTemplate(2, 3, "Blue Tokai", "Coffee & Tea", 520, ("restaurant",)),
-    _SpendTemplate(2, 8, "Metro", "Metro & Public Transit", 300),
+    _SpendTemplate(2, 3, "Blue Tokai", "Dining Out & Delivery", 520, ("restaurant",)),
+    _SpendTemplate(2, 8, "Metro", "Daily Commute", 300),
     _SpendTemplate(2, 14, "Big Basket", "Groceries", 4100),
-    _SpendTemplate(2, 25, "Croma", "Electronics & Gadgets", 1200),
+    _SpendTemplate(2, 25, "Croma", "Electronics & Home", 1200),
     # slot 1
-    _SpendTemplate(1, 3, "Blue Tokai", "Coffee & Tea", 450, ("restaurant",)),
-    _SpendTemplate(1, 7, "Metro card", "Metro & Public Transit", 180),
+    _SpendTemplate(1, 3, "Blue Tokai", "Dining Out & Delivery", 450, ("restaurant",)),
+    _SpendTemplate(1, 7, "Metro card", "Daily Commute", 180),
     _SpendTemplate(1, 9, "Big Basket", "Groceries", 1200),
-    _SpendTemplate(1, 12, "Swiggy", "Online Food Delivery", 895, ("online",)),
+    _SpendTemplate(1, 12, "Swiggy", "Dining Out & Delivery", 895, ("online",)),
     # slot 0 (current month) — truncated to day <= anchor.day at generation time
     _SpendTemplate(0, 4, "Big Basket", "Groceries", 2600),
-    _SpendTemplate(0, 9, "Swiggy", "Online Food Delivery", 740, ("online",)),
-    _SpendTemplate(0, 14, "Uber", "Ride-Hailing & Taxis", 390),
+    _SpendTemplate(0, 9, "Swiggy", "Dining Out & Delivery", 740, ("online",)),
+    _SpendTemplate(0, 14, "Uber", "Daily Commute", 390),
 ]
 
 # Card credits: `spend`-typed with a POSITIVE amount. A refund is not its own type
@@ -300,20 +308,18 @@ _REFUND_TEMPLATE: list[_SpendTemplate] = [
         9,
         28,
         "Myntra refund",
-        "Clothing & Apparel",
+        "Clothing & Personal",
         2000,
         ("festive",),
         refund_of=(9, 22, "Myntra"),
     ),
     _SpendTemplate(8, 28, "Card Cashback", "Cashback", 350),
-    _SpendTemplate(7, 17, "Uber refund", "Ride-Hailing & Taxis", 180, refund_of=(7, 15, "Uber")),
+    _SpendTemplate(7, 17, "Uber refund", "Daily Commute", 180, refund_of=(7, 15, "Uber")),
     _SpendTemplate(6, 30, "Card Cashback", "Cashback", 420),
     _SpendTemplate(
         2, 18, "Amazon refund", "Shopping", 600, ("online",), refund_of=(3, 22, "Amazon")
     ),
-    _SpendTemplate(
-        2, 29, "Croma refund", "Electronics & Gadgets", 1200, refund_of=(2, 25, "Croma")
-    ),
+    _SpendTemplate(2, 29, "Croma refund", "Electronics & Home", 1200, refund_of=(2, 25, "Croma")),
 ]
 
 # Bank income: salary every slot + a year-end and an appraisal bonus (Salary) and

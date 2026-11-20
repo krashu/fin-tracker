@@ -96,7 +96,7 @@ def test_seed_skips_existing_map_row(session: Session, user: User) -> None:
     never merged, never bumped, never overwritten with the seed's hit_count=0."""
     provision_default_categories(session, user.id)
     session.flush()
-    food_id = _category_id(session, user.id, "Online Food Delivery")
+    food_id = _category_id(session, user.id, "Dining Out & Delivery")
     learned = MerchantTagMap(
         user_id=user.id, merchant_normalized="swiggy", category_id=food_id, hit_count=1
     )
@@ -123,7 +123,7 @@ def test_seed_skips_existing_map_row(session: Session, user: User) -> None:
 def test_seed_skips_existing_pinned_row(session: Session, user: User) -> None:
     provision_default_categories(session, user.id)
     session.flush()
-    food_id = _category_id(session, user.id, "Online Food Delivery")
+    food_id = _category_id(session, user.id, "Dining Out & Delivery")
     pinned = MerchantTagMap(
         user_id=user.id,
         merchant_normalized="swiggy",
@@ -158,7 +158,9 @@ def test_seed_skips_archived_category(session: Session, user: User) -> None:
     session.flush()
     health = session.scalars(
         select(Category).where(
-            Category.user_id == user.id, Category.kind == "spend", Category.name == "Health"
+            Category.user_id == user.id,
+            Category.kind == "spend",
+            Category.name == "Doctor & Diagnostics",
         )
     ).one()
     health.archived_at = clock.naive_utcnow()
@@ -167,8 +169,8 @@ def test_seed_skips_archived_category(session: Session, user: User) -> None:
     provision_seed_merchant_dictionary(session, user.id)
     session.flush()
 
-    health_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name == "Health"}
-    other_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name != "Health"}
+    health_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name == "Doctor & Diagnostics"}
+    other_canonicals = {c for _, c, name in _MERCHANT_DICTIONARY if name != "Doctor & Diagnostics"}
     maps = list(session.scalars(select(MerchantTagMap).where(MerchantTagMap.user_id == user.id)))
     assert not any(m.merchant_normalized in health_canonicals for m in maps)
     assert {m.merchant_normalized for m in maps} == other_canonicals
@@ -192,7 +194,7 @@ def test_cold_start_prefill_resolves_from_seed(engine: Engine) -> None:
         assert canon == "swiggy"
 
         tag_map = prefetch_tag_map(s, user_id=u.id, resolver=resolver)
-        food_id = _category_id(s, u.id, "Online Food Delivery")
+        food_id = _category_id(s, u.id, "Dining Out & Delivery")
         assert tag_map[canon] == food_id
 
 
@@ -218,8 +220,8 @@ def test_seed_does_not_fold_uber_eats_onto_uber(engine: Engine) -> None:
         assert ride == "uber"
 
         tag_map = prefetch_tag_map(s, user_id=u.id, resolver=resolver)
-        assert tag_map[eats] == _category_id(s, u.id, "Online Food Delivery")
-        assert tag_map[ride] == _category_id(s, u.id, "Ride-Hailing & Taxis")
+        assert tag_map[eats] == _category_id(s, u.id, "Dining Out & Delivery")
+        assert tag_map[ride] == _category_id(s, u.id, "Daily Commute")
 
 
 def test_provision_default_categories_creates_two_level_tree(session: Session, user: User) -> None:

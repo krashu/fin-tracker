@@ -400,6 +400,51 @@ _ARCHIVED_SEEDS = frozenset(
         ("Transfer", "spend"),
         ("Cashback", "income"),
         ("Credit Card Payments", "spend"),
+        ("Bills & Utilities", "spend"),
+        ("Food", "spend"),
+        ("Quick Bites & Snacks", "spend"),
+        ("Restaurants & Cafes", "spend"),
+        ("Coffee & Tea", "spend"),
+        ("Online Food Delivery", "spend"),
+        ("Instant Grocery Delivery", "spend"),
+        ("Rent", "spend"),
+        ("Utilities", "spend"),
+        ("Electricity", "spend"),
+        ("Cooking Gas & LPG", "spend"),
+        ("Water & Municipal Taxes", "spend"),
+        ("Mobile & Broadband", "spend"),
+        ("Cable & Satellite TV", "spend"),
+        ("Household Help & Domestic Staff", "spend"),
+        ("Home Improvements & Repairs", "spend"),
+        ("Furniture & Appliances", "spend"),
+        ("Transport", "spend"),
+        ("Travel", "spend"),
+        ("Fuel & Petrol", "spend"),
+        ("Metro & Public Transit", "spend"),
+        ("Ride-Hailing & Taxis", "spend"),
+        ("Highway Tolls & Parking", "spend"),
+        ("Vehicle Service & Repairs", "spend"),
+        ("Shopping", "spend"),
+        ("Clothing & Apparel", "spend"),
+        ("Footwear & Accessories", "spend"),
+        ("Personal Care & Grooming", "spend"),
+        ("Electronics & Gadgets", "spend"),
+        ("Health", "spend"),
+        ("Health & Life Insurance", "spend"),
+        ("Subscriptions", "spend"),
+        ("Digital Subscriptions & Streaming", "spend"),
+        ("Entertainment", "spend"),
+        ("Gifts & Celebrations", "spend"),
+        ("Family Support & Transfers", "spend"),
+        ("Education & Tuition", "spend"),
+        ("Charity & Donations", "spend"),
+        ("Investment", "spend"),
+        ("Precious Metals & Gold", "spend"),
+        ("Fixed Deposits & Savings", "spend"),
+        ("EMI", "spend"),
+        ("Loan EMIs & Repayments", "spend"),
+        ("Home & Personal Loans", "spend"),
+        ("Shared Expenses & Splits", "spend"),
     }
 )
 
@@ -3387,5 +3432,217 @@ def test_card_bill_category_migration_archives_a_promoted_seed_with_its_children
 
         with eng.begin() as conn:
             command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+_REV_STREAMLINE_CATEGORIES = "0049_streamline_category_taxonomy"
+
+
+@pytest.mark.slow
+def test_0049_upgrade_reassigns_utility_bills_to_bills_and_utilities() -> None:
+    """Historical utility transactions must be reassigned to the new subcategory
+    'Bills & Utilities' under 'Housing & Utilities', not 'Rent & Maintenance'."""
+    eng = _migration_engine()
+    try:
+        user_id = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_STREAMLINE_CATEGORIES))
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": user_id})
+            conn.execute(
+                text(
+                    "INSERT INTO accounts (user_id, name, type) VALUES (:u, 'Primary Bank', 'bank')"
+                ),
+                {"u": user_id},
+            )
+            acct_id = conn.execute(
+                text("SELECT id FROM accounts WHERE user_id = :u"), {"u": user_id}
+            ).scalar_one()
+
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id) "
+                    "VALUES (:u, 'Bills & Utilities', 'spend', 1, '#6c5cd6', NULL)"
+                ),
+                {"u": user_id},
+            )
+            root_bu_id = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u AND name = 'Bills & Utilities' "
+                    "AND parent_id IS NULL"
+                ),
+                {"u": user_id},
+            ).scalar_one()
+
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id) "
+                    "VALUES (:u, 'Electricity', 'spend', 1, NULL, :p)"
+                ),
+                {"u": user_id, "p": root_bu_id},
+            )
+            elec_id = conn.execute(
+                text("SELECT id FROM categories WHERE user_id = :u AND name = 'Electricity'"),
+                {"u": user_id},
+            ).scalar_one()
+
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id) "
+                    "VALUES (:u, 'Household & Living', 'spend', 1, '#6c5cd6', NULL)"
+                ),
+                {"u": user_id},
+            )
+
+            conn.execute(
+                text(
+                    "INSERT INTO transactions (user_id, account_id, category_id, amount_paise, "
+                    "transaction_type, date, fingerprint, source, merchant_normalized) "
+                    "VALUES (:u, :a, :c, 150000, 'spend', '2026-01-01', 'fp-elec-1', 'manual', "
+                    "'bescom electricity')"
+                ),
+                {"u": user_id, "a": acct_id, "c": elec_id},
+            )
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_STREAMLINE_CATEGORIES)
+
+        with eng.connect() as conn:
+            housing_id = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u AND name = 'Housing & Utilities' "
+                    "AND parent_id IS NULL AND archived_at IS NULL"
+                ),
+                {"u": user_id},
+            ).scalar_one()
+
+            sub_bu_id = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u AND name = 'Bills & Utilities' "
+                    "AND parent_id = :p AND archived_at IS NULL"
+                ),
+                {"u": user_id, "p": housing_id},
+            ).scalar_one()
+
+            assigned_cat = conn.execute(
+                text("SELECT category_id FROM transactions WHERE user_id = :u"),
+                {"u": user_id},
+            ).scalar_one()
+            assert assigned_cat == sub_bu_id
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0049_downgrade_reverses_category_streamline() -> None:
+    """0049 downgrade must restore 0048 root names/colors and un-archive retired categories."""
+    eng = _migration_engine()
+    try:
+        user_id = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_STREAMLINE_CATEGORIES)
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": user_id})
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id) "
+                    "VALUES (:u, 'Housing & Utilities', 'spend', 1, '#6c5cd6', NULL)"
+                ),
+                {"u": user_id},
+            )
+            housing_id = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u AND name = 'Housing & Utilities'"
+                ),
+                {"u": user_id},
+            ).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id) "
+                    "VALUES (:u, 'Bills & Utilities', 'spend', 1, NULL, :p)"
+                ),
+                {"u": user_id, "p": housing_id},
+            )
+
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_STREAMLINE_CATEGORIES))
+
+        with eng.connect() as conn:
+            reverted = conn.execute(
+                text("SELECT name FROM categories WHERE user_id = :u AND id = :id"),
+                {"u": user_id, "id": housing_id},
+            ).scalar_one()
+            assert reverted == "Household & Living"
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0049_upgrade_with_archived_household_and_living() -> None:
+    """Migration 0049 must not fail if user previously archived Household & Living."""
+    eng = _migration_engine()
+    try:
+        user_id = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_STREAMLINE_CATEGORIES))
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": user_id})
+            conn.execute(
+                text(
+                    "INSERT INTO categories (user_id, name, kind, is_seeded, color, parent_id, "
+                    "archived_at) VALUES (:u, 'Household & Living', 'spend', 1, '#6c5cd6', NULL, "
+                    "'2026-01-01 00:00:00')"
+                ),
+                {"u": user_id},
+            )
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_STREAMLINE_CATEGORIES)
+
+        with eng.connect() as conn:
+            hc = conn.execute(
+                text(
+                    "SELECT id FROM categories WHERE user_id = :u AND name = 'Healthcare' "
+                    "AND parent_id IS NULL AND archived_at IS NULL"
+                ),
+                {"u": user_id},
+            ).scalar_one_or_none()
+            assert hc is not None
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0049_seeds_missing_merchant_aliases_and_tag_maps() -> None:
+    """Existing users should receive newly added merchant aliases and seed tag maps."""
+    eng = _migration_engine()
+    try:
+        user_id = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_STREAMLINE_CATEGORIES))
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": user_id})
+
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_STREAMLINE_CATEGORIES)
+
+        with eng.connect() as conn:
+            alias_canonical = conn.execute(
+                text(
+                    "SELECT canonical FROM merchant_alias WHERE user_id = :u AND pattern = 'irctc'"
+                ),
+                {"u": user_id},
+            ).scalar_one_or_none()
+            assert alias_canonical == "irctc"
+
+            tag_cat = conn.execute(
+                text(
+                    "SELECT c.name FROM merchant_tag_map m "
+                    "JOIN categories c ON c.id = m.category_id "
+                    "WHERE m.user_id = :u AND m.merchant_normalized = 'irctc'"
+                ),
+                {"u": user_id},
+            ).scalar_one_or_none()
+            assert tag_cat == "Flights & Trains"
     finally:
         eng.dispose()

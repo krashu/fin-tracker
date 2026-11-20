@@ -91,29 +91,58 @@ export function CategorySelector({
     setQuery("");
   }
 
-  // Filter tree when query is present
+  // Search ranking when query is present
   const q = query.trim().toLowerCase();
-  const filteredTree = useMemo(() => {
-    if (!q) return tree;
-    return tree
-      .map((parent) => {
-        const parentMatches = parent.name.toLowerCase().includes(q);
-        const matchingSubcategories = parent.subcategories.filter((sub) =>
-          sub.name.toLowerCase().includes(q),
-        );
-        if (parentMatches || matchingSubcategories.length > 0) {
-          return {
-            ...parent,
-            // If parent matches, show all its subcategories; otherwise show matching subcategories
-            subcategories: parentMatches
-              ? parent.subcategories
-              : matchingSubcategories,
-          };
-        }
-        return null;
-      })
-      .filter((node): node is NonNullable<typeof node> => node !== null);
-  }, [tree, q]);
+  const searchResults = useMemo(() => {
+    if (!q) return [];
+
+    type ScoredItem = {
+      category: CategoryRead;
+      parent: CategoryRead | null;
+      score: number;
+    };
+
+    const results: ScoredItem[] = [];
+
+    for (const c of visibleCategories) {
+      const nameLower = c.name.toLowerCase();
+      const parent =
+        c.parent_id != null ? (categoriesById.get(c.parent_id) ?? null) : null;
+      const parentNameLower = parent?.name.toLowerCase() ?? "";
+
+      let score = 99;
+      if (nameLower === q) {
+        // Exact match
+        score = 1;
+      } else if (nameLower.startsWith(q)) {
+        // Prefix match
+        score = 2;
+      } else if (nameLower.split(/[^\p{L}\p{N}]+/u).some((w) => w.startsWith(q))) {
+        // Word boundary startsWith match (e.g. "Food" in "Fast Food")
+        score = 3;
+      } else if (nameLower.includes(q)) {
+        // Substring match
+        score = 4;
+      } else if (parentNameLower.includes(q)) {
+        // Parent matches query
+        score = 5;
+      }
+
+      if (score < 99) {
+        results.push({ category: c, parent, score });
+      }
+    }
+
+    results.sort((a, b) => {
+      if (a.score !== b.score) return a.score - b.score;
+      if (a.category.name.length !== b.category.name.length) {
+        return a.category.name.length - b.category.name.length;
+      }
+      return a.category.name.localeCompare(b.category.name);
+    });
+
+    return results;
+  }, [visibleCategories, categoriesById, q]);
 
   const displayText = selectedCategory
     ? categoryDisplayName(selectedCategory, categoriesById)
@@ -169,91 +198,142 @@ export function CategorySelector({
               className="max-h-72 overflow-y-auto"
               onWheelCapture={(e) => e.stopPropagation()}
             >
-              {filteredTree.length === 0 ? (
-                <CommandEmpty>No matching categories.</CommandEmpty>
-              ) : null}
-
-              {optional && !q ? (
-                <>
-                  <CommandGroup>
-                    <CommandItem
-                      value="__uncategorized__"
-                      onSelect={() => handleSelect(null)}
-                      className="text-[12.5px]"
-                    >
-                      <CategoryDot categoryId={null} />
-                      <span className="flex-1 text-muted-foreground">
-                        {placeholder}
-                      </span>
-                      {value === null ? (
-                        <IconCheck className="size-3.5 text-primary" />
-                      ) : null}
-                    </CommandItem>
-                  </CommandGroup>
-                  <CommandSeparator />
-                </>
-              ) : null}
-
-              {filteredTree.map((parent) => {
-                const parentColor = parent.display_color;
-                const isParentSelected = value === parent.id;
-
-                return (
-                  <CommandGroup key={parent.id} className="p-1">
-                    {/* Top-level Parent Category Item */}
-                    <CommandItem
-                      value={`parent-${parent.id}-${parent.name}`}
-                      onSelect={() => handleSelect(parent.id)}
-                      className={cn(
-                        "flex items-center gap-2 rounded-[5px] px-2 py-1.5 text-[12.5px] font-medium",
-                        isParentSelected && "bg-accent text-accent-foreground",
-                      )}
-                    >
-                      <CategoryDot
-                        categoryId={parent.id}
-                        color={parentColor}
-                      />
-                      <span className="flex-1 truncate">{parent.name}</span>
-                      {isParentSelected ? (
-                        <IconCheck className="size-3.5 text-primary" />
-                      ) : parent.subcategories.length > 0 ? (
-                        <span className="text-[10px] text-muted-foreground/70">
-                          {parent.subcategories.length} sub
-                        </span>
-                      ) : null}
-                    </CommandItem>
-
-                    {/* Subcategories (indented) */}
-                    {parent.subcategories.map((sub) => {
-                      const subColor = sub.display_color;
-                      const isSubSelected = value === sub.id;
+              {q ? (
+                // Search results (ranked by match priority: exact -> prefix -> word -> substring)
+                searchResults.length === 0 ? (
+                  <CommandEmpty>No matching categories.</CommandEmpty>
+                ) : (
+                  <CommandGroup className="p-1">
+                    {searchResults.map(({ category, parent }) => {
+                      const isSelected = value === category.id;
+                      const isSub = category.parent_id !== null;
 
                       return (
                         <CommandItem
-                          key={sub.id}
-                          value={`sub-${sub.id}-${sub.name}-${parent.name}`}
-                          onSelect={() => handleSelect(sub.id)}
+                          key={category.id}
+                          value={`cat-${category.id}-${category.name}`}
+                          onSelect={() => handleSelect(category.id)}
                           className={cn(
-                            "ml-3 flex items-center gap-2 border-l border-border/60 py-1.5 pl-3 pr-2 text-[12px]",
-                            isSubSelected &&
+                            "flex items-center gap-2 rounded-[5px] px-2 py-1.5 text-[12.5px]",
+                            isSelected &&
                               "bg-accent font-medium text-accent-foreground",
                           )}
                         >
                           <CategoryDot
-                            categoryId={sub.id}
-                            color={subColor}
-                            className="size-1.5"
+                            categoryId={category.id}
+                            color={category.display_color}
+                            className={isSub ? "size-1.5" : "size-2"}
                           />
-                          <span className="flex-1 truncate">{sub.name}</span>
-                          {isSubSelected ? (
-                            <IconCheck className="size-3.5 text-primary" />
+                          <div className="flex flex-1 items-center gap-1.5 min-w-0">
+                            <span className="font-medium truncate">{category.name}</span>
+                            {isSub && parent ? (
+                              <span className="shrink-0 text-[11px] text-muted-foreground/70">
+                                · {parent.name}
+                              </span>
+                            ) : !isSub ? (
+                              <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 text-[10px] text-muted-foreground/70 font-normal">
+                                parent
+                              </span>
+                            ) : null}
+                          </div>
+                          {isSelected ? (
+                            <IconCheck className="ml-auto size-3.5 text-primary shrink-0" />
                           ) : null}
                         </CommandItem>
                       );
                     })}
                   </CommandGroup>
-                );
-              })}
+                )
+              ) : (
+                // Default Tree browsing view (no search query)
+                <>
+                  {visibleCategories.length === 0 ? (
+                    <CommandEmpty>No categories available.</CommandEmpty>
+                  ) : null}
+
+                  {optional ? (
+                    <>
+                      <CommandGroup>
+                        <CommandItem
+                          value="__uncategorized__"
+                          onSelect={() => handleSelect(null)}
+                          className="text-[12.5px]"
+                        >
+                          <CategoryDot categoryId={null} />
+                          <span className="flex-1 text-muted-foreground">
+                            {placeholder}
+                          </span>
+                          {value === null ? (
+                            <IconCheck className="size-3.5 text-primary" />
+                          ) : null}
+                        </CommandItem>
+                      </CommandGroup>
+                      <CommandSeparator />
+                    </>
+                  ) : null}
+
+                  {tree.map((parent) => {
+                    const parentColor = parent.display_color;
+                    const isParentSelected = value === parent.id;
+
+                    return (
+                      <CommandGroup key={parent.id} className="p-1">
+                        {/* Top-level Parent Category Item */}
+                        <CommandItem
+                          value={`parent-${parent.id}-${parent.name}`}
+                          onSelect={() => handleSelect(parent.id)}
+                          className={cn(
+                            "flex items-center gap-2 rounded-[5px] px-2 py-1.5 text-[12.5px] font-medium",
+                            isParentSelected && "bg-accent text-accent-foreground",
+                          )}
+                        >
+                          <CategoryDot
+                            categoryId={parent.id}
+                            color={parentColor}
+                          />
+                          <span className="flex-1 truncate">{parent.name}</span>
+                          {isParentSelected ? (
+                            <IconCheck className="size-3.5 text-primary" />
+                          ) : parent.subcategories.length > 0 ? (
+                            <span className="text-[10px] text-muted-foreground/70">
+                              {parent.subcategories.length} sub
+                            </span>
+                          ) : null}
+                        </CommandItem>
+
+                        {/* Subcategories (indented) */}
+                        {parent.subcategories.map((sub) => {
+                          const subColor = sub.display_color;
+                          const isSubSelected = value === sub.id;
+
+                          return (
+                            <CommandItem
+                              key={sub.id}
+                              value={`sub-${sub.id}-${sub.name}-${parent.name}`}
+                              onSelect={() => handleSelect(sub.id)}
+                              className={cn(
+                                "ml-3 flex items-center gap-2 border-l border-border/60 py-1.5 pl-3 pr-2 text-[12px]",
+                                isSubSelected &&
+                                  "bg-accent font-medium text-accent-foreground",
+                              )}
+                            >
+                              <CategoryDot
+                                categoryId={sub.id}
+                                color={subColor}
+                                className="size-1.5"
+                              />
+                              <span className="flex-1 truncate">{sub.name}</span>
+                              {isSubSelected ? (
+                                <IconCheck className="size-3.5 text-primary" />
+                              ) : null}
+                            </CommandItem>
+                          );
+                        })}
+                      </CommandGroup>
+                    );
+                  })}
+                </>
+              )}
             </CommandList>
           </Command>
         </PopoverContent>

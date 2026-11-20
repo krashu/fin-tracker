@@ -38,6 +38,28 @@ const mockCategories: CategoryRead[] = [
     role: null,
   },
   {
+    id: 5,
+    name: "Food",
+    kind: "spend",
+    is_seeded: true,
+    archived_at: null,
+    color: null,
+    display_color: "#ff5500",
+    parent_id: 1,
+    role: null,
+  },
+  {
+    id: 6,
+    name: "Fast Food",
+    kind: "spend",
+    is_seeded: true,
+    archived_at: null,
+    color: null,
+    display_color: "#ff5500",
+    parent_id: 1,
+    role: null,
+  },
+  {
     id: 4,
     name: "Salary",
     kind: "income",
@@ -114,5 +136,88 @@ describe("CategorySelector", () => {
     await user.click(screen.getByText("Groceries"));
 
     expect(handleChange).toHaveBeenCalledWith(2);
+  });
+
+  it("ranks exact match first when searching", async () => {
+    const { user } = renderWithProviders(
+      <CategorySelector
+        value={null}
+        onChange={vi.fn()}
+        categories={mockCategories}
+      />,
+    );
+
+    await user.click(screen.getByRole("button"));
+
+    const searchInput = screen.getByPlaceholderText("Search categories…");
+    await user.type(searchInput, "Food");
+
+    // All matching items should be present
+    const items = screen.getAllByRole("option");
+    // #1 item must be the exact match "Food" (id: 5)
+    expect(items[0]).toHaveTextContent(/^Food\b/);
+    // Followed by prefix match "Food & Dining"
+    expect(items[1]).toHaveTextContent(/^Food & Dining/);
+    // Followed by word boundary match "Fast Food"
+    expect(items[2]).toHaveTextContent(/^Fast Food/);
+  });
+
+  it("renders empty state when no category matches search query", async () => {
+    const { user } = renderWithProviders(
+      <CategorySelector
+        value={null}
+        onChange={vi.fn()}
+        categories={mockCategories}
+      />,
+    );
+
+    await user.click(screen.getByRole("button"));
+
+    const searchInput = screen.getByPlaceholderText("Search categories…");
+    await user.type(searchInput, "xyznonexistent");
+
+    expect(screen.getByText("No matching categories.")).toBeInTheDocument();
+  });
+
+  it("ranks direct match above match via parent name", async () => {
+    const categoriesWithDining: CategoryRead[] = [
+      ...mockCategories,
+      {
+        id: 7,
+        name: "Dining Supplies",
+        kind: "spend",
+        is_seeded: true,
+        archived_at: null,
+        color: null,
+        display_color: "#ff5500",
+        parent_id: null,
+        role: null,
+      },
+    ];
+
+    const { user } = renderWithProviders(
+      <CategorySelector
+        value={null}
+        onChange={vi.fn()}
+        categories={categoriesWithDining}
+      />,
+    );
+
+    await user.click(screen.getByRole("button"));
+
+    const searchInput = screen.getByPlaceholderText("Search categories…");
+    await user.type(searchInput, "Dining");
+
+    const items = screen.getAllByRole("option");
+    // "Dining Supplies" directly starts with "Dining" (score 2)
+    // "Food & Dining" contains "Dining" (score 3 or 4)
+    // "Groceries" only matches because parent is "Food & Dining" (score 5)
+    const texts = items.map((el) => el.textContent || "");
+    const diningDirectIdx = texts.findIndex((t) => t.includes("Dining Supplies"));
+    const parentMatchIdx = texts.findIndex((t) => t.includes("Groceries"));
+
+    expect(diningDirectIdx).toBeGreaterThanOrEqual(0);
+    expect(parentMatchIdx).toBeGreaterThanOrEqual(0);
+    expect(diningDirectIdx).toBeLessThan(parentMatchIdx);
   });
 });
