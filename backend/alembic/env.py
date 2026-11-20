@@ -55,9 +55,10 @@ an enum-value edit was captured; that still needs to be written by hand.
 from __future__ import annotations
 
 from logging.config import fileConfig
+from pathlib import Path
 
 from sqlalchemy import engine_from_config, event, pool
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 
 from alembic import context
 from app.core.config import get_settings
@@ -78,6 +79,18 @@ config.set_main_option("sqlalchemy.url", _DB_URL.replace("%", "%%"))
 
 def _is_sqlite() -> bool:
     return _DB_URL.startswith("sqlite")
+
+
+def _ensure_sqlite_parent_dir() -> None:
+    if not _is_sqlite():
+        return
+    url = make_url(_DB_URL)
+    if not url.database or url.database == ":memory:":
+        return
+    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+
+
+_ensure_sqlite_parent_dir()
 
 
 def _disable_sqlite_fk_for_migration(engine: Engine) -> None:

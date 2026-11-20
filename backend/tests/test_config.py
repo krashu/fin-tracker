@@ -10,10 +10,13 @@ deterministic regardless of local env.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.engine import make_url
 
-from app.core.config import _DEV_JWT_SECRET, Settings
+from app.core.config import _DEV_JWT_SECRET, REPO_ROOT, Settings
 
 _VALID_CORS = "http://localhost:3000"
 
@@ -73,3 +76,33 @@ def test_registration_closed_by_default(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.delenv("REGISTRATION_ENABLED", raising=False)
     s = Settings(_env_file=None, cors_allowed_origins=_VALID_CORS)
     assert s.registration_enabled is False
+
+
+def test_anchor_relative_sqlite_path_default() -> None:
+    s = Settings(_env_file=None, cors_allowed_origins=_VALID_CORS)
+    url = make_url(s.database_url)
+    assert url.database == str((REPO_ROOT / "data" / "fin-tracker.db").resolve())
+
+
+def test_anchor_relative_sqlite_path_slash_prefixed() -> None:
+    s = Settings(
+        _env_file=None,
+        database_url="sqlite:////data/fin-tracker.db",
+        cors_allowed_origins=_VALID_CORS,
+    )
+    url = make_url(s.database_url)
+    if sys.platform == "win32":
+        assert url.database == str((REPO_ROOT / "data" / "fin-tracker.db").resolve())
+    else:
+        assert url.database == "/data/fin-tracker.db"
+
+
+def test_anchor_relative_sqlite_path_preserves_memory_and_postgres() -> None:
+    s_mem = Settings(
+        _env_file=None, database_url="sqlite:///:memory:", cors_allowed_origins=_VALID_CORS
+    )
+    assert s_mem.database_url == "sqlite:///:memory:"
+
+    pg_url = "postgresql+psycopg://user:pass@localhost:5432/fintracker"
+    s_pg = Settings(_env_file=None, database_url=pg_url, cors_allowed_origins=_VALID_CORS)
+    assert s_pg.database_url == pg_url

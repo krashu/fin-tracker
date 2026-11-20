@@ -253,7 +253,7 @@ Environment variables live in `.env` at the project root (copy from [.env.exampl
 | Variable                       | Default                                  | Purpose                                                                                          |
 | ------------------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `JWT_SECRET`                   | dev placeholder                          | Secret for signing JWT session tokens. **Set a real value on any self-host stack.**               |
-| `DATABASE_URL`                 | Docker: `sqlite:////data/fin-tracker.db`; from source: `./data` under `backend/` | Database connection string (SQLite or Postgres).        |
+| `DATABASE_URL`                 | Docker: `sqlite:////data/fin-tracker.db`; from source: `./data` at repo root | Database connection string (SQLite or Postgres).        |
 | `API_HOST`                     | `127.0.0.1`                              | Backend bind address (`0.0.0.0` for LAN access).                                                 |
 | `API_PORT`                     | `8000`                                   | Backend API port.                                                                                |
 | `API_RELOAD`                   | `false`                                  | Enable uvicorn hot reloading in development.                                                     |

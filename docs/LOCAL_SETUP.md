@@ -68,7 +68,7 @@ re-run it any time deps change.
 
 `alembic upgrade head` is **not optional on a fresh DB** — the startup guard refuses to
 boot if `V1_USER_ID` has no matching `users` row, and the migration seeds it.
-Equivalent: `make migrate` (which also creates `backend/data/`).
+Equivalent: `make migrate` (which also creates `data/`).
 
 `pre-commit install` wires the local gate so `ruff` + `ty` + `eslint` + `tsc` (and the
 fixture-redaction test) run on every commit — matching CI. Run it from whichever directory

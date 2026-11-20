@@ -26,13 +26,6 @@ from sqlalchemy.engine import make_url
 # precedence over the env_file anyway.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# Anchor for a relative sqlite DATABASE_URL (see _anchor_relative_sqlite_path
-# below) — the backend/ dir, where data/ actually lives on disk today.
-# Independent of migrations.py's own _BACKEND_ROOT (same value, computed from
-# that module's file location) rather than imported from it, so config.py —
-# imported at module-load time by app/core/db.py — doesn't pull in alembic.
-_BACKEND_ROOT = Path(__file__).resolve().parents[2]
-
 # Fixed API mount prefix. Single source of truth: main.py mounts the v1 router
 # here and app/api/v1/auth.py derives its refresh-cookie path from it. Lives in
 # this leaf module (both importers already import get_settings from here) so the
@@ -435,33 +428,34 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _anchor_relative_sqlite_path(self) -> Settings:
         """Rewrite a relative sqlite ``database_url`` to an absolute one, anchored
-        at ``backend/`` rather than the process's current working directory.
+        at ``REPO_ROOT`` rather than the process's current working directory.
 
-        The default — ``sqlite:///./data/fin-tracker.db`` — is only correct when
-        the process happens to be launched with ``backend/`` as CWD (the
-        documented ``cd backend && uv run main.py``). Launched any other way —
-        an absolute path to ``main.py``, an IDE run config, a cron job — SQLite
-        silently opens (or creates) a *different*, empty DB file under whatever
-        directory the process actually started in, instead of erroring. Rewriting
-        here, once, fixes every consumer of this field in one place —
-        app/core/db.py's module-level engine, app/core/migrations.py's
-        startup-upgrade path, and alembic/env.py's CLI path all just read
-        ``settings.database_url``.
+        The default — ``sqlite:///./data/fin-tracker.db`` — resolves under the
+        repo root's gitignored ``data/`` directory. Without an absolute anchor,
+        launching the app or CLI from different working directories (e.g.
+        ``cd backend`` vs repo root vs IDE runners) causes SQLite to silently
+        open or create different DB files. Rewriting here, once, guarantees every
+        consumer — app/core/db.py engine, app/core/migrations.py startup upgrade,
+        and alembic/env.py CLI — targets the identical DB file.
 
-        No-op for ``:memory:``, an already-absolute path (including the Docker
-        image's ``sqlite:////data/fin-tracker.db``), or a non-sqlite URL (v2
-        Postgres) — ``make_url`` parses the sqlite URL variants (relative /
-        absolute / query params) robustly rather than string-splitting.
+        No-op for ``:memory:``, an already-absolute path (e.g. an explicit Windows
+        drive path like ``sqlite:///C:/...`` or Linux Docker path ``sqlite:////data/...``),
+        or a non-sqlite URL (v2 Postgres).
         """
         url = make_url(self.database_url)
         if not url.drivername.startswith("sqlite"):
             return self
         if not url.database or url.database == ":memory:":
             return self
-        relative_path = Path(url.database)
-        if relative_path.is_absolute():
+        raw_path = Path(url.database)
+        if raw_path.is_absolute():
             return self
-        absolute_path = (_BACKEND_ROOT / relative_path).resolve()
+        # On Windows, a path like '/data/fin-tracker.db' has no drive letter so
+        # is_absolute() is False, but Path(url.database) has root '\\' which would
+        # re-anchor to the root of the current drive (C:\data\...). Strip leading
+        # slashes so it anchors relative to REPO_ROOT (fin-tracker/data/...).
+        clean_rel = Path(url.database.lstrip("/\\"))
+        absolute_path = (REPO_ROOT / clean_rel).resolve()
         new_url = url.set(database=str(absolute_path))
         self.database_url = new_url.render_as_string(hide_password=False)
         return self

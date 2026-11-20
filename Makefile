@@ -43,7 +43,7 @@ up-proxy:
 	docker compose -f docker-compose.yml -f docker-compose.proxy.yml up --build
 
 migrate:
-	@mkdir -p backend/data
+	@mkdir -p data
 	cd backend && uv run alembic upgrade head
 
 backend: ca-bundle
