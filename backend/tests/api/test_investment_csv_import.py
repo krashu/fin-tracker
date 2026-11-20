@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from app.models import User
 
@@ -178,3 +179,95 @@ def test_import_legacy_xls_returns_actionable_422(client: TestClient, seeded_use
     )
     assert resp.status_code == 422
     assert "legacy .xls format is not supported" in resp.json()["detail"]
+
+
+def test_drivewealth_us_import_with_fx_rate(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    from datetime import date
+    from decimal import Decimal
+
+    from app.models import FxRateQuote
+
+    session.add(
+        FxRateQuote(
+            from_currency="USD",
+            to_currency="INR",
+            date=date(2022, 1, 1),
+            rate=Decimal("75.00"),
+            source="frankfurter",
+        )
+    )
+    session.commit()
+    csv_text = (
+        "Account Details,,,,,,,,,\n"
+        "Broker Name,DriveWealth,,,,,,,,\n"
+        "Broker Account,,,,,,,,,\n"
+        "Period From,2022-01-01,,,,,,,,\n"
+        "Period To,2026-11-20,,,,,,,,\n"
+        "Total Buy Amount ($),20.00,,,,,,,,\n"
+        "Total Sell Amount ($),0,,,,,,,,\n"
+        ",,,,,,,,,\n"
+        ",,,,,,,,,\n"
+        "Stock Name,Stock Symbol,Order Placed Time,Order Execution Time,"
+        "Broker Reference Id,Transaction Type,Order Type,Quantity,Price ($),"
+        "Order Amount ($),Brokerage ($)\n"
+        '"Invesco QQQ Trust, Series 1",QQQ,"07 Dec 2021, 12:40 AM",'
+        '"26 Jan 2022, 09:29 AM",IL.123,BUY,market,0.05164355,387.27,20,0\n'
+    )
+    resp = _post(client, csv_text, asset_class="us_equity")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["txns_imported"] == 1
+    assert body["instruments_new"] == 1
+    assert body["rows_rejected"] == 0
+    assert body["warnings"] == []
+
+    holdings = client.get("/api/v1/holdings").json()["holdings"]
+    qqq = next(h for h in holdings if h["symbol"] == "QQQ")
+    assert qqq["currency"] == "USD"
+    assert qqq["asset_class"] == "us_equity"
+    assert qqq["net_units"] == "0.05164355"
+
+
+def test_drivewealth_us_import_with_stock_split(
+    client: TestClient, seeded_user: User, session: Session
+) -> None:
+    from datetime import date
+    from decimal import Decimal
+
+    from app.models import FxRateQuote
+
+    session.add(
+        FxRateQuote(
+            from_currency="USD",
+            to_currency="INR",
+            date=date(2022, 1, 1),
+            rate=Decimal("75.00"),
+            source="frankfurter",
+        )
+    )
+    session.commit()
+    # GOOG: pre-split buy in Feb 2022 (0.0038043 @ 2628.60),
+    # post-split sell in Dec 2022 (0.076086 @ 94.37).
+    # Without split adjustment, selling 0.076086 oversells the 0.0038043 buy and fails.
+    # With split adjustment, buy is rescaled by 20x to 0.076086 and matches cleanly.
+    csv_text = (
+        "Stock Name,Stock Symbol,Order Execution Time,Broker Reference Id,"
+        "Transaction Type,Order Type,Quantity,Price ($),Order Amount ($),Brokerage ($)\n"
+        'Alphabet Inc. Class C Capital Stock,GOOG,"23 Feb 2022, 08:09 PM",'
+        "JB.1,BUY,market,0.0038043,2628.6,10,0\n"
+        'Alphabet Inc. Class C Capital Stock,GOOG,"08 Dec 2022, 10:52 PM",'
+        "JL.2,SELL,market,0.076086,94.37,7.18,0\n"
+    )
+    resp = _post(client, csv_text, asset_class="us_equity")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["txns_imported"] == 2
+    assert body["instruments_new"] == 1
+    assert body["rows_rejected"] == 0
+    assert body["warnings"] == []
+
+    # Net units for GOOG is 0 (fully closed lot, no open holding)
+    holdings = client.get("/api/v1/holdings").json()["holdings"]
+    assert not any(h["symbol"] == "GOOG" for h in holdings)

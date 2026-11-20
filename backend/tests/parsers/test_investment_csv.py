@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from app.parsers import CSVParseError, UnsupportedFileFormatError, parse_investment_csv
-from app.parsers.investment_csv import HEADER_ALIASES
+from app.parsers.investment_csv import FALLBACK_HEADER_ALIASES, HEADER_ALIASES
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "investment_csv"
 
@@ -61,6 +63,121 @@ def test_header_aliases_are_disjoint() -> None:
             assert spelling == spelling.lower(), f"{spelling!r} must be lowercase"
             assert spelling not in seen, f"{spelling!r} maps to both {seen[spelling]} and {field}"
             seen[spelling] = field
+    for field, spellings in FALLBACK_HEADER_ALIASES.items():
+        for spelling in spellings:
+            assert spelling == spelling.lower(), f"{spelling!r} must be lowercase"
+            assert spelling not in seen, f"fallback {spelling!r} already mapped in {seen[spelling]}"
+            seen[spelling] = f"fallback:{field}"
+
+
+def test_drivewealth_us_transactions_csv() -> None:
+    # INDmoney / DriveWealth US stock trade report export
+    csv_bytes = (
+        b"Account Details,,,,,,,,,\n"
+        b"Broker Name,DriveWealth,,,,,,,,\n"
+        b"Broker Account,,,,,,,,,\n"
+        b"Period From,2022-01-01,,,,,,,,\n"
+        b"Period To,2026-11-20,,,,,,,,\n"
+        b"Total Buy Amount ($),100.00,,,,,,,,\n"
+        b"Total Sell Amount ($),50.00,,,,,,,,\n"
+        b",,,,,,,,,\n"
+        b",,,,,,,,,\n"
+        b"Stock Name,Stock Symbol,Order Placed Time,Order Execution Time,"
+        b"Broker Reference Id,Transaction Type,Order Type,Quantity,Price ($),"
+        b"Order Amount ($),Brokerage ($)\n"
+        b'"Invesco QQQ Trust, Series 1",QQQ,"07 Dec 2021, 12:40 AM",'
+        b'"26 Jan 2022, 09:29 AM",IL.123,BUY,market,0.05164355,387.27,20,0\n'
+        b'Apple Inc. Common Stock,AAPL,"14 Feb 2022, 10:42 PM",'
+        b'"14 Feb 2022, 10:42 PM",JB.456,BUY,market,0.05911213,169.17,10,0.01\n'
+        b'Apple Inc. Common Stock,AAPL,"07 Oct 2026, 08:26 PM",'
+        b'"07 Oct 2026, 08:26 PM",NJ.789,SELL,market,0.05,300.00,15,0.05\n'
+        b",,,,,,,,,\n"
+        b"Disclaimer:-,,,,,,,,,\n"
+        b"* This Profit and Loss report is for informational purposes only.,,,,,,,,,\n"
+        b"* INDmoney does not make any warranty.,,,,,,,,,\n"
+    )
+    rows, warnings = parse_investment_csv(csv_bytes, default_asset_class="us_equity")
+    assert warnings == []
+    assert len(rows) == 3
+    assert rows[0].symbol == "QQQ"
+    assert rows[0].date == date(2022, 1, 26)
+    assert rows[0].txn_type == "buy"
+    assert rows[0].currency == "USD"
+    assert rows[0].amount_native_paise == 2000
+    assert rows[0].fees_native_paise == 0
+
+    assert rows[1].symbol == "AAPL"
+    assert rows[1].date == date(2022, 2, 14)
+    assert rows[1].txn_type == "buy"
+    assert rows[1].currency == "USD"
+    assert rows[1].amount_native_paise == 1000
+    assert rows[1].fees_native_paise == 1
+
+    assert rows[2].symbol == "AAPL"
+    assert rows[2].date == date(2026, 10, 7)
+    assert rows[2].txn_type == "sell"
+    assert rows[2].currency == "USD"
+    assert rows[2].amount_native_paise == 1500
+    assert rows[2].fees_native_paise == 5
+
+
+def test_us_stock_split_adjustment() -> None:
+    # GOOG split 20:1 on 2022-07-18
+    # NVDA split 4:1 on 2021-07-20 and 10:1 on 2024-06-10
+    csv_text = (
+        "date,type,symbol,units,price,amount,currency,asset_class\n"
+        # Pre-split GOOG buy (should rescale 20x)
+        "2022-02-23,buy,GOOG,0.0038043,2628.60,10.00,USD,us_equity\n"
+        # Post-split GOOG sell (no rescale)
+        "2022-12-08,sell,GOOG,0.076086,94.37,7.18,USD,us_equity\n"
+        # Pre-2021 NVDA buy (rescale 40x)
+        "2020-05-15,buy,NVDA,1.0,500.00,500.00,USD,us_equity\n"
+        # Between splits NVDA buy (rescale 10x)
+        "2022-10-15,buy,NVDA,2.0,120.00,240.00,USD,us_equity\n"
+        # Post-2024 NVDA buy (no rescale)
+        "2025-01-15,buy,NVDA,5.0,130.00,650.00,USD,us_equity\n"
+        # Non-US row (INR equity) is untouched even if symbol collides
+        "2022-02-23,buy,GOOG,1.0,2000.00,2000.00,INR,indian_equity\n"
+    )
+    rows, warnings = parse_investment_csv(csv_text.encode("utf-8"), default_asset_class="us_equity")
+    assert warnings == []
+    assert len(rows) == 6
+
+    # 1. Pre-split GOOG: units * 20, price / 20, amount_native_paise preserved
+    goog_buy = rows[0]
+    assert goog_buy.units == Decimal("0.07608600")
+    assert goog_buy.price == Decimal("131.43000000")
+    assert goog_buy.amount_native_paise == 1000
+
+    # 2. Post-split GOOG: unchanged
+    goog_sell = rows[1]
+    assert goog_sell.units == Decimal("0.07608600")
+    assert goog_sell.price == Decimal("94.37000000")
+    assert goog_sell.amount_native_paise == 718
+
+    # 3. Pre-2021 NVDA: units * 40, price / 40
+    nvda_2020 = rows[2]
+    assert nvda_2020.units == Decimal("40.00000000")
+    assert nvda_2020.price == Decimal("12.50000000")
+    assert nvda_2020.amount_native_paise == 50000
+
+    # 4. Between-splits NVDA: units * 10, price / 10
+    nvda_2022 = rows[3]
+    assert nvda_2022.units == Decimal("20.00000000")
+    assert nvda_2022.price == Decimal("12.00000000")
+    assert nvda_2022.amount_native_paise == 24000
+
+    # 5. Post-2024 NVDA: unchanged
+    nvda_2025 = rows[4]
+    assert nvda_2025.units == Decimal("5.00000000")
+    assert nvda_2025.price == Decimal("130.00000000")
+    assert nvda_2025.amount_native_paise == 65000
+
+    # 6. INR row: unchanged
+    inr_row = rows[5]
+    assert inr_row.units == Decimal("1.00000000")
+    assert inr_row.price == Decimal("2000.00000000")
+    assert inr_row.currency == "INR"
 
 
 def test_missing_required_column_raises() -> None:

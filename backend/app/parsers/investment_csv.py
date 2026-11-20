@@ -36,7 +36,7 @@ from __future__ import annotations
 import csv
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date as date_t
 from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -46,7 +46,7 @@ import openpyxl
 import openpyxl.utils.datetime
 
 from app.models.account import CurrencyStr
-from app.models.instrument import AssetClassStr, ExchangeStr, class_currencies
+from app.models.instrument import USD_ASSET_CLASSES, AssetClassStr, ExchangeStr, class_currencies
 from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.parsers.base import ParserError
 
@@ -61,7 +61,6 @@ HEADER_ALIASES: dict[str, tuple[str, ...]] = {
         "type",
         "trade_type",
         "transaction_type",
-        "order_type",
         "side",
         "action",
         "buy/sell",
@@ -97,15 +96,37 @@ HEADER_ALIASES: dict[str, tuple[str, ...]] = {
         "trade_price",
         "nav",
     ),
-    "amount": ("amount", "value", "total_amount", "total_value", "trade_value", "gross_amount"),
+    "amount": (
+        "amount",
+        "value",
+        "total_amount",
+        "total_value",
+        "trade_value",
+        "gross_amount",
+        "order_amount",
+    ),
     "fees": ("fees", "charges", "total_charges", "brokerage", "commission"),
     "currency": ("currency",),
+}
+
+# Fallback aliases used only when a canonical field has no primary column present.
+# Prevents false-positive duplicates in brokers that export both primary and secondary
+# columns (e.g. Zerodha exports both trade_date and order_execution_time; DriveWealth
+# exports both transaction_type and order_type).
+FALLBACK_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
+    "date": ("order_execution_time", "execution_time"),
+    "type": ("order_type",),
 }
 
 _REQUIRED_FIELDS = frozenset({"date", "type", "symbol", "units", "price"})
 # Reverse index: alias spelling → canonical field. Built once at import.
 _ALIAS_TO_FIELD: dict[str, str] = {
     spelling: field for field, spellings in HEADER_ALIASES.items() for spelling in spellings
+}
+_FALLBACK_ALIAS_TO_FIELD: dict[str, str] = {
+    spelling: field
+    for field, spellings in FALLBACK_HEADER_ALIASES.items()
+    for spelling in spellings
 }
 
 _ASSET_CLASSES = frozenset(get_args(AssetClassStr))
@@ -135,6 +156,15 @@ _DATE_FORMATS = (
     "%d-%b-%Y",
     "%d-%b-%y",
     "%d-%B-%Y",
+    "%d %b %Y, %I:%M %p",
+    "%d %b %Y, %I:%M:%S %p",
+    "%d %b %Y, %H:%M:%S",
+    "%d %b %Y, %H:%M",
+    "%d %b %Y",
+    "%d %B %Y",
+    "%b %d, %Y, %I:%M %p",
+    "%b %d, %Y",
+    "%B %d, %Y",
 )
 
 _ZIP_MAGIC = b"PK\x03\x04"
@@ -177,7 +207,8 @@ class UnsupportedFileFormatError(CSVParseError):
 
 def _normalize_header(header: str) -> str:
     """Normalize header text: strip, lowercase, replace spaces/dots/hyphens with underscores."""
-    s = header.strip().lower()
+    s = re.sub(r"\s*\([^\)]*\)", "", header)
+    s = s.strip().lower()
     return re.sub(r"[\s\.\-]+", "_", s)
 
 
@@ -230,7 +261,7 @@ def _try_date(val: object) -> date_t | None:
     if not text:
         return None
     # Check ISO format e.g. "2024-03-15T09:30:00" or "2024-03-15 09:30:00"
-    if "T" in text or " " in text:
+    if "T" in text:
         iso_candidate = text.replace("T", " ").split()[0]
         try:
             return datetime.strptime(iso_candidate, "%Y-%m-%d").date()
@@ -241,6 +272,13 @@ def _try_date(val: object) -> date_t | None:
             return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
+    if "," in text:
+        date_part = text.split(",")[0].strip()
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.strptime(date_part, fmt).date()
+            except ValueError:
+                continue
     return None
 
 
@@ -252,8 +290,67 @@ def _is_summary_or_blank(raw_symbol: str | None, values: dict[str, object]) -> b
     is_summary_text = bool(
         (raw_symbol and raw_symbol.upper() in _SUMMARY_SYMBOLS)
         or (raw_name and raw_name.upper() in _SUMMARY_SYMBOLS)
+        or raw_name.upper().startswith("DISCLAIMER")
+        or raw_name.startswith("*")
     )
-    return bool(is_summary_text and (values.get("date") is None or values.get("type") is None))
+    if is_summary_text and (values.get("date") is None or values.get("type") is None):
+        return True
+    return bool(not raw_symbol and (values.get("date") is None or values.get("type") is None))
+
+
+# Known major US stock splits: symbol → tuple of (ex_date, forward_ratio).
+# forward_ratio is new_shares / old_shares (e.g. 20 for a 20:1 forward split).
+# Pre-split trades executed prior to ex_date are rescaled so their share counts
+# match post-split holdings and quotes (ADR-0015 Rule 1).
+KNOWN_US_SPLITS: dict[str, tuple[tuple[date_t, Decimal], ...]] = {
+    "GOOG": ((date_t(2022, 7, 18), Decimal("20")),),
+    "GOOGL": ((date_t(2022, 7, 18), Decimal("20")),),
+    "AMZN": ((date_t(2022, 6, 6), Decimal("20")),),
+    "NVDA": (
+        (date_t(2021, 7, 20), Decimal("4")),
+        (date_t(2024, 6, 10), Decimal("10")),
+    ),
+    "TSLA": (
+        (date_t(2020, 8, 31), Decimal("5")),
+        (date_t(2022, 8, 25), Decimal("3")),
+    ),
+    "AAPL": ((date_t(2020, 8, 31), Decimal("4")),),
+    "AVGO": ((date_t(2024, 7, 15), Decimal("10")),),
+    "WMT": ((date_t(2024, 2, 26), Decimal("3")),),
+    "CMG": ((date_t(2024, 6, 26), Decimal("50")),),
+    "SMCI": ((date_t(2024, 10, 1), Decimal("10")),),
+}
+
+
+def _adjust_splits_for_rows(rows: list[ParsedInvestmentRow]) -> list[ParsedInvestmentRow]:
+    """Rescale historical pre-split trades for known corporate action stock splits.
+
+    When a broker exports order execution receipts (e.g. DriveWealth / INDmoney), historical
+    trades executed prior to a stock split carry pre-split share counts and prices, whereas
+    post-split trades and depository holdings reflect post-split counts. Rescaling units
+    and price by the split ratio preserves exact cash amounts (cents spent/received) while
+    ensuring lots match post-split sells (avoiding OversellError) and current portfolio units.
+    """
+    adjusted: list[ParsedInvestmentRow] = []
+    for r in rows:
+        if r.currency != "USD" and r.asset_class not in USD_ASSET_CLASSES:
+            adjusted.append(r)
+            continue
+        splits = KNOWN_US_SPLITS.get(r.symbol)
+        if not splits:
+            adjusted.append(r)
+            continue
+        multiplier = Decimal("1")
+        for split_date, ratio in splits:
+            if r.date < split_date:
+                multiplier *= ratio
+        if multiplier != Decimal("1"):
+            new_units = _q8(r.units * multiplier)
+            new_price = _q8(r.price / multiplier) if r.price is not None else None
+            adjusted.append(replace(r, units=new_units, price=new_price))
+        else:
+            adjusted.append(r)
+    return adjusted
 
 
 def parse_investment_csv(
@@ -277,8 +374,10 @@ def parse_investment_csv(
             "legacy .xls format is not supported; please save or export as .xlsx or .csv"
         )
     if fmt == "xlsx":
-        return _parse_excel(file_bytes, default_asset_class=default_asset_class)
-    return _parse_csv(file_bytes, default_asset_class=default_asset_class)
+        rows, warnings = _parse_excel(file_bytes, default_asset_class=default_asset_class)
+    else:
+        rows, warnings = _parse_csv(file_bytes, default_asset_class=default_asset_class)
+    return _adjust_splits_for_rows(rows), warnings
 
 
 # Alias for caller clarity
@@ -304,12 +403,14 @@ def _parse_csv(
         row = list(csv.reader([line]))[0]
         candidate_col_map: dict[str, str] = {}
         dup_found = False
+        unmapped: list[tuple[str, str]] = []
         for cell in row:
             if not cell.strip():
                 continue
             norm_header = _normalize_header(cell)
             field = _ALIAS_TO_FIELD.get(norm_header)
             if field is None:
+                unmapped.append((cell, norm_header))
                 continue
             if field in candidate_col_map:
                 dup_found = True
@@ -317,6 +418,10 @@ def _parse_csv(
             candidate_col_map[field] = cell
         if dup_found:
             raise CSVParseError(f"duplicate column for {field!r}")
+        for cell, norm_header in unmapped:
+            fallback_field = _FALLBACK_ALIAS_TO_FIELD.get(norm_header)
+            if fallback_field is not None and fallback_field not in candidate_col_map:
+                candidate_col_map[fallback_field] = cell
         if candidate_col_map.keys() >= _REQUIRED_FIELDS:
             header_idx = idx
             col_map = candidate_col_map
@@ -382,12 +487,14 @@ def _parse_excel(
                     continue
                 candidate_col_map: dict[str, int] = {}
                 dup_found = False
+                unmapped: list[tuple[int, str]] = []
                 for c_idx, cell in enumerate(row):
                     if cell is None:
                         continue
                     norm_header = _normalize_header(str(cell))
                     field = _ALIAS_TO_FIELD.get(norm_header)
                     if field is None:
+                        unmapped.append((c_idx, norm_header))
                         continue
                     if field in candidate_col_map:
                         dup_found = True
@@ -395,6 +502,10 @@ def _parse_excel(
                     candidate_col_map[field] = c_idx
                 if dup_found:
                     raise CSVParseError(f"duplicate column for {field!r}")
+                for c_idx, norm_header in unmapped:
+                    fallback_field = _FALLBACK_ALIAS_TO_FIELD.get(norm_header)
+                    if fallback_field is not None and fallback_field not in candidate_col_map:
+                        candidate_col_map[fallback_field] = c_idx
                 if candidate_col_map.keys() >= _REQUIRED_FIELDS:
                     target_sheet = sheet
                     header_row_idx = r_idx
@@ -458,8 +569,12 @@ def _parse_row(
     isin = str(isin_val).strip().upper() if isin_val is not None and str(isin_val).strip() else None
 
     curr_val = values.get("currency")
-    curr_str = str(curr_val).strip() if curr_val is not None and str(curr_val).strip() else "INR"
-    currency = curr_str.upper()
+    if curr_val is not None and str(curr_val).strip():
+        currency = str(curr_val).strip().upper()
+    elif default_asset_class.lower() in USD_ASSET_CLASSES:
+        currency = "USD"
+    else:
+        currency = "INR"
     if currency not in ("INR", "USD"):
         return f"row {line_no}: unsupported currency {currency} (INR/USD only)"
 
