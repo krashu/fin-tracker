@@ -39,3 +39,14 @@ export function invalidateFriends(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ["friends"] });
   qc.invalidateQueries({ queryKey: ["dashboards"] });
 }
+
+/**
+ * Invalidate every cache that an investment account mutation can change:
+ * the investment accounts list (`/investment-accounts`) and computed holdings (`["holdings"]`).
+ *
+ * Call this from every mutation that creates, updates, or deletes investment accounts.
+ */
+export function invalidateInvestmentAccounts(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: ["investment-accounts"] });
+  qc.invalidateQueries({ queryKey: ["holdings"] });
+}

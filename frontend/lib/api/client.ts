@@ -361,7 +361,7 @@ async function sendWithRefresh(
  * `noRefresh` is used by the auth endpoints themselves (a login 401 is bad creds,
  * not an expired session, and the refresh call must never recurse).
  */
-async function request<T>(
+export async function request<T>(
   path: string,
   init?: RequestInit,
   opts?: { noRefresh?: boolean },
@@ -1834,8 +1834,23 @@ export function createReinvestment(
   });
 }
 
-export function listHoldings(): Promise<HoldingsResponse> {
-  return request<HoldingsResponse>("/holdings");
+export type ListHoldingsParams = {
+  account_id?: number | null;
+};
+
+export function listHoldings(): Promise<HoldingsResponse>;
+export function listHoldings(
+  params: ListHoldingsParams,
+): Promise<HoldingsResponse>;
+export function listHoldings(
+  params?: ListHoldingsParams,
+): Promise<HoldingsResponse> {
+  const qs = new URLSearchParams();
+  if (params?.account_id != null) {
+    qs.set("account_id", String(params.account_id));
+  }
+  const s = qs.toString();
+  return request<HoldingsResponse>(`/holdings${s ? `?${s}` : ""}`);
 }
 
 // --- Portfolio summary (PRD §F8 view 6 / §F9) ---------------------------------

@@ -15,6 +15,7 @@ import type {
   StatementIssuer,
   TransactionRead,
 } from "@/lib/api/client";
+import type { InvestmentAccountRead } from "@/lib/types/investment-accounts";
 
 export const mockUser: AuthUser = {
   id: "u-test-1",
@@ -255,6 +256,27 @@ export const mockBenchmarkRefreshSummary: BenchmarkRefreshSummary = {
   fetch_errors: 0,
   warnings: [],
 };
+
+export const mockInvestmentAccounts: InvestmentAccountRead[] = [
+  {
+    id: 1,
+    name: "Zerodha Demat",
+    account_type: "demat",
+    provider: "zerodha",
+    external_account_ref: "12345",
+    currency: "INR",
+    is_active: true,
+  },
+  {
+    id: 2,
+    name: "INDmoney US",
+    account_type: "us_broker",
+    provider: "indmoney",
+    external_account_ref: "67890",
+    currency: "USD",
+    is_active: true,
+  },
+];
 
 export const handlers = [
   // --- Auth Endpoints ---
@@ -590,6 +612,41 @@ export const handlers = [
 
   http.post("*/api/v1/benchmarks/refresh", () => {
     return HttpResponse.json(mockBenchmarkRefreshSummary);
+  }),
+
+  // --- Investment Accounts Endpoints (ADR-0019) ---
+  http.get("*/api/v1/investment-accounts", () => {
+    return HttpResponse.json(mockInvestmentAccounts);
+  }),
+  http.get("*/api/v1/investment-accounts/:id", ({ params }) => {
+    const acc = mockInvestmentAccounts.find((a) => a.id === Number(params.id));
+    if (!acc) return new HttpResponse(null, { status: 404 });
+    return HttpResponse.json(acc);
+  }),
+  http.post("*/api/v1/investment-accounts", async ({ request }) => {
+    const body = (await request.json()) as Record<string, unknown>;
+    return HttpResponse.json(
+      {
+        id: 99,
+        user_id: "u-test-1",
+        name: body.name ?? "New Account",
+        account_type: body.account_type ?? "demat",
+        provider: body.provider ?? "zerodha",
+        external_account_ref: body.external_account_ref ?? "default",
+        currency: body.currency ?? "INR",
+        is_active: body.is_active ?? true,
+      },
+      { status: 201 },
+    );
+  }),
+  http.patch("*/api/v1/investment-accounts/:id", async ({ params, request }) => {
+    const acc = mockInvestmentAccounts.find((a) => a.id === Number(params.id));
+    if (!acc) return new HttpResponse(null, { status: 404 });
+    const body = (await request.json()) as Record<string, unknown>;
+    return HttpResponse.json({ ...acc, ...body });
+  }),
+  http.delete("*/api/v1/investment-accounts/:id", () => {
+    return new HttpResponse(null, { status: 204 });
   }),
 
   // --- Tax statement (F11) ---

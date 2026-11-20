@@ -1,6 +1,10 @@
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
-import { invalidateFriends, invalidateRules } from "./invalidate";
+import {
+  invalidateFriends,
+  invalidateInvestmentAccounts,
+  invalidateRules,
+} from "./invalidate";
 
 describe("TanStack Query Invalidation Contract (lib/queries/invalidate.ts)", () => {
   it("invalidates rules, tagging-stats, and all candidates cache keys", () => {
@@ -92,6 +96,39 @@ describe("TanStack Query Invalidation Contract (lib/queries/invalidate.ts)", () 
     expect(getQuery(["friends", "contacts"])?.isStale()).toBe(true);
     expect(getQuery(["friends", "contacts", 1, "entries"])?.isStale()).toBe(true);
     expect(getQuery(["dashboards", "summary"])?.isStale()).toBe(true);
+    expect(getQuery(["accounts"])?.isStale()).toBe(false);
+  });
+
+  it("invalidates investment-accounts and holdings cache keys", () => {
+    const qc = new QueryClient({
+      defaultOptions: {
+        queries: {
+          staleTime: 60_000,
+        },
+      },
+    });
+
+    qc.setQueryData(["investment-accounts"], [{ id: 1, name: "Zerodha" }]);
+    qc.setQueryData(["investment-accounts", { is_active: true }], [{ id: 1 }]);
+    qc.setQueryData(["holdings"], { holdings: [] });
+    qc.setQueryData(["holdings", { account_id: 1 }], { holdings: [] });
+    qc.setQueryData(["accounts"], [{ id: 1 }]);
+
+    const cache = qc.getQueryCache();
+    const getQuery = (queryKey: unknown[]) => cache.find({ queryKey });
+
+    expect(getQuery(["investment-accounts"])?.isStale()).toBe(false);
+    expect(getQuery(["investment-accounts", { is_active: true }])?.isStale()).toBe(false);
+    expect(getQuery(["holdings"])?.isStale()).toBe(false);
+    expect(getQuery(["holdings", { account_id: 1 }])?.isStale()).toBe(false);
+    expect(getQuery(["accounts"])?.isStale()).toBe(false);
+
+    invalidateInvestmentAccounts(qc);
+
+    expect(getQuery(["investment-accounts"])?.isStale()).toBe(true);
+    expect(getQuery(["investment-accounts", { is_active: true }])?.isStale()).toBe(true);
+    expect(getQuery(["holdings"])?.isStale()).toBe(true);
+    expect(getQuery(["holdings", { account_id: 1 }])?.isStale()).toBe(true);
     expect(getQuery(["accounts"])?.isStale()).toBe(false);
   });
 });

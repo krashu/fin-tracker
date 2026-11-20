@@ -46,8 +46,24 @@ import { MONO, StateRow, Td, Th } from "@/components/ui/table";
 
 const COLS = 9;
 
-export function HoldingsTable() {
-  const query = useQuery({ queryKey: ["holdings"], queryFn: listHoldings });
+export type HoldingsTableProps = {
+  accountId?: number | null;
+  holdings?: HoldingRead[];
+  isLoading?: boolean;
+  isError?: boolean;
+};
+
+export function HoldingsTable({
+  accountId,
+  holdings: externalHoldings,
+  isLoading: externalLoading,
+  isError: externalError,
+}: HoldingsTableProps = {}) {
+  const query = useQuery({
+    queryKey: ["holdings", { account_id: accountId ?? null }],
+    queryFn: () => listHoldings({ account_id: accountId ?? undefined }),
+    enabled: externalHoldings === undefined,
+  });
   // Per-holding XIRR rides on the portfolio summary (shared cache key, so the
   // /portfolio page and this table fetch it once). It degrades independently of
   // the holdings query — a missing/loading/errored summary just shows "—".
@@ -56,7 +72,9 @@ export function HoldingsTable() {
     queryFn: getPortfolioSummary,
   });
 
-  const rows = query.data?.holdings ?? [];
+  const isPending = externalLoading ?? query.status === "pending";
+  const hasError = externalError ?? query.status === "error";
+  const rows = externalHoldings ?? query.data?.holdings ?? [];
   // %Alloc denominator: total current value across PRICED holdings, in INR
   // (null-NAV — and USD holdings with no cached FX rate — contribute neither
   // value nor a denominator share). INR rollup, never native, so mixed-currency
@@ -105,9 +123,9 @@ export function HoldingsTable() {
             </tr>
           </thead>
           <tbody>
-            {query.status === "pending" ? (
+            {isPending ? (
               <StateRow colSpan={COLS}>Loading…</StateRow>
-            ) : query.status === "error" ? (
+            ) : hasError ? (
               <StateRow colSpan={COLS} tone="error">
                 Couldn’t load holdings — is the API running?
               </StateRow>
