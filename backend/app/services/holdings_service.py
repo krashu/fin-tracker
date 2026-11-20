@@ -96,6 +96,7 @@ class Holding:
     fx_pnl_inr_paise: int | None
     nav_staleness_days: int | None
     supports_price_feed: bool
+    account_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +157,7 @@ class _Lot:
     fx_rate_to_inr: Decimal
     txn_id: int
     acquired_on: date
+    account_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +173,7 @@ class LotMatch:
     buy_date: date
     sell_date: date
     kind: RealisedLotKindStr
+    account_id: int
 
 
 @dataclass(slots=True)
@@ -228,12 +231,14 @@ def compute_holdings(
     user_id: UUID,
     usd_inr_rate: Decimal | None = None,
     as_of: date | None = None,
+    account_id: int | None = None,
 ) -> list[Holding]:
     """Return current positions (``net_units > 0``) for ``user_id``, symbol-sorted.
 
     Two queries: active instruments, then every investment transaction ordered
-    ``(instrument_id, *_REPLAY_ORDER)`` so the per-instrument replay is FIFO in the
-    ADR-0015 rule 3 order. Instruments with no NAV yield ``None`` for current value / P&L.
+    ``(instrument_id, account_id, *_REPLAY_ORDER)`` so the per-instrument replay is FIFO in the
+    ADR-0015 rule 3 order per account (CBDT Circular 768). Instruments with no NAV yield
+    ``None`` for current value / P&L.
 
     ``usd_inr_rate`` is the as-of USD→INR rate used to convert a USD holding's current value
     to INR (``None`` ⇒ no rate cached ⇒ that holding's ``current_value_inr_paise`` is ``None``).
@@ -258,21 +263,24 @@ def compute_holdings(
     if not by_id:
         return []
 
-    txns = session.scalars(
-        select(InvestmentTransaction)
-        .where(
-            InvestmentTransaction.user_id == user_id,
-            InvestmentTransaction.instrument_id.in_(by_id.keys()),
-        )
-        .order_by(InvestmentTransaction.instrument_id, *_REPLAY_ORDER)
+    stmt = select(InvestmentTransaction).where(
+        InvestmentTransaction.user_id == user_id,
+        InvestmentTransaction.instrument_id.in_(by_id.keys()),
     )
+    if account_id is not None:
+        stmt = stmt.where(InvestmentTransaction.account_id == account_id)
+    stmt = stmt.order_by(
+        InvestmentTransaction.instrument_id, InvestmentTransaction.account_id, *_REPLAY_ORDER
+    )
+    txns = session.scalars(stmt)
 
     lots_by_instrument: dict[int, deque[_Lot]] = {iid: deque() for iid in by_id}
     for iid, group in groupby(txns, key=lambda t: t.instrument_id):
         if iid in by_id:  # a txn against an archived/foreign instrument is skipped
-            lots_by_instrument[iid] = _replay(
-                group, nets_intraday=by_id[iid].asset_class in _NETS_INTRADAY
-            )
+            for _, acc_group in groupby(group, key=lambda t: t.account_id):
+                lots_by_instrument[iid].extend(
+                    _replay(acc_group, nets_intraday=by_id[iid].asset_class in _NETS_INTRADAY)
+                )
 
     holdings: list[Holding] = []
     for inst in instruments:
@@ -346,6 +354,7 @@ def compute_holdings(
                     else None
                 ),
                 supports_price_feed=supports_price_feed(inst.asset_class, inst.exchange),
+                account_id=account_id,
             )
         )
 
@@ -448,6 +457,7 @@ def _open_lot(txn: InvestmentTransaction) -> _Lot:
         fx_rate_to_inr=txn.fx_rate_to_inr,
         txn_id=txn.id,
         acquired_on=txn.date,
+        account_id=txn.account_id,
     )
 
 
@@ -477,6 +487,7 @@ def _apply(lots: deque[_Lot], txn: InvestmentTransaction, out: _ReplayOut | None
                 fx_rate_to_inr=txn.fx_rate_to_inr,
                 txn_id=txn.id,
                 acquired_on=txn.date,
+                account_id=txn.account_id,
             )
         )
     elif t in ("sell", "switch_out"):
@@ -542,6 +553,7 @@ def _consume(
                     buy_date=lot.acquired_on,
                     sell_date=txn.date,
                     kind=kind,
+                    account_id=txn.account_id,
                 )
             )
         sell.units -= matched
@@ -618,10 +630,11 @@ def _replay(
 
 
 def rebuild_realised_lots(session: Session, *, user_id: UUID, instrument_id: int) -> None:
-    """Replace one instrument's ``realised_lots`` with a fresh replay (ADR-0015 rules 4, 5, 7, 9).
+    """Replace one instrument's ``realised_lots`` with a fresh replay (ADR-0015, ADR-0019).
 
-    The replay nets same-day trades first for an ``indian_equity`` instrument (rule 7), so the
-    rows carry both ``fifo`` matches and ``intraday`` matches, marked by ``kind``.
+    The replay is scoped strictly per account (CBDT Circular 768), and nets same-day
+    trades first for an ``indian_equity`` instrument (rule 7), so the rows carry both
+    ``fifo`` matches and ``intraday`` matches, marked by ``kind``.
 
     Call after every write to the instrument's investment transactions, in the same DB
     transaction. Raises :class:`OversellError`, before writing anything, if the replay
@@ -629,13 +642,15 @@ def rebuild_realised_lots(session: Session, *, user_id: UUID, instrument_id: int
     ``archived_at``: an archived instrument keeps its rows.
     """
     session.flush()  # sessions here are autoflush=False; the replay must see pending rows
-    txns = session.scalars(
-        select(InvestmentTransaction)
-        .where(
-            InvestmentTransaction.user_id == user_id,
-            InvestmentTransaction.instrument_id == instrument_id,
+    txns = list(
+        session.scalars(
+            select(InvestmentTransaction)
+            .where(
+                InvestmentTransaction.user_id == user_id,
+                InvestmentTransaction.instrument_id == instrument_id,
+            )
+            .order_by(InvestmentTransaction.account_id, *_REPLAY_ORDER)
         )
-        .order_by(*_REPLAY_ORDER)
     )
     asset_class = session.scalar(
         select(Instrument.asset_class).where(
@@ -643,7 +658,8 @@ def rebuild_realised_lots(session: Session, *, user_id: UUID, instrument_id: int
         )
     )
     out = _ReplayOut(matches=[], uncovered=[])
-    _replay(txns, nets_intraday=asset_class in _NETS_INTRADAY, out=out)
+    for _, acc_txns in groupby(txns, key=lambda t: t.account_id):
+        _replay(acc_txns, nets_intraday=asset_class in _NETS_INTRADAY, out=out)
     if out.uncovered:
         raise OversellError(instrument_id=instrument_id, uncovered=out.uncovered)
 
@@ -661,6 +677,7 @@ def rebuild_realised_lots(session: Session, *, user_id: UUID, instrument_id: int
     session.add_all(
         RealisedLot(
             user_id=user_id,
+            account_id=m.account_id,
             sell_txn_id=m.sell_txn_id,
             buy_txn_id=m.buy_txn_id,
             units=m.units,

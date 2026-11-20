@@ -18,9 +18,10 @@ from typing import get_args
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Instrument, InvestmentTransaction, User
+from app.models import Instrument, InvestmentAccount, InvestmentTransaction, User
 from app.models.instrument import AssetClassStr
 from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.services.holdings_service import (
@@ -34,6 +35,23 @@ from app.services.holdings_service import (
 from app.services.nav_snapshot_service import as_valuation_stamp
 
 _D = date(2026, 6, 1)
+
+
+def _default_account_id(session: Session, user_id: UUID) -> int:
+    acc = session.scalar(select(InvestmentAccount).where(InvestmentAccount.user_id == user_id))
+    if acc is None:
+        acc = InvestmentAccount(
+            user_id=user_id,
+            name="Default Portfolio",
+            account_type="manual",
+            provider="manual",
+            external_account_ref="default",
+            currency="INR",
+            is_active=True,
+        )
+        session.add(acc)
+        session.flush()
+    return acc.id
 
 
 def _instrument(
@@ -74,9 +92,12 @@ def _txn(
     price: Decimal | None = None,
     on: date = _D,
     fx_rate: Decimal = Decimal("1"),
+    account_id: int | None = None,
 ) -> InvestmentTransaction:
+    aid = account_id if account_id is not None else _default_account_id(session, user_id)
     txn = InvestmentTransaction(
         user_id=user_id,
+        account_id=aid,
         instrument_id=instrument_id,
         date=on,
         transaction_type=txn_type,
@@ -1030,3 +1051,102 @@ def test_summarize_holdings_absorbs_rounding_imbalance() -> None:
     # price_pnl absorbed the 1 paisa diff to preserve waterfall balance
     assert rollup.price_pnl_paise == 2_500_001
     assert rollup.price_pnl_paise + rollup.fx_pnl_paise == rollup.unrealized_pnl_paise
+
+
+def test_cbdt_768_per_account_fifo_isolation(session: Session, user: User) -> None:
+    """ADR-0019: FIFO matching is strictly per (account_id, instrument_id) under CBDT Circular 768.
+
+    A sell in Account 1 must only consume lots in Account 1, even if Account 2 has
+    older/cheaper lots.
+    A sell exceeding Account 2's units raises OversellError even if Account 1 has excess units.
+    """
+    from app.services.holdings_service import OversellError, rebuild_realised_lots
+
+    acc1 = InvestmentAccount(
+        user_id=user.id,
+        name="Zerodha Demat",
+        account_type="demat",
+        provider="zerodha",
+        external_account_ref="zerodha_1",
+        currency="INR",
+        is_active=True,
+    )
+    acc2 = InvestmentAccount(
+        user_id=user.id,
+        name="Groww Demat",
+        account_type="demat",
+        provider="groww",
+        external_account_ref="groww_1",
+        currency="INR",
+        is_active=True,
+    )
+    session.add_all([acc1, acc2])
+    session.flush()
+
+    inst = _instrument(session, user.id, symbol="INFY", current_nav=Decimal("200"))
+
+    # Acc 1 buys 100 units @ ₹100 on June 1
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("100"),
+        amount_paise=1000_000,
+        on=date(2026, 6, 1),
+        account_id=acc1.id,
+    )
+    # Acc 2 buys 50 units @ ₹150 on June 2
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="buy",
+        units=Decimal("50"),
+        amount_paise=750_000,
+        on=date(2026, 6, 2),
+        account_id=acc2.id,
+    )
+    # Acc 1 sells 40 units on June 3
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="sell",
+        units=Decimal("40"),
+        amount_paise=600_000,
+        on=date(2026, 6, 3),
+        account_id=acc1.id,
+    )
+
+    rebuild_realised_lots(session, user_id=user.id, instrument_id=inst.id)
+
+    # Filtered by Acc 1: 100 - 40 = 60 units remaining
+    (h1,) = compute_holdings(session, user_id=user.id, account_id=acc1.id)
+    assert h1.net_units == Decimal("60")
+    assert h1.invested_native_paise == 600_000
+
+    # Filtered by Acc 2: 50 units remaining
+    (h2,) = compute_holdings(session, user_id=user.id, account_id=acc2.id)
+    assert h2.net_units == Decimal("50")
+    assert h2.invested_native_paise == 750_000
+
+    # Combined across accounts: 60 + 50 = 110 units
+    (h_all,) = compute_holdings(session, user_id=user.id)
+    assert h_all.net_units == Decimal("110")
+    assert h_all.invested_native_paise == 1350_000
+
+    # An oversell in Acc 2 (selling 60 units when Acc 2 only has 50) must raise OversellError,
+    # even though globally the user holds 110 units!
+    _txn(
+        session,
+        user.id,
+        inst.id,
+        txn_type="sell",
+        units=Decimal("60"),
+        amount_paise=900_000,
+        on=date(2026, 6, 4),
+        account_id=acc2.id,
+    )
+    with pytest.raises(OversellError):
+        rebuild_realised_lots(session, user_id=user.id, instrument_id=inst.id)

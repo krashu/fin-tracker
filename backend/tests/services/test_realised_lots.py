@@ -15,7 +15,14 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Instrument, InvestmentTransaction, InvestmentTxnTypeStr, RealisedLot, User
+from app.models import (
+    Instrument,
+    InvestmentAccount,
+    InvestmentTransaction,
+    InvestmentTxnTypeStr,
+    RealisedLot,
+    User,
+)
 from app.models.instrument import AssetClassStr
 from app.services.fx_math import to_inr_paise
 from app.services.holdings_service import (
@@ -51,6 +58,23 @@ def _instrument(
     return inst
 
 
+def _default_account_id(session: Session, user_id: UUID) -> int:
+    acc = session.scalar(select(InvestmentAccount).where(InvestmentAccount.user_id == user_id))
+    if acc is None:
+        acc = InvestmentAccount(
+            user_id=user_id,
+            name="Default Portfolio",
+            account_type="manual",
+            provider="manual",
+            external_account_ref="default",
+            currency="INR",
+            is_active=True,
+        )
+        session.add(acc)
+        session.flush()
+    return acc.id
+
+
 def _txn(
     session: Session,
     user_id: UUID,
@@ -61,9 +85,12 @@ def _txn(
     amount: int = 0,
     fees: int = 0,
     fx: str = "1",
+    account_id: int | None = None,
 ) -> InvestmentTransaction:
+    aid = account_id if account_id is not None else _default_account_id(session, user_id)
     txn = InvestmentTransaction(
         user_id=user_id,
+        account_id=aid,
         instrument_id=instrument_id,
         date=on,
         transaction_type=txn_type,

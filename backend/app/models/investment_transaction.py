@@ -127,7 +127,13 @@ class InvestmentTransaction(Base, TimestampMixin):
             "pair_id IS NULL OR pair_id != id",
             name="no_self_pair",
         ),
-        # ADR-0003 rule 10: same-user composite FKs to the instrument and the batch.
+        # ADR-0003 rule 10 & ADR-0019: same-user composite FKs to instrument, batch,
+        # and investment account.
+        ForeignKeyConstraint(
+            ["account_id", "user_id"],
+            ["investment_accounts.id", "investment_accounts.user_id"],
+            name="fk_investment_transactions_account_id_investment_accounts",
+        ),
         ForeignKeyConstraint(
             ["instrument_id", "user_id"],
             ["instruments.id", "instruments.user_id"],
@@ -137,6 +143,15 @@ class InvestmentTransaction(Base, TimestampMixin):
             ["import_batch_id", "user_id"],
             ["import_batches.id", "import_batches.user_id"],
             name="fk_investment_transactions_import_batch_id_import_batches",
+        ),
+        # ADR-0019: Account-scoped index for per-account FIFO and broker filtering.
+        Index(
+            "ix_investment_transactions_user_account_instrument_date",
+            "user_id",
+            "account_id",
+            "instrument_id",
+            "date",
+            "id",
         ),
         # Backs the holdings FIFO read: per-instrument, oldest-first, with id as the
         # stored key for same-date source order (ADR-0015 rule 3).
@@ -165,6 +180,7 @@ class InvestmentTransaction(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    account_id: Mapped[int] = mapped_column()
     instrument_id: Mapped[int] = mapped_column()
     date: Mapped[date_t] = mapped_column(Date)
     transaction_type: Mapped[InvestmentTxnTypeStr] = mapped_column(

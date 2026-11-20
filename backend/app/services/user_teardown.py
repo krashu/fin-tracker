@@ -17,6 +17,7 @@ from app.models import (
     Category,
     ImportBatch,
     Instrument,
+    InvestmentAccount,
     InvestmentTransaction,
     Label,
     MerchantAlias,
@@ -71,6 +72,7 @@ def teardown_user(session: Session, user_id: UUID) -> None:
     # Phase 4: Delete primary reference entities
     session.execute(delete(Label).where(Label.user_id == user_id))
     session.execute(delete(Instrument).where(Instrument.user_id == user_id))
+    session.execute(delete(InvestmentAccount).where(InvestmentAccount.user_id == user_id))
     session.execute(delete(Account).where(Account.user_id == user_id))
     session.execute(delete(PeerContact).where(PeerContact.user_id == user_id))
 

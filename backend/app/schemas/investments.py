@@ -253,6 +253,7 @@ class InvestmentTransactionCreate(BaseModel):
 
     date: date_t
     instrument_id: int = Field(gt=0)
+    account_id: int | None = Field(default=None, gt=0)
     transaction_type: InvestmentTxnTypeStr
     # decimal_places caps input precision at the boundary (over-precise input is
     # rejected, not silently rounded at bind); max_digits keeps the scaled int64
@@ -309,6 +310,7 @@ class InvestmentTransactionRead(BaseModel):
 
     id: int
     instrument_id: int
+    account_id: int
     date: date_t
     transaction_type: InvestmentTxnTypeStr
     units: DecimalStr
@@ -365,6 +367,7 @@ class ReinvestmentCreate(BaseModel):
 
     date: date_t
     instrument_id: int = Field(gt=0)
+    account_id: int | None = Field(default=None, gt=0)
     amount_native_paise: int = Field(gt=0)
     units: Decimal = Field(gt=0, max_digits=18, decimal_places=8)
     price_per_unit_native: Decimal = Field(gt=0, max_digits=18, decimal_places=8)
@@ -428,6 +431,7 @@ class HoldingRead(BaseModel):
     fx_pnl_inr_paise: int | None = None
     nav_staleness_days: int | None
     supports_price_feed: bool
+    account_id: int | None = None
 
 
 class HoldingsResponse(BaseModel):

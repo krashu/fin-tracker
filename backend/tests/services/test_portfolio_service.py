@@ -16,10 +16,11 @@ from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from structlog.testing import capture_logs
 
-from app.models import FxRateQuote, Instrument, InvestmentTransaction, User
+from app.models import FxRateQuote, Instrument, InvestmentAccount, InvestmentTransaction, User
 from app.models.instrument import AssetClassStr
 from app.models.investment_transaction import InvestmentTxnTypeStr
 from app.schemas import AssetClassAllocation, HoldingXirr
@@ -58,6 +59,23 @@ def _instrument(
     return inst
 
 
+def _default_account_id(session: Session, user_id: UUID) -> int:
+    acc = session.scalar(select(InvestmentAccount).where(InvestmentAccount.user_id == user_id))
+    if acc is None:
+        acc = InvestmentAccount(
+            user_id=user_id,
+            name="Default Portfolio",
+            account_type="manual",
+            provider="manual",
+            external_account_ref="default",
+            currency="INR",
+            is_active=True,
+        )
+        session.add(acc)
+        session.flush()
+    return acc.id
+
+
 def _txn(
     session: Session,
     user_id: UUID,
@@ -69,9 +87,12 @@ def _txn(
     fees_paise: int = 0,
     price: Decimal | None = None,
     on: date = _BUY_ON,
+    account_id: int | None = None,
 ) -> InvestmentTransaction:
+    aid = account_id if account_id is not None else _default_account_id(session, user_id)
     txn = InvestmentTransaction(
         user_id=user_id,
+        account_id=aid,
         instrument_id=instrument_id,
         date=on,
         transaction_type=txn_type,
@@ -400,9 +421,11 @@ def test_usd_portfolio_rolls_up_to_inr_and_xirr_solvable(session: Session, user:
     )
     session.add(inst)
     session.flush()
+    aid = _default_account_id(session, user.id)
     session.add(
         InvestmentTransaction(
             user_id=user.id,
+            account_id=aid,
             instrument_id=inst.id,
             date=_BUY_ON,
             transaction_type="buy",
@@ -441,9 +464,11 @@ def test_usd_no_fx_rate_excluded_and_flagged(session: Session, user: User) -> No
     )
     session.add(inst)
     session.flush()
+    aid = _default_account_id(session, user.id)
     session.add(
         InvestmentTransaction(
             user_id=user.id,
+            account_id=aid,
             instrument_id=inst.id,
             date=_BUY_ON,
             transaction_type="buy",

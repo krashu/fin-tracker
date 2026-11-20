@@ -18,6 +18,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -25,6 +26,7 @@ from app.models import (
     BenchmarkNav,
     FxRateQuote,
     Instrument,
+    InvestmentAccount,
     InvestmentTransaction,
     User,
 )
@@ -62,6 +64,23 @@ def _instrument(
     return inst
 
 
+def _default_account_id(session: Session, user_id: UUID) -> int:
+    acc = session.scalar(select(InvestmentAccount).where(InvestmentAccount.user_id == user_id))
+    if acc is None:
+        acc = InvestmentAccount(
+            user_id=user_id,
+            name="Default Portfolio",
+            account_type="manual",
+            provider="manual",
+            external_account_ref="default",
+            currency="INR",
+            is_active=True,
+        )
+        session.add(acc)
+        session.flush()
+    return acc.id
+
+
 def _txn(
     session: Session,
     user_id: UUID,
@@ -72,9 +91,12 @@ def _txn(
     amount_paise: int = 0,
     price: Decimal | None = None,
     on: date = _BUY_ON,
+    account_id: int | None = None,
 ) -> InvestmentTransaction:
+    aid = account_id if account_id is not None else _default_account_id(session, user_id)
     txn = InvestmentTransaction(
         user_id=user_id,
+        account_id=aid,
         instrument_id=instrument_id,
         date=on,
         transaction_type=txn_type,
@@ -633,9 +655,11 @@ def _usd_holding(session: Session, user_id: UUID) -> Instrument:
     )
     session.add(inst)
     session.flush()
+    aid = _default_account_id(session, user_id)
     session.add(
         InvestmentTransaction(
             user_id=user_id,
+            account_id=aid,
             instrument_id=inst.id,
             date=_BUY_ON,
             transaction_type="buy",

@@ -55,8 +55,11 @@ from app.core.log_config import get_logger
 from app.models import (
     Account,
     Category,
+    CurrencyStr,
     FxRateQuote,
     Instrument,
+    InvestmentAccount,
+    InvestmentAccountTypeStr,
     InvestmentTransaction,
     Label,
     MerchantLabelMap,
@@ -551,6 +554,39 @@ def _seed_fx_rates(session: Session, *, today: date_t) -> None:
     )
 
 
+def _get_or_create_investment_account(
+    session: Session,
+    *,
+    user_id: UUID,
+    name: str,
+    account_type: InvestmentAccountTypeStr,
+    provider: str,
+    external_account_ref: str,
+    currency: CurrencyStr,
+) -> InvestmentAccount:
+    existing = session.scalar(
+        select(InvestmentAccount).where(
+            InvestmentAccount.user_id == user_id,
+            InvestmentAccount.provider == provider,
+            InvestmentAccount.external_account_ref == external_account_ref,
+        )
+    )
+    if existing is not None:
+        return existing
+    acc = InvestmentAccount(
+        user_id=user_id,
+        name=name,
+        account_type=account_type,
+        provider=provider,
+        external_account_ref=external_account_ref,
+        currency=currency,
+        is_active=True,
+    )
+    session.add(acc)
+    session.flush()
+    return acc
+
+
 def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tuple[int, int]:
     """Find-or-create each instrument + its txns. Returns (instruments, txns) made.
 
@@ -564,6 +600,24 @@ def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tupl
     """
     inst_made = 0
     inv_txn_made = 0
+    zerodha_acc = _get_or_create_investment_account(
+        session,
+        user_id=user_id,
+        name="Zerodha Demat",
+        account_type="demat",
+        provider="zerodha",
+        external_account_ref="zerodha_demo",
+        currency="INR",
+    )
+    indmoney_acc = _get_or_create_investment_account(
+        session,
+        user_id=user_id,
+        name="INDmoney US Brokerage",
+        account_type="us_broker",
+        provider="indmoney",
+        external_account_ref="indmoney_demo",
+        currency="USD",
+    )
     for spec in build_demo_instruments(today):
         symbol = str(spec["symbol"])
         currency = str(spec.get("currency", "INR"))
@@ -600,10 +654,12 @@ def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tupl
         session.add(instrument)
         session.flush()  # assign id for the txn FK
         inst_made += 1
+        account_id = indmoney_acc.id if currency == "USD" else zerodha_acc.id
         for t in spec["txns"]:
             session.add(
                 InvestmentTransaction(
                     user_id=user_id,
+                    account_id=account_id,
                     instrument_id=instrument.id,
                     date=date_t.fromisoformat(str(t["date"])),
                     transaction_type=str(t["type"]),

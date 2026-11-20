@@ -29,6 +29,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core import clock
@@ -38,6 +39,7 @@ from app.models import (
     FxRateQuote,
     ImportBatch,
     Instrument,
+    InvestmentAccount,
     InvestmentTransaction,
     Label,
     MerchantAlias,
@@ -56,6 +58,23 @@ from tests.fk_bypass import foreign_keys_off
 # Sentinel for the "use now()" default — distinct from caller-supplied None
 # (None = pending row in the review queue, intentionally).
 _DEFAULT_CONFIRMED: Any = object()
+
+
+def _default_inv_account_id(session: Session, user_id: UUID) -> int:
+    acc = session.scalar(select(InvestmentAccount).where(InvestmentAccount.user_id == user_id))
+    if acc is None:
+        acc = InvestmentAccount(
+            user_id=user_id,
+            name="Default Portfolio",
+            account_type="manual",
+            provider="manual",
+            external_account_ref="default",
+            currency="INR",
+            is_active=True,
+        )
+        session.add(acc)
+        session.flush()
+    return acc.id
 
 
 def _make_txn(
@@ -2679,6 +2698,7 @@ def test_overview_net_worth_includes_portfolio(
             ),
             InvestmentTransaction(
                 user_id=instrument.user_id,
+                account_id=_default_inv_account_id(session, instrument.user_id),
                 instrument_id=instrument.id,
                 date=date(2026, 5, 1),
                 transaction_type="buy",
@@ -2715,6 +2735,7 @@ def _usd_instrument_with_buy(session: Session, user_id: UUID) -> None:
     session.add(
         InvestmentTransaction(
             user_id=user_id,
+            account_id=_default_inv_account_id(session, user_id),
             instrument_id=inst.id,
             date=date(2026, 5, 1),
             transaction_type="buy",
@@ -2830,6 +2851,7 @@ def test_overview_null_nav_holding_contributes_zero(
     session.add(
         InvestmentTransaction(
             user_id=seeded_user.id,
+            account_id=_default_inv_account_id(session, seeded_user.id),
             instrument_id=no_nav.id,
             date=date(2026, 5, 1),
             transaction_type="buy",
@@ -2999,6 +3021,7 @@ def test_overview_investment_account_excluded_from_net_worth(
     session.add(
         InvestmentTransaction(
             user_id=user_id,
+            account_id=_default_inv_account_id(session, user_id),
             instrument_id=instrument.id,
             date=date(2026, 5, 1),
             transaction_type="buy",

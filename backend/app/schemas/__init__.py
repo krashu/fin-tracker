@@ -65,6 +65,11 @@ from app.schemas.imports import (
     SampleStatementRead,
     StatementUploadForm,
 )
+from app.schemas.investment_account import (
+    InvestmentAccountCreate,
+    InvestmentAccountRead,
+    InvestmentAccountUpdate,
+)
 from app.schemas.investments import (
     AssetClassAllocation,
     AssetClassCurrencies,
@@ -158,6 +163,9 @@ __all__ = [
     "IntradayTradeRead",
     "IntradayTradesResponse",
     "InstrumentUpdate",
+    "InvestmentAccountCreate",
+    "InvestmentAccountRead",
+    "InvestmentAccountUpdate",
     "InvestmentCsvImportSummary",
     "InvestmentCsvUploadForm",
     "SampleImportCreate",

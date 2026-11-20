@@ -21,6 +21,7 @@ from app.api.v1 import (
     holdings,
     imports,
     instruments,
+    investment_accounts,
     investment_transactions,
     labels,
     peer_ledger,
@@ -42,6 +43,7 @@ api_router.include_router(health.router)
 api_router.include_router(holdings.router)
 api_router.include_router(imports.router)
 api_router.include_router(instruments.router)
+api_router.include_router(investment_accounts.router)
 api_router.include_router(investment_transactions.router)
 api_router.include_router(labels.router)
 api_router.include_router(peer_ledger.router)

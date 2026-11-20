@@ -23,6 +23,7 @@ from app.models import (
     Category,
     ImportBatch,
     Instrument,
+    InvestmentAccount,
     InvestmentTransaction,
     MerchantAlias,
     MerchantLabelMap,
@@ -582,11 +583,21 @@ def test_investment_fx_rate_has_no_default(session: Session) -> None:
         asset_class="indian_mf",
         exchange="NSE",
     )
-    session.add(inst)
+    acc = InvestmentAccount(
+        user_id=u.id,
+        name="Default Portfolio",
+        account_type="manual",
+        provider="manual",
+        external_account_ref="default",
+        currency="INR",
+        is_active=True,
+    )
+    session.add_all([inst, acc])
     session.flush()
     session.add(
         InvestmentTransaction(
             user_id=u.id,
+            account_id=acc.id,
             instrument_id=inst.id,
             date=date(2026, 3, 15),
             transaction_type="buy",
@@ -604,11 +615,21 @@ def _lot_fixture(session: Session) -> tuple[User, InvestmentTransaction, Investm
     inst = Instrument(
         user_id=u.id, symbol="NIFTYBEES", name="Nifty BeES", asset_class="indian_mf", exchange="NSE"
     )
-    session.add(inst)
+    acc = InvestmentAccount(
+        user_id=u.id,
+        name="Default Portfolio",
+        account_type="manual",
+        provider="manual",
+        external_account_ref="default",
+        currency="INR",
+        is_active=True,
+    )
+    session.add_all([inst, acc])
     session.flush()
     txns = [
         InvestmentTransaction(
             user_id=u.id,
+            account_id=acc.id,
             instrument_id=inst.id,
             date=date(2026, 3, d),
             transaction_type=kind,
@@ -629,6 +650,7 @@ def _lot(
 ) -> RealisedLot:
     fields: dict[str, object] = {
         "user_id": u.id,
+        "account_id": sell.account_id,
         "sell_txn_id": sell.id,
         "buy_txn_id": buy.id,
         "units": Decimal("1"),

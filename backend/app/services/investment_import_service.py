@@ -84,11 +84,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.log_config import get_logger
-from app.models import ImportBatch, Instrument, InvestmentTransaction
+from app.models import ImportBatch, Instrument, InvestmentAccount, InvestmentTransaction
 from app.models.instrument import AssetClassStr
 from app.parsers import ParsedInvestmentRow, parse_investment_csv
 from app.services.fx_service import resolve_fx_rate_to_inr
 from app.services.holdings_service import OversellError, rebuild_realised_lots
+from app.services.investment_account_service import get_or_create_default_investment_account
 from app.services.occurrence import OccurrenceAllocator
 
 logger = get_logger(__name__)
@@ -117,6 +118,7 @@ def import_investment_csv(
     file_bytes: bytes,
     default_asset_class: AssetClassStr,
     session: Session,
+    account_id: int | None = None,
 ) -> InvestmentImportResult:
     """Parse a canonical investment CSV, then persist via the shared core.
 
@@ -137,6 +139,7 @@ def import_investment_csv(
         parse_warnings=parse_warnings,
         parser_name=_PARSER_NAME,
         source_file_hash=source_file_hash,
+        account_id=account_id,
     )
 
 
@@ -152,6 +155,7 @@ def persist_investment_rows(
     parse_warnings: list[str],
     parser_name: str,
     source_file_hash: str,
+    account_id: int | None = None,
 ) -> InvestmentImportResult:
     """Persist already-parsed rows: hash short-circuit → validate → upsert → dedup → stamp FX.
 
@@ -212,6 +216,20 @@ def persist_investment_rows(
     # Validate per-type BEFORE upsert so a dropped row doesn't create a dangling
     # instrument (unlike CAS, the rows are the only instrument source here). FX rejects
     # and refusals are swept after the coverage check instead.
+    if account_id is not None:
+        acc = session.scalar(
+            select(InvestmentAccount).where(
+                InvestmentAccount.id == account_id,
+                InvestmentAccount.user_id == user_id,
+                InvestmentAccount.is_active.is_(True),
+            )
+        )
+        if acc is None:
+            raise ValueError("investment account not found or inactive")
+        resolved_account_id = acc.id
+    else:
+        resolved_account_id = get_or_create_default_investment_account(session, user_id=user_id).id
+
     valid_rows, validation_warnings = _validate_rows(rows)
     created, instruments_by_key, isin_fills = _upsert_instruments(
         session, user_id=user_id, rows=valid_rows
@@ -219,6 +237,7 @@ def persist_investment_rows(
     imported, skipped_dupe, fx_rejected, new_rows = _persist_txns(
         session,
         user_id=user_id,
+        account_id=resolved_account_id,
         batch_id=batch.id,
         rows=valid_rows,
         instruments_by_key=instruments_by_key,
@@ -458,6 +477,7 @@ def _persist_txns(
     session: Session,
     *,
     user_id: UUID,
+    account_id: int,
     batch_id: int,
     rows: list[ParsedInvestmentRow],
     instruments_by_key: dict[tuple[str, str], Instrument],
@@ -549,6 +569,7 @@ def _persist_txns(
             continue
         txn = InvestmentTransaction(
             user_id=user_id,
+            account_id=account_id,
             instrument_id=inst.id,
             date=row.date,
             transaction_type=row.txn_type,

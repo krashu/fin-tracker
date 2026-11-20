@@ -33,7 +33,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 
 from app.api.deps import CurrentUserId, SessionDep
-from app.models import Instrument, InvestmentTransaction, InvestmentTxnTypeStr
+from app.models import Instrument, InvestmentAccount, InvestmentTransaction, InvestmentTxnTypeStr
 from app.schemas import (
     InvestmentTransactionCreate,
     InvestmentTransactionRead,
@@ -43,6 +43,7 @@ from app.schemas import (
 )
 from app.services.fx_service import resolve_fx_rate_to_inr
 from app.services.holdings_service import OversellError, rebuild_realised_lots
+from app.services.investment_account_service import get_or_create_default_investment_account
 
 router = APIRouter(prefix="/investment-transactions", tags=["investment-transactions"])
 
@@ -51,6 +52,7 @@ router = APIRouter(prefix="/investment-transactions", tags=["investment-transact
 def list_investment_transactions(
     session: SessionDep,
     user_id: CurrentUserId,
+    account_id: Annotated[int | None, Query(gt=0)] = None,
     instrument_id: Annotated[int | None, Query(gt=0)] = None,
     transaction_type: Annotated[list[InvestmentTxnTypeStr] | None, Query()] = None,
     date_from: Annotated[date_t | None, Query()] = None,
@@ -64,6 +66,8 @@ def list_investment_transactions(
             detail="date_from must be <= date_to",
         )
     stmt = select(InvestmentTransaction).where(InvestmentTransaction.user_id == user_id)
+    if account_id is not None:
+        stmt = stmt.where(InvestmentTransaction.account_id == account_id)
     if instrument_id is not None:
         stmt = stmt.where(InvestmentTransaction.instrument_id == instrument_id)
     if transaction_type:
@@ -78,6 +82,29 @@ def list_investment_transactions(
         .offset(offset)
     )
     return list(session.scalars(stmt))
+
+
+def _resolve_account_id(
+    session: SessionDep,
+    *,
+    user_id: UUID,
+    account_id: int | None,
+) -> int:
+    if account_id is not None:
+        acc = session.scalar(
+            select(InvestmentAccount).where(
+                InvestmentAccount.id == account_id,
+                InvestmentAccount.user_id == user_id,
+                InvestmentAccount.is_active.is_(True),
+            )
+        )
+        if acc is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="investment account not found or inactive",
+            )
+        return acc.id
+    return get_or_create_default_investment_account(session, user_id=user_id).id
 
 
 def _resolve_instrument_and_fx(
@@ -129,9 +156,11 @@ def create_investment_transaction(
     _, fx_rate = _resolve_instrument_and_fx(
         session, user_id=user_id, instrument_id=payload.instrument_id, on=payload.date
     )
+    target_account_id = _resolve_account_id(session, user_id=user_id, account_id=payload.account_id)
 
     txn = InvestmentTransaction(
         user_id=user_id,
+        account_id=target_account_id,
         instrument_id=payload.instrument_id,
         date=payload.date,
         transaction_type=payload.transaction_type,
@@ -189,9 +218,11 @@ def create_reinvestment(
     _, fx_rate = _resolve_instrument_and_fx(
         session, user_id=user_id, instrument_id=payload.instrument_id, on=payload.date
     )
+    target_account_id = _resolve_account_id(session, user_id=user_id, account_id=payload.account_id)
 
     common = {
         "user_id": user_id,
+        "account_id": target_account_id,
         "instrument_id": payload.instrument_id,
         "date": payload.date,
         "amount_native_paise": payload.amount_native_paise,

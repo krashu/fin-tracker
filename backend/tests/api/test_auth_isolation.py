@@ -35,6 +35,7 @@ from app.models import (
     Account,
     Category,
     ImportBatch,
+    InvestmentAccount,
     InvestmentTransaction,
     MerchantTagMap,
     PeerContact,
@@ -508,9 +509,14 @@ def test_realised_lots_are_isolated_per_user(unauth_client: TestClient, session:
         assert owners == {r.user_id}
 
     b_user = session.scalars(select(User).where(User.email == "lots-intruder@example.com")).one()
+    b_acc = session.scalars(
+        select(InvestmentAccount).where(InvestmentAccount.user_id == b_user.id)
+    ).first()
+    assert b_acc is not None
     session.add(
         RealisedLot(
             user_id=b_user.id,
+            account_id=b_acc.id,
             sell_txn_id=a_sell,
             buy_txn_id=a_buy,
             units=Decimal("1"),
@@ -1035,3 +1041,62 @@ def test_peer_ledger_is_isolated_per_user(unauth_client: TestClient, session: Se
     assert [c.id for c in b_contacts] == [b_contact.id]
     b_entries = list(session.scalars(select(PeerEntry).where(PeerEntry.user_id == b_user.id)))
     assert [e.id for e in b_entries] == [b_entry.id]
+
+
+def test_investment_accounts_are_isolated_per_user(unauth_client: TestClient) -> None:
+    """ADR-0003 & ADR-0019: Investment accounts are strictly isolated.
+
+    User B cannot list or get User A's account, and passing User A's account_id
+    to an investment transaction returns 422.
+    """
+    _register(unauth_client, "inv-acc-owner@example.com")
+    a_acc_res = unauth_client.post(
+        "/api/v1/investment-accounts",
+        json={
+            "name": "User A Demat",
+            "account_type": "demat",
+            "provider": "zerodha",
+            "external_account_ref": "acc_a_demat",
+            "currency": "INR",
+        },
+    )
+    assert a_acc_res.status_code == 201
+    a_acc_id = a_acc_res.json()["id"]
+
+    unauth_client.cookies.clear()
+    _register(unauth_client, "inv-acc-intruder@example.com")
+
+    # B cannot list A's account
+    assert unauth_client.get("/api/v1/investment-accounts").json() == []
+
+    # B cannot fetch A's account (404, never 403)
+    assert unauth_client.get(f"/api/v1/investment-accounts/{a_acc_id}").status_code == 404
+
+    # B cannot link a transaction to A's account_id (ADR-0003 rule 3 -> 422)
+    b_inst_res = unauth_client.post(
+        "/api/v1/instruments",
+        json={
+            "symbol": "INFY-B",
+            "name": "Infosys",
+            "asset_class": "indian_equity",
+            "currency": "INR",
+            "exchange": "NSE",
+        },
+    )
+    assert b_inst_res.status_code == 201
+    b_inst_id = b_inst_res.json()["id"]
+
+    txn_res = unauth_client.post(
+        "/api/v1/investment-transactions",
+        json={
+            "instrument_id": b_inst_id,
+            "account_id": a_acc_id,
+            "date": "2026-06-01",
+            "transaction_type": "buy",
+            "units": 10,
+            "price_per_unit_native": 1500,
+            "amount_native_paise": 1500000,
+        },
+    )
+    assert txn_res.status_code == 422
+    assert "investment account not found or inactive" in txn_res.json()["detail"]

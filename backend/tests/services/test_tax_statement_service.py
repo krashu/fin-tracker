@@ -11,11 +11,18 @@ from datetime import date
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.clock import naive_utcnow
 from app.core.fiscal_year import fy_bounds
-from app.models import Instrument, InvestmentTransaction, InvestmentTxnTypeStr, User
+from app.models import (
+    Instrument,
+    InvestmentAccount,
+    InvestmentTransaction,
+    InvestmentTxnTypeStr,
+    User,
+)
 from app.services.holdings_service import rebuild_realised_lots
 from app.services.tax_statement_service import intraday_statement, realised_sale_span
 
@@ -43,6 +50,23 @@ def _instrument(
     return inst
 
 
+def _default_account_id(session: Session, user_id: UUID) -> int:
+    acc = session.scalar(select(InvestmentAccount).where(InvestmentAccount.user_id == user_id))
+    if acc is None:
+        acc = InvestmentAccount(
+            user_id=user_id,
+            name="Default Portfolio",
+            account_type="manual",
+            provider="manual",
+            external_account_ref="default",
+            currency="INR",
+            is_active=True,
+        )
+        session.add(acc)
+        session.flush()
+    return acc.id
+
+
 def _txn(
     session: Session,
     user_id: UUID,
@@ -52,9 +76,12 @@ def _txn(
     units: str,
     amount: int,
     fees: int = 0,
+    account_id: int | None = None,
 ) -> InvestmentTransaction:
+    aid = account_id if account_id is not None else _default_account_id(session, user_id)
     txn = InvestmentTransaction(
         user_id=user_id,
+        account_id=aid,
         instrument_id=instrument_id,
         date=on,
         transaction_type=txn_type,

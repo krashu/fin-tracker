@@ -7,6 +7,7 @@ from app.models.category import Category, CategoryKindStr
 from app.models.fx_rate_quote import FxRateQuote
 from app.models.import_batch import ImportBatch, ImportStatusStr
 from app.models.instrument import AssetClassStr, ExchangeStr, Instrument
+from app.models.investment_account import InvestmentAccount, InvestmentAccountTypeStr
 from app.models.investment_transaction import InvestmentTransaction, InvestmentTxnTypeStr
 from app.models.label import Label
 from app.models.merchant_alias import MerchantAlias
@@ -36,6 +37,8 @@ __all__ = [
     "ImportBatch",
     "ImportStatusStr",
     "Instrument",
+    "InvestmentAccount",
+    "InvestmentAccountTypeStr",
     "InvestmentTransaction",
     "InvestmentTxnTypeStr",
     "Label",

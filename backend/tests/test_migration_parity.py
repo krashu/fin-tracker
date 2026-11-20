@@ -1322,14 +1322,40 @@ def _seed_investment_row(
     inst_id = conn.execute(  # ty: ignore[unresolved-attribute]
         text("SELECT id FROM instruments WHERE symbol = 'INFY'")
     ).scalar()
-    conn.execute(  # ty: ignore[unresolved-attribute]
-        text(
-            "INSERT INTO investment_transactions "
-            "(user_id, instrument_id, date, transaction_type, units, "
-            " amount_native_paise, fees_native_paise, fx_rate_to_inr, fingerprint) "
-            "VALUES (:u, :i, '2025-01-15', 'buy', :n, 100000, 0, 1000000, :f)"
-        ).bindparams(u=uid_hex, i=inst_id, n=units_scaled, f=fingerprint)
-    )
+    cols = {
+        row[1]
+        for row in conn.execute(  # ty: ignore[unresolved-attribute]
+            text("PRAGMA table_info(investment_transactions)")
+        ).fetchall()
+    }
+    if "account_id" in cols:
+        conn.execute(  # ty: ignore[unresolved-attribute]
+            text(
+                "INSERT INTO investment_accounts "
+                "(user_id, name, account_type, provider, external_account_ref, currency) "
+                "VALUES (:u, 'Default', 'demat', 'other', 'default', 'INR')"
+            ).bindparams(u=uid_hex)
+        )
+        acct_id = conn.execute(  # ty: ignore[unresolved-attribute]
+            text("SELECT id FROM investment_accounts WHERE user_id = :u").bindparams(u=uid_hex)
+        ).scalar()
+        conn.execute(  # ty: ignore[unresolved-attribute]
+            text(
+                "INSERT INTO investment_transactions "
+                "(user_id, account_id, instrument_id, date, transaction_type, units, "
+                " amount_native_paise, fees_native_paise, fx_rate_to_inr, fingerprint) "
+                "VALUES (:u, :a, :i, '2025-01-15', 'buy', :n, 100000, 0, 1000000, :f)"
+            ).bindparams(u=uid_hex, a=acct_id, i=inst_id, n=units_scaled, f=fingerprint)
+        )
+    else:
+        conn.execute(  # ty: ignore[unresolved-attribute]
+            text(
+                "INSERT INTO investment_transactions "
+                "(user_id, instrument_id, date, transaction_type, units, "
+                " amount_native_paise, fees_native_paise, fx_rate_to_inr, fingerprint) "
+                "VALUES (:u, :i, '2025-01-15', 'buy', :n, 100000, 0, 1000000, :f)"
+            ).bindparams(u=uid_hex, i=inst_id, n=units_scaled, f=fingerprint)
+        )
     txn_id = conn.execute(  # ty: ignore[unresolved-attribute]
         text("SELECT id FROM investment_transactions WHERE fingerprint = :f").bindparams(
             f=fingerprint
@@ -1483,16 +1509,19 @@ def test_0027_downgrade_refuses_to_merge_two_real_duplicates() -> None:
         uid_hex = uuid.uuid4().hex
         with eng.begin() as conn:
             inst_id, _ = _seed_investment_row(conn, uid_hex=uid_hex, fingerprint="dupe")
+            acct_id = conn.execute(
+                text("SELECT id FROM investment_accounts WHERE user_id = :u").bindparams(u=uid_hex)
+            ).scalar()
             # The second of two genuinely-distinct identical transactions.
             conn.execute(
                 text(
                     "INSERT INTO investment_transactions "
-                    "(user_id, instrument_id, date, transaction_type, units, "
+                    "(user_id, account_id, instrument_id, date, transaction_type, units, "
                     " amount_native_paise, fees_native_paise, fx_rate_to_inr, "
                     " fingerprint, occurrence) "
-                    "VALUES (:u, :i, '2025-01-15', 'buy', 1000000000, 100000, 0, 1000000, "
+                    "VALUES (:u, :a, :i, '2025-01-15', 'buy', 1000000000, 100000, 0, 1000000, "
                     " 'dupe', 1)"
-                ).bindparams(u=uid_hex, i=inst_id)
+                ).bindparams(u=uid_hex, a=acct_id, i=inst_id)
             )
 
         with pytest.raises(IntegrityError), eng.begin() as conn:
@@ -3437,6 +3466,7 @@ def test_card_bill_category_migration_archives_a_promoted_seed_with_its_children
 
 
 _REV_STREAMLINE_CATEGORIES = "0049_streamline_category_taxonomy"
+_REV_INVESTMENT_ACCOUNTS = "0050_investment_accounts_and_attribution"
 
 
 @pytest.mark.slow
@@ -3644,5 +3674,81 @@ def test_0049_seeds_missing_merchant_aliases_and_tag_maps() -> None:
                 {"u": user_id},
             ).scalar_one_or_none()
             assert tag_cat == "Flights & Trains"
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0050_upgrade_backfills_and_links_default_accounts() -> None:
+    """Migration 0050 must create Default Portfolio and backfill account_id onto historical rows."""
+    eng = _migration_engine()
+    try:
+        user_id = uuid.uuid4().hex
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_INVESTMENT_ACCOUNTS))
+            conn.execute(text("INSERT INTO users (id) VALUES (:u)"), {"u": user_id})
+            inst_id = conn.execute(
+                text(
+                    "INSERT INTO instruments "
+                    "(user_id, symbol, name, asset_class, currency, exchange) "
+                    "VALUES (:u, 'HDFC', 'HDFC Bank', 'indian_equity', 'INR', 'NSE')"
+                ),
+                {"u": user_id},
+            ).lastrowid
+            txn_id = conn.execute(
+                text(
+                    "INSERT INTO investment_transactions (user_id, instrument_id, date, "
+                    "transaction_type, units, price_per_unit_native, amount_native_paise, "
+                    "fx_rate_to_inr, fingerprint) "
+                    "VALUES (:u, :i, '2026-01-15', 'buy', 1000000000, 150000, 1500000, "
+                    "1000000, 'test_fp_0050')"
+                ),
+                {"u": user_id, "i": inst_id},
+            ).lastrowid
+
+        # Upgrade to 0050
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_INVESTMENT_ACCOUNTS)
+
+        with eng.connect() as conn:
+            acc_row = (
+                conn.execute(
+                    text(
+                        "SELECT id, name, provider, external_account_ref, currency, is_active "
+                        "FROM investment_accounts WHERE user_id = :u"
+                    ),
+                    {"u": user_id},
+                )
+                .mappings()
+                .one()
+            )
+            assert acc_row["name"] == "Default Portfolio"
+            assert acc_row["provider"] == "manual"
+            assert acc_row["external_account_ref"] == "default"
+            assert acc_row["currency"] == "INR"
+            assert acc_row["is_active"] == 1
+
+            linked_acc_id = conn.execute(
+                text("SELECT account_id FROM investment_transactions WHERE id = :t"),
+                {"t": txn_id},
+            ).scalar_one()
+            assert linked_acc_id == acc_row["id"]
+
+        # Downgrade back to 0049
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_INVESTMENT_ACCOUNTS))
+
+        with eng.connect() as conn:
+            tbl_exists = conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='investment_accounts'"
+                )
+            ).scalar_one_or_none()
+            assert tbl_exists is None
+
+        # Re-upgrade to head
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
     finally:
         eng.dispose()

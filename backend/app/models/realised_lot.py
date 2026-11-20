@@ -58,6 +58,12 @@ class RealisedLot(Base, TimestampMixin):
     __tablename__ = "realised_lots"
     __table_args__ = (
         ForeignKeyConstraint(
+            ["account_id", "user_id"],
+            ["investment_accounts.id", "investment_accounts.user_id"],
+            name="fk_realised_lots_account_id_investment_accounts",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
             ["sell_txn_id", "user_id"],
             ["investment_transactions.id", "investment_transactions.user_id"],
             name="fk_realised_lots_sell_txn_id_investment_transactions",
@@ -86,6 +92,7 @@ class RealisedLot(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     # NOT NULL: a nullable member would slacken a composite FK to MATCH-SIMPLE.
     user_id: Mapped[uuid.UUID] = mapped_column()
+    account_id: Mapped[int] = mapped_column()
     sell_txn_id: Mapped[int] = mapped_column()
     buy_txn_id: Mapped[int] = mapped_column()
     units: Mapped[Decimal] = mapped_column(Units())

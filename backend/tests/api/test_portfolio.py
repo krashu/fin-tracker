@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.models import FxRateQuote, Instrument, InvestmentTransaction, User
+from app.models import FxRateQuote, Instrument, InvestmentAccount, InvestmentTransaction, User
 
 
 def test_empty_summary(client: TestClient, seeded_user: User) -> None:
@@ -117,12 +117,25 @@ def test_summary_as_of_comes_from_the_app_clock(
     )
     session.add(usd)
     session.flush()
+    acc = InvestmentAccount(
+        user_id=seeded_user.id,
+        name="Default Portfolio",
+        account_type="manual",
+        provider="manual",
+        external_account_ref="default",
+        currency="USD",
+        is_active=True,
+    )
+    session.add(acc)
+    session.flush()
+
     # Constructed directly rather than via POST: the API stamps fx_rate_to_inr itself from
     # the transaction date, which would need its own cached rate and is not what's under
     # test here. Mirrors tests/api/test_dashboards.py's _usd_instrument_with_buy.
     session.add(
         InvestmentTransaction(
             user_id=seeded_user.id,
+            account_id=acc.id,
             instrument_id=usd.id,
             date=date(2020, 1, 1),
             transaction_type="buy",
