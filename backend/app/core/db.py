@@ -13,13 +13,25 @@ so ``ON DELETE`` cascades and FK constraint failures actually fire.
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import Pool
 
 from app.core.config import get_settings
+
+
+def _ensure_sqlite_parent_dir(database_url: str) -> None:
+    """Create the parent directory of a file-based SQLite DB if it's missing."""
+    if not database_url.startswith("sqlite"):
+        return
+    url = make_url(database_url)
+    if not url.database or url.database == ":memory:":
+        return
+    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
 
 
 def make_engine(url: str, poolclass: type[Pool] | None = None) -> Engine:
@@ -39,6 +51,8 @@ def make_engine(url: str, poolclass: type[Pool] | None = None) -> Engine:
     create_kwargs: dict[str, Any] = {"connect_args": connect_args}
     if poolclass is not None:
         create_kwargs["poolclass"] = poolclass
+    if url.startswith("sqlite"):
+        _ensure_sqlite_parent_dir(url)
     engine = create_engine(url, **create_kwargs)
 
     if url.startswith("sqlite"):

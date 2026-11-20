@@ -449,6 +449,19 @@ class Settings(BaseSettings):
             return self
         raw_path = Path(url.database)
         if raw_path.is_absolute():
+            # In Docker, backend is at /app and REPO_ROOT resolves to '/'.
+            # On host Linux/macOS, REPO_ROOT is the repo root. If an absolute URL
+            # points to '/data/...' from a Docker template but we are on host Linux
+            # (REPO_ROOT != Path("/")), anchor to REPO_ROOT / data instead of system root.
+            if (
+                str(raw_path).startswith(("/data/", "\\data\\", "/data", "\\data"))
+                and Path("/") != REPO_ROOT
+            ):
+                clean_rel = Path(url.database.lstrip("/\\"))
+                absolute_path = (REPO_ROOT / clean_rel).resolve()
+                new_url = url.set(database=str(absolute_path))
+                self.database_url = new_url.render_as_string(hide_password=False)
+                return self
             return self
         # On Windows, a path like '/data/fin-tracker.db' has no drive letter so
         # is_absolute() is False, but Path(url.database) has root '\\' which would

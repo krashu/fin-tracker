@@ -11,6 +11,7 @@ deterministic regardless of local env.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -91,10 +92,20 @@ def test_anchor_relative_sqlite_path_slash_prefixed() -> None:
         cors_allowed_origins=_VALID_CORS,
     )
     url = make_url(s.database_url)
+    assert url.database == str((REPO_ROOT / "data" / "fin-tracker.db").resolve())
+
+
+def test_anchor_relative_sqlite_path_in_docker_container(monkeypatch: pytest.MonkeyPatch) -> None:
     if sys.platform == "win32":
-        assert url.database == str((REPO_ROOT / "data" / "fin-tracker.db").resolve())
-    else:
-        assert url.database == "/data/fin-tracker.db"
+        pytest.skip("Docker container paths are POSIX-only (/data/...)")
+    monkeypatch.setattr("app.core.config.REPO_ROOT", Path("/"))
+    s = Settings(
+        _env_file=None,
+        database_url="sqlite:////data/fin-tracker.db",
+        cors_allowed_origins=_VALID_CORS,
+    )
+    url = make_url(s.database_url)
+    assert url.database == "/data/fin-tracker.db"
 
 
 def test_anchor_relative_sqlite_path_preserves_memory_and_postgres() -> None:
@@ -106,3 +117,28 @@ def test_anchor_relative_sqlite_path_preserves_memory_and_postgres() -> None:
     pg_url = "postgresql+psycopg://user:pass@localhost:5432/fintracker"
     s_pg = Settings(_env_file=None, database_url=pg_url, cors_allowed_origins=_VALID_CORS)
     assert s_pg.database_url == pg_url
+
+
+def test_db_ensure_sqlite_parent_dir(tmp_path: Path) -> None:
+    from app.core.db import _ensure_sqlite_parent_dir
+
+    target_dir = tmp_path / "deep" / "nested"
+    db_file = target_dir / "test.db"
+    assert not target_dir.exists()
+    _ensure_sqlite_parent_dir(f"sqlite:///{db_file}")
+    assert target_dir.exists()
+
+
+def test_make_engine_creates_missing_sqlite_parent_dir(tmp_path: Path) -> None:
+    from app.core.db import make_engine
+
+    target_dir = tmp_path / "engine_data"
+    db_file = target_dir / "test.db"
+    assert not target_dir.exists()
+    eng = make_engine(f"sqlite:///{db_file}")
+    assert target_dir.exists()
+    with eng.connect() as conn:
+        res = conn.exec_driver_sql("SELECT 1").scalar()
+        assert res == 1
+    assert db_file.exists()
+    eng.dispose()
