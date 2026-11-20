@@ -71,7 +71,15 @@ class ReturnResult:
 
 
 def compute_portfolio_summary(session: Session, *, user_id: UUID, as_of: date) -> PortfolioSummary:
-    """Roll up tiles + allocations + XIRR for ``user_id``, valued at ``as_of`` — INR.
+    """Roll up tiles + allocations + XIRR for ``user_id``, valued at ``as_of`` — INR."""
+    summary, _ = compute_portfolio_summary_and_flows(session, user_id=user_id, as_of=as_of)
+    return summary
+
+
+def compute_portfolio_summary_and_flows(
+    session: Session, *, user_id: UUID, as_of: date
+) -> tuple[PortfolioSummary, dict[int, list[tuple[date, int]]]]:
+    """Roll up tiles + allocations + XIRR for ``user_id``; return summary and sourced flows.
 
     ``as_of`` dates the terminal (current-value) cashflow of every XIRR; the route
     passes ``clock.today()`` (the IST business date). NAV-bearing =
@@ -105,9 +113,11 @@ def compute_portfolio_summary(session: Session, *, user_id: UUID, as_of: date) -
     # XIRR — re-fold investment_transactions for the NAV-bearing instruments only.
     holding_xirr: list[HoldingXirr]
     portfolio_ret: ReturnResult | None
+    cashflows: dict[int, list[tuple[date, int]]]
     if not priced:
         holding_xirr = []
         portfolio_ret = None
+        cashflows = defaultdict(list)
     else:
         sourced_ids = [h.instrument_id for h, _ in priced]
         cashflows = _source_portfolio_cashflows(session, user_id=user_id, sourced_ids=sourced_ids)
@@ -137,7 +147,7 @@ def compute_portfolio_summary(session: Session, *, user_id: UUID, as_of: date) -
         union.append((as_of, rollup.current_value_paise))
         portfolio_ret = compute_return(union, as_of=as_of, scope="portfolio")
 
-    return PortfolioSummary(
+    summary = PortfolioSummary(
         current_value_paise=rollup.current_value_paise,
         invested_paise=rollup.invested_paise,
         unrealized_pnl_paise=rollup.unrealized_pnl_paise,
@@ -154,6 +164,7 @@ def compute_portfolio_summary(session: Session, *, user_id: UUID, as_of: date) -
         allocations=allocations,
         holding_xirr=holding_xirr,
     )
+    return summary, cashflows
 
 
 def _source_portfolio_cashflows(
@@ -264,7 +275,7 @@ def compute_return(
         return ReturnResult(rate=None, return_type=None, xirr=None, hpr=None, duration_days=0)
 
     dates = [d for d, _ in cashflows]
-    delta_t = (as_of - min(dates)).days
+    delta_t = max(0, (as_of - min(dates)).days)
 
     invested = sum(-cf for _, cf in cashflows if cf < 0)
     proceeds = sum(cf for _, cf in cashflows if cf > 0)

@@ -65,8 +65,7 @@ from app.services.fx_service import latest_rate_date
 from app.services.holdings_service import max_staleness_days
 from app.services.portfolio_service import (
     _safe_xirr,
-    _source_portfolio_cashflows,
-    compute_portfolio_summary,
+    compute_portfolio_summary_and_flows,
 )
 
 logger = get_logger(__name__)
@@ -88,7 +87,9 @@ def compute_portfolio_performance(
     if benchmark is None:  # pragma: no cover - route guarantees existence
         raise ValueError(f"benchmark {benchmark_id} not found")
 
-    summary = compute_portfolio_summary(session, user_id=user_id, as_of=as_of)
+    summary, per_instrument = compute_portfolio_summary_and_flows(
+        session, user_id=user_id, as_of=as_of
+    )
     # The NAV-bearing held instruments the portfolio XIRR sourced — replay the SAME set.
     sourced_ids = [hx.instrument_id for hx in summary.holding_xirr]
 
@@ -99,7 +100,6 @@ def compute_portfolio_performance(
         session, user_id=user_id, sourced_ids=sourced_ids, as_of=as_of
     )
 
-    per_instrument = _source_portfolio_cashflows(session, user_id=user_id, sourced_ids=sourced_ids)
     union: list[_Cashflow] = [flow for flows in per_instrument.values() for flow in flows]
 
     nav_rows = session.execute(

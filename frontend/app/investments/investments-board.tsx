@@ -35,11 +35,12 @@ import { Badge } from "@/components/ui/badge";
 import { MONO, StateRow, Td, Th } from "@/components/ui/table";
 
 const COLS = 7;
+const BOARD_LIMIT = 500;
 
 export function InvestmentsBoard() {
   const txnsQuery = useQuery({
-    queryKey: ["investment-transactions"],
-    queryFn: listInvestmentTransactions,
+    queryKey: ["investment-transactions", { limit: BOARD_LIMIT }],
+    queryFn: () => listInvestmentTransactions({ limit: BOARD_LIMIT }),
   });
   const instrumentsQuery = useQuery({
     queryKey: ["instruments"],
@@ -117,6 +118,11 @@ export function InvestmentsBoard() {
           </tbody>
         </table>
       </div>
+      {rows.length >= BOARD_LIMIT ? (
+        <div className="border-t border-border px-4 py-2.5 text-center text-[12px] text-muted-foreground">
+          Showing newest {BOARD_LIMIT} transactions.
+        </div>
+      ) : null}
     </section>
   );
 }

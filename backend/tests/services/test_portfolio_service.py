@@ -544,3 +544,15 @@ def test_short_duration_portfolio_summary_suppresses_xirr(session: Session, user
     assert summary.holding_xirr[0].return_type == "hpr"
     assert summary.holding_xirr[0].rate == 0.5
     assert summary.holding_xirr[0].duration_days == 90
+
+
+def test_compute_return_future_dated_cashflow_non_negative_duration() -> None:
+    # A cashflow dated in the future relative to as_of (e.g. clerical error)
+    cashflows = [
+        (date(2026, 7, 1), -100000),  # Buy in future
+        (date(2026, 7, 1), 110000),  # Terminal in future
+    ]
+    res = compute_return(cashflows, as_of=date(2026, 6, 19))
+    assert res.duration_days == 0
+    assert res.return_type == "hpr"
+    assert res.rate == 0.1

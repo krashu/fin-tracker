@@ -271,6 +271,107 @@ _NEW_MERCHANT_SEED: tuple[tuple[str, str, str], ...] = (
     ("pvr", "pvr", "Events & Outings"),
 )
 
+# Frozen duplicate of 0035 dictionary seed for reversible downgrade
+_PRE_0049_MERCHANT_SEED: tuple[tuple[str, str, str], ...] = (
+    ("swiggy", "swiggy", "Online Food Delivery"),
+    ("zomato", "zomato", "Online Food Delivery"),
+    ("eatsure", "eatsure", "Online Food Delivery"),
+    ("box8", "box8", "Online Food Delivery"),
+    ("faasos", "faasos", "Online Food Delivery"),
+    ("dominos", "dominos", "Online Food Delivery"),
+    ("pizza hut", "pizza hut", "Online Food Delivery"),
+    ("mcdonalds", "mcdonalds", "Quick Bites & Snacks"),
+    ("kfc", "kfc", "Quick Bites & Snacks"),
+    ("burger king", "burger king", "Quick Bites & Snacks"),
+    ("subway", "subway", "Quick Bites & Snacks"),
+    ("starbucks", "starbucks", "Coffee & Tea"),
+    ("barista", "barista", "Coffee & Tea"),
+    ("chaayos", "chaayos", "Coffee & Tea"),
+    ("bigbasket", "big basket", "Groceries"),
+    ("big basket", "big basket", "Groceries"),
+    ("swiggy instamart", "swiggy instamart", "Instant Grocery Delivery"),
+    ("dmart", "dmart", "Groceries"),
+    ("jiomart", "jiomart", "Groceries"),
+    ("natures basket", "natures basket", "Groceries"),
+    ("reliance fresh", "reliance fresh", "Groceries"),
+    ("milkbasket", "milkbasket", "Instant Grocery Delivery"),
+    ("licious", "licious", "Groceries"),
+    ("country delight", "country delight", "Groceries"),
+    ("uber", "uber", "Ride-Hailing & Taxis"),
+    ("uber eats", "uber eats", "Online Food Delivery"),
+    ("ola", "ola", "Ride-Hailing & Taxis"),
+    ("rapido", "rapido", "Ride-Hailing & Taxis"),
+    ("namma yatri", "namma yatri", "Ride-Hailing & Taxis"),
+    ("yulu", "yulu", "Ride-Hailing & Taxis"),
+    ("netflix", "netflix", "Digital Subscriptions & Streaming"),
+    ("spotify", "spotify", "Digital Subscriptions & Streaming"),
+    ("hotstar", "hotstar", "Digital Subscriptions & Streaming"),
+    ("disney hotstar", "hotstar", "Digital Subscriptions & Streaming"),
+    ("sonyliv", "sonyliv", "Digital Subscriptions & Streaming"),
+    ("zee5", "zee5", "Digital Subscriptions & Streaming"),
+    ("jiocinema", "jiocinema", "Digital Subscriptions & Streaming"),
+    ("youtube premium", "youtube premium", "Digital Subscriptions & Streaming"),
+    ("amazon prime", "amazon prime", "Digital Subscriptions & Streaming"),
+    ("amazon prime video", "amazon prime video", "Digital Subscriptions & Streaming"),
+    ("wynk music", "wynk music", "Digital Subscriptions & Streaming"),
+    ("audible", "audible", "Digital Subscriptions & Streaming"),
+    ("kindle unlimited", "kindle unlimited", "Digital Subscriptions & Streaming"),
+    ("icloud", "icloud", "Digital Subscriptions & Streaming"),
+    ("office 365", "office 365", "Digital Subscriptions & Streaming"),
+    ("google one", "google one", "Digital Subscriptions & Streaming"),
+    ("linkedin premium", "linkedin premium", "Digital Subscriptions & Streaming"),
+    ("makemytrip", "makemytrip", "Travel"),
+    ("irctc", "irctc", "Travel"),
+    ("goibibo", "goibibo", "Travel"),
+    ("cleartrip", "cleartrip", "Travel"),
+    ("redbus", "redbus", "Travel"),
+    ("air india", "air india", "Travel"),
+    ("spicejet", "spicejet", "Travel"),
+    ("oyo", "oyo", "Travel"),
+    ("airbnb", "airbnb", "Travel"),
+    ("trivago", "trivago", "Travel"),
+    ("agoda", "agoda", "Travel"),
+    ("ixigo", "ixigo", "Travel"),
+    ("abhibus", "abhibus", "Travel"),
+    ("apollo pharmacy", "apollo pharmacy", "Health"),
+    ("pharmeasy", "pharmeasy", "Health"),
+    ("1mg", "1mg", "Health"),
+    ("netmeds", "netmeds", "Health"),
+    ("practo", "practo", "Health"),
+    ("cult fit", "cult fit", "Health"),
+    ("healthkart", "healthkart", "Health"),
+    ("lal pathlabs", "lal pathlabs", "Health"),
+    ("metropolis healthcare", "metropolis healthcare", "Health"),
+    ("thyrocare", "thyrocare", "Health"),
+    ("fortis healthcare", "fortis healthcare", "Health"),
+    ("max healthcare", "max healthcare", "Health"),
+    ("manipal hospitals", "manipal hospitals", "Health"),
+    ("apollo hospitals", "apollo hospitals", "Health"),
+    ("medlife", "medlife", "Health"),
+    ("flipkart", "flipkart", "Shopping"),
+    ("myntra", "myntra", "Clothing & Apparel"),
+    ("ajio", "ajio", "Clothing & Apparel"),
+    ("nykaa", "nykaa", "Personal Care & Grooming"),
+    ("croma", "croma", "Electronics & Gadgets"),
+    ("tata cliq", "tata cliq", "Shopping"),
+    ("meesho", "meesho", "Shopping"),
+    ("lenskart", "lenskart", "Footwear & Accessories"),
+    ("decathlon", "decathlon", "Clothing & Apparel"),
+    ("ikea", "ikea", "Furniture & Appliances"),
+    ("pepperfry", "pepperfry", "Furniture & Appliances"),
+    ("urban company", "urban company", "Household Help & Domestic Staff"),
+    ("airtel", "airtel", "Mobile & Broadband"),
+    ("bsnl", "bsnl", "Mobile & Broadband"),
+    ("tata play", "tata play", "Cable & Satellite TV"),
+    ("act fibernet", "act fibernet", "Mobile & Broadband"),
+    ("jiofiber", "jiofiber", "Mobile & Broadband"),
+    ("vodafone idea", "vodafone idea", "Mobile & Broadband"),
+    ("bookmyshow", "bookmyshow", "Entertainment"),
+    ("inox", "inox", "Entertainment"),
+    ("cinepolis", "cinepolis", "Events & Outings"),
+    ("pvr", "pvr", "Entertainment"),
+)
+
 
 def _is_category_referenced(bind: sa.Connection, user_id: object, category_id: int) -> bool:
     """Check if category is referenced by transactions, merchant tags, or child categories."""
@@ -290,6 +391,7 @@ def _is_category_referenced(bind: sa.Connection, user_id: object, category_id: i
         sa.select(sa.literal(1)).where(
             _categories.c.user_id == user_id,
             _categories.c.parent_id == category_id,
+            _categories.c.archived_at.is_(None),
         ),
     )
     return any(bind.execute(probe.limit(1)).first() is not None for probe in probes)
@@ -569,7 +671,7 @@ def upgrade() -> None:
                 existing_patterns.add(pattern)
 
             map_key = (canonical, target_cat_id)
-            if map_key not in existing_map_keys:
+            if canonical not in rows_by_merchant and map_key not in existing_map_keys:
                 bind.execute(
                     _merchant_tag_map.insert().values(
                         user_id=user_id,
@@ -580,6 +682,7 @@ def upgrade() -> None:
                     )
                 )
                 existing_map_keys.add(map_key)
+                rows_by_merchant.setdefault(canonical, [])
 
 
 def downgrade() -> None:
@@ -591,65 +694,7 @@ def downgrade() -> None:
     new_root_names = {root_name for root_name, _ in _NEW_ROOTS}
 
     for user_id in user_ids:
-        # Step 0: Find IDs of all new subcategories and roots added by 0049
-        new_cat_rows = bind.execute(
-            sa.select(_categories.c.id, _categories.c.name).where(
-                _categories.c.user_id == user_id,
-                _categories.c.is_seeded.is_(True),
-                sa.or_(
-                    sa.and_(
-                        _categories.c.parent_id.is_not(None),
-                        _categories.c.name.in_(new_sub_names),
-                    ),
-                    sa.and_(
-                        _categories.c.parent_id.is_(None),
-                        _categories.c.name.in_(new_root_names),
-                    ),
-                ),
-            )
-        ).all()
-        new_cat_ids = [r.id for r in new_cat_rows]
-
-        # Clean up merchant tag map rows pointing to new categories (unpinned seed rows)
-        if new_cat_ids:
-            bind.execute(
-                _merchant_tag_map.delete().where(
-                    _merchant_tag_map.c.user_id == user_id,
-                    _merchant_tag_map.c.category_id.in_(new_cat_ids),
-                    _merchant_tag_map.c.hit_count == 0,
-                    _merchant_tag_map.c.pinned.is_(False),
-                )
-            )
-
-        # Step 1: Remove new subcategories (delete if unreferenced, else archive so no
-        # active collision)
-        sub_rows = bind.execute(
-            sa.select(_categories.c.id).where(
-                _categories.c.user_id == user_id,
-                _categories.c.parent_id.is_not(None),
-                _categories.c.name.in_(new_sub_names),
-                _categories.c.is_seeded.is_(True),
-            )
-        ).all()
-        for row in sub_rows:
-            if not _is_category_referenced(bind, user_id, row.id):
-                bind.execute(
-                    _categories.delete().where(
-                        _categories.c.user_id == user_id,
-                        _categories.c.id == row.id,
-                    )
-                )
-            else:
-                bind.execute(
-                    _categories.update()
-                    .where(
-                        _categories.c.user_id == user_id,
-                        _categories.c.id == row.id,
-                    )
-                    .values(archived_at=now)
-                )
-
-        # Step 2: Revert root renames and restored colors
+        # Step 1: Revert root renames and restored colors
         for old_name, (new_name, _, old_color) in _ROOT_RENAMES.items():
             bind.execute(
                 _categories.update()
@@ -662,7 +707,7 @@ def downgrade() -> None:
                 .values(name=old_name, color=old_color)
             )
 
-        # Step 3: Un-archive retired categories (most recently archived seeded row per name)
+        # Step 2: Un-archive retired categories (most recently archived seeded row per name)
         for old_name in _REASSIGN_MAP:
             active_exists = bind.execute(
                 sa.select(_categories.c.id).where(
@@ -697,7 +742,147 @@ def downgrade() -> None:
                     .values(archived_at=None)
                 )
 
-        # Step 4: Remove new roots added by 0049 (delete if unreferenced, else archive)
+        # Step 3: Revert merchant tag map seed rows to pre-0049 (0035) dictionary
+        # If the user has no active 0035 categories (e.g. a user created after 0032/0035 who
+        # was only seeded in 0049), delete all unpinned seed rows since they were inserted by 0049.
+        active_cats_0035 = {
+            row.name: row.id
+            for row in bind.execute(
+                sa.select(_categories.c.name, _categories.c.id).where(
+                    _categories.c.user_id == user_id,
+                    _categories.c.kind == "spend",
+                    _categories.c.archived_at.is_(None),
+                )
+            ).all()
+        }
+        legacy_flat_cats = {
+            row.name
+            for row in bind.execute(
+                sa.select(_categories.c.name).where(
+                    _categories.c.user_id == user_id,
+                    _categories.c.kind == "spend",
+                    _categories.c.parent_id.is_(None),
+                    _categories.c.name.in_({"Food", "Transport", "Shopping", "Health"}),
+                )
+            ).all()
+        }
+        if not legacy_flat_cats:
+            # User was not seeded in 0032/0035; delete all unpinned seed rows inserted by 0049
+            bind.execute(
+                _merchant_tag_map.delete().where(
+                    _merchant_tag_map.c.user_id == user_id,
+                    _merchant_tag_map.c.hit_count == 0,
+                    _merchant_tag_map.c.pinned.is_(False),
+                )
+            )
+            bind.execute(
+                _merchant_alias.delete().where(
+                    _merchant_alias.c.user_id == user_id,
+                    _merchant_alias.c.is_seeded.is_(True),
+                )
+            )
+        else:
+            tag_rows = bind.execute(
+                sa.select(
+                    _merchant_tag_map.c.id,
+                    _merchant_tag_map.c.merchant_normalized,
+                    _merchant_tag_map.c.category_id,
+                    _merchant_tag_map.c.hit_count,
+                    _merchant_tag_map.c.pinned,
+                ).where(_merchant_tag_map.c.user_id == user_id)
+            ).all()
+            tag_rows_by_merchant: dict[str, list[object]] = {}
+            for r in tag_rows:
+                tag_rows_by_merchant.setdefault(r.merchant_normalized, []).append(r)
+
+            for _, canonical, pre49_cat_name in _PRE_0049_MERCHANT_SEED:
+                target_cat_id = active_cats_0035.get(pre49_cat_name)
+                if target_cat_id is None:
+                    continue
+
+                merchant_rows = tag_rows_by_merchant.get(canonical, [])
+                target_row = next(
+                    (r for r in merchant_rows if r.category_id == target_cat_id), None
+                )
+                seed_row = next(
+                    (r for r in merchant_rows if r.hit_count == 0 and not r.pinned), None
+                )
+
+                if target_row is not None:
+                    if seed_row is not None and seed_row.id != target_row.id:
+                        bind.execute(
+                            _merchant_tag_map.delete().where(
+                                _merchant_tag_map.c.user_id == user_id,
+                                _merchant_tag_map.c.id == seed_row.id,
+                            )
+                        )
+                elif seed_row is not None:
+                    bind.execute(
+                        _merchant_tag_map.update()
+                        .where(
+                            _merchant_tag_map.c.user_id == user_id,
+                            _merchant_tag_map.c.id == seed_row.id,
+                        )
+                        .values(category_id=target_cat_id)
+                    )
+
+        # Step 4: Clean up any remaining merchant tag map rows pointing to new categories
+        new_cat_rows = bind.execute(
+            sa.select(_categories.c.id, _categories.c.name).where(
+                _categories.c.user_id == user_id,
+                _categories.c.is_seeded.is_(True),
+                sa.or_(
+                    sa.and_(
+                        _categories.c.parent_id.is_not(None),
+                        _categories.c.name.in_(new_sub_names),
+                    ),
+                    sa.and_(
+                        _categories.c.parent_id.is_(None),
+                        _categories.c.name.in_(new_root_names),
+                    ),
+                ),
+            )
+        ).all()
+        new_cat_ids = [r.id for r in new_cat_rows]
+
+        if new_cat_ids:
+            bind.execute(
+                _merchant_tag_map.delete().where(
+                    _merchant_tag_map.c.user_id == user_id,
+                    _merchant_tag_map.c.category_id.in_(new_cat_ids),
+                    _merchant_tag_map.c.hit_count == 0,
+                    _merchant_tag_map.c.pinned.is_(False),
+                )
+            )
+
+        # Step 5: Remove new subcategories (delete if unreferenced, else archive)
+        sub_rows = bind.execute(
+            sa.select(_categories.c.id).where(
+                _categories.c.user_id == user_id,
+                _categories.c.parent_id.is_not(None),
+                _categories.c.name.in_(new_sub_names),
+                _categories.c.is_seeded.is_(True),
+            )
+        ).all()
+        for row in sub_rows:
+            if not _is_category_referenced(bind, user_id, row.id):
+                bind.execute(
+                    _categories.delete().where(
+                        _categories.c.user_id == user_id,
+                        _categories.c.id == row.id,
+                    )
+                )
+            else:
+                bind.execute(
+                    _categories.update()
+                    .where(
+                        _categories.c.user_id == user_id,
+                        _categories.c.id == row.id,
+                    )
+                    .values(archived_at=now)
+                )
+
+        # Step 6: Remove new roots added by 0049 (delete if unreferenced, else archive)
         root_rows = bind.execute(
             sa.select(_categories.c.id).where(
                 _categories.c.user_id == user_id,

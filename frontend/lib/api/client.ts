@@ -1784,12 +1784,32 @@ export function createInstrument(
 // no UI consumer this slice — add the client fns when the edit/delete surface
 // lands (CLAUDE.md §2: no client export without a call site to type-check it).
 
-/** List investment transactions, newest-first (server default limit 50). No
- * filter params wired this slice — the board lists all (CLAUDE.md §2). */
-export function listInvestmentTransactions(): Promise<
-  InvestmentTransactionRead[]
-> {
-  return request<InvestmentTransactionRead[]>("/investment-transactions");
+export type ListInvestmentTransactionsParams = {
+  limit?: number;
+  offset?: number;
+  instrument_id?: number;
+  transaction_type?: string[];
+  date_from?: string;
+  date_to?: string;
+};
+
+/** List investment transactions, newest-first. Supports pagination and filters. */
+export function listInvestmentTransactions(
+  params: ListInvestmentTransactionsParams = {},
+): Promise<InvestmentTransactionRead[]> {
+  const qs = new URLSearchParams();
+  if (params.limit != null) qs.set("limit", String(params.limit));
+  if (params.offset != null) qs.set("offset", String(params.offset));
+  if (params.instrument_id != null) qs.set("instrument_id", String(params.instrument_id));
+  if (params.date_from) qs.set("date_from", params.date_from);
+  if (params.date_to) qs.set("date_to", params.date_to);
+  if (params.transaction_type) {
+    for (const t of params.transaction_type) qs.append("transaction_type", t);
+  }
+  const s = qs.toString();
+  return request<InvestmentTransactionRead[]>(
+    `/investment-transactions${s ? `?${s}` : ""}`,
+  );
 }
 
 export function createInvestmentTransaction(

@@ -601,3 +601,56 @@ def test_contact_ledger_export_endpoint(
     _act_as(client, b_user_id)
     r_b_exp = client.get(f"/api/v1/friends/contacts/{contact_id}/export")
     assert r_b_exp.status_code == 404
+
+
+def test_transaction_patch_allocation_guard(
+    client: TestClient, session: Session, seeded_user: User
+) -> None:
+    _act_as(client, seeded_user.id)
+    # 1. Create spend transaction for ₹5,000 (amount_paise = -500000)
+    txn = _make_card_txn(session, seeded_user, amount_paise=-500000)
+
+    # 2. Create contact and link a peer entry of ₹3,000 (300000 paise)
+    r_c = client.post("/api/v1/friends/contacts", json={"name": "Alice"})
+    assert r_c.status_code == 201
+    contact_id = r_c.json()["id"]
+
+    r_e = client.post(
+        "/api/v1/friends/entries",
+        json={
+            "contact_id": contact_id,
+            "transaction_id": txn.id,
+            "amount_paise": 300000,
+        },
+    )
+    assert r_e.status_code == 201
+
+    # 3. Attempt to PATCH transaction amount below 300000 paise -> 422
+    r_patch_fail = client.patch(
+        f"/api/v1/transactions/{txn.id}",
+        json={"amount_paise": -200000},
+    )
+    assert r_patch_fail.status_code == 422
+    assert (
+        "transaction amount cannot be less than allocated peer entries"
+        in r_patch_fail.json()["detail"]
+    )
+
+    # 4. Attempt to invert sign (change to positive amount) -> 422
+    r_patch_sign = client.patch(
+        f"/api/v1/transactions/{txn.id}",
+        json={"amount_paise": 400000},
+    )
+    assert r_patch_sign.status_code == 422
+    assert (
+        "cannot invert transaction sign while peer entries remain linked"
+        in r_patch_sign.json()["detail"]
+    )
+
+    # 5. Patching with an amount >= allocated sum succeeds
+    r_patch_ok = client.patch(
+        f"/api/v1/transactions/{txn.id}",
+        json={"amount_paise": -350000},
+    )
+    assert r_patch_ok.status_code == 200
+    assert r_patch_ok.json()["amount_paise"] == -350000

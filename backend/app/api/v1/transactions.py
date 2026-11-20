@@ -85,7 +85,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -97,6 +97,7 @@ from app.models import (
     Category,
     CategoryKindStr,
     Label,
+    PeerEntry,
     Transaction,
     TransactionTypeStr,
 )
@@ -706,6 +707,36 @@ def update_transaction(
                 detail="a refund links to this row; remove that link before changing "
                 "its sign or type",
             )
+
+    # --- ADR-0017 Rule 4 & 8: transaction allocation guard & peer link direction -
+    # If the transaction is linked to peer debt entries, the new absolute magnitude
+    # must not be less than the total allocated paise, and the sign must not invert
+    # (fronted debt vs repayment credit).
+    if {"transaction_type", "amount_paise"} & updates.keys():
+        merged_amount = updates.get("amount_paise", txn.amount_paise)
+        allocated_peer_paise = (
+            session.scalar(
+                select(func.coalesce(func.sum(PeerEntry.amount_paise), 0)).where(
+                    PeerEntry.user_id == user_id,
+                    PeerEntry.transaction_id == txn.id,
+                )
+            )
+            or 0
+        )
+        if allocated_peer_paise > 0:
+            if abs(merged_amount) < allocated_peer_paise:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=(
+                        f"transaction amount cannot be less than allocated peer entries "
+                        f"({allocated_peer_paise} paise)"
+                    ),
+                )
+            if (merged_amount > 0) != (txn.amount_paise > 0):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="cannot invert transaction sign while peer entries remain linked",
+                )
 
     # --- Rule 5: the category kind follows the POST-patch type ------------------
     merged_kind = kind_for_type(merged_type)
