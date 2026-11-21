@@ -78,6 +78,47 @@ class AccountSpec(NamedTuple):
     bill_day: int | None = None
 
 
+class AllocationTargetSpec(NamedTuple):
+    """Target portfolio allocation weight for one asset class or instrument."""
+
+    target_type: Literal["asset_class", "instrument", "tag"]
+    target_key: str
+    target_bps: int
+    rebalance_threshold_bps: int = 500
+
+
+DEMO_ALLOCATION_TARGETS: list[AllocationTargetSpec] = [
+    AllocationTargetSpec("asset_class", "indian_equity", 2500, 500),
+    AllocationTargetSpec("asset_class", "indian_mf", 2500, 500),
+    AllocationTargetSpec("asset_class", "us_equity", 2500, 500),
+    AllocationTargetSpec("asset_class", "debt", 1500, 500),
+    AllocationTargetSpec("asset_class", "gold", 1000, 500),
+]
+
+
+class InvestmentAccountSpec(NamedTuple):
+    """Demo investment account partition (ADR-0019)."""
+
+    key: str
+    name: str
+    account_type: Literal["demat", "mf_folio", "us_broker", "bank_fd", "nps", "manual"]
+    provider: str
+    external_account_ref: str
+    currency: Literal["INR", "USD"]
+
+
+INVESTMENT_ACCOUNTS: list[InvestmentAccountSpec] = [
+    InvestmentAccountSpec("zerodha", "Zerodha Demat", "demat", "zerodha", "zerodha_demo", "INR"),
+    InvestmentAccountSpec("groww", "Groww Mutual Funds", "mf_folio", "groww", "groww_demo", "INR"),
+    InvestmentAccountSpec(
+        "indmoney", "INDmoney US Brokerage", "us_broker", "indmoney", "indmoney_demo", "USD"
+    ),
+    InvestmentAccountSpec(
+        "hdfc_fd", "HDFC Fixed Deposits", "bank_fd", "hdfc", "hdfc_fd_demo", "INR"
+    ),
+]
+
+
 ACCOUNTS: list[AccountSpec] = [
     # Bills after the 1st's salary, apart so the two read as two payments.
     AccountSpec("card", "Axis Flipkart", "credit_card", "axis", "4321", "bank", 18),
@@ -816,6 +857,176 @@ INSTRUMENTS: list[dict[str, Any]] = [
             },
         ],
     },
+    {
+        "symbol": "QQQ",
+        "name": "Invesco QQQ Trust",
+        "asset_class": "us_etf",
+        "exchange": "NASDAQ",
+        "currency": "USD",
+        "current_nav": "520.40",
+        "txns": [
+            {
+                "date": "2025-11-17",
+                "type": "buy",
+                "units": "0.3125",
+                "price": "480.00",
+                "amount": 15000,
+                "fx": "88.45",
+            },
+            {
+                "date": "2026-02-16",
+                "type": "buy",
+                "units": "0.3960",
+                "price": "505.00",
+                "amount": 20000,
+                "fx": "89.20",
+            },
+            {
+                "date": "2026-05-18",
+                "type": "buy",
+                "units": "0.3883",
+                "price": "515.00",
+                "amount": 20000,
+                "fx": "88.90",
+            },
+            {
+                "date": "2026-08-17",
+                "type": "buy",
+                "units": "0.4780",
+                "price": "523.00",
+                "amount": 25000,
+                "fx": "89.40",
+            },
+            {"date": "2026-09-22", "type": "dividend", "amount": 125, "fx": "89.50"},
+        ],
+    },
+    {
+        "symbol": "NVDA",
+        "name": "NVIDIA Corp",
+        "asset_class": "us_equity",
+        "exchange": "NASDAQ",
+        "currency": "USD",
+        "current_nav": "142.50",
+        "txns": [
+            {
+                "date": "2025-10-20",
+                "type": "buy",
+                "units": "2.4500",
+                "price": "112.50",
+                "amount": 27563,
+                "fx": "88.60",
+            },
+            {
+                "date": "2026-01-26",
+                "type": "buy",
+                "units": "1.8000",
+                "price": "125.00",
+                "amount": 22500,
+                "fx": "89.80",
+            },
+            {
+                "date": "2026-06-15",
+                "type": "sell",
+                "units": "1.2500",
+                "price": "144.00",
+                "amount": 18000,
+                "fx": "89.10",
+                "note": "Trimmed fractional lot",
+            },
+            {"date": "2026-07-02", "type": "dividend", "amount": 45, "fx": "89.25"},
+        ],
+    },
+    {
+        "symbol": "MSFT",
+        "name": "Microsoft Corp",
+        "asset_class": "us_equity",
+        "exchange": "NASDAQ",
+        "currency": "USD",
+        "current_nav": "435.00",
+        "txns": [
+            {
+                "date": "2025-11-24",
+                "type": "buy",
+                "units": "0.6500",
+                "price": "415.00",
+                "amount": 26975,
+                "fx": "88.80",
+            },
+            {
+                "date": "2026-03-23",
+                "type": "buy",
+                "units": "0.4500",
+                "price": "428.00",
+                "amount": 19260,
+                "fx": "89.50",
+            },
+            {"date": "2026-06-11", "type": "dividend", "amount": 83, "fx": "89.05"},
+        ],
+    },
+    {
+        "symbol": "GOOGL",
+        "name": "Alphabet Inc",
+        "asset_class": "us_equity",
+        "exchange": "NASDAQ",
+        "currency": "USD",
+        "current_nav": "188.00",
+        "txns": [
+            {
+                "date": "2025-12-15",
+                "type": "buy",
+                "units": "1.5500",
+                "price": "170.00",
+                "amount": 26350,
+                "fx": "89.15",
+            },
+            {
+                "date": "2026-04-20",
+                "type": "buy",
+                "units": "0.9500",
+                "price": "182.00",
+                "amount": 17290,
+                "fx": "88.75",
+            },
+        ],
+    },
+    {
+        "symbol": "MIRAEELSS",
+        "name": "Mirae Asset ELSS Tax Saver Fund",
+        "asset_class": "indian_mf",
+        "exchange": "MFCentral",
+        "isin": "INF769K01DW3",
+        "current_nav": "48.60",
+        "txns": [
+            {
+                "date": "2025-12-20",
+                "type": "buy",
+                "units": "1028.807",
+                "price": "43.74",
+                "amount": 4500000,
+                "note": "FY25-26 80C Tax Saver",
+            },
+        ],
+    },
+    {
+        "symbol": "HDFC-FD-01",
+        "name": "HDFC 1-Year Cumulative FD",
+        "asset_class": "fd",
+        "exchange": "OTHER",
+        "currency": "INR",
+        "current_nav": "100",
+        "txns": [
+            {
+                "date": "2025-10-01",
+                "type": "buy",
+                "units": "2000",
+                "price": "100",
+                "amount": 20000000,
+            },
+            {"date": "2026-01-01", "type": "dividend", "amount": 362500},
+            {"date": "2026-04-01", "type": "dividend", "amount": 362500},
+            {"date": "2026-07-01", "type": "dividend", "amount": 362500},
+        ],
+    },
 ]
 
 
@@ -843,3 +1054,42 @@ def build_demo_instruments(anchor: date_t) -> list[dict[str, Any]]:
         }
         for spec in INSTRUMENTS
     ]
+
+
+def build_demo_sip_spends(anchor: date_t) -> list[SpendRow]:
+    """Bank account debits on ``HDFC Savings`` for the mutual fund SIPs in
+    :func:`build_demo_instruments`.
+
+    Categorised under ``system:investment_transfer`` (INVESTMENT_TRANSFER_CATEGORY_NAME)
+    and dated to match each fund's allotment date. In :mod:`app.services.demo_seed`,
+    these are linked via ``linked_spend_txn_id`` to the corresponding SIP rows,
+    with the newest UTINIFTY SIP left unlinked to showcase manual linking.
+    """
+    spends: list[SpendRow] = []
+    instruments = build_demo_instruments(anchor)
+    for inst in instruments:
+        if inst["symbol"] == "PPFCF":
+            for t in inst["txns"]:
+                if t.get("type") == "sip":
+                    spends.append(
+                        SpendRow(
+                            date=str(t["date"]),
+                            merchant="BSE STAR MF - Parag Parikh Flexi Cap",
+                            category="system:investment_transfer",
+                            rupees=int(t["amount"]) // 100,
+                            account="bank",
+                        )
+                    )
+        elif inst["symbol"] == "UTINIFTY":
+            for t in inst["txns"]:
+                if t.get("type") == "sip":
+                    spends.append(
+                        SpendRow(
+                            date=str(t["date"]),
+                            merchant="ACH Debit - UTI Mutual Fund",
+                            category="system:investment_transfer",
+                            rupees=int(t["amount"]) // 100,
+                            account="bank",
+                        )
+                    )
+    return spends

@@ -86,39 +86,42 @@ def seed_rows_demo_seed_lacks(session: Session, user_id: UUID) -> None:
         .where(Transaction.id == refund, Transaction.user_id == user_id)
         .values(refund_of_id=original)
     )
-    contact = PeerContact(user_id=user_id, name="Test Contact")
-    session.add(contact)
-    session.flush()
-    entry = PeerEntry(
-        user_id=user_id,
-        contact_id=contact.id,
-        transaction_id=first_txn,
-        date=clock.today(),
-        amount_paise=1000,
-        direction="you_gave",
-    )
-    session.add(entry)
-    session.flush()
-    snapshot = PortfolioDailySnapshot(
-        user_id=user_id,
-        scope_type="all",
-        scope_id=0,
-        snapshot_date=clock.today(),
-        portfolio_value_paise=100000,
-        invested_capital_paise=100000,
-        net_cashflow_paise=100000,
-        twr_index_micros=1000000,
-    )
-    session.add(snapshot)
-    session.flush()
-    target = AllocationTarget(
-        user_id=user_id,
-        scope_type="all",
-        account_id=None,
-        target_type="asset_class",
-        target_key="indian_equity",
-        target_bps=6000,
-        rebalance_threshold_bps=500,
-    )
-    session.add(target)
-    session.flush()
+    if rows_owned_by(session, PeerContact.__table__, user_id) == 0:
+        contact = PeerContact(user_id=user_id, name="Test Contact")
+        session.add(contact)
+        session.flush()
+        entry = PeerEntry(
+            user_id=user_id,
+            contact_id=contact.id,
+            transaction_id=first_txn,
+            date=clock.today(),
+            amount_paise=1000,
+            direction="you_gave",
+        )
+        session.add(entry)
+        session.flush()
+    if rows_owned_by(session, PortfolioDailySnapshot.__table__, user_id) == 0:
+        snapshot = PortfolioDailySnapshot(
+            user_id=user_id,
+            scope_type="all",
+            scope_id=0,
+            snapshot_date=clock.today(),
+            portfolio_value_paise=100000,
+            invested_capital_paise=100000,
+            net_cashflow_paise=100000,
+            twr_index_micros=1000000,
+        )
+        session.add(snapshot)
+        session.flush()
+    if rows_owned_by(session, AllocationTarget.__table__, user_id) == 0:
+        target = AllocationTarget(
+            user_id=user_id,
+            scope_type="all",
+            account_id=None,
+            target_type="asset_class",
+            target_key="indian_equity",
+            target_bps=6000,
+            rebalance_threshold_bps=500,
+        )
+        session.add(target)
+        session.flush()

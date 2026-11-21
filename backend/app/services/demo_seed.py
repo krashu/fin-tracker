@@ -34,26 +34,31 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import date as date_t
+from datetime import timedelta
 from decimal import Decimal
 from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.core.db_errors import insert_skip_existing
 from app.core.demo_data import (
     ACCOUNTS,
+    DEMO_ALLOCATION_TARGETS,
+    INVESTMENT_ACCOUNTS,
     AccountKey,
     build_demo_card_bills,
     build_demo_dataset,
     build_demo_instruments,
+    build_demo_sip_spends,
     build_demo_transfers,
 )
 from app.core.log_config import get_logger
 from app.models import (
     Account,
+    AllocationTarget,
     Category,
     CurrencyStr,
     FxRateQuote,
@@ -64,14 +69,23 @@ from app.models import (
     Label,
     MerchantLabelMap,
     MerchantTagMap,
+    PeerContact,
+    PeerEntry,
     Transaction,
 )
-from app.services.category_service import FALLBACK_CATEGORY_NAME
+from app.services.category_service import (
+    FALLBACK_CATEGORY_NAME,
+    get_or_create_investment_transfer_category,
+)
 from app.services.fingerprint import transaction_fingerprint
 from app.services.holdings_service import rebuild_realised_lots
 from app.services.merchant import normalize_merchant
 from app.services.merchant_alias import AliasResolver, load_alias_resolver
 from app.services.nav_snapshot_service import as_valuation_stamp
+from app.services.portfolio_analytics_service import (
+    get_or_compute_portfolio_timeseries,
+    invalidate_portfolio_cache,
+)
 from app.services.reconciliation_service import pair_existing_rows
 from app.services.tag_service import should_learn_tag
 from app.services.transaction_delete import delete_owned_transactions
@@ -419,6 +433,7 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
     _reset_demo_transactions(
         session, user_id=user_id, account_ids=tuple(a.id for a in accounts.values())
     )
+    invalidate_portfolio_cache(user_id)
     # Read once: a seed spanning midnight at a month's end must not build the spends for
     # one window and the transfers and bills for the next.
     today = clock.today()
@@ -508,8 +523,49 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
         session, user_id=user_id, tag_counts=tag_counts, label_counts=label_counts
     )
 
+    # Spend Seam (Milestone 1 Step 3): Materialize bank debits for mutual fund SIPs
+    inv_transfer_cat = get_or_create_investment_transfer_category(session, user_id=user_id)
+    bank_sip_txns: dict[tuple[str, str], Transaction] = {}
+    for sip_spend in build_demo_sip_spends(today):
+        b_txn = _add_transaction(
+            session,
+            user_id=user_id,
+            account_id=accounts["bank"].id,
+            on=date_t.fromisoformat(sip_spend.date),
+            amount_paise=-sip_spend.rupees * 100,
+            transaction_type="spend",
+            merchant_raw=sip_spend.merchant,
+            category_id=inv_transfer_cat.id,
+            resolver=resolver,
+            tag_counts=tag_counts,
+            label_counts=label_counts,
+            resolved_labels=resolved_labels,
+            pending_links=pending_links,
+        )
+        txn_count += 1
+        symbol = "PPFCF" if "Parag Parikh" in sip_spend.merchant else "UTINIFTY"
+        bank_sip_txns[(symbol, sip_spend.date)] = b_txn
+
+    session.flush()  # assign ids for bank_sip_txns and pending links
+
     _seed_fx_rates(session, today=today)
-    inst_count, inv_txn_count = _seed_investments(session, user_id=user_id, today=today)
+    inst_count, inv_txn_count = _seed_investments(
+        session, user_id=user_id, today=today, bank_sip_txns=bank_sip_txns
+    )
+    _seed_allocation_targets(session, user_id=user_id)
+    _seed_peer_ledger(session, user_id=user_id, today=today, by_row=by_row)
+
+    # Warm up portfolio daily snapshots for instant load of /portfolio & /net-worth
+    try:
+        get_or_compute_portfolio_timeseries(
+            session,
+            user_id=user_id,
+            scope_type="all",
+            to_date=today,
+            persist=True,
+        )
+    except Exception:
+        logger.exception("portfolio_timeseries_warmup_failed")
 
     session.flush()
     return DemoSeedCounts(
@@ -518,6 +574,78 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
         instruments=inst_count,
         investment_transactions=inv_txn_count,
     )
+
+
+def _seed_allocation_targets(session: Session, *, user_id: UUID) -> int:
+    """Seed default target allocation across asset classes for the demo user."""
+    session.execute(
+        delete(AllocationTarget).where(
+            AllocationTarget.user_id == user_id,
+            AllocationTarget.scope_type == "all",
+            AllocationTarget.account_id.is_(None),
+        )
+    )
+    targets = [
+        AllocationTarget(
+            user_id=user_id,
+            scope_type="all",
+            account_id=None,
+            target_type=spec.target_type,
+            target_key=spec.target_key,
+            target_bps=spec.target_bps,
+            rebalance_threshold_bps=spec.rebalance_threshold_bps,
+        )
+        for spec in DEMO_ALLOCATION_TARGETS
+    ]
+    session.add_all(targets)
+    session.flush()
+    return len(targets)
+
+
+def _seed_peer_ledger(
+    session: Session,
+    *,
+    user_id: UUID,
+    today: date_t,
+    by_row: dict[tuple[AccountKey, str, str], Transaction],
+) -> int:
+    """Seed demo peer ledger contacts and entries (Khatabook ADR-0017)."""
+    session.execute(delete(PeerEntry).where(PeerEntry.user_id == user_id))
+    session.execute(delete(PeerContact).where(PeerContact.user_id == user_id))
+    session.flush()
+
+    c1 = PeerContact(user_id=user_id, name="Rahul Sharma (Goa Trip)")
+    c2 = PeerContact(user_id=user_id, name="Priya Verma")
+    session.add_all((c1, c2))
+    session.flush()
+
+    trip_txn_id = None
+    for (_acc, _d, m), txn in by_row.items():
+        if "MakeMyTrip" in m:
+            trip_txn_id = txn.id
+            break
+
+    e1 = PeerEntry(
+        user_id=user_id,
+        contact_id=c1.id,
+        transaction_id=trip_txn_id,
+        date=today - timedelta(days=25),
+        amount_paise=450000,
+        direction="you_gave",
+        notes="Goa villa advance share",
+    )
+    e2 = PeerEntry(
+        user_id=user_id,
+        contact_id=c2.id,
+        transaction_id=None,
+        date=today - timedelta(days=10),
+        amount_paise=200000,
+        direction="you_got",
+        notes="Split cab to airport",
+    )
+    session.add_all((e1, e2))
+    session.flush()
+    return 2
 
 
 def _seed_fx_rates(session: Session, *, today: date_t) -> None:
@@ -587,7 +715,13 @@ def _get_or_create_investment_account(
     return acc
 
 
-def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tuple[int, int]:
+def _seed_investments(
+    session: Session,
+    *,
+    user_id: UUID,
+    today: date_t,
+    bank_sip_txns: dict[tuple[str, str], Transaction],
+) -> tuple[int, int]:
     """Find-or-create each instrument + its txns. Returns (instruments, txns) made.
 
     Only seeds an instrument's txns when the instrument is newly created (manual
@@ -600,25 +734,30 @@ def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tupl
     """
     inst_made = 0
     inv_txn_made = 0
-    zerodha_acc = _get_or_create_investment_account(
-        session,
-        user_id=user_id,
-        name="Zerodha Demat",
-        account_type="demat",
-        provider="zerodha",
-        external_account_ref="zerodha_demo",
-        currency="INR",
-    )
-    indmoney_acc = _get_or_create_investment_account(
-        session,
-        user_id=user_id,
-        name="INDmoney US Brokerage",
-        account_type="us_broker",
-        provider="indmoney",
-        external_account_ref="indmoney_demo",
-        currency="USD",
-    )
-    for spec in build_demo_instruments(today):
+    inv_accounts: dict[str, InvestmentAccount] = {
+        spec.key: _get_or_create_investment_account(
+            session,
+            user_id=user_id,
+            name=spec.name,
+            account_type=spec.account_type,
+            provider=spec.provider,
+            external_account_ref=spec.external_account_ref,
+            currency=spec.currency,
+        )
+        for spec in INVESTMENT_ACCOUNTS
+    }
+
+    demo_instruments = build_demo_instruments(today)
+    utinifty_dates = [
+        str(t["date"])
+        for spec in demo_instruments
+        if spec["symbol"] == "UTINIFTY"
+        for t in spec.get("txns", [])
+        if t.get("type") == "sip"
+    ]
+    max_utinifty_sip_date = max(utinifty_dates) if utinifty_dates else None
+
+    for spec in demo_instruments:
         symbol = str(spec["symbol"])
         currency = str(spec.get("currency", "INR"))
         existing = session.scalar(
@@ -634,6 +773,25 @@ def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tupl
                 today
             ):
                 existing.nav_updated_at = as_valuation_stamp(today)
+            # Reseed relink: ensure existing SIP rows are linked to fresh bank debits
+            if symbol in ("PPFCF", "UTINIFTY"):
+                existing_txns = session.scalars(
+                    select(InvestmentTransaction).where(
+                        InvestmentTransaction.user_id == user_id,
+                        InvestmentTransaction.instrument_id == existing.id,
+                        InvestmentTransaction.transaction_type == "sip",
+                    )
+                ).all()
+                for inv_t in existing_txns:
+                    d_str = inv_t.date.isoformat()
+                    if symbol == "PPFCF":
+                        b_txn = bank_sip_txns.get(("PPFCF", d_str))
+                        inv_t.linked_spend_txn_id = b_txn.id if b_txn else None
+                    elif symbol == "UTINIFTY" and d_str != max_utinifty_sip_date:
+                        b_txn = bank_sip_txns.get(("UTINIFTY", d_str))
+                        inv_t.linked_spend_txn_id = b_txn.id if b_txn else None
+                    else:
+                        inv_t.linked_spend_txn_id = None
             continue
         instrument = Instrument(
             user_id=user_id,
@@ -654,14 +812,33 @@ def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tupl
         session.add(instrument)
         session.flush()  # assign id for the txn FK
         inst_made += 1
-        account_id = indmoney_acc.id if currency == "USD" else zerodha_acc.id
+
+        if currency == "USD":
+            account_id = inv_accounts["indmoney"].id
+        elif spec["asset_class"] == "indian_mf":
+            account_id = inv_accounts["groww"].id
+        elif spec["asset_class"] == "fd":
+            account_id = inv_accounts["hdfc_fd"].id
+        else:
+            account_id = inv_accounts["zerodha"].id
+
         for t in spec["txns"]:
+            d_str = str(t["date"])
+            linked_spend_txn_id = None
+            if symbol == "PPFCF":
+                b_txn = bank_sip_txns.get(("PPFCF", d_str))
+                linked_spend_txn_id = b_txn.id if b_txn else None
+            elif symbol == "UTINIFTY" and d_str != max_utinifty_sip_date:
+                # Leave newest SIP unlinked to demonstrate manual linking in UI
+                b_txn = bank_sip_txns.get(("UTINIFTY", d_str))
+                linked_spend_txn_id = b_txn.id if b_txn else None
+
             session.add(
                 InvestmentTransaction(
                     user_id=user_id,
                     account_id=account_id,
                     instrument_id=instrument.id,
-                    date=date_t.fromisoformat(str(t["date"])),
+                    date=date_t.fromisoformat(d_str),
                     transaction_type=str(t["type"]),
                     units=Decimal(str(t["units"])) if "units" in t else Decimal("0"),
                     price_per_unit_native=Decimal(str(t["price"])) if "price" in t else None,
@@ -670,6 +847,7 @@ def _seed_investments(session: Session, *, user_id: UUID, today: date_t) -> tupl
                     fx_rate_to_inr=Decimal(str(t.get("fx", "1"))),
                     note=str(t["note"]) if t.get("note") else None,
                     pair_id=None,
+                    linked_spend_txn_id=linked_spend_txn_id,
                 )
             )
             inv_txn_made += 1

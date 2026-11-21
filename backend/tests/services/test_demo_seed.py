@@ -26,30 +26,41 @@ from app.core import clock
 from app.core.config import get_settings
 from app.core.demo_data import (
     ACCOUNTS,
+    DEMO_ALLOCATION_TARGETS,
     INSTRUMENTS,
     build_demo_card_bills,
     build_demo_dataset,
+    build_demo_sip_spends,
     build_demo_transfers,
 )
 from app.models import (
     Account,
+    AllocationTarget,
     Category,
     FxRateQuote,
     Instrument,
+    InvestmentAccount,
     InvestmentTransaction,
     Label,
     MerchantLabelMap,
     MerchantTagMap,
+    PeerContact,
+    PeerEntry,
+    PortfolioDailySnapshot,
     RealisedLot,
     Transaction,
     User,
 )
-from app.services.category_service import CASHBACK_CATEGORY_NAME
+from app.services.category_service import (
+    CASHBACK_CATEGORY_NAME,
+    INVESTMENT_TRANSFER_CATEGORY_NAME,
+)
 from app.services.demo_seed import seed_demo_data
 from app.services.fx_service import latest_rate
 from app.services.holdings_service import compute_holdings
 from app.services.merchant_labels import LABEL_PREFILL_MIN
 from app.services.provisioning import provision_default_categories
+from app.services.rebalancing_service import evaluate_rebalancing
 from app.services.reconciliation_service import (
     card_bill_link_offered_ids,
     is_card_bill_debit,
@@ -65,10 +76,12 @@ from app.services.refund_link import refund_link_problem
 _ANCHOR = date(2026, 8, 20)
 _SPENDS, _REFUNDS, _INCOME = build_demo_dataset(_ANCHOR)
 _BILLS = build_demo_card_bills(_ANCHOR)
+_SIP_SPENDS = build_demo_sip_spends(_ANCHOR)
 _TXN_TOTAL = (
     len(_SPENDS)
     + len(_REFUNDS)
     + len(_INCOME)
+    + len(_SIP_SPENDS)
     + 2 * len(build_demo_transfers(_ANCHOR))
     + 2 * len(_BILLS)
 )
@@ -260,6 +273,7 @@ def test_seed_rolls_the_window_forward(
         len(expected_spends)
         + len(expected_refunds)
         + len(expected_income)
+        + len(build_demo_sip_spends(later_anchor))
         + 2 * len(build_demo_transfers(later_anchor))
         + 2 * len(build_demo_card_bills(later_anchor))
     )
@@ -772,3 +786,192 @@ def test_seed_reads_today_once(
     monkeypatch.setattr(clock, "today", today)
     seed_demo_data(session, user_id=seeded_user.id)
     assert len(calls) == 1
+
+
+def test_seed_links_sip_spend_seam_and_leaves_latest_utinifty_unlinked(
+    session: Session, seeded_user: User
+) -> None:
+    """Spend Seam (Milestone 1 Step 3): MF SIPs link to bank spend debits under
+    system:investment_transfer, with the latest UTINIFTY SIP left unlinked to demo
+    the link candidate modal in the UI."""
+    seed_demo_data(session, user_id=seeded_user.id)
+
+    # 1. Bank spends exist under system:investment_transfer
+    sip_debits = session.scalars(
+        select(Transaction)
+        .join(Category, Category.id == Transaction.category_id)
+        .where(
+            Transaction.user_id == seeded_user.id,
+            Category.name == INVESTMENT_TRANSFER_CATEGORY_NAME,
+        )
+    ).all()
+    assert len(sip_debits) == len(_SIP_SPENDS)
+    assert all(t.amount_paise < 0 for t in sip_debits)
+
+    # 2. PPFCF SIPs are 100% linked
+    ppfcf = session.scalar(
+        select(Instrument).where(Instrument.user_id == seeded_user.id, Instrument.symbol == "PPFCF")
+    )
+    assert ppfcf is not None
+    ppfcf_sips = session.scalars(
+        select(InvestmentTransaction).where(
+            InvestmentTransaction.instrument_id == ppfcf.id,
+            InvestmentTransaction.transaction_type == "sip",
+        )
+    ).all()
+    assert len(ppfcf_sips) > 0
+    assert all(s.linked_spend_txn_id is not None for s in ppfcf_sips)
+
+    # 3. UTINIFTY SIPs: all linked except the newest one
+    utinifty = session.scalar(
+        select(Instrument).where(
+            Instrument.user_id == seeded_user.id, Instrument.symbol == "UTINIFTY"
+        )
+    )
+    assert utinifty is not None
+    utinifty_sips = session.scalars(
+        select(InvestmentTransaction)
+        .where(
+            InvestmentTransaction.instrument_id == utinifty.id,
+            InvestmentTransaction.transaction_type == "sip",
+        )
+        .order_by(InvestmentTransaction.date.asc())
+    ).all()
+    assert len(utinifty_sips) > 1
+    assert all(s.linked_spend_txn_id is not None for s in utinifty_sips[:-1])
+    assert utinifty_sips[-1].linked_spend_txn_id is None
+
+    # 4. The unlinked bank debit is an eligible candidate for manual link
+    unlinked_debit = session.scalar(
+        select(Transaction).where(
+            Transaction.user_id == seeded_user.id,
+            Transaction.date == utinifty_sips[-1].date,
+            Transaction.merchant_raw == "ACH Debit - UTI Mutual Fund",
+        )
+    )
+    assert unlinked_debit is not None
+    assert unlinked_debit.amount_paise == -utinifty_sips[-1].amount_native_paise
+
+
+def test_seed_allocation_targets_and_drift_evaluation(session: Session, seeded_user: User) -> None:
+    """Milestone 4: Target allocation weights are seeded summing to 10,000 bps (100.00%)
+    and evaluate_rebalancing evaluates portfolio drift cleanly."""
+    seed_demo_data(session, user_id=seeded_user.id)
+
+    targets = session.scalars(
+        select(AllocationTarget).where(
+            AllocationTarget.user_id == seeded_user.id,
+            AllocationTarget.scope_type == "all",
+        )
+    ).all()
+    assert len(targets) == len(DEMO_ALLOCATION_TARGETS)
+    assert sum(t.target_bps for t in targets) == 10000
+
+    report = evaluate_rebalancing(session, user_id=seeded_user.id, scope_type="all")
+    assert report.total_portfolio_value_paise > 0
+    assert len(report.buckets) == len(DEMO_ALLOCATION_TARGETS)
+    assert any(b.is_out_of_tolerance for b in report.buckets)
+
+
+def test_seed_investment_accounts_segmentation(session: Session, seeded_user: User) -> None:
+    """Milestone 1 Phases 1 & 2: 4 distinct investment accounts partition brokers:
+    Zerodha (demat), Groww (mf_folio), INDmoney (us_broker), HDFC (bank_fd)."""
+    seed_demo_data(session, user_id=seeded_user.id)
+
+    accounts = {
+        acc.provider: acc
+        for acc in session.scalars(
+            select(InvestmentAccount).where(InvestmentAccount.user_id == seeded_user.id)
+        )
+    }
+    assert set(accounts.keys()) == {"zerodha", "groww", "indmoney", "hdfc"}
+    assert accounts["zerodha"].account_type == "demat"
+    assert accounts["groww"].account_type == "mf_folio"
+    assert accounts["indmoney"].account_type == "us_broker"
+    assert accounts["hdfc"].account_type == "bank_fd"
+
+    # MFs are held under Groww
+    ppfcf = session.scalar(
+        select(Instrument).where(Instrument.user_id == seeded_user.id, Instrument.symbol == "PPFCF")
+    )
+    assert ppfcf is not None
+    mirae = session.scalar(
+        select(Instrument).where(
+            Instrument.user_id == seeded_user.id, Instrument.symbol == "MIRAEELSS"
+        )
+    )
+    assert mirae is not None
+    for inst in (ppfcf, mirae):
+        first_txn = session.scalar(
+            select(InvestmentTransaction).where(InvestmentTransaction.instrument_id == inst.id)
+        )
+        assert first_txn is not None
+        assert first_txn.account_id == accounts["groww"].id
+
+
+def test_seed_fractional_us_tech_stocks_and_etfs(session: Session, seeded_user: User) -> None:
+    """QQQ, NVDA, MSFT, GOOGL, AAPL, VOO seeded with fractional share quantities,
+    and NVDA partial sell books fractional lot under FIFO."""
+    seed_demo_data(session, user_id=seeded_user.id)
+
+    symbols = set(
+        session.scalars(
+            select(Instrument.symbol).where(
+                Instrument.user_id == seeded_user.id, Instrument.currency == "USD"
+            )
+        )
+    )
+    assert symbols == {"QQQ", "VOO", "NVDA", "MSFT", "GOOGL", "AAPL"}
+
+    # QQQ has fractional units
+    qqq = session.scalar(
+        select(Instrument).where(Instrument.user_id == seeded_user.id, Instrument.symbol == "QQQ")
+    )
+    assert qqq is not None
+    qqq_buys = session.scalars(
+        select(InvestmentTransaction).where(
+            InvestmentTransaction.instrument_id == qqq.id,
+            InvestmentTransaction.transaction_type == "buy",
+        )
+    ).all()
+    assert any(b.units % Decimal("1") != Decimal("0") for b in qqq_buys)
+
+    # NVDA partial sell books a fractional realised lot
+    nvda = session.scalar(
+        select(Instrument).where(Instrument.user_id == seeded_user.id, Instrument.symbol == "NVDA")
+    )
+    assert nvda is not None
+    nvda_lot = session.scalar(
+        select(RealisedLot)
+        .join(
+            InvestmentTransaction,
+            InvestmentTransaction.id == RealisedLot.sell_txn_id,
+        )
+        .where(InvestmentTransaction.instrument_id == nvda.id)
+    )
+    assert nvda_lot is not None
+    assert nvda_lot.units == Decimal("1.25")
+
+
+def test_seed_peer_ledger_and_portfolio_snapshots(session: Session, seeded_user: User) -> None:
+    """Khatabook peer entries and daily snapshots are seeded."""
+    seed_demo_data(session, user_id=seeded_user.id)
+
+    contacts = session.scalars(
+        select(PeerContact).where(PeerContact.user_id == seeded_user.id)
+    ).all()
+    assert len(contacts) == 2
+
+    entries = session.scalars(select(PeerEntry).where(PeerEntry.user_id == seeded_user.id)).all()
+    assert len(entries) == 2
+    assert {e.direction for e in entries} == {"you_gave", "you_got"}
+
+    # Daily snapshots pre-warmed
+    snapshots = session.scalars(
+        select(PortfolioDailySnapshot).where(
+            PortfolioDailySnapshot.user_id == seeded_user.id,
+            PortfolioDailySnapshot.scope_type == "all",
+        )
+    ).all()
+    assert len(snapshots) > 0
+    assert all(s.portfolio_value_paise > 0 for s in snapshots)

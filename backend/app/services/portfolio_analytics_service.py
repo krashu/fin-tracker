@@ -832,6 +832,14 @@ def get_or_compute_portfolio_timeseries(
 
     if cache_key in _TIMESERIES_CACHE:
         cached_time, resp = _TIMESERIES_CACHE[cache_key]
+        if persist and resp.points:
+            persist_portfolio_snapshots(
+                session,
+                user_id,
+                scope_type,
+                resolved_scope_id,
+                resp.points,
+            )
         return resp
 
     trades = load_user_trades(
