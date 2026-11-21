@@ -12,7 +12,14 @@ from sqlalchemy import Table, func, select, update
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.models import Base, ImportBatch, PeerContact, PeerEntry, Transaction
+from app.models import (
+    Base,
+    ImportBatch,
+    PeerContact,
+    PeerEntry,
+    PortfolioDailySnapshot,
+    Transaction,
+)
 
 # ADR-0003 & ADR-0021: the only tables without an owner. ``users`` is the tenant root itself.
 GLOBAL_TABLES = frozenset(
@@ -90,4 +97,16 @@ def seed_rows_demo_seed_lacks(session: Session, user_id: UUID) -> None:
         direction="you_gave",
     )
     session.add(entry)
+    session.flush()
+    snapshot = PortfolioDailySnapshot(
+        user_id=user_id,
+        scope_type="all",
+        scope_id=0,
+        snapshot_date=clock.today(),
+        portfolio_value_paise=100000,
+        invested_capital_paise=100000,
+        net_cashflow_paise=100000,
+        twr_index_micros=1000000,
+    )
+    session.add(snapshot)
     session.flush()

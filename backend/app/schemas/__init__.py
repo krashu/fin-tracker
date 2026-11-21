@@ -100,6 +100,12 @@ from app.schemas.peer_ledger import (
     PeerSettleRequest,
 )
 from app.schemas.performance import PortfolioPerformance
+from app.schemas.portfolio_timeseries import (
+    PeriodPerformance,
+    PortfolioTimeseriesPoint,
+    PortfolioTimeseriesResponse,
+    ScopeTypeStr,
+)
 from app.schemas.rules import (
     CategoryRuleCreate,
     CategoryRuleRead,
@@ -171,6 +177,7 @@ __all__ = [
     "InvestmentCsvUploadForm",
     "SampleImportCreate",
     "SampleStatementRead",
+    "ScopeTypeStr",
     "StatementIssuerRead",
     "StatementUploadForm",
     "InvestmentTransactionCreate",
@@ -201,9 +208,12 @@ __all__ = [
     "PeerLedgerSummaryRead",
     "PeerSettleRequest",
     "PendingImportBatch",
+    "PeriodPerformance",
     "PeriodTotalsResponse",
     "PortfolioPerformance",
     "PortfolioSummary",
+    "PortfolioTimeseriesPoint",
+    "PortfolioTimeseriesResponse",
     "RegisterRequest",
     "RulePinPatch",
     "RuleWriteResult",

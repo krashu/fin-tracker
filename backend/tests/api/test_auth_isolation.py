@@ -225,6 +225,9 @@ def test_investment_read_models_are_isolated_per_user(unauth_client: TestClient)
     assert summary["holdings_count"] == 0
     assert summary["current_value_paise"] == 0
     assert summary["holding_xirr"] == []
+    timeseries = unauth_client.get("/api/v1/portfolio/timeseries").json()
+    assert timeseries["points"] == []
+    assert timeseries["periods"] == []
 
 
 def test_import_batch_commit_cancel_and_reconciliation_are_scoped(

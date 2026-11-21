@@ -25,6 +25,7 @@ from app.models.merchant_label_map import MerchantLabelMap
 from app.models.merchant_tag_map import MerchantTagMap
 from app.models.peer_contact import PeerContact
 from app.models.peer_entry import PeerDirectionStr, PeerEntry
+from app.models.portfolio_daily_snapshot import PortfolioDailySnapshot
 from app.models.realised_lot import RealisedLot
 from app.models.session import RefreshSession
 from app.models.transaction import Transaction, TransactionSourceStr, TransactionTypeStr
@@ -66,6 +67,7 @@ __all__ = [
     "PeerContact",
     "PeerDirectionStr",
     "PeerEntry",
+    "PortfolioDailySnapshot",
     "RealisedLot",
     "RefreshSession",
     "Transaction",

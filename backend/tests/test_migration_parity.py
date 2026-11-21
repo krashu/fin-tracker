@@ -3470,6 +3470,7 @@ _REV_STREAMLINE_CATEGORIES = "0049_streamline_category_taxonomy"
 _REV_INVESTMENT_ACCOUNTS = "0050_investment_accounts_and_attribution"
 _REV_SPEND_SEAM = "0051_spend_seam_and_investment_transfer"
 _REV_MARKET_PRICING = "0052_market_pricing"
+_REV_PORTFOLIO_DAILY_SNAPSHOTS = "0053_portfolio_daily_snapshots"
 
 
 @pytest.mark.slow
@@ -3867,6 +3868,61 @@ def test_0052_upgrade_creates_market_pricing_tables() -> None:
             insp = inspect(conn)
             for tbl in tables:
                 assert not insp.has_table(tbl)
+
+        # Re-upgrade to head
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0053_upgrade_creates_portfolio_daily_snapshots() -> None:
+    """Migration 0053 must create portfolio_daily_snapshots with composite PK and constraints."""
+    eng = _migration_engine()
+    tbl = "portfolio_daily_snapshots"
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_PORTFOLIO_DAILY_SNAPSHOTS))
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            assert not insp.has_table(tbl)
+
+        # Upgrade to 0053
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_PORTFOLIO_DAILY_SNAPSHOTS)
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            assert insp.has_table(tbl)
+
+            # Check columns
+            col_names = {c["name"] for c in insp.get_columns(tbl)}
+            assert col_names == {
+                "user_id",
+                "scope_type",
+                "scope_id",
+                "snapshot_date",
+                "portfolio_value_paise",
+                "invested_capital_paise",
+                "net_cashflow_paise",
+                "twr_index_micros",
+                "benchmark_value_paise",
+                "created_at",
+            }
+
+            # Check primary key columns
+            pk_cols = insp.get_pk_constraint(tbl)["constrained_columns"]
+            assert tuple(pk_cols) == ("user_id", "scope_type", "scope_id", "snapshot_date")
+
+        # Downgrade back to 0052
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_PORTFOLIO_DAILY_SNAPSHOTS))
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            assert not insp.has_table(tbl)
 
         # Re-upgrade to head
         with eng.begin() as conn:

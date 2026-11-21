@@ -76,6 +76,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Annotated, Literal, cast, get_args
 from uuid import UUID
 
@@ -127,6 +128,7 @@ from app.services.import_service import (
 from app.services.investment_import_service import import_investment_csv
 from app.services.merchant_alias import load_alias_resolver
 from app.services.merchant_labels import LABEL_PREFILL_MIN, learn_merchant_memory
+from app.services.portfolio_analytics_service import invalidate_portfolio_snapshots
 from app.services.reconciliation_service import (
     auto_link_cc_bill,
     card_bill_transfer_gate,
@@ -346,6 +348,8 @@ def create_investment_csv_import(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="could not parse investment CSV",
         ) from e
+    if result.txns_imported > 0:
+        invalidate_portfolio_snapshots(session, user_id=user_id, from_date=date.min)
     session.commit()
     return InvestmentCsvImportSummary.model_validate(result)
 

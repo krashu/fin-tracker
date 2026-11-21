@@ -25,6 +25,7 @@ from app.models import (
     MerchantTagMap,
     PeerContact,
     PeerEntry,
+    PortfolioDailySnapshot,
     RealisedLot,
     RefreshSession,
     Transaction,
@@ -65,6 +66,7 @@ def teardown_user(session: Session, user_id: UUID) -> None:
     session.execute(delete(PeerEntry).where(PeerEntry.user_id == user_id))
 
     # Phase 3: Delete transactional records & import batches
+    session.execute(delete(PortfolioDailySnapshot).where(PortfolioDailySnapshot.user_id == user_id))
     session.execute(delete(Transaction).where(Transaction.user_id == user_id))
     session.execute(delete(InvestmentTransaction).where(InvestmentTransaction.user_id == user_id))
     session.execute(delete(ImportBatch).where(ImportBatch.user_id == user_id))

@@ -55,6 +55,7 @@ from app.services.category_service import (
 from app.services.fx_service import resolve_fx_rate_to_inr
 from app.services.holdings_service import OversellError, rebuild_realised_lots
 from app.services.investment_account_service import get_or_create_default_investment_account
+from app.services.portfolio_analytics_service import invalidate_portfolio_snapshots
 
 router = APIRouter(prefix="/investment-transactions", tags=["investment-transactions"])
 
@@ -275,6 +276,7 @@ def create_investment_transaction(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="sell/switch_out exceeds available units for this instrument",
         ) from None
+    invalidate_portfolio_snapshots(session, user_id=user_id, from_date=payload.date)
     session.commit()
     session.refresh(txn)
     return txn
@@ -355,6 +357,7 @@ def create_reinvestment(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="sell/switch_out exceeds available units for this instrument",
         ) from None
+    invalidate_portfolio_snapshots(session, user_id=user_id, from_date=payload.date)
     session.commit()
     session.refresh(dividend)
     session.refresh(buy)
@@ -399,6 +402,7 @@ def update_investment_transaction(
 
     for field, value in updates.items():
         setattr(txn, field, value)
+    invalidate_portfolio_snapshots(session, user_id=user_id, from_date=txn.date)
     session.commit()
     session.refresh(txn)
     return txn
@@ -496,6 +500,7 @@ def delete_investment_transaction(
             partner.pair_id = None
 
     instrument_id = txn.instrument_id
+    txn_date = txn.date
     session.delete(txn)
     # The rebuild flushes first, so the partner UPDATE and this DELETE go out (and the DB
     # cascade clears this row's realised lots) before the replay. Deleting an acquisition
@@ -511,5 +516,6 @@ def delete_investment_transaction(
                 "without enough units at its date"
             ),
         ) from None
+    invalidate_portfolio_snapshots(session, user_id=user_id, from_date=txn_date)
     session.commit()
     return None
