@@ -7,7 +7,7 @@
  */
 import { PageHeader } from "@/components/shell/page-header";
 import { RefreshPricesButton } from "@/components/refresh-prices-button";
-import { PortfolioPerformance } from "./portfolio-performance";
+import { PortfolioDashboardView } from "@/components/investments/portfolio-dashboard-view";
 import { PortfolioSummary } from "./portfolio-summary";
 
 export default function PortfolioPage() {
@@ -18,9 +18,9 @@ export default function PortfolioPage() {
         description="Value, returns (XIRR), allocation, and how you’re tracking against the market."
         actions={<RefreshPricesButton />}
       />
-      <div className="flex flex-col gap-5">
+      <div className="flex flex-col gap-8">
+        <PortfolioDashboardView />
         <PortfolioSummary />
-        <PortfolioPerformance />
       </div>
     </div>
   );
