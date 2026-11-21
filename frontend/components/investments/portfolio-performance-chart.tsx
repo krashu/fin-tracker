@@ -48,7 +48,7 @@ const CHART_CONFIG = {
   },
   benchmark: {
     label: "Benchmark (TRI)",
-    color: "#f59e0b",
+    color: "#d97706",
   },
 } satisfies ChartConfig;
 
@@ -200,6 +200,7 @@ export function PortfolioPerformanceChart({
               className="aspect-auto h-[290px] w-full"
             >
               <LineChart
+                syncId="portfolio-hub-timeline"
                 data={chartData}
                 margin={{ left: 8, right: 12, top: 12, bottom: 4 }}
               >

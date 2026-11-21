@@ -18,7 +18,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.models import Instrument, InvestmentAccount, InvestmentTransaction, User
+from app.models import FxRateQuote, Instrument, InvestmentAccount, InvestmentTransaction, User
 from app.schemas.rebalancing import (
     AllocationTargetBatchCreate,
     AllocationTargetCreate,
@@ -471,3 +471,107 @@ def test_tax_aware_rebalance_elss_lock_and_tax_drag(
     first_lot = plan.lot_sell_recommendations[0]
     assert first_lot.gain_type == "loss"
     assert first_lot.tax_drag_rank == 1
+
+
+def test_foreign_usd_assets_included_and_rebalanced(
+    session: Session, test_user: User, test_account: InvestmentAccount
+) -> None:
+    """Verify that foreign USD assets are valued and included in rebalance drift evaluation."""
+    today = clock.today()
+
+    session.add(
+        FxRateQuote(
+            date=today,
+            from_currency="USD",
+            to_currency="INR",
+            rate=Decimal("84.00"),
+            source="seed",
+        )
+    )
+    session.flush()
+
+    # Create target: US Equity 50% (5000 bps), Indian Equity 50% (5000 bps)
+    rebalancing_service.create_target(
+        session,
+        user_id=test_user.id,
+        target_in=AllocationTargetCreate(
+            scope_type="all",
+            target_type="asset_class",
+            target_key="us_equity",
+            target_bps=5000,
+            rebalance_threshold_bps=500,
+        ),
+    )
+    rebalancing_service.create_target(
+        session,
+        user_id=test_user.id,
+        target_in=AllocationTargetCreate(
+            scope_type="all",
+            target_type="asset_class",
+            target_key="indian_equity",
+            target_bps=5000,
+            rebalance_threshold_bps=500,
+        ),
+    )
+
+    # Add US stock (AAPL): 10 shares @ $150 = $1500. NAV = $200 -> $2000 value.
+    # At rate 84, $2000 = ₹1,68,000 (16800000 paise).
+    aapl = Instrument(
+        user_id=test_user.id,
+        symbol="AAPL",
+        name="Apple Inc",
+        asset_class="us_equity",
+        currency="USD",
+        exchange="NASDAQ",
+        current_nav=Decimal("200.00"),
+    )
+    # Add Indian stock: 100 shares @ ₹1000 = ₹1,00,000 (10000000 paise).
+    infy = Instrument(
+        user_id=test_user.id,
+        symbol="INFY",
+        name="Infosys Ltd",
+        asset_class="indian_equity",
+        currency="INR",
+        exchange="NSE",
+        current_nav=Decimal("1000.00"),
+    )
+    session.add_all([aapl, infy])
+    session.flush()
+
+    session.add(
+        InvestmentTransaction(
+            user_id=test_user.id,
+            account_id=test_account.id,
+            instrument_id=aapl.id,
+            date=today - timedelta(days=100),
+            transaction_type="buy",
+            units=Decimal("10.0"),
+            price_per_unit_native=Decimal("150.00"),
+            amount_native_paise=150000,  # 1500 USD cents
+            fx_rate_to_inr=Decimal("84.00"),
+        )
+    )
+    session.add(
+        InvestmentTransaction(
+            user_id=test_user.id,
+            account_id=test_account.id,
+            instrument_id=infy.id,
+            date=today - timedelta(days=100),
+            transaction_type="buy",
+            units=Decimal("100.0"),
+            price_per_unit_native=Decimal("1000.00"),
+            amount_native_paise=10000000,
+            fx_rate_to_inr=Decimal("1.0"),
+        )
+    )
+    session.flush()
+
+    eval_res = rebalancing_service.evaluate_rebalancing(
+        session, user_id=test_user.id, scope_type="all", as_of=today
+    )
+
+    # Total portfolio should be AAPL (16800000) + INFY (10000000) = 26800000 paise
+    assert eval_res.total_portfolio_value_paise == 26800000
+    us_bucket = next(b for b in eval_res.buckets if b.target_key == "us_equity")
+    assert us_bucket.actual_value_paise == 16800000
+    assert us_bucket.actual_bps == 6269  # 168000 / 268000 = ~62.69%

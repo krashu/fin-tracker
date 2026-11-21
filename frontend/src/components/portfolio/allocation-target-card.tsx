@@ -54,6 +54,10 @@ import { RebalanceSimulationSheet } from "./rebalance-simulation-sheet";
 export type AllocationTargetCardProps = {
   initialScope?: AllocationScopeType;
   initialAccountId?: number | null;
+  scope?: AllocationScopeType;
+  accountId?: number | null;
+  onScopeChange?: (scope: AllocationScopeType, accountId?: number | null) => void;
+  hideScopeSelector?: boolean;
   className?: string;
 };
 
@@ -103,10 +107,25 @@ const COMMON_ASSET_CLASSES = [
 export function AllocationTargetCard({
   initialScope = "all",
   initialAccountId = null,
+  scope: controlledScope,
+  accountId: controlledAccountId,
+  onScopeChange,
+  hideScopeSelector = false,
   className,
 }: AllocationTargetCardProps) {
-  const [scope, setScope] = useState<AllocationScopeType>(initialScope);
-  const [accountId, setAccountId] = useState<number | null>(initialAccountId);
+  const [internalScope, setInternalScope] = useState<AllocationScopeType>(initialScope);
+  const [internalAccountId, setInternalAccountId] = useState<number | null>(initialAccountId);
+
+  const scope = controlledScope !== undefined ? controlledScope : internalScope;
+  const accountId = controlledAccountId !== undefined ? controlledAccountId : internalAccountId;
+
+  const handleScopeSelect = (newScope: AllocationScopeType, newAccountId: number | null) => {
+    if (controlledScope === undefined) {
+      setInternalScope(newScope);
+      setInternalAccountId(newAccountId);
+    }
+    onScopeChange?.(newScope, newAccountId);
+  };
   const [isConfigOpen, setIsConfigOpen] = useState(false);
   const [isRebalanceOpen, setIsRebalanceOpen] = useState(false);
 
@@ -158,19 +177,17 @@ export function AllocationTargetCard({
 
           <div className="flex flex-wrap items-center gap-2">
             {/* Scope Filter */}
-            {accounts.length > 0 && (
+            {!hideScopeSelector && accounts.length > 0 && (
               <select
                 aria-label="Allocation Scope"
                 value={scope === "account" ? `account:${accountId}` : "all"}
                 onChange={(e) => {
                   const val = e.target.value;
                   if (val === "all") {
-                    setScope("all");
-                    setAccountId(null);
+                    handleScopeSelect("all", null);
                   } else {
                     const accId = Number(val.replace("account:", ""));
-                    setScope("account");
-                    setAccountId(accId);
+                    handleScopeSelect("account", accId);
                   }
                 }}
                 className="h-8 rounded-md border border-input bg-card px-2.5 text-xs font-medium text-foreground shadow-sm focus:border-ring focus:outline-none"

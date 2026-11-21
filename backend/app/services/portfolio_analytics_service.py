@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.core.log_config import get_logger
+from app.models.benchmark import Benchmark, BenchmarkNav
 from app.models.instrument import Instrument
 from app.models.investment_account import InvestmentAccount
 from app.models.investment_transaction import InvestmentTransaction
@@ -299,6 +300,7 @@ def calculate_portfolio_report(
     *,
     end: date | None = None,
     benchmark_key: str | None = "INDEX:NSEI",
+    benchmark_id: int | None = None,
     base_currency: str = "INR",
     apply_splits: bool = True,
 ) -> PortfolioReport:
@@ -367,6 +369,36 @@ def calculate_portfolio_report(
             splits_by_key[key] = splits_for(session, inst.id)
         series = filled_series(session, inst.id, start_date, end_date)
         prices_by_key[key] = {p.day: p.nav_micros / 10_000.0 for p in series}
+
+    # Load benchmark prices from BenchmarkNav if benchmark_id is provided or resolved
+    resolved_benchmark_id = benchmark_id
+    if resolved_benchmark_id is None and benchmark_key and benchmark_key not in prices_by_key:
+        first_b = session.scalar(
+            select(Benchmark).where(Benchmark.archived_at.is_(None)).order_by(Benchmark.id.asc())
+        )
+        if first_b:
+            resolved_benchmark_id = first_b.id
+
+    if resolved_benchmark_id is not None:
+        nav_rows = session.execute(
+            select(BenchmarkNav.nav_date, BenchmarkNav.nav)
+            .where(BenchmarkNav.benchmark_id == resolved_benchmark_id)
+            .order_by(BenchmarkNav.nav_date.asc())
+        ).all()
+        if nav_rows:
+            target_b_key = benchmark_key or "INDEX:NSEI"
+            raw_navs = {r.nav_date: float(r.nav) for r in nav_rows}
+            sorted_dates = sorted(raw_navs.keys())
+            if sorted_dates:
+                b_map: dict[date, float] = {}
+                curr_p = raw_navs[sorted_dates[0]]
+                cur_d = min(start_date, sorted_dates[0])
+                while cur_d <= end_date:
+                    if cur_d in raw_navs:
+                        curr_p = raw_navs[cur_d]
+                    b_map[cur_d] = curr_p
+                    cur_d += timedelta(days=1)
+                prices_by_key[target_b_key] = b_map
 
     # Fallback to last known trade price for instruments without market data
     last_trade_price: dict[str, float] = {}
@@ -828,7 +860,16 @@ def get_or_compute_portfolio_timeseries(
     resolved_scope_id = scope_id or 0
     end_date = to_date or clock.today()
     epoch = _USER_TX_EPOCHS.get(user_id, 0)
-    cache_key = (user_id, scope_type, resolved_scope_id, from_date, end_date, benchmark_key, epoch)
+    cache_key = (
+        user_id,
+        scope_type,
+        resolved_scope_id,
+        from_date,
+        end_date,
+        benchmark_id,
+        benchmark_key,
+        epoch,
+    )
 
     if cache_key in _TIMESERIES_CACHE:
         cached_time, resp = _TIMESERIES_CACHE[cache_key]
@@ -854,6 +895,7 @@ def get_or_compute_portfolio_timeseries(
         trades,
         end=end_date,
         benchmark_key=benchmark_key,
+        benchmark_id=benchmark_id,
     )
 
     if not report.daily_series:

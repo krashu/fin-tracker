@@ -908,6 +908,55 @@ def test_seed_investment_accounts_segmentation(session: Session, seeded_user: Us
         assert first_txn is not None
         assert first_txn.account_id == accounts["groww"].id
 
+    # Indian equities are held under Zerodha
+    infy = session.scalar(
+        select(Instrument).where(Instrument.user_id == seeded_user.id, Instrument.symbol == "INFY")
+    )
+    assert infy is not None
+    first_infy_txn = session.scalar(
+        select(InvestmentTransaction).where(InvestmentTransaction.instrument_id == infy.id)
+    )
+    assert first_infy_txn is not None
+    assert first_infy_txn.account_id == accounts["zerodha"].id
+
+    # US stocks are held under INDmoney
+    aapl = session.scalar(
+        select(Instrument).where(Instrument.user_id == seeded_user.id, Instrument.symbol == "AAPL")
+    )
+    assert aapl is not None
+    first_aapl_txn = session.scalar(
+        select(InvestmentTransaction).where(InvestmentTransaction.instrument_id == aapl.id)
+    )
+    assert first_aapl_txn is not None
+    assert first_aapl_txn.account_id == accounts["indmoney"].id
+
+    # Reseed cleanly migrates any transaction stuck in legacy Default Portfolio
+    legacy_default = InvestmentAccount(
+        user_id=seeded_user.id,
+        name="Default Portfolio",
+        account_type="manual",
+        provider="manual",
+        external_account_ref="default",
+        currency="INR",
+        is_active=True,
+    )
+    session.add(legacy_default)
+    session.flush()
+    first_infy_txn.account_id = legacy_default.id
+    session.flush()
+
+    seed_demo_data(session, user_id=seeded_user.id)
+    session.refresh(first_infy_txn)
+    assert first_infy_txn.account_id == accounts["zerodha"].id
+    remaining_default = session.scalar(
+        select(InvestmentAccount).where(
+            InvestmentAccount.user_id == seeded_user.id,
+            InvestmentAccount.provider == "manual",
+            InvestmentAccount.external_account_ref == "default",
+        )
+    )
+    assert remaining_default is None
+
 
 def test_seed_fractional_us_tech_stocks_and_etfs(session: Session, seeded_user: User) -> None:
     """QQQ, NVDA, MSFT, GOOGL, AAPL, VOO seeded with fractional share quantities,

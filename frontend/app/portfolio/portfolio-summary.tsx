@@ -42,7 +42,7 @@ const sliceColor = (i: number) => `var(--chart-${(i % 6) + 1})`;
 
 const DASH = <span className="text-muted-foreground">—</span>;
 
-export function PortfolioSummary() {
+export function PortfolioSummary({ hideTiles = false }: { hideTiles?: boolean } = {}) {
   const query = useQuery({
     queryKey: ["portfolio", "summary"],
     queryFn: getPortfolioSummary,
@@ -90,14 +90,16 @@ export function PortfolioSummary() {
           : "text-foreground";
 
   return (
-    <div className="mt-6 flex flex-col gap-5">
-      {ready && data.holdings_count > 0 ? (
-        <div className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
-          <span className="size-1.5 rounded-full bg-emerald-500" />
-          <span>Prices up to date</span>
-        </div>
-      ) : null}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+    <div className={cn(!hideTiles && "mt-6", "flex flex-col gap-5")}>
+      {!hideTiles && (
+        <>
+          {ready && data.holdings_count > 0 ? (
+            <div className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
+              <span className="size-1.5 rounded-full bg-emerald-500" />
+              <span>Prices up to date</span>
+            </div>
+          ) : null}
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <Tile
           label="Current value"
           sub={
@@ -233,6 +235,8 @@ export function PortfolioSummary() {
           </span>
         </Tile>
       </div>
+        </>
+      )}
 
       <AllocationDonut
         allocations={data?.allocations ?? []}
@@ -273,7 +277,7 @@ function Tile({
   );
 }
 
-function AllocationDonut({
+export function AllocationDonut({
   allocations,
   ready,
   hasHoldings,

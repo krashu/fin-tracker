@@ -24,8 +24,11 @@ import {
   type ScopeType,
 } from "@/lib/api/portfolio-timeseries";
 import type { RollingPeriod } from "@/lib/investments";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { AllocationTargetCard } from "@/src/components/portfolio/allocation-target-card";
+import { PortfolioSummary } from "@/app/portfolio/portfolio-summary";
 import { PortfolioPerformanceChart } from "./portfolio-performance-chart";
 import { PortfolioScopeBenchmarkBar } from "./portfolio-scope-benchmark-bar";
 import { PortfolioStatTiles } from "./portfolio-stat-tiles";
@@ -37,6 +40,7 @@ export function PortfolioDashboardView() {
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [selectedBenchmarkId, setSelectedBenchmarkId] = useState<number | null>(null);
   const [selectedPeriod, setSelectedPeriod] = useState<RollingPeriod>("all");
+  const [activeTab, setActiveTab] = useState<"performance" | "allocation" | "rebalance">("performance");
 
   // 1. Fetch active investment accounts
   const accountsQuery = useQuery({
@@ -162,31 +166,108 @@ export function PortfolioDashboardView() {
             isLoading={isPending}
           />
 
-          {/* 3. Interactive Charts Grid (Performance TWR vs. Valuation & Capital) */}
-          <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
-            <PortfolioPerformanceChart
-              points={points}
-              periods={periods}
-              benchmarkName={benchmarkName}
-              selectedPeriod={selectedPeriod}
-              onSelectPeriod={setSelectedPeriod}
-            />
-
-            <ValuationCapitalChart
-              points={points}
-              periods={periods}
-              benchmarkName={benchmarkName}
-              selectedPeriod={selectedPeriod}
-            />
+          {/* 3. Segmented Workspace Tabs */}
+          <div className="flex items-center gap-2 border-b border-border/60 pb-3">
+            <button
+              type="button"
+              onClick={() => setActiveTab("performance")}
+              className={cn(
+                "inline-flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-medium transition-colors",
+                activeTab === "performance"
+                  ? "bg-primary text-primary-foreground shadow-sm"
+                  : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
+              )}
+            >
+              <span>📊</span>
+              <span>Performance & Valuation</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("allocation")}
+              className={cn(
+                "inline-flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-medium transition-colors",
+                activeTab === "allocation"
+                  ? "bg-primary text-primary-foreground shadow-sm"
+                  : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
+              )}
+            >
+              <span>🎯</span>
+              <span>Asset Allocation & Drift</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("rebalance")}
+              className={cn(
+                "inline-flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-medium transition-colors",
+                activeTab === "rebalance"
+                  ? "bg-primary text-primary-foreground shadow-sm"
+                  : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
+              )}
+            >
+              <span>⚖️</span>
+              <span>Rebalance Desk</span>
+            </button>
           </div>
 
-          {/* 4. Rolling Period Performance Matrix */}
-          <RollingPeriodTable
-            periods={periods}
-            selectedPeriod={selectedPeriod}
-            onSelectPeriod={setSelectedPeriod}
-            benchmarkName={benchmarkName}
-          />
+          {/* Tab 1: Performance & Valuation */}
+          {activeTab === "performance" && (
+            <div className="flex flex-col gap-6">
+              {/* Interactive Charts Grid (Performance TWR vs. Valuation & Capital) */}
+              <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+                <PortfolioPerformanceChart
+                  points={points}
+                  periods={periods}
+                  benchmarkName={benchmarkName}
+                  selectedPeriod={selectedPeriod}
+                  onSelectPeriod={setSelectedPeriod}
+                />
+
+                <ValuationCapitalChart
+                  points={points}
+                  periods={periods}
+                  benchmarkName={benchmarkName}
+                  selectedPeriod={selectedPeriod}
+                />
+              </div>
+
+              {/* Rolling Period Performance Matrix */}
+              <RollingPeriodTable
+                periods={periods}
+                selectedPeriod={selectedPeriod}
+                onSelectPeriod={setSelectedPeriod}
+                benchmarkName={benchmarkName}
+              />
+            </div>
+          )}
+
+          {/* Tab 2: Asset Allocation & Drift */}
+          {activeTab === "allocation" && (
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+              <div className="lg:col-span-5">
+                <PortfolioSummary hideTiles={true} />
+              </div>
+              <div className="lg:col-span-7">
+                <AllocationTargetCard
+                  scope={scope === "account" ? "account" : "all"}
+                  accountId={selectedAccountId}
+                  onScopeChange={(newScope, newAccId) => handleScopeChange(newScope, newAccId)}
+                  hideScopeSelector={true}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Tab 3: Rebalance Desk */}
+          {activeTab === "rebalance" && (
+            <div className="flex flex-col gap-6">
+              <AllocationTargetCard
+                scope={scope === "account" ? "account" : "all"}
+                accountId={selectedAccountId}
+                onScopeChange={(newScope, newAccId) => handleScopeChange(newScope, newAccId)}
+                hideScopeSelector={true}
+              />
+            </div>
+          )}
         </div>
       ) : null}
     </div>

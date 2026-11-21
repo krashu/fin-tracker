@@ -8,21 +8,17 @@
 import { PageHeader } from "@/components/shell/page-header";
 import { RefreshPricesButton } from "@/components/refresh-prices-button";
 import { PortfolioDashboardView } from "@/components/investments/portfolio-dashboard-view";
-import { AllocationTargetCard } from "@/src/components/portfolio/allocation-target-card";
-import { PortfolioSummary } from "./portfolio-summary";
 
 export default function PortfolioPage() {
   return (
     <div className="mx-auto" style={{ maxWidth: 1240, padding: "0 24px 40px" }}>
       <PageHeader
         title="Portfolio"
-        description="Value, returns (XIRR), allocation, and how you’re tracking against the market."
+        description="Value, returns (XIRR/TWR), asset allocation drift, and tax-optimized rebalancing."
         actions={<RefreshPricesButton />}
       />
-      <div className="flex flex-col gap-8">
+      <div className="flex flex-col gap-6">
         <PortfolioDashboardView />
-        <AllocationTargetCard />
-        <PortfolioSummary />
       </div>
     </div>
   );

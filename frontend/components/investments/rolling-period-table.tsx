@@ -21,6 +21,14 @@ import { ROLLING_PERIODS, type RollingPeriod } from "@/lib/investments";
 import { cn } from "@/lib/utils";
 
 const DASH = <span className="text-muted-foreground">—</span>;
+const SUPPRESSED_DASH = (
+  <span
+    title="Annualized return is suppressed for horizons under 365 days to avoid unrepresentative extrapolation (ADR-0018 / GIPS)."
+    className="cursor-help text-muted-foreground underline decoration-dotted underline-offset-2"
+  >
+    —
+  </span>
+);
 
 function signedColor(value: number | null): string {
   if (value == null) return "text-muted-foreground";
@@ -146,6 +154,8 @@ export function RollingPeriodTable({
                       >
                         {twrAnn != null ? (
                           `${twrAnn >= 0 ? "+" : ""}${formatPercent(twrAnn)} p.a.`
+                        ) : activeDays < 365 ? (
+                          SUPPRESSED_DASH
                         ) : (
                           DASH
                         )}
@@ -160,6 +170,8 @@ export function RollingPeriodTable({
                       >
                         {pXirr != null ? (
                           `${pXirr >= 0 ? "+" : ""}${formatPercent(pXirr)}`
+                        ) : activeDays < 365 ? (
+                          SUPPRESSED_DASH
                         ) : (
                           DASH
                         )}
@@ -174,6 +186,8 @@ export function RollingPeriodTable({
                       >
                         {bXirr != null ? (
                           `${bXirr >= 0 ? "+" : ""}${formatPercent(bXirr)}`
+                        ) : activeDays < 365 ? (
+                          SUPPRESSED_DASH
                         ) : (
                           DASH
                         )}
@@ -188,6 +202,8 @@ export function RollingPeriodTable({
                       >
                         {alpha != null ? (
                           `${alpha >= 0 ? "+" : ""}${(alpha * 100).toFixed(2)}%`
+                        ) : activeDays < 365 ? (
+                          SUPPRESSED_DASH
                         ) : (
                           DASH
                         )}
@@ -230,6 +246,9 @@ export function RollingPeriodTable({
             </tbody>
           </table>
         </div>
+        <p className="mt-3 text-[11px] text-muted-foreground/80">
+          ⓘ Note: Per ADR-0018 & GIPS standards, annualized TWR, XIRR, and Alpha are suppressed for horizons under 365 days to prevent unrepresentative extrapolation.
+        </p>
       </CardContent>
     </Card>
   );

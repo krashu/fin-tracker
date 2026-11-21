@@ -48,7 +48,7 @@ const CHART_CONFIG = {
   },
   mpme: {
     label: "Benchmark mPME Counterfactual",
-    color: "#f59e0b",
+    color: "#d97706",
   },
 } satisfies ChartConfig;
 
@@ -151,6 +151,7 @@ export function ValuationCapitalChart({
               )}
             >
               <ComposedChart
+                syncId="portfolio-hub-timeline"
                 data={chartData}
                 margin={{ left: 8, right: 12, top: 12, bottom: 4 }}
               >

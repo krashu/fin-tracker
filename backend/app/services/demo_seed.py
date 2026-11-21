@@ -39,7 +39,7 @@ from decimal import Decimal
 from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.core import clock
@@ -85,6 +85,7 @@ from app.services.nav_snapshot_service import as_valuation_stamp
 from app.services.portfolio_analytics_service import (
     get_or_compute_portfolio_timeseries,
     invalidate_portfolio_cache,
+    invalidate_portfolio_snapshots,
 )
 from app.services.reconciliation_service import pair_existing_rows
 from app.services.tag_service import should_learn_tag
@@ -549,14 +550,15 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
     session.flush()  # assign ids for bank_sip_txns and pending links
 
     _seed_fx_rates(session, today=today)
-    inst_count, inv_txn_count = _seed_investments(
+    inst_count, inv_txn_count, inv_accounts = _seed_investments(
         session, user_id=user_id, today=today, bank_sip_txns=bank_sip_txns
     )
-    _seed_allocation_targets(session, user_id=user_id)
+    _seed_allocation_targets(session, user_id=user_id, inv_accounts=inv_accounts)
     _seed_peer_ledger(session, user_id=user_id, today=today, by_row=by_row)
 
     # Warm up portfolio daily snapshots for instant load of /portfolio & /net-worth
     try:
+        invalidate_portfolio_snapshots(session, user_id=user_id, from_date=date_t(2000, 1, 1))
         get_or_compute_portfolio_timeseries(
             session,
             user_id=user_id,
@@ -564,6 +566,15 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
             to_date=today,
             persist=True,
         )
+        for acc in inv_accounts.values():
+            get_or_compute_portfolio_timeseries(
+                session,
+                user_id=user_id,
+                scope_type="account",
+                scope_id=acc.id,
+                to_date=today,
+                persist=True,
+            )
     except Exception:
         logger.exception("portfolio_timeseries_warmup_failed")
 
@@ -576,7 +587,12 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
     )
 
 
-def _seed_allocation_targets(session: Session, *, user_id: UUID) -> int:
+def _seed_allocation_targets(
+    session: Session,
+    *,
+    user_id: UUID,
+    inv_accounts: dict[str, InvestmentAccount] | None = None,
+) -> int:
     """Seed default target allocation across asset classes for the demo user."""
     session.execute(
         delete(AllocationTarget).where(
@@ -599,6 +615,49 @@ def _seed_allocation_targets(session: Session, *, user_id: UUID) -> int:
     ]
     session.add_all(targets)
     session.flush()
+
+    if inv_accounts:
+        acc_targets_spec: dict[str, list[tuple[str, str, int, int]]] = {
+            "zerodha": [
+                ("asset_class", "indian_equity", 7000, 500),
+                ("asset_class", "gold", 3000, 500),
+            ],
+            "indmoney": [
+                ("asset_class", "us_equity", 6000, 500),
+                ("asset_class", "us_etf", 4000, 500),
+            ],
+            "groww": [
+                ("asset_class", "indian_mf", 10000, 500),
+            ],
+            "hdfc_fd": [
+                ("asset_class", "debt", 10000, 500),
+            ],
+        }
+        for acc_key, target_defs in acc_targets_spec.items():
+            acc = inv_accounts.get(acc_key)
+            if acc is not None:
+                session.execute(
+                    delete(AllocationTarget).where(
+                        AllocationTarget.user_id == user_id,
+                        AllocationTarget.scope_type == "account",
+                        AllocationTarget.account_id == acc.id,
+                    )
+                )
+                for t_type, t_key, t_bps, t_thresh in target_defs:
+                    targets.append(
+                        AllocationTarget(
+                            user_id=user_id,
+                            scope_type="account",
+                            account_id=acc.id,
+                            target_type=t_type,
+                            target_key=t_key,
+                            target_bps=t_bps,
+                            rebalance_threshold_bps=t_thresh,
+                        )
+                    )
+        session.add_all(targets[len(DEMO_ALLOCATION_TARGETS) :])
+        session.flush()
+
     return len(targets)
 
 
@@ -721,8 +780,8 @@ def _seed_investments(
     user_id: UUID,
     today: date_t,
     bank_sip_txns: dict[tuple[str, str], Transaction],
-) -> tuple[int, int]:
-    """Find-or-create each instrument + its txns. Returns (instruments, txns) made.
+) -> tuple[int, int, dict[str, InvestmentAccount]]:
+    """Find-or-create each instrument + its txns. Returns (instruments, txns, accounts).
 
     Only seeds an instrument's txns when the instrument is newly created (manual
     investment txns have no dedup key), mirroring the HTTP script's gate. INR
@@ -760,6 +819,16 @@ def _seed_investments(
     for spec in demo_instruments:
         symbol = str(spec["symbol"])
         currency = str(spec.get("currency", "INR"))
+
+        if currency == "USD":
+            target_account_id = inv_accounts["indmoney"].id
+        elif spec["asset_class"] == "indian_mf":
+            target_account_id = inv_accounts["groww"].id
+        elif spec["asset_class"] == "fd":
+            target_account_id = inv_accounts["hdfc_fd"].id
+        else:
+            target_account_id = inv_accounts["zerodha"].id
+
         existing = session.scalar(
             select(Instrument).where(
                 Instrument.user_id == user_id,
@@ -769,10 +838,65 @@ def _seed_investments(
             )
         )
         if existing is not None:
+            existing.current_nav = Decimal(str(spec["current_nav"]))
             if existing.nav_updated_at is not None and existing.nav_updated_at < as_valuation_stamp(
                 today
             ):
                 existing.nav_updated_at = as_valuation_stamp(today)
+
+            # Reconcile target account on any existing transactions for this instrument
+            session.execute(
+                update(InvestmentTransaction)
+                .where(
+                    InvestmentTransaction.user_id == user_id,
+                    InvestmentTransaction.instrument_id == existing.id,
+                    InvestmentTransaction.account_id != target_account_id,
+                )
+                .values(account_id=target_account_id)
+            )
+
+            # Ensure any instrument that somehow had 0 transactions gets its demo transactions
+            existing_txns_count = (
+                session.scalar(
+                    select(func.count(InvestmentTransaction.id)).where(
+                        InvestmentTransaction.user_id == user_id,
+                        InvestmentTransaction.instrument_id == existing.id,
+                    )
+                )
+                or 0
+            )
+            if existing_txns_count == 0:
+                for t in spec["txns"]:
+                    d_str = str(t["date"])
+                    linked_spend_txn_id = None
+                    if symbol == "PPFCF":
+                        b_txn = bank_sip_txns.get(("PPFCF", d_str))
+                        linked_spend_txn_id = b_txn.id if b_txn else None
+                    elif symbol == "UTINIFTY" and d_str != max_utinifty_sip_date:
+                        b_txn = bank_sip_txns.get(("UTINIFTY", d_str))
+                        linked_spend_txn_id = b_txn.id if b_txn else None
+
+                    session.add(
+                        InvestmentTransaction(
+                            user_id=user_id,
+                            account_id=target_account_id,
+                            instrument_id=existing.id,
+                            date=date_t.fromisoformat(d_str),
+                            transaction_type=str(t["type"]),
+                            units=Decimal(str(t["units"])) if "units" in t else Decimal("0"),
+                            price_per_unit_native=(
+                                Decimal(str(t["price"])) if "price" in t else None
+                            ),
+                            amount_native_paise=int(t.get("amount", 0)),
+                            fees_native_paise=int(t.get("fee", 0)),
+                            fx_rate_to_inr=Decimal(str(t.get("fx", "1"))),
+                            note=str(t["note"]) if t.get("note") else None,
+                            pair_id=None,
+                            linked_spend_txn_id=linked_spend_txn_id,
+                        )
+                    )
+                    inv_txn_made += 1
+
             # Reseed relink: ensure existing SIP rows are linked to fresh bank debits
             if symbol in ("PPFCF", "UTINIFTY"):
                 existing_txns = session.scalars(
@@ -792,7 +916,9 @@ def _seed_investments(
                         inv_t.linked_spend_txn_id = b_txn.id if b_txn else None
                     else:
                         inv_t.linked_spend_txn_id = None
+            rebuild_realised_lots(session, user_id=user_id, instrument_id=existing.id)
             continue
+
         instrument = Instrument(
             user_id=user_id,
             symbol=symbol,
@@ -813,15 +939,6 @@ def _seed_investments(
         session.flush()  # assign id for the txn FK
         inst_made += 1
 
-        if currency == "USD":
-            account_id = inv_accounts["indmoney"].id
-        elif spec["asset_class"] == "indian_mf":
-            account_id = inv_accounts["groww"].id
-        elif spec["asset_class"] == "fd":
-            account_id = inv_accounts["hdfc_fd"].id
-        else:
-            account_id = inv_accounts["zerodha"].id
-
         for t in spec["txns"]:
             d_str = str(t["date"])
             linked_spend_txn_id = None
@@ -836,7 +953,7 @@ def _seed_investments(
             session.add(
                 InvestmentTransaction(
                     user_id=user_id,
-                    account_id=account_id,
+                    account_id=target_account_id,
                     instrument_id=instrument.id,
                     date=date_t.fromisoformat(d_str),
                     transaction_type=str(t["type"]),
@@ -853,4 +970,29 @@ def _seed_investments(
             inv_txn_made += 1
         # ADR-0015 rule 5: the demo's sells (e.g. INFY) own realised lots like any other.
         rebuild_realised_lots(session, user_id=user_id, instrument_id=instrument.id)
-    return inst_made, inv_txn_made
+
+    # Clean up legacy unsegmented 'Default Portfolio' account if present for demo user
+    legacy_default = session.scalar(
+        select(InvestmentAccount).where(
+            InvestmentAccount.user_id == user_id,
+            InvestmentAccount.provider == "manual",
+            InvestmentAccount.external_account_ref == "default",
+        )
+    )
+    if legacy_default is not None:
+        remaining_txns = (
+            session.scalar(
+                select(func.count(InvestmentTransaction.id)).where(
+                    InvestmentTransaction.user_id == user_id,
+                    InvestmentTransaction.account_id == legacy_default.id,
+                )
+            )
+            or 0
+        )
+        if remaining_txns == 0:
+            session.delete(legacy_default)
+            session.flush()
+        else:
+            legacy_default.is_active = False
+
+    return inst_made, inv_txn_made, inv_accounts

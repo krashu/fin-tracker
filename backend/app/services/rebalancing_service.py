@@ -39,6 +39,8 @@ from app.schemas.rebalancing import (
     RebalancingBucketAction,
     RecommendedOrder,
 )
+from app.services.fx_math import to_inr_paise
+from app.services.fx_service import rate_on
 from app.services.holdings_service import (
     Holding,
     OpenLot,
@@ -334,12 +336,14 @@ def evaluate_rebalancing(
     """Evaluate current portfolio drift and Swedroe 5/25 tolerance status."""
     as_of = as_of or clock.today()
     targets = list_targets(session, user_id=user_id, scope_type=scope_type, account_id=account_id)
+    usd_inr = rate_on(session, on=as_of)
 
     holdings = compute_holdings(
         session,
         user_id=user_id,
         account_id=account_id if scope_type == "account" else None,
         as_of=as_of,
+        usd_inr_rate=usd_inr,
     )
 
     total_portfolio_value_paise = sum(
@@ -566,11 +570,13 @@ def plan_rebalancing(
     )
 
     targets = list_targets(session, user_id=user_id, scope_type=scope_type, account_id=account_id)
+    usd_inr = rate_on(session, on=as_of)
     holdings = compute_holdings(
         session,
         user_id=user_id,
         account_id=account_id if scope_type == "account" else None,
         as_of=as_of,
+        usd_inr_rate=usd_inr,
     )
 
     total_val = eval_res.total_portfolio_value_paise
@@ -626,27 +632,33 @@ def plan_rebalancing(
                     if inst is None or inst.current_nav is None or inst.current_nav <= 0:
                         continue
                     lots = open_lots_by_inst.get(inst.id, [])
+                    fx_rate = Decimal(1) if inst.currency == "INR" else (usd_inr or Decimal(1))
+                    lot_nav_inr = inst.current_nav * fx_rate
                     for lot in lots:
                         is_locked, lock_expiry = _check_elss_lock(inst, lot, as_of)
+                        # Proceeds and cost in INR paise
                         proceeds = int(
-                            (lot.units * inst.current_nav * 100).to_integral_value(
+                            (lot.units * lot_nav_inr * 100).to_integral_value(
                                 rounding=ROUND_HALF_EVEN
                             )
                         )
-                        cost = lot.cost_paise
+                        cost = to_inr_paise(lot.cost_paise, lot.fx_rate_to_inr)
                         gain = proceeds - cost
                         days = (as_of - lot.acquired_on).days
-                        is_equity = inst.asset_class in (
-                            "indian_equity",
-                            "indian_mf",
+                        is_foreign = inst.currency != "INR" or inst.asset_class in (
                             "us_equity",
                             "us_etf",
                         )
-                        ltcg_days = 365 if is_equity else 730
+                        is_debt = inst.asset_class in ("debt", "bank_fd")
+                        ltcg_days = 730 if is_foreign else 365
 
                         if gain < 0:
                             g_type: Literal["loss", "ltcg", "stcg"] = "loss"
                             drag_rank = 1
+                        elif is_debt:
+                            # Section 50AA: specified debt mutual funds taxed as STCG
+                            g_type = "stcg"
+                            drag_rank = 3
                         elif days >= ltcg_days:
                             g_type = "ltcg"
                             drag_rank = 2
@@ -694,27 +706,34 @@ def plan_rebalancing(
                     if is_locked:
                         continue  # statutory lock-in guard: skip locked ELSS lots
 
-                    # How much to sell from this lot
+                    # How much to sell from this lot in INR terms
                     lot_proceeds = proceeds
-                    lot_nav = inst.current_nav or Decimal(1)
+                    fx_rate = Decimal(1) if inst.currency == "INR" else (usd_inr or Decimal(1))
+                    lot_nav_inr = (inst.current_nav or Decimal(1)) * fx_rate
                     if lot_proceeds <= remaining_trim:
                         units_to_sell = lot.units
                         sell_proceeds = lot_proceeds
                         sell_cost = cost
                         sell_gain = gain
                     else:
-                        units_to_sell = (Decimal(remaining_trim) / Decimal(100) / lot_nav).quantize(
-                            Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
-                        )
+                        raw_units = Decimal(remaining_trim) / Decimal(100) / lot_nav_inr
+                        if inst.asset_class == "indian_equity":
+                            units_to_sell = Decimal(int(raw_units))
+                            if units_to_sell <= 0:
+                                continue
+                        else:
+                            units_to_sell = raw_units.quantize(
+                                Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+                            )
                         if units_to_sell > lot.units:
                             units_to_sell = lot.units
                         sell_proceeds = int(
-                            (units_to_sell * lot_nav * 100).to_integral_value(
+                            (units_to_sell * lot_nav_inr * 100).to_integral_value(
                                 rounding=ROUND_HALF_EVEN
                             )
                         )
                         sell_cost = int(
-                            (lot.cost_paise * (units_to_sell / lot.units)).to_integral_value(
+                            (cost * (units_to_sell / lot.units)).to_integral_value(
                                 rounding=ROUND_HALF_EVEN
                             )
                         )
@@ -753,7 +772,7 @@ def plan_rebalancing(
                             action="sell",
                             amount_paise=sell_proceeds,
                             units=units_to_sell,
-                            current_nav=lot_nav,
+                            current_nav=inst.current_nav,
                             reason=f"Trim overweight {target_obj.target_key} ({g_type.upper()})",
                         )
                     )
