@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     Account,
+    AllocationTarget,
     Category,
     ImportBatch,
     Instrument,
@@ -72,6 +73,7 @@ def teardown_user(session: Session, user_id: UUID) -> None:
     session.execute(delete(ImportBatch).where(ImportBatch.user_id == user_id))
 
     # Phase 4: Delete primary reference entities
+    session.execute(delete(AllocationTarget).where(AllocationTarget.user_id == user_id))
     session.execute(delete(Label).where(Label.user_id == user_id))
     session.execute(delete(Instrument).where(Instrument.user_id == user_id))
     session.execute(delete(InvestmentAccount).where(InvestmentAccount.user_id == user_id))

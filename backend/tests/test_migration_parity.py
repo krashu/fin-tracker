@@ -3471,6 +3471,7 @@ _REV_INVESTMENT_ACCOUNTS = "0050_investment_accounts_and_attribution"
 _REV_SPEND_SEAM = "0051_spend_seam_and_investment_transfer"
 _REV_MARKET_PRICING = "0052_market_pricing"
 _REV_PORTFOLIO_DAILY_SNAPSHOTS = "0053_portfolio_daily_snapshots"
+_REV_ALLOCATION_TARGETS = "0054_allocation_targets"
 
 
 @pytest.mark.slow
@@ -3919,6 +3920,60 @@ def test_0053_upgrade_creates_portfolio_daily_snapshots() -> None:
         # Downgrade back to 0052
         with eng.begin() as conn:
             command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_PORTFOLIO_DAILY_SNAPSHOTS))
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            assert not insp.has_table(tbl)
+
+        # Re-upgrade to head
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+def test_0054_upgrade_creates_allocation_targets() -> None:
+    """Migration 0054 must create allocation_targets with composite FKs and constraints."""
+    eng = _migration_engine()
+    tbl = "allocation_targets"
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_ALLOCATION_TARGETS))
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            assert not insp.has_table(tbl)
+
+        # Upgrade to 0054
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_ALLOCATION_TARGETS)
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            assert insp.has_table(tbl)
+
+            # Check columns
+            col_names = {c["name"] for c in insp.get_columns(tbl)}
+            assert col_names == {
+                "id",
+                "user_id",
+                "scope_type",
+                "account_id",
+                "target_type",
+                "target_key",
+                "target_bps",
+                "rebalance_threshold_bps",
+                "created_at",
+                "updated_at",
+            }
+
+            # Check primary key
+            pk_cols = insp.get_pk_constraint(tbl)["constrained_columns"]
+            assert tuple(pk_cols) == ("id",)
+
+        # Downgrade back to 0053
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_ALLOCATION_TARGETS))
 
         with eng.connect() as conn:
             insp = inspect(conn)

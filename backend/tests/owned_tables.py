@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.models import (
+    AllocationTarget,
     Base,
     ImportBatch,
     PeerContact,
@@ -109,4 +110,15 @@ def seed_rows_demo_seed_lacks(session: Session, user_id: UUID) -> None:
         twr_index_micros=1000000,
     )
     session.add(snapshot)
+    session.flush()
+    target = AllocationTarget(
+        user_id=user_id,
+        scope_type="all",
+        account_id=None,
+        target_type="asset_class",
+        target_key="indian_equity",
+        target_bps=6000,
+        rebalance_threshold_bps=500,
+    )
+    session.add(target)
     session.flush()

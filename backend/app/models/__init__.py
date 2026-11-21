@@ -1,6 +1,11 @@
 """SQLAlchemy ORM models. One file per logical table (per PRD §Data model)."""
 
 from app.models.account import Account, AccountTypeStr, CurrencyStr
+from app.models.allocation_target import (
+    AllocationScopeTypeStr,
+    AllocationTarget,
+    AllocationTargetTypeStr,
+)
 from app.models.base import Base
 from app.models.benchmark import Benchmark, BenchmarkKindStr, BenchmarkNav
 from app.models.category import Category, CategoryKindStr
@@ -35,6 +40,9 @@ from app.models.user import User
 __all__ = [
     "Account",
     "AccountTypeStr",
+    "AllocationScopeTypeStr",
+    "AllocationTarget",
+    "AllocationTargetTypeStr",
     "AssetClassStr",
     "Base",
     "Benchmark",

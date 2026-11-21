@@ -147,7 +147,7 @@ def max_staleness_days(stamps: Iterable[datetime | None], *, as_of: date) -> int
 
 
 @dataclass(slots=True)
-class _Lot:
+class OpenLot:
     """A mutable open lot: units still held, their remaining cost basis, and the
     acquisition-date FX rate (rides with the lot through FIFO consumption so a surviving
     lot keeps the rate it was bought at — load-bearing for ``invested_inr_paise``)."""
@@ -158,6 +158,9 @@ class _Lot:
     txn_id: int
     acquired_on: date
     account_id: int = 0
+
+
+_Lot = OpenLot
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +228,60 @@ _NETTED_BUYS = frozenset({"buy", "sip"})
 _NETTED_SELLS = frozenset({"sell"})
 
 
+def _compute_open_lots(
+    session: Session,
+    *,
+    user_id: UUID,
+    instruments: list[Instrument],
+    account_id: int | None = None,
+) -> dict[int, deque[OpenLot]]:
+    by_id = {inst.id: inst for inst in instruments}
+    if not by_id:
+        return {}
+
+    stmt = select(InvestmentTransaction).where(
+        InvestmentTransaction.user_id == user_id,
+        InvestmentTransaction.instrument_id.in_(by_id.keys()),
+    )
+    if account_id is not None:
+        stmt = stmt.where(InvestmentTransaction.account_id == account_id)
+    stmt = stmt.order_by(
+        InvestmentTransaction.instrument_id, InvestmentTransaction.account_id, *_REPLAY_ORDER
+    )
+    txns = session.scalars(stmt)
+
+    lots_by_instrument: dict[int, deque[OpenLot]] = {iid: deque() for iid in by_id}
+    for iid, group in groupby(txns, key=lambda t: t.instrument_id):
+        if iid in by_id:
+            for _, acc_group in groupby(group, key=lambda t: t.account_id):
+                lots_by_instrument[iid].extend(
+                    _replay(acc_group, nets_intraday=by_id[iid].asset_class in _NETS_INTRADAY)
+                )
+    return lots_by_instrument
+
+
+def get_open_lots_by_instrument(
+    session: Session,
+    *,
+    user_id: UUID,
+    account_id: int | None = None,
+) -> tuple[dict[int, list[OpenLot]], dict[int, Instrument]]:
+    """Return surviving open FIFO lots and active instruments for ``user_id``."""
+    instruments = list(
+        session.scalars(
+            select(Instrument).where(
+                Instrument.user_id == user_id,
+                Instrument.archived_at.is_(None),
+            )
+        )
+    )
+    by_id = {inst.id: inst for inst in instruments}
+    lots = _compute_open_lots(
+        session, user_id=user_id, instruments=instruments, account_id=account_id
+    )
+    return {iid: list(q) for iid, q in lots.items()}, by_id
+
+
 def compute_holdings(
     session: Session,
     *,
@@ -263,24 +320,9 @@ def compute_holdings(
     if not by_id:
         return []
 
-    stmt = select(InvestmentTransaction).where(
-        InvestmentTransaction.user_id == user_id,
-        InvestmentTransaction.instrument_id.in_(by_id.keys()),
+    lots_by_instrument = _compute_open_lots(
+        session, user_id=user_id, instruments=instruments, account_id=account_id
     )
-    if account_id is not None:
-        stmt = stmt.where(InvestmentTransaction.account_id == account_id)
-    stmt = stmt.order_by(
-        InvestmentTransaction.instrument_id, InvestmentTransaction.account_id, *_REPLAY_ORDER
-    )
-    txns = session.scalars(stmt)
-
-    lots_by_instrument: dict[int, deque[_Lot]] = {iid: deque() for iid in by_id}
-    for iid, group in groupby(txns, key=lambda t: t.instrument_id):
-        if iid in by_id:  # a txn against an archived/foreign instrument is skipped
-            for _, acc_group in groupby(group, key=lambda t: t.account_id):
-                lots_by_instrument[iid].extend(
-                    _replay(acc_group, nets_intraday=by_id[iid].asset_class in _NETS_INTRADAY)
-                )
 
     holdings: list[Holding] = []
     for inst in instruments:

@@ -33,6 +33,7 @@ from app.core.fiscal_year import fy_start_year
 from app.core.security import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, create_access_token
 from app.models import (
     Account,
+    AllocationTarget,
     Category,
     ImportBatch,
     InvestmentAccount,
@@ -1202,6 +1203,97 @@ def test_investment_transaction_linked_spend_is_isolated_per_user(
         linked_spend_txn_id=a_spend_id,
     )
     session.add(cross_txn)
+    with pytest.raises(IntegrityError):
+        session.flush()
+    session.rollback()
+
+
+def test_allocation_targets_tenant_isolation(unauth_client: TestClient, session: Session) -> None:
+    """ADR-0003: Allocation targets are strictly isolated per tenant.
+
+    - Target authored by User A cannot be listed, read, edited, or deleted by User B (404).
+    - User B cannot create an account-scoped target pointing at User A's investment account (422).
+    - Direct DB insert with cross-user account_id trips composite same-user FK.
+    """
+    # 1. User A registers and creates an account-scoped target
+    _register(unauth_client, "user-a-rebalance@example.com")
+    res_acc_a = unauth_client.post(
+        "/api/v1/investment-accounts",
+        json={
+            "name": "User A Demat",
+            "account_type": "demat",
+            "provider": "zerodha",
+            "external_account_ref": "A-DEMAT-1",
+        },
+    )
+    assert res_acc_a.status_code == 201
+    a_acc_id = res_acc_a.json()["id"]
+
+    res_target_a = unauth_client.post(
+        "/api/v1/rebalancing/targets",
+        json={
+            "scope_type": "account",
+            "account_id": a_acc_id,
+            "target_type": "asset_class",
+            "target_key": "indian_equity",
+            "target_bps": 6000,
+        },
+    )
+    assert res_target_a.status_code == 201
+    a_target_id = res_target_a.json()["id"]
+
+    # 2. User B registers
+    unauth_client.cookies.clear()
+    _register(unauth_client, "user-b-rebalance@example.com")
+
+    # User B list targets -> empty
+    res_b_list = unauth_client.get("/api/v1/rebalancing/targets")
+    assert res_b_list.status_code == 200
+    assert res_b_list.json() == []
+
+    # User B GET single target -> 404 (ADR-0003 Rule 2)
+    assert unauth_client.get(f"/api/v1/rebalancing/targets/{a_target_id}").status_code == 404
+
+    # User B PATCH target -> 404
+    assert (
+        unauth_client.patch(
+            f"/api/v1/rebalancing/targets/{a_target_id}", json={"target_bps": 5000}
+        ).status_code
+        == 404
+    )
+
+    # User B DELETE target -> 404
+    assert unauth_client.delete(f"/api/v1/rebalancing/targets/{a_target_id}").status_code == 404
+
+    # User B POST target referencing User A's account_id -> 422 (ADR-0003 Rule 3)
+    res_b_post_cross = unauth_client.post(
+        "/api/v1/rebalancing/targets",
+        json={
+            "scope_type": "account",
+            "account_id": a_acc_id,
+            "target_type": "asset_class",
+            "target_key": "gold",
+            "target_bps": 2000,
+        },
+    )
+    assert res_b_post_cross.status_code == 422
+    assert (
+        "investment account not found or does not belong to you"
+        in res_b_post_cross.json()["detail"]
+    )
+
+    # Direct DB insert trips composite same-user FK
+    b_user = session.scalar(select(User).where(User.email == "user-b-rebalance@example.com"))
+    assert b_user is not None
+    cross_target = AllocationTarget(
+        user_id=b_user.id,
+        scope_type="account",
+        account_id=a_acc_id,  # belongs to User A
+        target_type="asset_class",
+        target_key="gold",
+        target_bps=2000,
+    )
+    session.add(cross_target)
     with pytest.raises(IntegrityError):
         session.flush()
     session.rollback()
