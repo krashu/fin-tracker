@@ -14,8 +14,22 @@ from sqlalchemy.orm import Session
 from app.core import clock
 from app.models import Base, ImportBatch, PeerContact, PeerEntry, Transaction
 
-# ADR-0003 §Decision: the only tables without an owner. ``users`` is the tenant root itself.
-GLOBAL_TABLES = frozenset({"benchmarks", "benchmark_nav", "fx_rates"})
+# ADR-0003 & ADR-0021: the only tables without an owner. ``users`` is the tenant root itself.
+GLOBAL_TABLES = frozenset(
+    {
+        "benchmarks",
+        "benchmark_nav",
+        "fx_rates",
+        "market_instruments",
+        "market_price_history",
+        "market_price_coverage",
+        "market_corporate_actions",
+        "market_instrument_pins",
+        "market_price_jobs",
+        "market_host_state",
+        "market_task_runs",
+    }
+)
 TENANT_ROOT = "users"
 
 

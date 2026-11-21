@@ -3469,6 +3469,7 @@ def test_card_bill_category_migration_archives_a_promoted_seed_with_its_children
 _REV_STREAMLINE_CATEGORIES = "0049_streamline_category_taxonomy"
 _REV_INVESTMENT_ACCOUNTS = "0050_investment_accounts_and_attribution"
 _REV_SPEND_SEAM = "0051_spend_seam_and_investment_transfer"
+_REV_MARKET_PRICING = "0052_market_pricing"
 
 
 @pytest.mark.slow
@@ -3809,6 +3810,63 @@ def test_0051_upgrade_adds_linked_spend_and_system_category() -> None:
                 {"u": user_id},
             ).scalar_one_or_none()
             assert cat_exists is None
+
+        # Re-upgrade to head
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), "head")
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.slow
+def test_0052_upgrade_creates_market_pricing_tables() -> None:
+    """Migration 0052 must create market pricing tables with indexes and constraints."""
+    eng = _migration_engine()
+    tables = [
+        "market_instruments",
+        "market_price_history",
+        "market_price_coverage",
+        "market_corporate_actions",
+        "market_instrument_pins",
+        "market_price_jobs",
+        "market_host_state",
+        "market_task_runs",
+    ]
+    try:
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _down_revision_of(_REV_MARKET_PRICING))
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            for tbl in tables:
+                assert not insp.has_table(tbl)
+
+        # Upgrade to 0052
+        with eng.begin() as conn:
+            command.upgrade(_alembic_cfg(conn), _REV_MARKET_PRICING)
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            for tbl in tables:
+                assert insp.has_table(tbl)
+
+            # Check market_price_history columns
+            col_names = {c["name"] for c in insp.get_columns("market_price_history")}
+            assert col_names == {"instrument_id", "nav_date", "nav_micros"}
+
+            # Check market_price_jobs indexes
+            job_indexes = {i["name"] for i in insp.get_indexes("market_price_jobs")}
+            assert "uq_market_price_jobs_active" in job_indexes
+            assert "ix_market_price_jobs_claim" in job_indexes
+
+        # Downgrade back to 0051
+        with eng.begin() as conn:
+            command.downgrade(_alembic_cfg(conn), _down_revision_of(_REV_MARKET_PRICING))
+
+        with eng.connect() as conn:
+            insp = inspect(conn)
+            for tbl in tables:
+                assert not insp.has_table(tbl)
 
         # Re-upgrade to head
         with eng.begin() as conn:

@@ -10,6 +10,16 @@ from app.models.instrument import AssetClassStr, ExchangeStr, Instrument
 from app.models.investment_account import InvestmentAccount, InvestmentAccountTypeStr
 from app.models.investment_transaction import InvestmentTransaction, InvestmentTxnTypeStr
 from app.models.label import Label
+from app.models.market_pricing import (
+    MarketCorporateAction,
+    MarketHostState,
+    MarketInstrument,
+    MarketInstrumentPin,
+    MarketPriceCoverage,
+    MarketPriceHistory,
+    MarketPriceJob,
+    MarketTaskRun,
+)
 from app.models.merchant_alias import MerchantAlias
 from app.models.merchant_label_map import MerchantLabelMap
 from app.models.merchant_tag_map import MerchantTagMap
@@ -42,6 +52,14 @@ __all__ = [
     "InvestmentTransaction",
     "InvestmentTxnTypeStr",
     "Label",
+    "MarketCorporateAction",
+    "MarketHostState",
+    "MarketInstrument",
+    "MarketInstrumentPin",
+    "MarketPriceCoverage",
+    "MarketPriceHistory",
+    "MarketPriceJob",
+    "MarketTaskRun",
     "MerchantAlias",
     "MerchantLabelMap",
     "MerchantTagMap",

@@ -130,6 +130,31 @@ def insert_skip_existing(
     session.execute(stmt, rows)
 
 
+def upsert_overwrite(
+    session: Session,
+    model: type[DeclarativeBase],
+    rows: list[dict[str, object]],
+    *,
+    conflict_cols: list[str],
+    update_cols: list[str],
+    label: str,
+) -> None:
+    """Bulk ``INSERT … ON CONFLICT (conflict_cols) DO UPDATE SET col = EXCLUDED.col`` for ``model``.
+
+    Updates specified columns when a conflict occurs on ``conflict_cols``.
+    Portable across SQLite (v1) and PostgreSQL (v2).
+    """
+    if not rows:
+        return
+    stmt = _dialect_insert(session, model, label=label)
+    set_clause = {col: getattr(stmt.excluded, col) for col in update_cols}
+    upsert_stmt = stmt.on_conflict_do_update(
+        index_elements=conflict_cols,
+        set_=set_clause,
+    )
+    session.execute(upsert_stmt, rows)
+
+
 def insert_or_increment[M: DeclarativeBase](
     session: Session,
     model: type[M],

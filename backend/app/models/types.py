@@ -25,10 +25,12 @@ so any raw SQL default must be the *scaled int* (e.g. ``fx_rate 1.0`` → ``1000
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import ROUND_HALF_EVEN, Decimal
+from typing import Any
 
-from sqlalchemy import BigInteger, Dialect
-from sqlalchemy.types import TypeDecorator
+from sqlalchemy import BigInteger, Date, Dialect, Integer
+from sqlalchemy.types import TypeDecorator, TypeEngine
 
 
 class ScaledDecimal(TypeDecorator[Decimal]):
@@ -77,3 +79,35 @@ class FxRate(ScaledDecimal):
 
     cache_ok = True
     scale = 10**6
+
+
+class CompactDate(TypeDecorator[date]):
+    """A date stored as a ``YYYYMMDD`` integer on SQLite, native DATE elsewhere.
+
+    SQLite has no date type: SQLAlchemy's ``Date`` writes 10 bytes of text per
+    value, twice (row + index) on a rowid table. An integer costs 4 bytes, sorts
+    the same way and stays readable in the sqlite3 shell. PostgreSQL's DATE is
+    already 4 bytes, so it is used as-is there.
+    """
+
+    impl = Integer
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[Any]:
+        if dialect.name == "sqlite":
+            return dialect.type_descriptor(Integer())
+        return dialect.type_descriptor(Date())
+
+    def process_bind_param(self, value: date | None, dialect: Dialect) -> int | date | None:
+        if value is None or dialect.name != "sqlite":
+            return value
+        return value.year * 10000 + value.month * 100 + value.day
+
+    def process_result_value(self, value: int | date | None, dialect: Dialect) -> date | None:
+        if value is None:
+            return None
+        if isinstance(value, date):
+            return value
+        if isinstance(value, int):
+            return date(value // 10000, value // 100 % 100, value % 100)
+        return None

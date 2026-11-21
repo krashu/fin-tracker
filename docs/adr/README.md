@@ -74,3 +74,5 @@ Do *not* write an ADR for:
 | [0016](0016-fx-stamped-at-transaction-date.md) | An investment row's FX rate is stamped at its transaction date and never re-derived | Accepted | 2026-11-15 |
 | [0017](0017-peer-debt-khatabook-ledger.md) | Peer debts and Khatabook balances are tracked in an auxiliary peer ledger linked to transactions | Accepted | 2026-11-18 |
 | [0018](0018-foreign-return-waterfall-and-hpr-guard.md) | Foreign return decomposes into asset price and currency gain; returns under 365 days suppress XIRR for HPR | Accepted | 2026-11-19 |
+| [0019](0019-investment-accounts-and-per-account-fifo.md) | Investment accounts and per-account FIFO lot matching (CBDT Circular No. 768) | Accepted | 2026-11-20 |
+| [0021](0021-shared-nav-history-and-twr-engine.md) | Shared reference pricing (Market NAV History) & Time-Weighted Return (TWR) Cache Foundation | Accepted | 2026-11-21 |
