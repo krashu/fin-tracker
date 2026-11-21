@@ -38,6 +38,15 @@ export function invalidateRules(qc: QueryClient): void {
 export function invalidateFriends(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ["friends"] });
   qc.invalidateQueries({ queryKey: ["dashboards"] });
+  qc.invalidateQueries({ queryKey: ["net-worth"] });
+}
+
+/**
+ * Invalidate net worth and cashflow waterfall caches on transaction / investment / peer mutations.
+ */
+export function invalidateNetWorth(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: ["net-worth"] });
+  qc.invalidateQueries({ queryKey: ["dashboards", "cashflow-waterfall"] });
 }
 
 /**

@@ -65,11 +65,13 @@ from app.schemas import (
     TopMerchantRow,
     TopMerchantsResponse,
 )
+from app.schemas.net_worth import CashflowWaterfallResponse, YearTypeStr
 from app.services.category_colors import category_colors
 from app.services.category_service import CASHBACK_CATEGORY_NAME, INVESTMENT_TRANSFER_CATEGORY_NAME
 from app.services.fx_service import latest_rate
 from app.services.holdings_service import compute_holdings, summarize_holdings
 from app.services.merchant_alias import is_unknown_via, load_alias_resolver
+from app.services.net_worth_service import compute_cashflow_waterfall
 from app.services.tag_service import AUTO_TAGGABLE_TYPES
 from app.services.transaction_queries import confirmed_only
 
@@ -1455,3 +1457,17 @@ def category_trend(
         for pid, acc in ordered
     ]
     return CategoryTrendResponse(periods=periods, parents=parents, label_id=label_id)
+
+
+@router.get("/cashflow-waterfall", response_model=CashflowWaterfallResponse)
+def get_cashflow_waterfall(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    year: Annotated[int | None, Query(ge=1900, le=2100, description="Year to analyze")] = None,
+    year_type: Annotated[YearTypeStr, Query(description="Calendar or fiscal year")] = "calendar",
+) -> CashflowWaterfallResponse:
+    """Return annual inflow-to-wealth cashflow waterfall data (PRD §F8 View 4)."""
+    target_year = year or clock.today().year
+    return compute_cashflow_waterfall(
+        session, user_id=user_id, year=target_year, year_type=year_type
+    )

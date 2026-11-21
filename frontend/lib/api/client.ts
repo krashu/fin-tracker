@@ -2275,3 +2275,118 @@ export async function exportPeerContactStatement(id: number): Promise<{
     filename: match?.[1] ?? `peer_contact_${id}_statement.csv`,
   };
 }
+
+// -----------------------------------------------------------------------------
+// Net Worth & Cashflow Waterfall (PRD §F8 View 4 & Wealth Analytics)
+// -----------------------------------------------------------------------------
+
+export type TimelineRange = "1M" | "6M" | "1Y" | "3Y" | "5Y" | "ALL";
+export type TimelineInterval = "daily" | "weekly" | "monthly";
+export type YearType = "calendar" | "fiscal";
+
+export interface AssetCategoryBreakdown {
+  bank_cash_paise: number;
+  indian_equity_paise: number;
+  indian_mf_paise: number;
+  us_equity_paise: number;
+  debt_fd_paise: number;
+  gold_paise: number;
+  peer_receivables_paise: number;
+  peer_payables_paise: number;
+}
+
+export interface NetWorthSummaryResponse {
+  as_of: string;
+  net_worth_paise: number;
+  assets_paise: number;
+  liabilities_paise: number;
+  delta_30d_paise: number;
+  delta_30d_pct: number | null;
+  delta_1y_paise: number;
+  delta_1y_pct: number | null;
+  breakdown: AssetCategoryBreakdown;
+}
+
+export interface NetWorthTimelinePoint {
+  date: string;
+  net_worth_paise: number;
+  assets_paise: number;
+  liabilities_paise: number;
+  bank_cash_paise: number;
+  indian_equity_paise: number;
+  indian_mf_paise: number;
+  us_equity_paise: number;
+  debt_fd_paise: number;
+  gold_paise: number;
+  peer_receivables_paise: number;
+  peer_payables_paise: number;
+}
+
+export interface NetWorthTimelineResponse {
+  range: TimelineRange;
+  interval: TimelineInterval;
+  start_date: string;
+  end_date: string;
+  points: NetWorthTimelinePoint[];
+}
+
+export interface WaterfallCategoryItem {
+  category_id: number | null;
+  name: string;
+  amount_paise: number;
+  display_color: string | null;
+}
+
+export interface WaterfallStep {
+  step_index: number;
+  label: string;
+  amount_paise: number;
+  cumulative_paise: number;
+  kind: "income" | "expense" | "peer" | "investment" | "surplus";
+  display_color: string | null;
+}
+
+export interface CashflowWaterfallResponse {
+  year: number;
+  year_type: YearType;
+  start_date: string;
+  end_date: string;
+  gross_income_paise: number;
+  total_living_expenses_paise: number;
+  expense_categories: WaterfallCategoryItem[];
+  peer_net_paise: number;
+  investment_transfers_paise: number;
+  net_liquid_surplus_paise: number;
+  steps: WaterfallStep[];
+}
+
+export function getNetWorthSummary(
+  asOf?: string,
+): Promise<NetWorthSummaryResponse> {
+  const query = asOf ? `?as_of=${encodeURIComponent(asOf)}` : "";
+  return request<NetWorthSummaryResponse>(`/net-worth/summary${query}`);
+}
+
+export function getNetWorthTimeline(
+  range: TimelineRange = "1Y",
+  asOf?: string,
+): Promise<NetWorthTimelineResponse> {
+  const params = new URLSearchParams();
+  params.set("range", range);
+  if (asOf) params.set("as_of", asOf);
+  return request<NetWorthTimelineResponse>(
+    `/net-worth/timeline?${params.toString()}`,
+  );
+}
+
+export function getCashflowWaterfall(
+  year?: number,
+  yearType: YearType = "calendar",
+): Promise<CashflowWaterfallResponse> {
+  const params = new URLSearchParams();
+  if (year) params.set("year", year.toString());
+  params.set("year_type", yearType);
+  return request<CashflowWaterfallResponse>(
+    `/dashboards/cashflow-waterfall?${params.toString()}`,
+  );
+}

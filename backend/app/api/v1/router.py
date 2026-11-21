@@ -24,6 +24,7 @@ from app.api.v1 import (
     investment_accounts,
     investment_transactions,
     labels,
+    net_worth,
     peer_ledger,
     portfolio,
     rebalancing,
@@ -47,6 +48,7 @@ api_router.include_router(instruments.router)
 api_router.include_router(investment_accounts.router)
 api_router.include_router(investment_transactions.router)
 api_router.include_router(labels.router)
+api_router.include_router(net_worth.router)
 api_router.include_router(peer_ledger.router)
 api_router.include_router(portfolio.router)
 api_router.include_router(rebalancing.router)

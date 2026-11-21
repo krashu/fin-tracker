@@ -50,6 +50,8 @@ import { CategoryDot } from "@/components/category-dot";
 import { Sensitive } from "@/components/balance-visibility";
 import { MONO } from "@/components/ui/table";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { NetWorthCard } from "@/components/dashboard/net-worth-card";
+import { CashflowWaterfallCard } from "@/components/dashboard/cashflow-waterfall-card";
 import { SummaryStrip } from "@/components/dashboard/summary-strip";
 import { FriendsDuesCard } from "@/components/dashboard/friends-dues-card";
 import { PeriodPicker } from "@/components/dashboard/period-picker";
@@ -150,6 +152,8 @@ export function Overview() {
     <div className="flex flex-col gap-5">
       <h1 className="sr-only">Overview</h1>
       <NetWorthHero data={data} />
+      <NetWorthCard />
+      <CashflowWaterfallCard />
       <SummaryStrip year={year} allDates />
       <FriendsDuesCard overview={data} />
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">

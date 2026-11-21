@@ -89,6 +89,18 @@ from app.schemas.investments import (
     ReinvestmentRead,
 )
 from app.schemas.labels import LabelCreate, LabelRead, LabelUpdate
+from app.schemas.net_worth import (
+    AssetCategoryBreakdown,
+    CashflowWaterfallResponse,
+    NetWorthSummaryResponse,
+    NetWorthTimelinePoint,
+    NetWorthTimelineResponse,
+    TimelineIntervalStr,
+    TimelineRangeStr,
+    WaterfallCategoryItem,
+    WaterfallStep,
+    YearTypeStr,
+)
 from app.schemas.peer_ledger import (
     PeerContactCreate,
     PeerContactRead,
@@ -157,6 +169,16 @@ __all__ = [
     "AllocationTargetUpdate",
     "AssetClassAllocation",
     "AssetClassCurrencies",
+    "AssetCategoryBreakdown",
+    "CashflowWaterfallResponse",
+    "NetWorthSummaryResponse",
+    "NetWorthTimelinePoint",
+    "NetWorthTimelineResponse",
+    "TimelineIntervalStr",
+    "TimelineRangeStr",
+    "WaterfallCategoryItem",
+    "WaterfallStep",
+    "YearTypeStr",
     "AuthConfig",
     "AvailableYearsResponse",
     "BackupImportSummary",
