@@ -8,6 +8,7 @@
 import { PageHeader } from "@/components/shell/page-header";
 import { RefreshPricesButton } from "@/components/refresh-prices-button";
 import { PortfolioDashboardView } from "@/components/investments/portfolio-dashboard-view";
+import { AllocationTargetCard } from "@/src/components/portfolio/allocation-target-card";
 import { PortfolioSummary } from "./portfolio-summary";
 
 export default function PortfolioPage() {
@@ -20,6 +21,7 @@ export default function PortfolioPage() {
       />
       <div className="flex flex-col gap-8">
         <PortfolioDashboardView />
+        <AllocationTargetCard />
         <PortfolioSummary />
       </div>
     </div>

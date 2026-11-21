@@ -11,7 +11,7 @@ export default defineConfig({
     maxWorkers: 2,
     environment: "happy-dom",
     setupFiles: ["./tests/setup.ts"],
-    include: ["{app,components,lib,tests}/**/*.test.{ts,tsx}"],
+    include: ["{app,components,lib,tests,src}/**/*.test.{ts,tsx}"],
     exclude: ["**/node_modules/**", "**/.next/**"],
   },
   resolve: {
