@@ -112,10 +112,14 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 # `--durations` is the regression radar, not decoration: a 104ms argon2 call in one
 # fixture silently grew into 82s of this suite because nothing ever printed the slowest
-# tests. Deliberately NOT `-n auto` here — xdist costs ~17s of worker startup on 14
+# tests. Deliberately NOT `-n auto` here — xdist costs ~17s of worker startup on 14-16
 # cores, which is a loss on the single-file runs pre-commit and debugging do. Parallelism
 # lives in the Makefile's full-suite targets instead.
-addopts = "--cov --cov-report=term-missing --durations=15"
+# `--maxprocesses=8` caps parallel workers when `-n auto` is invoked (on 16+ core / hybrid
+# CPU chips, throughput peaks near 7-8 workers; 16 workers cause process spawn storm,
+# memory/cache thrashing, and CPU starvation on argon2 hashing).
+# `--dist=worksteal` dynamically balances test distribution when a worker finishes its queue.
+addopts = "--cov --cov-report=term-missing --durations=15 --maxprocesses=8 --dist=worksteal"
 markers = [
     "real_pdf: requires a _local/<parser>*.pdf fixture and its password env var (cards: AXIS_TEST_PWD, ICICI_TEST_PWD; banks: HDFC_BANK_TEST_PWD, ICICI_BANK_TEST_PWD, SBI_BANK_TEST_PWD, AXIS_BANK_TEST_PWD); skipped when absent",
     "slow: single test costing >10s, or a migration test that runs upgrade/downgrade steps; deselected by `make test-fast`, always run by the gate",
