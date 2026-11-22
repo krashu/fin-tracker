@@ -165,6 +165,69 @@ describe("NetWorthCard & CashflowWaterfallCard (frontend/components/dashboard)",
 
     // Fiscal year toggle button exists and can be clicked
     const fyBtn = screen.getByRole("button", { name: /Fiscal \(FY\)/i });
+    expect(fyBtn).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /Calendar \(CY\)/i })).toHaveAttribute("aria-pressed", "true");
     await userEvent.click(fyBtn);
+    expect(fyBtn).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("renders deficit waterfall with negative surplus correctly without clamping", async () => {
+    server.use(
+      http.get("*/api/v1/dashboards/available-years", () =>
+        HttpResponse.json({ years: [2026] }),
+      ),
+      http.get("*/api/v1/dashboards/cashflow-waterfall", () =>
+        HttpResponse.json({
+          year: 2026,
+          year_type: "calendar",
+          start_date: "2026-01-01",
+          end_date: "2026-12-31",
+          gross_income_paise: 5000000,
+          total_living_expenses_paise: -7000000,
+          expense_categories: [
+            { category_id: 1, name: "Rent", amount_paise: -7000000, display_color: "#ef4444" },
+          ],
+          peer_net_paise: 0,
+          investment_transfers_paise: 0,
+          net_liquid_surplus_paise: -2000000,
+          steps: [
+            { step_index: 1, label: "Gross Income", amount_paise: 5000000, cumulative_paise: 5000000, kind: "income", display_color: "#10b981" },
+            { step_index: 2, label: "Rent", amount_paise: -7000000, cumulative_paise: -2000000, kind: "expense", display_color: "#ef4444" },
+            { step_index: 3, label: "Net Liquid Surplus", amount_paise: -2000000, cumulative_paise: -2000000, kind: "surplus", display_color: "#f59e0b" },
+          ],
+        }),
+      ),
+    );
+
+    renderWithProviders(<CashflowWaterfallCard />, { initialBalanceHidden: false });
+
+    expect(await screen.findByText("Cashflow Waterfall: Inflow to Wealth")).toBeInTheDocument();
+    expect(await screen.findByText("₹50,000.00")).toBeInTheDocument();
+    expect(screen.getByText("−₹70,000.00")).toBeInTheDocument();
+    expect(screen.getByText("−₹20,000.00")).toBeInTheDocument();
+  });
+
+  it("applies blur and disables interaction on ChartContainer when privacy mode is active", async () => {
+    server.use(
+      http.get("*/api/v1/net-worth/summary", () => HttpResponse.json(mockSummary)),
+      http.get("*/api/v1/net-worth/timeline", () =>
+        HttpResponse.json({
+          range: "1Y",
+          interval: "daily",
+          start_date: "2026-05-01",
+          end_date: "2026-06-01",
+          points: mockTimelinePoints,
+        }),
+      ),
+    );
+
+    const { container } = renderWithProviders(<NetWorthCard />, { initialBalanceHidden: true });
+
+    await waitFor(() => {
+      const chartContainer = container.querySelector('[data-slot="chart"]');
+      expect(chartContainer).toBeInTheDocument();
+      expect(chartContainer?.className).toContain("blur-sm");
+      expect(chartContainer?.className).toContain("pointer-events-none");
+    });
   });
 });

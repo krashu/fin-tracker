@@ -62,19 +62,19 @@ export function FriendsDuesCard({ overview }: FriendsDuesCardProps) {
         </Link>
       </div>
 
-      <div className="p-4">
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="p-3.5">
+        <div className="grid grid-cols-2 gap-3">
           {/* Tile 1: To Collect (Receivable) */}
-          <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-3.5">
+          <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-3">
             <div>
               <span className="text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
                 To Collect
               </span>
-              <div className="mt-2 text-[22px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-emerald-600 dark:text-emerald-400">
+              <div className="mt-1.5 text-[17px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-emerald-600 dark:text-emerald-400">
                 <Sensitive>{formatINR(receivablePaise)}</Sensitive>
               </div>
             </div>
-            <p className="mt-2 text-[11px] text-muted-foreground">
+            <p className="mt-1.5 text-[10.5px] leading-tight text-muted-foreground">
               {receivablePaise > 0
                 ? "Total friends owe you across active contacts."
                 : "No outstanding money owed to you."}
@@ -82,16 +82,16 @@ export function FriendsDuesCard({ overview }: FriendsDuesCardProps) {
           </div>
 
           {/* Tile 2: To Pay (Payable) */}
-          <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-3.5">
+          <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-3">
             <div>
               <span className="text-[10px] font-medium uppercase tracking-wider text-rose-600 dark:text-rose-400">
                 To Pay
               </span>
-              <div className="mt-2 text-[22px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-rose-600 dark:text-rose-400">
+              <div className="mt-1.5 text-[17px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-rose-600 dark:text-rose-400">
                 <Sensitive>{formatINR(payablePaise)}</Sensitive>
               </div>
             </div>
-            <p className="mt-2 text-[11px] text-muted-foreground">
+            <p className="mt-1.5 text-[10.5px] leading-tight text-muted-foreground">
               {payablePaise > 0
                 ? "Total you owe friends across active contacts."
                 : "You are fully settled up with friends."}
@@ -100,16 +100,16 @@ export function FriendsDuesCard({ overview }: FriendsDuesCardProps) {
 
           {/* Tile 3: Net Personal Spend (if fronted spend exists) */}
           {hasFronted ? (
-            <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-3.5 sm:col-span-2 lg:col-span-1">
+            <div className="col-span-2 flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-3">
               <div>
                 <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/80">
                   Net Personal Spend
                 </span>
-                <div className="mt-2 text-[22px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-foreground">
+                <div className="mt-1.5 text-[18px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-foreground">
                   <Sensitive>{formatINR(netPersonalSpendPaise)}</Sensitive>
                 </div>
               </div>
-              <p className="mt-2 text-[11px] text-muted-foreground">
+              <p className="mt-1.5 text-[11px] leading-tight text-muted-foreground">
                 <Sensitive>{formatINR(frontedPeerPaise)}</Sensitive> fronted for friends deducted from gross spend.
               </p>
             </div>

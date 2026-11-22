@@ -7,6 +7,8 @@
  * Gross Income -> Living Expenses (by top parent categories) -> Peer Lending/Repayments
  * -> Net Investment Transfers -> Net Liquid Surplus.
  *
+ * Implements a horizontal bar orientation (layout="vertical") with dynamic container height
+ * to prevent category label crowding and truncation.
  * Supports calendar-year and financial-year scopes with privacy masking.
  */
 
@@ -45,23 +47,70 @@ const CHART_CONFIG = {
   amount: { label: "Cashflow", color: "#3b82f6" },
 } satisfies ChartConfig;
 
+function TruncatedCategoryTick({
+  x,
+  y,
+  payload,
+}: {
+  x?: number;
+  y?: number;
+  payload?: { value?: string };
+}) {
+  const val = String(payload?.value ?? "");
+  const maxChars = 14;
+  const truncated = val.length > maxChars ? `${val.slice(0, maxChars)}…` : val;
+  return (
+    <g transform={`translate(${x ?? 0},${y ?? 0})`}>
+      <text
+        x={-8}
+        y={3}
+        textAnchor="end"
+        fontSize={11}
+        className="fill-muted-foreground select-none"
+      >
+        <title>{val}</title>
+        {truncated}
+      </text>
+    </g>
+  );
+}
+
+export interface CashflowWaterfallCardProps {
+  className?: string;
+  embedded?: boolean;
+  yearType?: YearType;
+  year?: number;
+  onYearTypeChange?: (yt: YearType) => void;
+  onYearChange?: (y: number) => void;
+}
+
 export function CashflowWaterfallCard({
   className,
   embedded = false,
-}: {
-  className?: string;
-  embedded?: boolean;
-}) {
+  yearType,
+  year,
+  onYearTypeChange,
+  onYearChange,
+}: CashflowWaterfallCardProps) {
   const { hidden } = useBalanceHidden();
   const yearsQuery = useAvailableYears();
-  const [selectedYear, setSelectedYear] = useState<number>(() => currentYear());
-  const [yearType, setYearType] = useState<YearType>("calendar");
 
-  const effectiveYear = selectedYear ?? yearsQuery.years[0] ?? currentYear();
+  const [internalYear, setInternalYear] = useState<number>(() => currentYear());
+  const [internalYearType, setInternalYearType] = useState<YearType>("calendar");
+
+  const effectiveYearType = yearType ?? internalYearType;
+  const setEffectiveYearType = onYearTypeChange ?? setInternalYearType;
+
+  const effectiveYear = year ?? internalYear ?? currentYear();
+  const setEffectiveYear = onYearChange ?? setInternalYear;
 
   const waterfallQuery = useQuery({
-    queryKey: ["dashboards", "cashflow-waterfall", { year: effectiveYear, year_type: yearType }],
-    queryFn: () => getCashflowWaterfall(effectiveYear, yearType),
+    queryKey: [
+      "dashboards",
+      "cashflow-waterfall",
+      { year: effectiveYear, year_type: effectiveYearType },
+    ],
+    queryFn: () => getCashflowWaterfall(effectiveYear, effectiveYearType),
   });
 
   const data = waterfallQuery.data;
@@ -116,27 +165,26 @@ export function CashflowWaterfallCard({
       processedSteps = newSteps;
     }
 
+    let prevCumPaise = 0;
     return processedSteps.map((s) => {
-      let baseRupees = 0;
-      const amtRupees = Math.abs(s.amount_paise) / 100;
-      const cumRupees = s.cumulative_paise / 100;
+      let startPaise: number;
+      let endPaise: number;
 
-      if (s.kind === "income" || s.kind === "surplus") {
-        baseRupees = 0;
+      if (s.kind === "surplus") {
+        startPaise = 0;
+        endPaise = s.cumulative_paise;
       } else {
-        // Outflows step downwards: base starts at the lower level
-        if (s.amount_paise <= 0) {
-          baseRupees = cumRupees;
-        } else {
-          // Inflow step upwards
-          baseRupees = cumRupees - amtRupees;
-        }
+        startPaise = prevCumPaise;
+        endPaise = s.cumulative_paise;
+        prevCumPaise = s.cumulative_paise;
       }
+
+      const minRupees = Math.min(startPaise, endPaise) / 100;
+      const maxRupees = Math.max(startPaise, endPaise) / 100;
 
       return {
         label: s.label,
-        base: Math.max(0, baseRupees),
-        amount: amtRupees,
+        range: [minRupees, maxRupees],
         signed_amount_paise: s.amount_paise,
         cumulative_paise: s.cumulative_paise,
         kind: s.kind,
@@ -145,7 +193,9 @@ export function CashflowWaterfallCard({
           (s.kind === "income"
             ? "#10b981"
             : s.kind === "surplus"
-            ? "#06b6d4"
+            ? s.cumulative_paise >= 0
+              ? "#06b6d4"
+              : "#f59e0b"
             : s.kind === "investment"
             ? "#3b82f6"
             : s.amount_paise < 0
@@ -159,6 +209,42 @@ export function CashflowWaterfallCard({
   const livingExpenses = data?.total_living_expenses_paise ?? 0;
   const netSurplus = data?.net_liquid_surplus_paise ?? 0;
 
+  // Dynamic vertical height scaling to eliminate vertical bar cramping
+  const dynamicHeight = Math.max(300, chartData.length * 36 + 48);
+
+  const summaryStrip = (
+    <div className="flex flex-wrap items-baseline gap-4">
+      <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-foreground">
+        <span className="text-muted-foreground font-normal">Income:</span>
+        <Sensitive className="text-emerald-600 dark:text-emerald-400">
+          {formatINR(grossIncome)}
+        </Sensitive>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-foreground">
+        <span className="text-muted-foreground font-normal">Living Spend:</span>
+        <Sensitive className="text-rose-600 dark:text-rose-400">
+          {livingExpenses < 0 ? "−" : ""}
+          {formatINR(Math.abs(livingExpenses))}
+        </Sensitive>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-foreground">
+        <span className="text-muted-foreground font-normal">Liquid Surplus:</span>
+        <Sensitive
+          className={
+            netSurplus >= 0
+              ? "text-cyan-600 dark:text-cyan-400"
+              : "text-amber-600 dark:text-amber-400"
+          }
+        >
+          {netSurplus < 0 ? "−" : ""}
+          {formatINR(Math.abs(netSurplus))}
+        </Sensitive>
+      </div>
+    </div>
+  );
+
   return (
     <Card
       className={cn(
@@ -167,130 +253,104 @@ export function CashflowWaterfallCard({
         className,
       )}
     >
-      <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <div className="flex items-center gap-2">
-            <Eyebrow as="h2">Cashflow Waterfall: Inflow to Wealth</Eyebrow>
-            <Link
-              href="/spending"
-              className="inline-flex items-center gap-0.5 text-[11px] font-medium text-muted-foreground hover:text-foreground hover:underline"
-            >
-              Category spending ↗
-            </Link>
-          </div>
-
-          <div className="mt-1 flex flex-wrap items-baseline gap-4">
-            <div className="flex items-center gap-1.5 text-[13px] font-semibold text-foreground">
-              <span className="text-muted-foreground font-normal">Income:</span>
-              <Sensitive className="text-emerald-600 dark:text-emerald-400">
-                {formatINR(grossIncome)}
-              </Sensitive>
-            </div>
-
-            <div className="flex items-center gap-1.5 text-[13px] font-semibold text-foreground">
-              <span className="text-muted-foreground font-normal">Living Spend:</span>
-              <Sensitive className="text-rose-600 dark:text-rose-400">
-                {livingExpenses < 0 ? "−" : ""}
-                {formatINR(Math.abs(livingExpenses))}
-              </Sensitive>
-            </div>
-
-            <div className="flex items-center gap-1.5 text-[13px] font-semibold text-foreground">
-              <span className="text-muted-foreground font-normal">Liquid Surplus:</span>
-              <Sensitive
-                className={
-                  netSurplus >= 0
-                    ? "text-cyan-600 dark:text-cyan-400"
-                    : "text-amber-600 dark:text-amber-400"
-                }
+      {!embedded ? (
+        <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <Eyebrow as="h2">Cashflow Waterfall: Inflow to Wealth</Eyebrow>
+              <Link
+                href="/spending"
+                className="inline-flex items-center gap-0.5 text-[11px] font-medium text-muted-foreground hover:text-foreground hover:underline"
               >
-                {netSurplus < 0 ? "−" : ""}
-                {formatINR(Math.abs(netSurplus))}
-              </Sensitive>
+                Category spending ↗
+              </Link>
             </div>
-          </div>
-        </div>
-
-        {/* Controls: Year Type + Year Picker */}
-        <div className="flex flex-wrap items-center gap-2">
-          {/* Calendar vs Fiscal Year Toggle */}
-          <div className="flex items-center rounded-md border bg-muted/40 p-0.5">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setYearType("calendar")}
-              className={cn(
-                "h-7 px-2 text-[11px] font-medium transition-colors",
-                yearType === "calendar"
-                  ? "bg-background text-foreground shadow-xs font-semibold"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              Calendar (CY)
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setYearType("fiscal")}
-              className={cn(
-                "h-7 px-2 text-[11px] font-medium transition-colors",
-                yearType === "fiscal"
-                  ? "bg-background text-foreground shadow-xs font-semibold"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              Fiscal (FY)
-            </Button>
+            <div className="mt-1">{summaryStrip}</div>
           </div>
 
-          {/* Year Picker */}
-          <select
-            value={effectiveYear}
-            onChange={(e) => setSelectedYear(Number(e.target.value))}
-            className="h-8 rounded-md border border-input bg-background px-2 py-1 text-[12px] font-medium text-foreground shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-          >
-            {yearsQuery.years.map((y) => (
-              <option key={y} value={y}>
-                {yearType === "fiscal" ? `FY ${y}-${(y + 1) % 100}` : y}
-              </option>
-            ))}
-          </select>
-        </div>
-      </CardHeader>
+          {/* Controls: Year Type + Year Picker in Standalone Mode */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center rounded-md border bg-muted/40 p-0.5">
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-pressed={effectiveYearType === "calendar"}
+                onClick={() => setEffectiveYearType("calendar")}
+                className={cn(
+                  "h-7 px-2 text-[11px] font-medium transition-colors",
+                  effectiveYearType === "calendar"
+                    ? "bg-background text-foreground shadow-xs font-semibold"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                Calendar (CY)
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-pressed={effectiveYearType === "fiscal"}
+                onClick={() => setEffectiveYearType("fiscal")}
+                className={cn(
+                  "h-7 px-2 text-[11px] font-medium transition-colors",
+                  effectiveYearType === "fiscal"
+                    ? "bg-background text-foreground shadow-xs font-semibold"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                Fiscal (FY)
+              </Button>
+            </div>
 
-      <CardContent className="pt-2">
+            <select
+              value={effectiveYear}
+              onChange={(e) => setEffectiveYear(Number(e.target.value))}
+              className="h-8 rounded-md border border-input bg-background px-2 py-1 text-[12px] font-medium text-foreground shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              {yearsQuery.years.map((y) => (
+                <option key={y} value={y}>
+                  {effectiveYearType === "fiscal" ? `FY ${y}-${(y + 1) % 100}` : y}
+                </option>
+              ))}
+            </select>
+          </div>
+        </CardHeader>
+      ) : null}
+
+      <CardContent className={cn("pt-2", embedded && "px-4 pt-3")}>
+        {/* Render summary figures at top of embedded card content */}
+        {embedded ? <div className="mb-3">{summaryStrip}</div> : null}
+
         {waterfallQuery.isPending ? (
-          <div className="flex h-[260px] items-center justify-center text-sm text-muted-foreground">
+          <div className="flex h-[280px] items-center justify-center text-sm text-muted-foreground">
             Computing waterfall decomposition…
           </div>
         ) : waterfallQuery.isError ? (
-          <div className="flex h-[260px] items-center justify-center text-sm text-neg">
+          <div className="flex h-[280px] items-center justify-center text-sm text-neg">
             Unable to load cashflow waterfall.
           </div>
         ) : chartData.length === 0 ? (
-          <div className="flex h-[260px] items-center justify-center text-sm text-muted-foreground">
+          <div className="flex h-[280px] items-center justify-center text-sm text-muted-foreground">
             No income or spending records found for this year.
           </div>
         ) : (
-          <ChartContainer config={CHART_CONFIG} className="h-[260px] w-full">
+          <ChartContainer
+            config={CHART_CONFIG}
+            className={cn(
+              "w-full aspect-auto transition-all duration-200",
+              hidden && "pointer-events-none select-none blur-sm",
+            )}
+            style={{ height: dynamicHeight }}
+          >
             <BarChart
+              layout="vertical"
               data={chartData}
-              margin={{ top: 12, right: 12, left: 0, bottom: 20 }}
+              margin={{ top: 12, right: 32, left: 16, bottom: 12 }}
             >
-              <CartesianGrid strokeDasharray="3 3" vertical={false} opacity={0.2} />
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} opacity={0.2} />
 
               <XAxis
-                dataKey="label"
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
-                fontSize={10.5}
-                interval={0}
-                angle={0}
-                textAnchor="middle"
-              />
-
-              <YAxis
+                type="number"
+                domain={[(dataMin: number) => Math.min(0, dataMin), (dataMax: number) => Math.max(0, dataMax)]}
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
@@ -298,13 +358,20 @@ export function CashflowWaterfallCard({
                 tickFormatter={(val: number) => (hidden ? "••••" : compactINR(val * 100))}
               />
 
-              <ReferenceLine y={0} stroke="#94a3b8" opacity={0.5} />
+              <YAxis
+                type="category"
+                dataKey="label"
+                tickLine={false}
+                axisLine={false}
+                width={130}
+                interval={0}
+                tick={<TruncatedCategoryTick />}
+              />
 
-              {/* Invisible transparent base segment for floating waterfall bars */}
-              <Bar dataKey="base" stackId="waterfall" fill="transparent" />
+              <ReferenceLine x={0} stroke="#94a3b8" opacity={0.4} />
 
-              {/* Visible floating bar for each step */}
-              <Bar dataKey="amount" stackId="waterfall" radius={[3, 3, 3, 3]}>
+              {/* Floating horizontal waterfall bar spanning [minRupees, maxRupees] */}
+              <Bar dataKey="range" radius={[3, 3, 3, 3]} isAnimationActive={false}>
                 {chartData.map((entry, index) => (
                   <Cell key={`cell-${index}`} fill={entry.color} />
                 ))}

@@ -136,18 +136,26 @@ export function Overview() {
       {/* Tier 1: 5-Second Daily Financial Pulse Ribbon */}
       <DailyPulseRibbon overview={data} isLoading={overviewQuery.isLoading} />
 
-      {/* Tier 2: Two-Column Operational Desk */}
-      <div className="grid gap-5 lg:grid-cols-[1.4fr_1fr] items-start">
-        {/* Left Column (1.4fr): Cashflow Velocity & Activity Ledger */}
-        <RecentActivity
-          rows={recentQuery.data ?? []}
-          accountsById={accountsById}
-          categoryColorById={categoryColorById}
-          status={recentQuery.status}
-        />
+      {/* Tier 2 & 3: Asymmetric Responsive Cockpit */}
+      <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(340px,380px)]">
+        {/* 1. Recent Activity & Cashflow Velocity (Mobile order #1, Desktop: Col 1 Row 1) */}
+        <section
+          aria-label="Recent Activity and Cashflow"
+          className="xl:col-start-1 xl:row-start-1"
+        >
+          <RecentActivity
+            rows={recentQuery.data ?? []}
+            accountsById={accountsById}
+            categoryColorById={categoryColorById}
+            status={recentQuery.status}
+          />
+        </section>
 
-        {/* Right Column (1fr): Liquidity Accounts, Credit Cards, Khata Dues & Portfolio */}
-        <div className="flex flex-col gap-4">
+        {/* 2. Right Rail: Liquidity, Khata & Portfolio (Mobile order #2, Desktop: Col 2 Row 1-2) */}
+        <aside
+          aria-label="Accounts and holdings overview"
+          className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:col-start-2 xl:row-start-1 xl:row-span-2 xl:grid-cols-1"
+        >
           <AccountsCard
             accounts={data?.accounts ?? []}
             ready={data !== undefined}
@@ -155,23 +163,27 @@ export function Overview() {
             availableYears={yearsQuery.years}
             onPeriodChange={(p) => setPickedYear(p.year)}
           />
-          <FriendsDuesCard overview={data} />
-          <PortfolioCard
-            valuePaise={data?.portfolio_value_paise ?? 0}
-            count={
-              holdingsQuery.isSuccess
-                ? holdings.length - nullNav - fxUnavailable
-                : null
-            }
-            nullNav={nullNav}
-            fxUnavailable={fxUnavailable}
-            ready={data !== undefined}
-          />
+          <div className="flex flex-col gap-4">
+            <FriendsDuesCard overview={data} />
+            <PortfolioCard
+              valuePaise={data?.portfolio_value_paise ?? 0}
+              count={
+                holdingsQuery.isSuccess
+                  ? holdings.length - nullNav - fxUnavailable
+                  : null
+              }
+              nullNav={nullNav}
+              fxUnavailable={fxUnavailable}
+              ready={data !== undefined}
+            />
+          </div>
+        </aside>
+
+        {/* 3. Strategic Wealth Horizon Deck (Mobile order #3, Desktop: Col 1 Row 2) */}
+        <div className="xl:col-start-1 xl:row-start-2">
+          <MacroWealthDeck overview={data} />
         </div>
       </div>
-
-      {/* Tier 3: Macro Wealth Horizon Deck (Radix Tabbed) */}
-      <MacroWealthDeck overview={data} />
     </div>
   );
 }
@@ -559,12 +571,15 @@ function ActivityRow({
       >
         {merchant}
       </span>
-      <span className="hidden shrink-0 truncate text-[11.5px] text-muted-foreground sm:block">
+      <span
+        className="hidden shrink-0 truncate text-[11.5px] text-muted-foreground sm:block max-w-[130px] text-right"
+        title={accountName}
+      >
         {accountName}
       </span>
       <span
         className={cn(
-          "shrink-0 text-[12.5px] font-medium",
+          "w-[95px] shrink-0 text-right text-[12.5px] font-medium",
           isCredit ? "text-pos" : "text-foreground",
         )}
         style={MONO}
