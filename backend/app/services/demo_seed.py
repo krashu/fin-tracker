@@ -59,6 +59,8 @@ from app.core.log_config import get_logger
 from app.models import (
     Account,
     AllocationTarget,
+    Benchmark,
+    BenchmarkNav,
     Category,
     CurrencyStr,
     FxRateQuote,
@@ -550,6 +552,7 @@ def seed_demo_data(session: Session, *, user_id: UUID) -> DemoSeedCounts:
     session.flush()  # assign ids for bank_sip_txns and pending links
 
     _seed_fx_rates(session, today=today)
+    _seed_benchmark_navs(session, today=today)
     inst_count, inv_txn_count, inv_accounts = _seed_investments(
         session, user_id=user_id, today=today, bank_sip_txns=bank_sip_txns
     )
@@ -741,6 +744,50 @@ def _seed_fx_rates(session: Session, *, today: date_t) -> None:
     )
 
 
+def _seed_benchmark_navs(session: Session, *, today: date_t) -> None:
+    """Seed synthetic daily NAV history for the Nifty 50 benchmark (amfi_code: 120716).
+
+    Ensures the demo portfolio's benchmark comparison, mPME counterfactual, and alpha
+    metrics function out-of-the-box without requiring an initial external mfapi fetch.
+    """
+    b = session.scalar(
+        select(Benchmark).where(Benchmark.amfi_code == "120716", Benchmark.archived_at.is_(None))
+    )
+    if b is None:
+        return
+
+    existing_count = (
+        session.scalar(select(func.count(BenchmarkNav.id)).where(BenchmarkNav.benchmark_id == b.id))
+        or 0
+    )
+    if existing_count > 0:
+        return
+
+    start_date = today - timedelta(days=450)
+    cur = start_date
+    nav_val = Decimal("195.00")
+    rows: list[dict[str, object]] = []
+    step = Decimal("0.08")
+    while cur <= today:
+        rows.append(
+            {
+                "benchmark_id": b.id,
+                "nav_date": cur,
+                "nav": nav_val,
+            }
+        )
+        nav_val = (nav_val + step).quantize(Decimal("0.01"))
+        cur += timedelta(days=1)
+
+    insert_skip_existing(
+        session,
+        BenchmarkNav,
+        rows,
+        conflict_cols=["benchmark_id", "nav_date"],
+        label="benchmark_nav",
+    )
+
+
 def _get_or_create_investment_account(
     session: Session,
     *,
@@ -839,6 +886,8 @@ def _seed_investments(
         )
         if existing is not None:
             existing.current_nav = Decimal(str(spec["current_nav"]))
+            if spec.get("isin") and existing.isin != spec["isin"]:
+                existing.isin = str(spec["isin"])
             if existing.nav_updated_at is not None and existing.nav_updated_at < as_valuation_stamp(
                 today
             ):

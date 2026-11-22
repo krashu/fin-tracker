@@ -148,7 +148,7 @@ export function RefreshPricesButton({
   // the answer to "why didn't pressing this fix my FD".
   const handPricedNote =
     navSummary && navSummary.skipped > 0
-      ? `${navSummary.skipped} holding${navSummary.skipped === 1 ? " is" : "s are"} priced by hand — refreshing won’t update ${navSummary.skipped === 1 ? "it" : "them"}.`
+      ? `${navSummary.skipped} holding${navSummary.skipped === 1 ? " is" : "s are"} manually priced (e.g. fixed deposits) — daily refresh only updates mutual funds and exchange equities.`
       : null;
   const benchCount = benchSummary
     ? `${benchSummary.benchmarks_refreshed} refreshed · ${benchSummary.fetch_errors} ${benchSummary.fetch_errors === 1 ? "error" : "errors"}`

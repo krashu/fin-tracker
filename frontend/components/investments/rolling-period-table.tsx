@@ -23,7 +23,7 @@ import { cn } from "@/lib/utils";
 const DASH = <span className="text-muted-foreground">—</span>;
 const SUPPRESSED_DASH = (
   <span
-    title="Annualized return is suppressed for horizons under 365 days to avoid unrepresentative extrapolation (ADR-0018 / GIPS)."
+    title="Annualized return is not shown for periods under 1 year (365 days) to avoid misleading extrapolation."
     className="cursor-help text-muted-foreground underline decoration-dotted underline-offset-2"
   >
     —
@@ -247,7 +247,7 @@ export function RollingPeriodTable({
           </table>
         </div>
         <p className="mt-3 text-[11px] text-muted-foreground/80">
-          ⓘ Note: Per ADR-0018 & GIPS standards, annualized TWR, XIRR, and Alpha are suppressed for horizons under 365 days to prevent unrepresentative extrapolation.
+          ⓘ Note: Per GIPS (Global Investment Performance Standards), annualized TWR, XIRR, and Alpha are not shown for periods under 1 year (365 days) to avoid misleading annualization.
         </p>
       </CardContent>
     </Card>

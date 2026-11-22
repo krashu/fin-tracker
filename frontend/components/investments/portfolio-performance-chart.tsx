@@ -44,7 +44,7 @@ import { cn } from "@/lib/utils";
 const CHART_CONFIG = {
   portfolio: {
     label: "Portfolio (TWR)",
-    color: "hsl(var(--primary))",
+    color: "var(--primary)",
   },
   benchmark: {
     label: "Benchmark (TRI)",

@@ -994,7 +994,8 @@ INSTRUMENTS: list[dict[str, Any]] = [
         "name": "Mirae Asset ELSS Tax Saver Fund",
         "asset_class": "indian_mf",
         "exchange": "MFCentral",
-        "isin": "INF769K01DW3",
+        # Direct-Plan-Growth (INF769K01DM9, AMFI 135781)
+        "isin": "INF769K01DM9",
         "current_nav": "48.60",
         "txns": [
             {

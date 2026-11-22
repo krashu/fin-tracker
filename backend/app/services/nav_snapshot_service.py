@@ -395,10 +395,18 @@ def _build_isin_index(rows: list[AmfiNavRow]) -> MfIndex:
     return MfIndex(by_isin=index, ambiguous=frozenset(ambiguous))
 
 
+def _inst_label(inst: Instrument) -> str:
+    """Human-readable instrument identifier for user-facing warnings."""
+    if inst.name and inst.symbol and inst.name != inst.symbol:
+        return f"{inst.name} ({inst.symbol})"
+    return inst.name or inst.symbol or f"instrument {inst.id}"
+
+
 def _apply_mf_nav(inst: Instrument, index: MfIndex, warnings: list[str]) -> str:
     """Apply a matched NAV (skip-when-not-newer). Returns updated / stale_skipped / unmatched."""
+    label = _inst_label(inst)
     if inst.isin is None:
-        warnings.append(f"instrument {inst.id}: no ISIN — cannot match AMFI NAVAll")
+        warnings.append(f"{label}: no ISIN — cannot match AMFI NAVAll")
         return "unmatched"
     row = index.by_isin.get(inst.isin)
     if row is None:
@@ -407,11 +415,11 @@ def _apply_mf_nav(inst: Instrument, index: MfIndex, warnings: list[str]) -> str:
         # public fund reference data, not PII — same reasoning as the scheme name below.
         if inst.isin in index.ambiguous:
             warnings.append(
-                f"instrument {inst.id}: ISIN {inst.isin} maps to multiple AMFI schemes "
+                f"{label}: ISIN {inst.isin} maps to multiple AMFI schemes "
                 f"with differing NAV — not priced"
             )
         else:
-            warnings.append(f"instrument {inst.id}: ISIN not found in AMFI NAVAll")
+            warnings.append(f"{label}: ISIN not found in AMFI NAVAll")
         return "unmatched"
     if not _source_is_newer(inst.nav_updated_at, row.nav_date):
         return "stale_skipped"
@@ -425,13 +433,11 @@ def _apply_mf_nav(inst: Instrument, index: MfIndex, warnings: list[str]) -> str:
         # would then be priced off another fund's NAV with nothing anywhere to say so. The
         # scheme name is public AMFI reference data, not PII.
         warnings.append(
-            f"instrument {inst.id}: ISIN matched AMFI scheme {row.scheme_name!r} — "
+            f"{label}: ISIN matched AMFI scheme {row.scheme_name!r} — "
             f"check this is the fund you meant"
         )
     elif inst.amfi_code != row.scheme_code:
-        warnings.append(
-            f"instrument {inst.id}: amfi_code disagrees with matched scheme — kept existing"
-        )
+        warnings.append(f"{label}: amfi_code disagrees with matched scheme — kept existing")
     return "updated"
 
 
@@ -523,12 +529,13 @@ def _apply_equity_quote(
     network / no-price (retry may help) — the split lets the user tell them apart.
     """
     ticker = _yahoo_ticker(inst.symbol, inst.exchange, inst.asset_class)
+    label = _inst_label(inst)
     if ticker is None:
-        warnings.append(f"instrument {inst.id}: exchange {inst.exchange} has no quote source")
+        warnings.append(f"{label}: exchange {inst.exchange} has no quote source")
         return "unmatched"
     quote, cause = _fetch_equity_quote(client, base_url, ticker, ttl_hours=ttl_hours)
     if quote is None:
-        warnings.append(f"instrument {inst.id}: no quote returned for {ticker} — {cause}")
+        warnings.append(f"{label}: no quote returned for {ticker} — {cause}")
         return "fetch_error"
     if not _source_is_newer(inst.nav_updated_at, quote.as_of.date()):
         return "stale_skipped"

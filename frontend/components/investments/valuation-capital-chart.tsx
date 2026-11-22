@@ -40,7 +40,7 @@ import { cn } from "@/lib/utils";
 const CHART_CONFIG = {
   value: {
     label: "Portfolio Value",
-    color: "hsl(var(--primary))",
+    color: "var(--primary)",
   },
   invested: {
     label: "Net Invested Capital",

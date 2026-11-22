@@ -333,7 +333,7 @@ def test_duplicate_isin_differing_nav_is_dropped(session: Session, user: User) -
     assert result.unmatched == 1
     assert inst.current_nav is None
     assert [w for w in result.warnings if "multiple AMFI schemes" in w] == [
-        f"instrument {inst.id}: ISIN INFDUP0000001 maps to multiple AMFI schemes "
+        f"{inst.name}: ISIN INFDUP0000001 maps to multiple AMFI schemes "
         f"with differing NAV — not priced"
     ]
     assert not any("not found" in w for w in result.warnings)
