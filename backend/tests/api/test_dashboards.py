@@ -2551,7 +2551,51 @@ def test_overview_empty_no_accounts(client: TestClient, seeded_user: User) -> No
         "fronted_peer_entries_paise": 0,
         "net_personal_spend_paise": 0,
         "fronted_card_usage_paise": 0,
+        "peer_receivables_paise": 0,
+        "peer_payables_paise": 0,
     }
+
+
+def test_overview_includes_peer_debts_in_net_worth(
+    client: TestClient,
+    seeded_user: User,
+    session: Session,
+) -> None:
+    from app.models.peer_contact import PeerContact
+    from app.models.peer_entry import PeerEntry
+
+    contact1 = PeerContact(user_id=seeded_user.id, name="Rahul Sharma")
+    contact2 = PeerContact(user_id=seeded_user.id, name="Priya Patel")
+    session.add_all([contact1, contact2])
+    session.flush()
+
+    # Rahul owes you 5000 (receivable), you owe Priya 2000 (payable)
+    session.add(
+        PeerEntry(
+            user_id=seeded_user.id,
+            contact_id=contact1.id,
+            amount_paise=5000,
+            direction="you_gave",
+            date=date(2026, 5, 1),
+        )
+    )
+    session.add(
+        PeerEntry(
+            user_id=seeded_user.id,
+            contact_id=contact2.id,
+            amount_paise=2000,
+            direction="you_got",
+            date=date(2026, 5, 2),
+        )
+    )
+    session.commit()
+
+    resp = client.get(f"{_OVERVIEW_URL}?month=2026-05")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["peer_receivables_paise"] == 5000
+    assert data["peer_payables_paise"] == 2000
+    assert data["net_worth_paise"] == 3000  # 5000 - 2000 = 3000 net peer receivables
 
 
 def test_overview_account_balance_net_worth_and_period(

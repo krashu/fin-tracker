@@ -84,10 +84,10 @@ export function FriendsDuesCard({ overview }: FriendsDuesCardProps) {
           {/* Tile 2: To Pay (Payable) */}
           <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-3.5">
             <div>
-              <span className="text-[10px] font-medium uppercase tracking-wider text-amber-600 dark:text-amber-400">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-rose-600 dark:text-rose-400">
                 To Pay
               </span>
-              <div className="mt-2 text-[22px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-amber-600 dark:text-amber-400">
+              <div className="mt-2 text-[22px] font-semibold leading-none tracking-[-0.02em] tabular-nums font-mono text-rose-600 dark:text-rose-400">
                 <Sensitive>{formatINR(payablePaise)}</Sensitive>
               </div>
             </div>

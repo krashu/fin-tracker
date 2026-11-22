@@ -1594,6 +1594,8 @@ export type OverviewResponse = {
   fronted_peer_entries_paise: number;
   net_personal_spend_paise: number;
   fronted_card_usage_paise: number;
+  peer_receivables_paise?: number;
+  peer_payables_paise?: number;
 };
 
 export function getOverview(params: {

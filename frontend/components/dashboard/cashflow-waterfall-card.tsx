@@ -11,6 +11,7 @@
  */
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import {
   Bar,
@@ -44,7 +45,13 @@ const CHART_CONFIG = {
   amount: { label: "Cashflow", color: "#3b82f6" },
 } satisfies ChartConfig;
 
-export function CashflowWaterfallCard({ className }: { className?: string }) {
+export function CashflowWaterfallCard({
+  className,
+  embedded = false,
+}: {
+  className?: string;
+  embedded?: boolean;
+}) {
   const { hidden } = useBalanceHidden();
   const yearsQuery = useAvailableYears();
   const [selectedYear, setSelectedYear] = useState<number>(() => currentYear());
@@ -61,15 +68,60 @@ export function CashflowWaterfallCard({ className }: { className?: string }) {
   const steps = data?.steps ?? [];
 
   // Transform steps into waterfall stacked segments [base, amount]
+  // Consolidates living expenses into Top 5 + Other Living if >5 expense categories
   const chartData = useMemo(() => {
-    return steps.map((s) => {
+    if (steps.length === 0) return [];
+
+    let processedSteps = steps;
+    const expenseSteps = steps.filter((s) => s.kind === "expense");
+    if (expenseSteps.length > 5) {
+      const sortedExp = [...expenseSteps].sort(
+        (a, b) => Math.abs(b.amount_paise) - Math.abs(a.amount_paise),
+      );
+      const top5 = new Set(sortedExp.slice(0, 5).map((e) => e.label));
+      const otherExpenses = sortedExp.slice(5);
+      const otherAmount = otherExpenses.reduce((sum, e) => sum + e.amount_paise, 0);
+
+      let runningCum = 0;
+      const newSteps: typeof steps = [];
+      let otherAdded = false;
+
+      for (const s of steps) {
+        if (s.kind === "income") {
+          runningCum += s.amount_paise;
+          newSteps.push({ ...s, step_index: newSteps.length, cumulative_paise: runningCum });
+        } else if (s.kind === "expense") {
+          if (top5.has(s.label)) {
+            runningCum += s.amount_paise;
+            newSteps.push({ ...s, step_index: newSteps.length, cumulative_paise: runningCum });
+          } else if (!otherAdded) {
+            runningCum += otherAmount;
+            newSteps.push({
+              step_index: newSteps.length,
+              label: "Other Living",
+              amount_paise: otherAmount,
+              cumulative_paise: runningCum,
+              kind: "expense",
+              display_color: "#94a3b8",
+            });
+            otherAdded = true;
+          }
+        } else if (s.kind === "surplus") {
+          newSteps.push({ ...s, step_index: newSteps.length, cumulative_paise: runningCum });
+        } else {
+          runningCum += s.amount_paise;
+          newSteps.push({ ...s, step_index: newSteps.length, cumulative_paise: runningCum });
+        }
+      }
+      processedSteps = newSteps;
+    }
+
+    return processedSteps.map((s) => {
       let baseRupees = 0;
       const amtRupees = Math.abs(s.amount_paise) / 100;
       const cumRupees = s.cumulative_paise / 100;
 
-      if (s.kind === "income") {
-        baseRupees = 0;
-      } else if (s.kind === "surplus") {
+      if (s.kind === "income" || s.kind === "surplus") {
         baseRupees = 0;
       } else {
         // Outflows step downwards: base starts at the lower level
@@ -108,11 +160,23 @@ export function CashflowWaterfallCard({ className }: { className?: string }) {
   const netSurplus = data?.net_liquid_surplus_paise ?? 0;
 
   return (
-    <Card className={cn("overflow-hidden border bg-card", className)}>
+    <Card
+      className={cn(
+        "overflow-hidden",
+        embedded ? "border-0 bg-transparent shadow-none" : "border bg-card",
+        className,
+      )}
+    >
       <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex items-center gap-2">
             <Eyebrow as="h2">Cashflow Waterfall: Inflow to Wealth</Eyebrow>
+            <Link
+              href="/spending"
+              className="inline-flex items-center gap-0.5 text-[11px] font-medium text-muted-foreground hover:text-foreground hover:underline"
+            >
+              Category spending ↗
+            </Link>
           </div>
 
           <div className="mt-1 flex flex-wrap items-baseline gap-4">
@@ -220,10 +284,10 @@ export function CashflowWaterfallCard({ className }: { className?: string }) {
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
-                fontSize={11}
+                fontSize={10.5}
                 interval={0}
-                angle={-18}
-                textAnchor="end"
+                angle={0}
+                textAnchor="middle"
               />
 
               <YAxis

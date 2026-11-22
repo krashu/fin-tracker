@@ -556,6 +556,8 @@ class OverviewResponse(BaseModel):
     fronted_peer_entries_paise: int = 0
     net_personal_spend_paise: int = 0
     fronted_card_usage_paise: int = 0
+    peer_receivables_paise: int = 0
+    peer_payables_paise: int = 0
 
 
 class CategoryTrendSubcategory(BaseModel):

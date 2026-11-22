@@ -40,6 +40,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 import {
   getNetWorthSummary,
   getNetWorthTimeline,
+  type OverviewResponse,
   type TimelineRange,
 } from "@/lib/api/client";
 import { compactINR, formatINR } from "@/lib/format";
@@ -116,7 +117,15 @@ function TrendingDownIcon(props: React.SVGProps<SVGSVGElement>) {
   );
 }
 
-export function NetWorthCard({ className }: { className?: string }) {
+export function NetWorthCard({
+  className,
+  overview,
+  embedded = false,
+}: {
+  className?: string;
+  overview?: OverviewResponse;
+  embedded?: boolean;
+}) {
   const [range, setRange] = useState<TimelineRange>("1Y");
   const { hidden } = useBalanceHidden();
 
@@ -135,6 +144,32 @@ export function NetWorthCard({ className }: { className?: string }) {
   const summary = summaryQuery.data;
   const timeline = timelineQuery.data;
   const points = timeline?.points ?? [];
+
+  // Executive Wealth Vitals
+  const savingsRatePct = useMemo(() => {
+    if (!overview || overview.income_paise <= 0) return null;
+    const surplus = overview.income_paise + overview.expense_paise;
+    return Math.round((surplus / overview.income_paise) * 1000) / 10;
+  }, [overview]);
+
+  const runwayMonths = useMemo(() => {
+    if (!overview) return null;
+    const liquidCash = overview.accounts
+      .filter((a) => a.type === "bank" || a.type === "cash")
+      .reduce((s, a) => s + Math.max(0, a.balance_paise), 0);
+    const annualSpend = Math.abs(overview.expense_paise);
+    if (annualSpend <= 0) return null;
+    const monthlyBurn = annualSpend / 12;
+    return (liquidCash / monthlyBurn).toFixed(1);
+  }, [overview]);
+
+  const netPeerDues = useMemo(() => {
+    if (!overview) return null;
+    const rec = overview.peer_receivables_paise ?? 0;
+    const pay = overview.peer_payables_paise ?? 0;
+    if (rec === 0 && pay === 0) return null;
+    return rec - pay;
+  }, [overview]);
 
   // Transform timeline points from paise to rupees for charting
   const chartData = useMemo(() => {
@@ -176,14 +211,24 @@ export function NetWorthCard({ className }: { className?: string }) {
   const delta1yPct = summary?.delta_1y_pct;
 
   return (
-    <Card className={cn("overflow-hidden border bg-card", className)}>
+    <Card
+      className={cn(
+        "overflow-hidden",
+        embedded ? "border-0 bg-transparent shadow-none" : "border bg-card",
+        className,
+      )}
+    >
       <CardHeader className="flex flex-col gap-4 pb-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex items-center gap-2">
             <Eyebrow as="h2">Net Worth Timeline & Wealth Trajectory</Eyebrow>
+            <span className="flex items-center gap-1 text-[10.5px] font-medium text-emerald-600 dark:text-emerald-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              Live
+            </span>
             <Link
               href="/portfolio"
-              className="inline-flex items-center gap-0.5 text-[11px] font-medium text-muted-foreground hover:text-foreground hover:underline"
+              className="ml-2 inline-flex items-center gap-0.5 text-[11px] font-medium text-muted-foreground hover:text-foreground hover:underline"
             >
               Portfolio <ArrowUpRightIcon className="h-3 w-3" />
             </Link>
@@ -191,7 +236,7 @@ export function NetWorthCard({ className }: { className?: string }) {
 
           <div className="mt-1 flex flex-wrap items-baseline gap-3">
             <div
-              className="text-[34px] font-bold tracking-tight text-foreground"
+              className="text-[36px] font-bold tracking-tight text-foreground"
               style={{ fontVariantNumeric: "tabular-nums lining-nums" }}
             >
               {summary ? (
@@ -248,13 +293,66 @@ export function NetWorthCard({ className }: { className?: string }) {
           {/* Asset vs Liability Decomposition */}
           {summary ? (
             <p className="mt-1 text-[12px] text-muted-foreground">
-              Assets <Sensitive>{formatINR(assetsPaise)}</Sensitive>
+              Liquid Assets <Sensitive>{formatINR(summary.breakdown?.bank_cash_paise ?? assetsPaise)}</Sensitive>
+              {" · "}
+              Investments <Sensitive>
+                {formatINR(
+                  (summary.breakdown?.indian_equity_paise ?? 0) +
+                  (summary.breakdown?.indian_mf_paise ?? 0) +
+                  (summary.breakdown?.us_equity_paise ?? 0) +
+                  (summary.breakdown?.debt_fd_paise ?? 0) +
+                  (summary.breakdown?.gold_paise ?? 0),
+                )}
+              </Sensitive>
               {liabilitiesPaise > 0 ? (
                 <>
                   {" · "}
                   Liabilities / Dues <Sensitive>−{formatINR(liabilitiesPaise)}</Sensitive>
                 </>
               ) : null}
+            </p>
+          ) : null}
+
+          {/* Executive Wealth Vitals Strip */}
+          {overview && (savingsRatePct !== null || runwayMonths !== null || netPeerDues !== null) ? (
+            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+              {savingsRatePct !== null && (
+                <div className="inline-flex items-center gap-1 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
+                  <span>Savings Rate:</span>
+                  <span className="font-semibold">{savingsRatePct}%</span>
+                </div>
+              )}
+              {runwayMonths !== null && (
+                <div className="inline-flex items-center gap-1 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-600 dark:text-cyan-400">
+                  <span>Emergency Runway:</span>
+                  <span className="font-semibold">{runwayMonths} mo</span>
+                </div>
+              )}
+              {netPeerDues !== null && netPeerDues !== 0 && (
+                <Link
+                  href="/friends"
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors hover:underline",
+                    netPeerDues > 0
+                      ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                      : "border-rose-500/20 bg-rose-500/10 text-rose-600 dark:text-rose-400",
+                  )}
+                >
+                  <span>Khata Dues:</span>
+                  <span className="font-semibold font-mono">
+                    <Sensitive>
+                      {netPeerDues > 0 ? "+" : "−"}{formatINR(Math.abs(netPeerDues))}
+                    </Sensitive>
+                  </span>
+                </Link>
+              )}
+            </div>
+          ) : null}
+
+          {overview && overview.fx_unavailable_count > 0 ? (
+            <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+              ⚠ Excludes {overview.fx_unavailable_count} USD holding
+              {overview.fx_unavailable_count === 1 ? "" : "s"} — no USD→INR rate is cached.
             </p>
           ) : null}
         </div>
@@ -337,14 +435,21 @@ export function NetWorthCard({ className }: { className?: string }) {
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
+                minTickGap={28}
+                interval="preserveStartEnd"
                 fontSize={11}
                 tickFormatter={(val: string) => {
                   try {
                     const d = new Date(val);
+                    if (range === "1M" || range === "6M") {
+                      return d.toLocaleDateString("en-IN", {
+                        day: "numeric",
+                        month: "short",
+                      });
+                    }
                     return d.toLocaleDateString("en-IN", {
                       month: "short",
-                      year: range === "ALL" || range === "5Y" || range === "3Y" ? "2-digit" : undefined,
-                      day: range === "1M" || range === "6M" ? "numeric" : undefined,
+                      year: "2-digit",
                     });
                   } catch {
                     return val;
@@ -534,6 +639,38 @@ export function NetWorthCard({ className }: { className?: string }) {
             </ComposedChart>
           </ChartContainer>
         )}
+
+        {/* Horizontal Asset Class Dot Legend */}
+        <div className="mt-3 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 border-t border-border/40 px-4 pt-3 text-[11px] text-muted-foreground">
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-[#0ea5e9]" />
+            Cash & Bank
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-[#8b5cf6]" />
+            Mutual Funds
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-[#3b82f6]" />
+            Equity
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-[#ec4899]" />
+            US Stocks
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-[#64748b]" />
+            Fixed Income
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-[#eab308]" />
+            Gold
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-[#14b8a6]" />
+            Peer Receivables
+          </span>
+        </div>
       </CardContent>
     </Card>
   );

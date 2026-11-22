@@ -72,6 +72,7 @@ from app.services.fx_service import latest_rate
 from app.services.holdings_service import compute_holdings, summarize_holdings
 from app.services.merchant_alias import is_unknown_via, load_alias_resolver
 from app.services.net_worth_service import compute_cashflow_waterfall
+from app.services.peer_service import get_peer_summary
 from app.services.tag_service import AUTO_TAGGABLE_TYPES
 from app.services.transaction_queries import confirmed_only
 
@@ -1164,9 +1165,14 @@ def overview(
     fronted_card_stmt = confirmed_only(fronted_card_stmt)
     fronted_card_usage_paise = int(session.scalar(fronted_card_stmt) or 0)
 
+    peer_summary = get_peer_summary(session, user_id=user_id)
+    peer_rec_paise = peer_summary.total_receivable_paise
+    peer_pay_paise = peer_summary.total_payable_paise
+    net_peer_paise = peer_rec_paise - peer_pay_paise
+
     return OverviewResponse(
         period=window.key,
-        net_worth_paise=net_worth_accounts + portfolio_value_paise,
+        net_worth_paise=net_worth_accounts + portfolio_value_paise + net_peer_paise,
         portfolio_value_paise=portfolio_value_paise,
         fx_unavailable_count=portfolio_rollup.fx_unavailable_count,
         income_paise=income_paise,
@@ -1177,6 +1183,8 @@ def overview(
         fronted_peer_entries_paise=fronted_peer_entries_paise,
         net_personal_spend_paise=net_personal_spend_paise,
         fronted_card_usage_paise=fronted_card_usage_paise,
+        peer_receivables_paise=peer_rec_paise,
+        peer_payables_paise=peer_pay_paise,
     )
 
 

@@ -359,6 +359,36 @@ def compute_net_worth_timeline(
         session, user_id, end_date
     )
 
+    # Live holdings anchor for today and future dates:
+    # Eliminates pricing divergence between live Instrument.current_nav and historical quotes.
+    live_today_breakdown: _DailyInvestments | None = None
+    today_dt = clock.today()
+    if end_date >= today_dt:
+        try:
+            from app.services.fx_service import latest_rate
+            from app.services.holdings_service import compute_holdings
+
+            usd_inr = latest_rate(session)
+            live_holdings = compute_holdings(session, user_id=user_id, usd_inr_rate=usd_inr)
+            b = _DailyInvestments()
+            for h in live_holdings:
+                val = h.current_value_inr_paise or 0
+                cat = _map_asset_class_category(h.asset_class)
+                if cat == "indian_equity":
+                    b.indian_equity_paise += val
+                elif cat == "indian_mf":
+                    b.indian_mf_paise += val
+                elif cat == "us_equity":
+                    b.us_equity_paise += val
+                elif cat == "debt_fd":
+                    b.debt_fd_paise += val
+                elif cat == "gold":
+                    b.gold_paise += val
+            if b.total_paise > 0:
+                live_today_breakdown = b
+        except Exception:
+            live_today_breakdown = None
+
     # 5. Daily forward sweep from start_date to end_date
     curr_bank_cash = bank_cash_prior_to_start
     daily_points: list[NetWorthTimelinePoint] = []
@@ -381,8 +411,11 @@ def compute_net_worth_timeline(
         peer_rec = sum(b for b in contact_balances.values() if b > 0)
         peer_pay = sum(-b for b in contact_balances.values() if b < 0)
 
-        # Investment breakdown
-        inv_day = inv_breakdown_by_date.get(curr_day, _DailyInvestments())
+        # Investment breakdown: for today and forward, prioritize authoritative live NAVs
+        if curr_day >= today_dt and live_today_breakdown is not None:
+            inv_day = live_today_breakdown
+        else:
+            inv_day = inv_breakdown_by_date.get(curr_day, _DailyInvestments())
         ie_paise = inv_day.indian_equity_paise
         imf_paise = inv_day.indian_mf_paise
         ue_paise = inv_day.us_equity_paise
