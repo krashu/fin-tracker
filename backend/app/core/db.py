@@ -31,7 +31,13 @@ def _ensure_sqlite_parent_dir(database_url: str) -> None:
     url = make_url(database_url)
     if not url.database or url.database == ":memory:":
         return
-    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+    parent = Path(url.database).parent
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            if not parent.exists():
+                raise
 
 
 def make_engine(url: str, poolclass: type[Pool] | None = None) -> Engine:

@@ -50,7 +50,9 @@ COPY --from=builder /app /app
 # to a stable value (see docker-compose.yml). No `chown -R /app` needed: appuser only READS
 # /app (world-readable) and executes the venv; the ONLY path it writes is the /data volume
 # (SQLite DB + WAL/journal), which the bind mount owns at runtime.
-RUN useradd -u 10001 --create-home appuser
+RUN useradd -u 10001 --create-home appuser \
+    && mkdir -p /data \
+    && chown -R appuser:appuser /data
 USER appuser
 
 EXPOSE 8000

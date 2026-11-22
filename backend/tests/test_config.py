@@ -127,6 +127,9 @@ def test_db_ensure_sqlite_parent_dir(tmp_path: Path) -> None:
     assert not target_dir.exists()
     _ensure_sqlite_parent_dir(f"sqlite:///{db_file}")
     assert target_dir.exists()
+    # Calling again when parent already exists is a safe no-op
+    _ensure_sqlite_parent_dir(f"sqlite:///{db_file}")
+    assert target_dir.exists()
 
 
 def test_make_engine_creates_missing_sqlite_parent_dir(tmp_path: Path) -> None:

@@ -87,7 +87,13 @@ def _ensure_sqlite_parent_dir() -> None:
     url = make_url(_DB_URL)
     if not url.database or url.database == ":memory:":
         return
-    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+    parent = Path(url.database).parent
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            if not parent.exists():
+                raise
 
 
 _ensure_sqlite_parent_dir()

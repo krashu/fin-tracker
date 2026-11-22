@@ -53,7 +53,13 @@ def _ensure_sqlite_parent_dir(database_url: str) -> None:
     # for the explicit form — neither is a filesystem path to create.
     if not url.database or url.database == ":memory:":
         return
-    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+    parent = Path(url.database).parent
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            if not parent.exists():
+                raise
 
 
 def run_migrations(settings: Settings) -> None:
