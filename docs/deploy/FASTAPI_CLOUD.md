@@ -54,6 +54,7 @@ fastapi cloud env set REGISTRATION_ENABLED "false"
 fastapi cloud env set SEED_DEMO_ON_STARTUP "true"
 fastapi cloud env set APPLY_MIGRATIONS_ON_STARTUP "true"
 fastapi cloud env set RATE_LIMIT_TRUST_PROXY "true"
+fastapi cloud env set DATABASE_URL "sqlite:////tmp/fin-tracker.db"
 
 # Secrets (encrypted in FastAPI Cloud)
 fastapi cloud env set --secret JWT_SECRET "<generate-random-64-char-string>"
@@ -70,6 +71,7 @@ fastapi cloud env set --secret JWT_SECRET "<generate-random-64-char-string>"
 | `SEED_DEMO_ON_STARTUP` | `true` | Auto-populates 90-day demo transactions and investments on boot |
 | `APPLY_MIGRATIONS_ON_STARTUP` | `true` | Automatically brings SQLite schema to `head` on boot |
 | `RATE_LIMIT_TRUST_PROXY` | `true` | Keys rate-limiter on client IP via X-Forwarded-For behind cloud ingress |
+| `DATABASE_URL` | `sqlite:////tmp/fin-tracker.db` | Database connection string. Points to `/tmp` for writable SQLite demo storage (or external PostgreSQL URL) |
 
 ---
 

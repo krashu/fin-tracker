@@ -468,7 +468,14 @@ class Settings(BaseSettings):
         # re-anchor to the root of the current drive (C:\data\...). Strip leading
         # slashes so it anchors relative to REPO_ROOT (fin-tracker/data/...).
         clean_rel = Path(url.database.lstrip("/\\"))
-        absolute_path = (REPO_ROOT / clean_rel).resolve()
+        if Path("/") == REPO_ROOT and not Path("/data").is_dir():
+            # In container deployment (e.g. FastAPI Cloud) without a mounted /data volume,
+            # system root '/' is read-only for non-root users. Anchor to /tmp where the
+            # process has write permission.
+            base_dir = Path("/tmp")
+        else:
+            base_dir = REPO_ROOT
+        absolute_path = (base_dir / clean_rel).resolve()
         new_url = url.set(database=str(absolute_path))
         self.database_url = new_url.render_as_string(hide_password=False)
         return self

@@ -108,6 +108,20 @@ def test_anchor_relative_sqlite_path_in_docker_container(monkeypatch: pytest.Mon
     assert url.database == "/data/fin-tracker.db"
 
 
+def test_anchor_relative_sqlite_path_in_container_without_data_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.core.config.REPO_ROOT", Path("/"))
+    monkeypatch.setattr(Path, "is_dir", lambda self: False)
+    s = Settings(
+        _env_file=None,
+        database_url="sqlite:///./data/fin-tracker.db",
+        cors_allowed_origins=_VALID_CORS,
+    )
+    url = make_url(s.database_url)
+    assert str(url.database).startswith(str(Path("/tmp").resolve()))
+
+
 def test_anchor_relative_sqlite_path_preserves_memory_and_postgres() -> None:
     s_mem = Settings(
         _env_file=None, database_url="sqlite:///:memory:", cors_allowed_origins=_VALID_CORS
